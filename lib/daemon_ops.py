@@ -373,7 +373,33 @@ def process_worker_completion(
         return result
 
     # Step 3: Determine outcome and update queue entry
-    if pending_count == 0:
+
+    # Safety net: enforce max_iter cap FIRST, regardless of pending_count.
+    # Without this, specs with 0 pending tasks could loop forever if the
+    # critic keeps requeuing them (Bug: max_iter was in an elif branch that
+    # was unreachable when pending_count == 0).
+    if iteration >= max_iter:
+        # Max iterations reached
+        fail(queue_dir, queue_id, "Max iterations reached")
+        result["outcome"] = "failed"
+        result["reason"] = "max_iterations"
+
+        write_event(
+            events_dir,
+            {
+                "type": "spec_failed",
+                "queue_id": queue_id,
+                "spec_path": spec_path,
+                "iterations": iteration,
+                "tasks_done": done_count,
+                "reason": "max_iterations",
+                "timestamp": timestamp,
+            },
+        )
+
+        run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=True)
+
+    elif pending_count == 0:
         # All tasks done — check if critic should run
         state_dir = str(Path(queue_dir).parent)
         critic_config = load_critic_config(state_dir)
@@ -459,27 +485,6 @@ def process_worker_completion(
             )
 
             run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
-
-    elif iteration >= max_iter:
-        # Max iterations reached
-        fail(queue_dir, queue_id, "Max iterations reached")
-        result["outcome"] = "failed"
-        result["reason"] = "max_iterations"
-
-        write_event(
-            events_dir,
-            {
-                "type": "spec_failed",
-                "queue_id": queue_id,
-                "spec_path": spec_path,
-                "iterations": iteration,
-                "tasks_done": done_count,
-                "reason": "max_iterations",
-                "timestamp": timestamp,
-            },
-        )
-
-        run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=True)
 
     else:
         # Still has pending tasks, requeue

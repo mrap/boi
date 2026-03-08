@@ -317,6 +317,56 @@ PYEOF
 
             # Clean up exit file
             rm -f "${exit_file}"
+
+            # Handle critic_review outcome: launch a critic worker
+            # (Without this, the spec gets requeued but no critic runs,
+            # causing an infinite requeue loop for completed specs.)
+            if [[ "${outcome}" == "critic_review" ]]; then
+                local critic_pass
+                critic_pass=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('critic_pass',1))" 2>/dev/null || echo "1")
+                log_info "Spec ${queue_id} entering critic review (pass ${critic_pass})"
+
+                # Set phase to "critic" and status to "running" for the critic worker
+                local critic_iter
+                critic_iter=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" "${worker_id}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.queue import _read_entry, _write_entry, set_running
+entry = _read_entry(sys.argv[1], sys.argv[2])
+if entry:
+    entry["phase"] = "critic"
+    _write_entry(sys.argv[1], entry)
+set_running(sys.argv[1], sys.argv[2], sys.argv[3])
+entry = _read_entry(sys.argv[1], sys.argv[2])
+print(json.dumps({"iteration": entry.get("iteration", 1), "spec_path": entry.get("spec_path", "")}))
+PYEOF
+                )
+                local c_iteration c_spec_path
+                c_iteration=$(echo "${critic_iter}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['iteration'])")
+                c_spec_path=$(echo "${critic_iter}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['spec_path'])")
+
+                # Launch critic worker
+                bash "${WORKER_SCRIPT}" --critic "${queue_id}" "${worktree_path}" "${c_spec_path}" "${c_iteration}" >> "${DAEMON_LOG}" 2>&1
+
+                # Read PID from the PID file
+                local critic_pid_file="${QUEUE_DIR}/${queue_id}.pid"
+                local critic_pid=""
+                if [[ -f "${critic_pid_file}" ]]; then
+                    critic_pid=$(cat "${critic_pid_file}")
+                fi
+
+                if [[ -n "${critic_pid}" ]]; then
+                    WORKER_CURRENT_SPEC["${worker_id}"]="${queue_id}"
+                    WORKER_PIDS["${worker_id}"]="${critic_pid}"
+                    WORKER_START_TIME["${worker_id}"]="$(date +%s)"
+                    log_info "Critic worker launched for ${queue_id} (PID ${critic_pid}, pass ${critic_pass})"
+                else
+                    log_error "Failed to launch critic worker for ${queue_id}."
+                fi
+
+                return 0
+            fi
+
             return 0
         fi
 
