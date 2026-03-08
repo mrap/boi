@@ -245,33 +245,68 @@ def _get_quality_alerts(entries: list[dict[str, Any]], color: bool = True) -> li
     return alert_lines
 
 
-def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
-    """Format queue status as a human-readable table.
+def _get_terminal_width() -> int:
+    """Get terminal width with fallback to 80."""
+    try:
+        return os.get_terminal_size().columns
+    except (ValueError, OSError):
+        return 80
 
-    Designed to fit in 80-char terminal width.
+
+def _sort_entries_for_display(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort entries: running first, then queued/requeued, then completed/canceled.
+
+    Within each group, preserve original priority order.
+    """
+    order = {
+        "running": 0,
+        "requeued": 0,
+        "needs_review": 1,
+        "failed": 1,
+        "queued": 2,
+        "completed": 3,
+        "canceled": 3,
+    }
+    return sorted(entries, key=lambda e: order.get(e.get("status", "queued"), 2))
+
+
+def format_queue_table(
+    status_data: dict[str, Any], color: bool = True, width: int | None = None
+) -> str:
+    """Format queue status as a human-readable, full-width table.
+
+    Adapts to terminal width. Fixed columns for structured data,
+    flexible SPEC column gets remaining space.
 
     Output:
         BOI
 
-        QUEUE                    MODE     WORKER ITER  TASKS      STATUS
-        q-001  ai-profile-v2     disc     w-1    7/30  5/8 done   running
+        SPEC                           MODE      WORKER  ITER    TASKS        STATUS
+        ─────────────────────────────────────────────────────────────────────────────
+        q-005  ux-polish               execute   w-1     10/30   6/6 done     running
         ...
 
-        Hint: Run 'boi log q-001' to see worker output
+        Workers: 3/3 busy  |  3 running, 2 queued, 7 completed
     """
     entries = status_data.get("entries", [])
     summary = status_data.get("summary", {})
     workers = status_data.get("workers", [])
 
-    # Mode abbreviations for compact display
-    mode_abbrev: dict[str, str] = {
-        "execute": "exec",
-        "challenge": "chal",
-        "discover": "disc",
-        "generate": "gen",
-    }
+    # Terminal width
+    term_w = width if width is not None else _get_terminal_width()
 
-    lines = []
+    # Fixed column widths (including trailing space as separator)
+    COL_MODE = 10  # "execute   " (8 + 2 space)
+    COL_WORKER = 8  # "w-1     " (6 + 2 space)
+    COL_ITER = 8  # "10/30   " (7 + 1 space)
+    COL_TASKS = 13  # "6/6 done     " (12 + 1 space)
+    COL_STATUS = 12  # "running" right-padded
+
+    fixed_cols = COL_MODE + COL_WORKER + COL_ITER + COL_TASKS + COL_STATUS
+    # SPEC column gets remaining space, minimum 20
+    col_spec = max(20, term_w - fixed_cols)
+
+    lines: list[str] = []
 
     header = "BOI"
     if color:
@@ -294,33 +329,49 @@ def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
         lines.append("  boi --help                       See all commands")
         return "\n".join(lines)
 
-    # Column widths: QUEUE(25) MODE(9) WORKER(7) ITER(6) TASKS(11) STATUS = ~68
+    # Column header
     col_header = (
-        f"{'QUEUE':<25}{'MODE':<9}{'WORKER':<7}{'ITER':<6}{'TASKS':<11}{'STATUS'}"
+        f"{'SPEC':<{col_spec}}"
+        f"{'MODE':<{COL_MODE}}"
+        f"{'WORKER':<{COL_WORKER}}"
+        f"{'ITER':<{COL_ITER}}"
+        f"{'TASKS':<{COL_TASKS}}"
+        f"{'STATUS'}"
     )
     if color:
         col_header = f"{BOLD}{col_header}{NC}"
     lines.append(col_header)
 
-    generate_details: list[tuple[int, list[str]]] = []
+    # Separator line spanning full width
+    sep = "\u2500" * term_w
+    if color:
+        sep = f"{DIM}{sep}{NC}"
+    lines.append(sep)
 
-    # Find first running spec for the hint
+    # Sort: running first, queued, then completed
+    sorted_entries = _sort_entries_for_display(entries)
+
+    generate_details: list[tuple[int, list[str]]] = []
     first_running_id = ""
 
-    for idx, entry in enumerate(entries):
+    for entry in sorted_entries:
         qid = entry.get("id", "?")
         spec_path = entry.get("original_spec_path", entry.get("spec_path", ""))
         spec_name = (
             os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
         )
         label = f"{qid}  {spec_name}"
-        if len(label) > 23:
-            label = label[:23]
+        # Truncate with ellipsis if too long
+        max_label = col_spec - 2  # leave padding
+        if len(label) > max_label:
+            label = label[: max_label - 1] + "\u2026"
 
         mode = entry.get("mode", "execute")
-        mode_str = mode_abbrev.get(mode, mode[:4])
+        mode_str = mode
 
         worker = entry.get("last_worker") or "-"
+        if entry.get("status") not in ("running", "requeued"):
+            worker = "-"
         iteration = entry.get("iteration", 0)
         max_iter = entry.get("max_iterations", 30)
         iter_str = f"{iteration}/{max_iter}" if entry.get("status") != "queued" else "-"
@@ -334,28 +385,48 @@ def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
             tasks_str = "-"
 
         status = entry.get("status", "queued")
-        status_display = status
 
         # Track first running spec for hint
         if not first_running_id and status == "running":
             first_running_id = qid
 
         # Quality annotation (compact, appended to status)
-        quality_str, progress_str = _get_quality_display(entry, color=False)
+        quality_str, _progress_str = _get_quality_display(entry, color=False)
         quality_suffix = ""
         if quality_str != "\u2014" and quality_str != "-":
             quality_suffix = f" [{quality_str}]"
 
-        if color:
-            status_color = STATUS_COLORS.get(status, "")
-            status_display = _colorize(status + quality_suffix, status_color)
-        else:
-            status_display = status + quality_suffix
-
-        lines.append(
-            f"{label:<25}{mode_str:<9}{worker:<7}{iter_str:<6}"
-            f"{tasks_str:<11}{status_display}"
+        # Build the plain-text row
+        row_text = (
+            f"{label:<{col_spec}}"
+            f"{mode_str:<{COL_MODE}}"
+            f"{worker:<{COL_WORKER}}"
+            f"{iter_str:<{COL_ITER}}"
+            f"{tasks_str:<{COL_TASKS}}"
+            f"{status}{quality_suffix}"
         )
+
+        if color:
+            is_completed = status in ("completed", "canceled")
+            if is_completed:
+                # Dim the entire row for completed specs
+                row_text = f"{DIM}{row_text}{NC}"
+            else:
+                # Colorize just the status portion
+                status_color = STATUS_COLORS.get(status, "")
+                if status_color:
+                    # Rebuild with colored status
+                    row_prefix = (
+                        f"{label:<{col_spec}}"
+                        f"{mode_str:<{COL_MODE}}"
+                        f"{worker:<{COL_WORKER}}"
+                        f"{iter_str:<{COL_ITER}}"
+                        f"{tasks_str:<{COL_TASKS}}"
+                    )
+                    colored_status = _colorize(status + quality_suffix, status_color)
+                    row_text = f"{row_prefix}{colored_status}"
+
+        lines.append(row_text)
 
         # Collect Generate mode detail blocks
         gen_detail = _get_generate_detail(entry)
@@ -376,29 +447,32 @@ def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
             lines.append(al)
         lines.append("")
 
-    # Summary line
+    # Summary line (single line)
     total_workers = len(workers)
     running = summary.get("running", 0)
     queued = summary.get("queued", 0) + summary.get("requeued", 0)
     completed = summary.get("completed", 0)
     needs_review = summary.get("needs_review", 0)
+    failed = summary.get("failed", 0)
 
-    parts = []
+    parts: list[str] = []
     if total_workers:
         parts.append(f"Workers: {running}/{total_workers} busy")
 
-    queue_parts = []
+    count_parts: list[str] = []
     if running:
-        queue_parts.append(f"{running} running")
+        count_parts.append(f"{running} running")
     if queued:
-        queue_parts.append(f"{queued} queued")
+        count_parts.append(f"{queued} queued")
     if needs_review:
-        queue_parts.append(f"{needs_review} needs review")
+        count_parts.append(f"{needs_review} needs review")
+    if failed:
+        count_parts.append(f"{failed} failed")
     if completed:
-        queue_parts.append(f"{completed} done")
+        count_parts.append(f"{completed} completed")
 
-    if queue_parts:
-        parts.append(f"Queue: {', '.join(queue_parts)}")
+    if count_parts:
+        parts.append(", ".join(count_parts))
 
     lines.append("  |  ".join(parts) if parts else f"Total: {summary.get('total', 0)}")
 
@@ -630,10 +704,12 @@ STATUS_ICONS: dict[str, str] = {
 }
 
 
-def format_dashboard(status_data: dict[str, Any], color: bool = True) -> str:
+def format_dashboard(
+    status_data: dict[str, Any], color: bool = True, width: int | None = None
+) -> str:
     """Format queue status as a compact dashboard for tmux panes.
 
-    Designed for 80-char width. Color-coded by status. Shows mode and quality.
+    Adapts to terminal width. Color-coded by status. Shows mode and quality.
 
     Output:
         ═══ BOI ═══════════════════════════════════════════════ 08:23 ══
@@ -646,6 +722,10 @@ def format_dashboard(status_data: dict[str, Any], color: bool = True) -> str:
     summary = status_data.get("summary", {})
     workers = status_data.get("workers", [])
 
+    term_w = width if width is not None else _get_terminal_width()
+    # Dashboard targets narrower widths
+    dash_w = min(term_w, 80)
+
     lines: list[str] = []
 
     # Header bar
@@ -653,7 +733,7 @@ def format_dashboard(status_data: dict[str, Any], color: bool = True) -> str:
     time_str = now.strftime("%H:%M")
     header_text = "\u2550\u2550\u2550 BOI "
     right = f" {time_str} \u2550\u2550"
-    fill_len = 72 - len(header_text) - len(right)
+    fill_len = dash_w - len(header_text) - len(right)
     if fill_len < 1:
         fill_len = 1
     header_line = header_text + ("\u2550" * fill_len) + right
@@ -684,7 +764,15 @@ def format_dashboard(status_data: dict[str, Any], color: bool = True) -> str:
         "generate": "gen",
     }
 
-    for entry in entries:
+    # Fixed right-side columns: mode(5) + tasks(6) + iter(4) + quality(9) + worker(5) + spacing
+    # We calculate the label (qid + spec_name) width as flexible
+    RIGHT_FIXED = 30  # approximate space for mode, tasks, iter, quality, worker
+    max_label_len = max(20, dash_w - RIGHT_FIXED - 4)  # 4 = icon + spaces
+
+    # Sort entries for display
+    sorted_entries = _sort_entries_for_display(entries)
+
+    for entry in sorted_entries:
         status = entry.get("status", "queued")
         icon = STATUS_ICONS.get(status, "?")
 
@@ -693,9 +781,10 @@ def format_dashboard(status_data: dict[str, Any], color: bool = True) -> str:
         spec_name = (
             os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
         )
-        max_name_len = 20
-        if len(spec_name) > max_name_len:
-            spec_name = spec_name[:max_name_len]
+        # Truncate spec name if needed (with ellipsis)
+        label = f"{qid} {spec_name}"
+        if len(label) > max_label_len:
+            label = label[: max_label_len - 1] + "\u2026"
 
         mode = entry.get("mode", "execute")
         mode_str = mode_abbrev.get(mode, mode[:4])
@@ -722,18 +811,21 @@ def format_dashboard(status_data: dict[str, Any], color: bool = True) -> str:
         worker = entry.get("last_worker") or ""
         worker_str = f"  {worker}" if worker and status == "running" else ""
 
-        # Build the line
-        label = f"{qid} {spec_name}"
-        right_part = f"{tasks_str}  {iter_str}  {quality_compact}{worker_str}"
-        pad_len = 68 - len(icon) - 2 - len(mode_str) - 2 - len(right_part)
-        if pad_len < len(label) + 1:
-            pad_len = len(label) + 1
-        padded_label = label.ljust(pad_len)
-        row = f" {icon} {padded_label}{mode_str}  {right_part}"
+        # Build row with fixed-width columns
+        row = (
+            f" {icon} {label:<{max_label_len}}"
+            f" {mode_str:<5}"
+            f" {tasks_str:>5}"
+            f" {iter_str:>3}"
+            f"  {quality_compact:<9}"
+            f"{worker_str}"
+        )
 
         if color:
             status_color = STATUS_COLORS.get(status, "")
-            if status_color:
+            if status in ("completed", "canceled"):
+                row = f"{DIM}{row}{NC}"
+            elif status_color:
                 row = f"{status_color}{row}{NC}"
 
         lines.append(row)
