@@ -41,6 +41,9 @@ DEFAULT_CHECKS = [
     "code-quality",
     "completeness",
     "fleet-readiness",
+    "conjecture-criticism",
+    "goal-alignment",
+    "quality-scoring",
 ]
 
 
