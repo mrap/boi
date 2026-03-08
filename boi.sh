@@ -115,6 +115,63 @@ require_daemon() {
     return 1
 }
 
+# Check if a BOI upgrade is available (cached, non-blocking).
+# Shows a one-line warning if behind remote. Caches result for 1 hour.
+check_upgrade_available() {
+    local src_dir="${BOI_STATE_DIR}/src"
+    local cache_file="${BOI_STATE_DIR}/.upgrade-check"
+    local cache_ttl=3600  # 1 hour in seconds
+
+    # Skip if not a git repo
+    [[ -d "${src_dir}/.git" ]] || return 0
+
+    local need_refresh=true
+
+    if [[ -f "${cache_file}" ]]; then
+        local cache_ts cache_result
+        cache_ts=$(head -1 "${cache_file}" 2>/dev/null || echo "0")
+        cache_result=$(sed -n '2p' "${cache_file}" 2>/dev/null || echo "ok")
+        local now
+        now=$(date +%s)
+        local age=$(( now - cache_ts ))
+
+        # Show cached result (even if stale) so users see the warning
+        if [[ "${cache_result}" =~ ^behind:([0-9]+)$ ]]; then
+            echo ""
+            echo -e "  ${YELLOW}Update available:${NC} ${BASH_REMATCH[1]} commit(s) behind. Run ${BOLD}boi upgrade${NC} to update."
+        fi
+
+        if [[ ${age} -lt ${cache_ttl} ]]; then
+            need_refresh=false
+        fi
+    fi
+
+    # Refresh in background if cache is stale or missing
+    if [[ "${need_refresh}" == "true" ]]; then
+        (
+            if timeout 10 git -C "${src_dir}" fetch origin --quiet 2>/dev/null; then
+                local local_head remote_head
+                local_head=$(git -C "${src_dir}" rev-parse HEAD 2>/dev/null)
+                remote_head=$(git -C "${src_dir}" rev-parse origin/main 2>/dev/null)
+                if [[ -n "${local_head}" ]] && [[ -n "${remote_head}" ]]; then
+                    local tmp="${cache_file}.tmp"
+                    if [[ "${local_head}" == "${remote_head}" ]]; then
+                        printf '%s\nok\n' "$(date +%s)" > "${tmp}"
+                    else
+                        local count
+                        count=$(git -C "${src_dir}" rev-list HEAD..origin/main --count 2>/dev/null || echo "0")
+                        printf '%s\nbehind:%s\n' "$(date +%s)" "${count}" > "${tmp}"
+                    fi
+                    mv "${tmp}" "${cache_file}"
+                fi
+            fi
+        ) &>/dev/null &
+        disown 2>/dev/null
+    fi
+
+    return 0
+}
+
 # resolve_queue_id — Find the most recent running or last-completed spec.
 # Used by log, cancel, telemetry, spec when no queue-id is provided.
 # Prints the queue-id and spec name to stderr for context, and the queue-id to stdout.
@@ -529,6 +586,9 @@ PYEOF
 
     echo ""
     info "Dispatched. Monitor with: boi status"
+
+    # Check for available upgrades (cached, non-blocking)
+    check_upgrade_available
 }
 
 # ─── Subcommand: queue ──────────────────────────────────────────────────────
@@ -677,6 +737,9 @@ except Exception:
         # Daemon running but no heartbeat file (pre-heartbeat version)
         :
     fi
+
+    # Check for available upgrades (cached, non-blocking)
+    check_upgrade_available
 }
 
 # Inner queue display used by both cmd_queue and cmd_status
@@ -1497,6 +1560,9 @@ cmd_upgrade() {
     echo -e "${BOLD}Changes:${NC}"
     git -C "${src_dir}" diff --stat "${old_commit}..${new_commit}" 2>/dev/null | tail -5
     echo ""
+    # Clear upgrade check cache so the warning disappears
+    rm -f "${BOI_STATE_DIR}/.upgrade-check"
+
     info "BOI upgraded successfully! (${old_commit:0:7} → ${new_commit:0:7})"
 }
 
