@@ -43,7 +43,7 @@ QUEUE_DIR="${BOI_STATE_DIR}/queue"
 EVENTS_DIR="${BOI_STATE_DIR}/events"
 LOG_DIR="${BOI_STATE_DIR}/logs"
 PID_FILE="${BOI_STATE_DIR}/daemon.pid"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # Colors
 RED='\033[0;31m'
