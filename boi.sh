@@ -12,6 +12,7 @@
 #   stop      — Stop daemon and all workers
 #   workers   — Show worktree/worker availability
 #   telemetry — Show per-iteration breakdown for a spec
+#   upgrade   — Update BOI to the latest version
 #   doctor    — Check prerequisites and environment health
 #   dashboard — Live-updating queue progress
 #   spec      — Live spec management (add, skip, reorder, block, edit tasks)
@@ -43,7 +44,7 @@ QUEUE_DIR="${BOI_STATE_DIR}/queue"
 EVENTS_DIR="${BOI_STATE_DIR}/events"
 LOG_DIR="${BOI_STATE_DIR}/logs"
 PID_FILE="${BOI_STATE_DIR}/daemon.pid"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # Colors
 RED='\033[0;31m'
@@ -1311,6 +1312,192 @@ cmd_stop() {
     else
         info "Daemon not running."
     fi
+}
+
+# ─── Subcommand: upgrade ─────────────────────────────────────────────────────
+
+cmd_upgrade() {
+    local force=false
+    local check_only=false
+    local no_plugin=false
+    local src_dir="${BOI_STATE_DIR}/src"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force)     force=true; shift ;;
+            --check)     check_only=true; shift ;;
+            --no-plugin) no_plugin=true; shift ;;
+            -h|--help)
+                echo "Usage: boi upgrade [--check] [--force] [--no-plugin]"
+                echo ""
+                echo "Update BOI to the latest version."
+                echo ""
+                echo "Options:"
+                echo "  --check       Check if an update is available without upgrading"
+                echo "  --force       Stop daemon and workers immediately, don't wait"
+                echo "  --no-plugin   Skip updating the Claude Code plugin"
+                exit 0
+                ;;
+            *) die_usage "Unknown option: $1. Use 'boi upgrade --help' for usage." ;;
+        esac
+    done
+
+    # 1. Pre-flight: verify ~/.boi/src/ is a git repo
+    if [[ ! -d "${src_dir}/.git" ]]; then
+        die "BOI source at ${src_dir} is not a git repo. Reinstall with: curl -fsSL https://raw.githubusercontent.com/mrap/boi/main/install-public.sh | bash"
+    fi
+
+    echo -e "${BOLD}BOI Upgrade${NC}"
+    echo ""
+
+    # 2. Fetch latest from remote
+    progress_step "Checking for updates"
+    if ! git -C "${src_dir}" fetch origin 2>/dev/null; then
+        progress_fail
+        die "Cannot reach remote. Check your network connection."
+    fi
+
+    local old_commit new_remote_commit
+    old_commit=$(git -C "${src_dir}" rev-parse HEAD)
+    new_remote_commit=$(git -C "${src_dir}" rev-parse origin/main 2>/dev/null || true)
+
+    if [[ -z "${new_remote_commit}" ]]; then
+        progress_fail
+        die "Could not resolve origin/main."
+    fi
+
+    if [[ "${old_commit}" == "${new_remote_commit}" ]]; then
+        progress_done "already up to date"
+        echo ""
+        local short_commit="${old_commit:0:7}"
+        info "BOI is up to date (v${BOI_VERSION}, ${short_commit})."
+        return 0
+    fi
+
+    local commit_count
+    commit_count=$(git -C "${src_dir}" rev-list HEAD..origin/main --count 2>/dev/null || echo "?")
+    progress_done "${commit_count} new commit(s)"
+
+    # Show what's coming
+    echo ""
+    echo -e "${BOLD}New commits:${NC}"
+    git -C "${src_dir}" log --oneline HEAD..origin/main 2>/dev/null | head -20
+    echo ""
+
+    # --check: just report and exit
+    if [[ "${check_only}" == "true" ]]; then
+        local old_short="${old_commit:0:7}"
+        local new_short="${new_remote_commit:0:7}"
+        info "Current: v${BOI_VERSION} (${old_short})"
+        info "Latest:  ${new_short}"
+        info "${commit_count} commit(s) behind. Run 'boi upgrade' to update."
+        return 0
+    fi
+
+    # 3. Stop daemon (if running)
+    local daemon_was_running=false
+    if require_daemon; then
+        daemon_was_running=true
+
+        if [[ "${force}" == "true" ]]; then
+            progress_step "Stopping daemon (force)"
+            cmd_stop
+            progress_done
+        else
+            # Wait for active worker iterations to finish
+            local active_workers=0
+            local sessions
+            sessions=$(tmux -L boi list-sessions -F '#{session_name}' 2>/dev/null || true)
+            if [[ -n "${sessions}" ]]; then
+                while IFS= read -r session; do
+                    if [[ "${session}" == boi-* ]]; then
+                        active_workers=$((active_workers + 1))
+                    fi
+                done <<< "${sessions}"
+            fi
+
+            if [[ ${active_workers} -gt 0 ]]; then
+                progress_step "Waiting for ${active_workers} active worker(s) to finish"
+                local waited=0
+                local timeout=120
+                while [[ ${waited} -lt ${timeout} ]]; do
+                    sleep 5
+                    waited=$((waited + 5))
+                    # Re-check active workers
+                    active_workers=0
+                    sessions=$(tmux -L boi list-sessions -F '#{session_name}' 2>/dev/null || true)
+                    if [[ -n "${sessions}" ]]; then
+                        while IFS= read -r session; do
+                            if [[ "${session}" == boi-* ]]; then
+                                active_workers=$((active_workers + 1))
+                            fi
+                        done <<< "${sessions}"
+                    fi
+                    if [[ ${active_workers} -eq 0 ]]; then
+                        break
+                    fi
+                done
+                if [[ ${active_workers} -gt 0 ]]; then
+                    progress_fail "timed out after ${timeout}s"
+                    warn "Proceeding with daemon stop. Active workers will be terminated."
+                else
+                    progress_done
+                fi
+            fi
+
+            progress_step "Stopping daemon"
+            cmd_stop
+            progress_done
+        fi
+    fi
+
+    # 4. Pull code
+    progress_step "Pulling latest code"
+    if ! git -C "${src_dir}" pull --ff-only origin main 2>/dev/null; then
+        # ff-only failed (diverged), force reset — safe since ~/.boi/src/ is read-only install
+        warn "Fast-forward failed. Resetting to origin/main."
+        git -C "${src_dir}" reset --hard origin/main 2>/dev/null
+    fi
+
+    local new_commit
+    new_commit=$(git -C "${src_dir}" rev-parse HEAD)
+    progress_done "${old_commit:0:7} → ${new_commit:0:7}"
+
+    # 5. Update Claude Code plugin (unless --no-plugin)
+    if [[ "${no_plugin}" == "false" ]]; then
+        local claude_dir="${HOME}/.claude"
+        if [[ -d "${claude_dir}" ]]; then
+            progress_step "Updating Claude Code plugin"
+            mkdir -p "${claude_dir}/skills/boi" "${claude_dir}/commands"
+            if [[ -f "${src_dir}/plugin/skills/boi/SKILL.md" ]]; then
+                cp "${src_dir}/plugin/skills/boi/SKILL.md" "${claude_dir}/skills/boi/SKILL.md"
+            fi
+            if [[ -f "${src_dir}/plugin/commands/boi.md" ]]; then
+                cp "${src_dir}/plugin/commands/boi.md" "${claude_dir}/commands/boi.md"
+            fi
+            progress_done
+        fi
+    fi
+
+    # 6. Restart daemon (if it was running)
+    if [[ "${daemon_was_running}" == "true" ]]; then
+        progress_step "Restarting daemon with upgraded code"
+        # start_daemon() uses SCRIPT_DIR which now points to updated ~/.boi/src/
+        nohup bash "${src_dir}/daemon.sh" > "${LOG_DIR}/daemon-startup.log" 2>&1 < /dev/null &
+        sleep 1
+        if require_daemon; then
+            progress_done
+        else
+            progress_fail "check ${LOG_DIR}/daemon-startup.log"
+        fi
+    fi
+
+    # 7. Report
+    echo ""
+    echo -e "${BOLD}Changes:${NC}"
+    git -C "${src_dir}" diff --stat "${old_commit}..${new_commit}" 2>/dev/null | tail -5
+    echo ""
+    info "BOI upgraded successfully! (${old_commit:0:7} → ${new_commit:0:7})"
 }
 
 # ─── Subcommand: workers ─────────────────────────────────────────────────────
@@ -3138,6 +3325,7 @@ usage() {
     echo "  spec        Live spec management (add, skip, reorder, block tasks)"
     echo "  project     Manage projects (create, list, status, context, delete)"
     echo "  do          Translate natural language into BOI commands"
+    echo "  upgrade     Update BOI to the latest version"
     echo "  doctor      Check prerequisites and environment health"
     echo "  dashboard   Live-updating queue progress"
     echo ""
@@ -3170,6 +3358,8 @@ usage() {
     echo "  boi project list                     # list projects"
     echo "  boi do \"show me what's running\"       # natural language"
     echo "  boi do --dry-run \"cancel stuck specs\" # preview commands"
+    echo "  boi upgrade                         # update to latest"
+    echo "  boi upgrade --check                 # check for updates"
     echo "  boi doctor                          # check prerequisites"
     echo "  boi --version                       # show version"
 }
@@ -3196,6 +3386,7 @@ main() {
         workers)    cmd_workers "$@" ;;
         telemetry)  cmd_telemetry "$@" ;;
         doctor)     cmd_doctor "$@" ;;
+        upgrade)    cmd_upgrade "$@" ;;
         critic)     cmd_critic "$@" ;;
         spec)       cmd_spec "$@" ;;
         project)    cmd_project "$@" ;;
