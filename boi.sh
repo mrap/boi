@@ -687,19 +687,16 @@ cmd_status() {
     require_config
 
     if [[ "${watch_mode}" == "true" ]]; then
-        if [[ -f "${SCRIPT_DIR}/dashboard.sh" ]]; then
-            # Pass initial sort/filter to dashboard via environment variables
-            [[ -n "${sort_mode}" ]] && export BOI_SORT_MODE="${sort_mode}"
-            [[ -n "${filter_status}" ]] && export BOI_FILTER_STATUS="${filter_status}"
-            exec bash "${SCRIPT_DIR}/dashboard.sh"
-        else
-            # Fallback: loop with clear + queue display
-            while true; do
-                clear
-                cmd_queue_inner "${json_mode}" "${sort_mode}" "${filter_status}"
-                sleep 2
-            done
-        fi
+        # Loop with clear + same output as non-watch mode, refreshed every 2s
+        while true; do
+            clear
+            if [[ -n "${sort_mode}" || -n "${filter_status}" ]]; then
+                cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}"
+            else
+                cmd_queue_inner "${json_mode}"
+            fi
+            sleep 2
+        done
     fi
 
     # Non-interactive: if sort or filter specified, use dashboard format for richer output
