@@ -273,7 +273,7 @@ create_directories() {
   "enabled": true,
   "trigger": "on_complete",
   "max_passes": 2,
-  "checks": ["spec-integrity", "verify-commands", "code-quality", "completeness", "fleet-readiness"],
+  "checks": ["spec-integrity", "verify-commands", "code-quality", "completeness", "fleet-readiness", "conjecture-criticism"],
   "custom_checks_dir": "custom",
   "timeout_seconds": 600
 }
