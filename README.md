@@ -138,6 +138,20 @@ boi log q-001 --full       # full output
 boi telemetry q-001        # per-iteration breakdown
 ```
 
+## Claude Code Integration
+
+BOI ships with a Claude Code plugin that teaches Claude how to use the BOI CLI. After install, you get:
+
+- **`/boi` command** — Tell Claude what you want to build. It decomposes the task into a spec and dispatches it.
+- **BOI skill** — Claude automatically knows all BOI commands and can help you manage specs, check status, and interpret results.
+
+The plugin installs automatically during `boi install`. To install manually:
+
+```bash
+cp -r ~/.boi/src/plugin/skills/boi ~/.claude/skills/
+cp ~/.boi/src/plugin/commands/boi.md ~/.claude/commands/
+```
+
 ## CLI Reference
 
 | Command | Description |

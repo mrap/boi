@@ -33,6 +33,7 @@ NC='\033[0m'
 # Flags
 PREFIX=""
 NO_SYMLINK=false
+NO_PLUGIN=false
 UPDATE_MODE=false
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
@@ -55,6 +56,7 @@ Usage:
 Options:
   --prefix <path>    Install location (default: ~/.boi)
   --no-symlink       Skip creating the 'boi' symlink in PATH
+  --no-plugin        Skip installing Claude Code plugin
   --update           Update an existing installation
   -h, --help         Show this help
 
@@ -76,6 +78,10 @@ parse_args() {
                 ;;
             --no-symlink)
                 NO_SYMLINK=true
+                shift
+                ;;
+            --no-plugin)
+                NO_PLUGIN=true
                 shift
                 ;;
             --update)
@@ -329,6 +335,33 @@ create_symlink() {
     fi
 }
 
+# ─── Claude Code Plugin ─────────────────────────────────────────────────────
+
+install_plugin() {
+    if [[ "${NO_PLUGIN}" == "true" ]]; then
+        log_info "Skipping Claude Code plugin (--no-plugin)"
+        return 0
+    fi
+
+    log_step "Installing Claude Code plugin"
+
+    local claude_dir="${HOME}/.claude"
+    if [[ -d "${claude_dir}" ]]; then
+        mkdir -p "${claude_dir}/skills/boi" "${claude_dir}/commands"
+
+        # Copy skill
+        cp "${BOI_SRC_DIR}/plugin/skills/boi/SKILL.md" "${claude_dir}/skills/boi/SKILL.md"
+
+        # Copy command
+        cp "${BOI_SRC_DIR}/plugin/commands/boi.md" "${claude_dir}/commands/boi.md"
+
+        log_info "Claude Code plugin installed (/boi command + BOI skill)"
+    else
+        log_info "Claude Code not detected. Skip plugin install."
+        log_info "To install later: cp -r ${BOI_SRC_DIR}/plugin/skills/boi ~/.claude/skills/"
+    fi
+}
+
 # ─── Verify ──────────────────────────────────────────────────────────────────
 
 verify_install() {
@@ -393,6 +426,7 @@ main() {
     clone_or_update_repo
     create_directories
     create_symlink
+    install_plugin
     verify_install
 
     echo ""

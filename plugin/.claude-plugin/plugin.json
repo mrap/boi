@@ -1,0 +1,13 @@
+{
+  "name": "boi",
+  "version": "0.1.0",
+  "description": "BOI (Beginning of Infinity) - Self-evolving autonomous agent fleet for Claude Code.",
+  "author": {
+    "name": "Mike Rapadas",
+    "email": "mike@mrap.me"
+  },
+  "homepage": "https://github.com/mrap/boi",
+  "keywords": ["boi", "autonomous", "agent", "fleet", "self-evolving", "dispatch", "parallel", "overnight"],
+  "skills": ["./skills/"],
+  "commands": ["./commands/boi.md"]
+}

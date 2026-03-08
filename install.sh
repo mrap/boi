@@ -33,6 +33,7 @@ NC='\033[0m'
 WORKER_COUNT="${DEFAULT_WORKERS}"
 DRY_RUN=false
 SKIP_WORKTREES=false
+NO_PLUGIN=false
 WORKTREE_PATHS=""
 REPO_PATH=""
 
@@ -45,6 +46,7 @@ usage() {
     echo "  --worktree-paths P1,P2   Comma-separated existing worktree paths (skips creation)"
     echo "  --dry-run                Show what would happen without doing it"
     echo "  --skip-worktrees         Skip worktree creation (use pre-existing worktrees)"
+    echo "  --no-plugin              Skip installing Claude Code plugin"
     echo "  -h, --help               Show this help"
 }
 
@@ -72,6 +74,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-worktrees|--skip-clone)
             SKIP_WORKTREES=true
+            shift
+            ;;
+        --no-plugin)
+            NO_PLUGIN=true
             shift
             ;;
         --worktree-paths|--checkout-paths)
@@ -394,6 +400,36 @@ setup_alias() {
     fi
 }
 
+install_plugin() {
+    if [[ "${NO_PLUGIN}" == "true" ]]; then
+        log_info "Skipping Claude Code plugin (--no-plugin)"
+        return 0
+    fi
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "[dry-run] Would install Claude Code plugin"
+        return 0
+    fi
+
+    log_step "Installing Claude Code plugin"
+
+    local claude_dir="${HOME}/.claude"
+    if [[ -d "${claude_dir}" ]]; then
+        mkdir -p "${claude_dir}/skills/boi" "${claude_dir}/commands"
+
+        # Copy skill
+        cp "${SCRIPT_DIR}/plugin/skills/boi/SKILL.md" "${claude_dir}/skills/boi/SKILL.md"
+
+        # Copy command
+        cp "${SCRIPT_DIR}/plugin/commands/boi.md" "${claude_dir}/commands/boi.md"
+
+        log_info "Claude Code plugin installed (/boi command + BOI skill)"
+    else
+        log_info "Claude Code not detected. Skip plugin install."
+        log_info "To install later: cp -r ${SCRIPT_DIR}/plugin/skills/boi ~/.claude/skills/"
+    fi
+}
+
 verify_install() {
     log_step "Verifying installation"
 
@@ -483,6 +519,9 @@ main() {
     echo ""
 
     setup_alias
+    echo ""
+
+    install_plugin
     echo ""
 
     if [[ "${DRY_RUN}" == "false" ]]; then
