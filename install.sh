@@ -238,6 +238,7 @@ create_directories() {
         "${BOI_STATE_DIR}/events"
         "${BOI_STATE_DIR}/logs"
         "${BOI_STATE_DIR}/hooks"
+        "${BOI_STATE_DIR}/critic/custom"
         "${WORKTREE_DIR}"
     )
 
@@ -249,6 +250,27 @@ create_directories() {
             log_info "Created: ${dir}"
         fi
     done
+
+    # Create critic config with defaults
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        if [[ ! -f "${BOI_STATE_DIR}/critic/config.json" ]]; then
+            log_info "[dry-run] Would create critic config with defaults"
+        fi
+    else
+        if [[ ! -f "${BOI_STATE_DIR}/critic/config.json" ]]; then
+            cat > "${BOI_STATE_DIR}/critic/config.json" << 'CRITIC_EOF'
+{
+  "enabled": true,
+  "trigger": "on_complete",
+  "max_passes": 2,
+  "checks": ["spec-integrity", "verify-commands", "code-quality", "completeness", "fleet-readiness"],
+  "custom_checks_dir": "custom",
+  "timeout_seconds": 600
+}
+CRITIC_EOF
+            log_info "Created critic config with defaults"
+        fi
+    fi
 }
 
 write_config() {
@@ -384,7 +406,7 @@ verify_install() {
         log_info "Config: ${BOI_CONFIG}"
     fi
 
-    for dir in queue events logs hooks; do
+    for dir in queue events logs hooks critic; do
         if [[ ! -d "${BOI_STATE_DIR}/${dir}" ]]; then
             log_error "Directory missing: ${BOI_STATE_DIR}/${dir}"
             ok=false

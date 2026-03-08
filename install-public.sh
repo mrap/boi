@@ -227,6 +227,7 @@ create_directories() {
         "${BOI_STATE_DIR}/events"
         "${BOI_STATE_DIR}/logs"
         "${BOI_STATE_DIR}/hooks"
+        "${BOI_STATE_DIR}/critic/custom"
         "${BOI_STATE_DIR}/worktrees"
         "${BOI_STATE_DIR}/projects"
     )
@@ -239,6 +240,21 @@ create_directories() {
             log_info "Exists:  ${dir}"
         fi
     done
+
+    # Create critic config with defaults
+    if [[ ! -f "${BOI_STATE_DIR}/critic/config.json" ]]; then
+        cat > "${BOI_STATE_DIR}/critic/config.json" << 'CRITIC_EOF'
+{
+  "enabled": true,
+  "trigger": "on_complete",
+  "max_passes": 2,
+  "checks": ["spec-integrity", "verify-commands", "code-quality", "completeness", "fleet-readiness"],
+  "custom_checks_dir": "custom",
+  "timeout_seconds": 600
+}
+CRITIC_EOF
+        log_info "Created critic config with defaults"
+    fi
 }
 
 # ─── Symlink ─────────────────────────────────────────────────────────────────
@@ -329,7 +345,7 @@ verify_install() {
     fi
 
     # Check state directories
-    for dir in queue events logs hooks worktrees projects; do
+    for dir in queue events logs hooks critic worktrees projects; do
         if [[ -d "${BOI_STATE_DIR}/${dir}" ]]; then
             log_info "Dir:    ${BOI_STATE_DIR}/${dir}"
         else

@@ -1342,7 +1342,6 @@ except Exception:
         local critic_status
         critic_status=$(python3 -c "
 import json, os, sys
-sys.path.insert(0, '${BOI_SCRIPT_DIR}')
 try:
     with open('${critic_config}') as f:
         cfg = json.load(f)
