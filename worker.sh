@@ -22,6 +22,10 @@
 
 set -uo pipefail
 
+# Source the Hive event logger (fire-and-forget, non-blocking)
+# shellcheck source=/dev/null
+source "${HOME}/hive/tools/logging/log_event.sh"
+
 # Constants
 BOI_STATE_DIR="${HOME}/.boi"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -458,6 +462,16 @@ with open(tmp, "w") as f:
 os.rename(tmp, target)
 PYEOF
 
+# ── Log iteration completion ────────────────────────────────────────────
+source "\${HOME}/hive/tools/logging/log_event.sh"
+if [[ \${_CLAUDE_EXIT} -eq 0 ]]; then
+    hive_log boi "\${_QUEUE_ID}" iteration_done "Iteration \${_ITERATION} completed (\${_TASKS_COMPLETED} tasks done, \${_TASKS_ADDED} added)" \
+        "{\"iteration\": \${_ITERATION}, \"exit_code\": \${_CLAUDE_EXIT}, \"duration_s\": \${_DURATION}, \"tasks_completed\": \${_TASKS_COMPLETED}, \"tasks_added\": \${_TASKS_ADDED}, \"pending_remaining\": \${_POST_PENDING}}" info
+else
+    hive_log boi "\${_QUEUE_ID}" iteration_error "Iteration \${_ITERATION} failed (exit \${_CLAUDE_EXIT})" \
+        "{\"iteration\": \${_ITERATION}, \"exit_code\": \${_CLAUDE_EXIT}, \"duration_s\": \${_DURATION}, \"tasks_completed\": \${_TASKS_COMPLETED}}" error
+fi
+
 # ── Write exit code ──────────────────────────────────────────────────────
 echo "\${_CLAUDE_EXIT}" > "\${_EXIT_FILE}"
 RUNEOF
@@ -517,6 +531,15 @@ main() {
 
     validate
 
+    # Log worker started
+    local _mode="execute"
+    if [[ "${CRITIC_MODE}" == "true" ]]; then _mode="critic"
+    elif [[ "${DECOMPOSE_MODE}" == "true" ]]; then _mode="decompose"
+    elif [[ "${EVALUATE_MODE}" == "true" ]]; then _mode="evaluate"
+    fi
+    hive_log boi "${QUEUE_ID}" worker_started "Worker starting spec ${QUEUE_ID} (iter ${ITERATION})" \
+        "{\"worktree\": \"${WORKTREE_PATH}\", \"iteration\": ${ITERATION}, \"mode\": \"${_mode}\"}" info
+
     # Count tasks before iteration
     local counts
     counts=$(count_tasks "${SPEC_PATH}")
@@ -528,6 +551,8 @@ main() {
 
     if [[ "${pre_pending}" == "0" ]] && [[ "${CRITIC_MODE}" != "true" ]] && [[ "${DECOMPOSE_MODE}" != "true" ]] && [[ "${EVALUATE_MODE}" != "true" ]]; then
         log_info "No PENDING tasks in spec. Exiting with success."
+        hive_log boi "${QUEUE_ID}" no_pending "No PENDING tasks, worker exiting" \
+            "{\"iteration\": ${ITERATION}}" info
         # Write exit file so the daemon can detect completion without a PID
         echo "0" > "${EXIT_FILE}"
         exit 0
@@ -550,10 +575,14 @@ main() {
     local rc=$?
     if [[ ${rc} -ne 0 ]]; then
         log_error "Failed to launch worker."
+        hive_log boi "${QUEUE_ID}" worker_launch_fail "Failed to launch worker for ${QUEUE_ID}" \
+            "{\"iteration\": ${ITERATION}}" error
         exit 1
     fi
 
     log_info "Worker is running. Monitor with: tmux -L boi attach -t ${TMUX_SESSION}"
+    hive_log boi "${QUEUE_ID}" worker_launched "Worker running in tmux session ${TMUX_SESSION}" \
+        "{\"iteration\": ${ITERATION}, \"pending_tasks\": ${pre_pending}}" info
 }
 
 main

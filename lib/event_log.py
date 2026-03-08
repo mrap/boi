@@ -4,12 +4,51 @@
 #   event-00001.json, event-00002.json, ...
 # Each file contains one JSON object. Writes are atomic (write .tmp, then mv).
 # Events are read back in sequence-number order.
+#
+# Also provides log_event() — a wrapper around ~/hive/tools/logging/log_event.sh
+# for sending BOI events to the unified Hive event log (SQLite-backed).
 
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
+
+
+# ---------------------------------------------------------------------------
+# Hive unified event log wrapper
+# ---------------------------------------------------------------------------
+
+_LOG_EVENT_SCRIPT = os.path.expanduser("~/hive/tools/logging/log_event.sh")
+
+
+def log_event(
+    source_id: str,
+    event_type: str,
+    message: str,
+    metadata: dict[str, Any] | None = None,
+    severity: str = "info",
+) -> None:
+    """Log an event to the Hive unified event log. Non-blocking.
+
+    Calls ~/hive/tools/logging/log_event.sh in a fire-and-forget subprocess.
+    All BOI events use source="boi".
+    """
+    cmd = [
+        "bash",
+        _LOG_EVENT_SCRIPT,
+        "boi",
+        source_id or "-",
+        event_type,
+        message,
+        json.dumps(metadata) if metadata else "",
+        severity,
+    ]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass  # Fire and forget
 
 
 EVENT_FILENAME_PATTERN = re.compile(r"^event-(\d{5})\.json$")

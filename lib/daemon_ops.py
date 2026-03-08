@@ -32,7 +32,7 @@ from lib.evaluate import (
     is_generate_spec,
     write_completion_summary_to_spec,
 )
-from lib.event_log import write_event
+from lib.event_log import log_event, write_event
 from lib.hooks import get_tasks_added_from_telemetry, run_completion_hooks, run_hook
 from lib.queue import (
     _read_entry,
@@ -584,6 +584,14 @@ def _handle_crash(
             },
         )
 
+        log_event(
+            queue_id,
+            "crashed",
+            f"Consecutive failures exceeded: {failure_reason}",
+            {"iteration": iteration, "reason": "consecutive_failures"},
+            "error",
+        )
+
         run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=True)
 
     elif iteration >= max_iter:
@@ -607,6 +615,14 @@ def _handle_crash(
             },
         )
 
+        log_event(
+            queue_id,
+            "crashed",
+            f"Max iterations reached with crashes: {failure_reason}",
+            {"iteration": iteration, "reason": "max_iterations_with_crashes"},
+            "error",
+        )
+
         run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=True)
 
     else:
@@ -628,6 +644,14 @@ def _handle_crash(
                 "failure_reason": failure_reason,
                 "timestamp": timestamp,
             },
+        )
+
+        log_event(
+            queue_id,
+            "crashed",
+            f"Worker crashed, requeued with cooldown: {failure_reason}",
+            {"iteration": iteration},
+            "warn",
         )
 
     # Write failure diagnostics to iteration metadata

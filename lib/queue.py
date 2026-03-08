@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from lib.event_log import log_event
 from lib.locking import queue_lock
 
 
@@ -205,6 +206,14 @@ def enqueue(
         }
 
         _write_entry(queue_dir, entry)
+
+        log_event(
+            queue_id,
+            "queued",
+            f"Spec queued: {_spec_name_from_entry(entry)}",
+            {"priority": priority, "max_iterations": max_iterations},
+        )
+
         return entry
 
 
@@ -309,6 +318,13 @@ def requeue(
 
         _write_entry(queue_dir, entry)
 
+        log_event(
+            queue_id,
+            "requeued",
+            f"Spec requeued ({tasks_done}/{tasks_total} tasks done)",
+            {"tasks_done": tasks_done, "tasks_total": tasks_total},
+        )
+
 
 def set_needs_review(
     queue_dir: str,
@@ -356,6 +372,13 @@ def complete(
         entry["tasks_total"] = tasks_total
 
         _write_entry(queue_dir, entry)
+
+        log_event(
+            queue_id,
+            "completed",
+            f"Spec completed ({tasks_done}/{tasks_total} tasks)",
+            {"tasks_done": tasks_done, "tasks_total": tasks_total},
+        )
 
     # Sync back outside the lock (file I/O that doesn't touch queue state)
     sync_back_spec(queue_dir, queue_id)
@@ -407,6 +430,14 @@ def fail(queue_dir: str, queue_id: str, reason: str = "") -> None:
 
         _write_entry(queue_dir, entry)
 
+        log_event(
+            queue_id,
+            "failed",
+            f"Spec failed: {reason or 'unknown'}",
+            {"reason": reason},
+            "warn",
+        )
+
 
 def record_failure(queue_dir: str, queue_id: str) -> bool:
     """Increment consecutive failure count and apply cooldown.
@@ -441,6 +472,8 @@ def cancel(queue_dir: str, queue_id: str) -> None:
 
         entry["status"] = "canceled"
         _write_entry(queue_dir, entry)
+
+        log_event(queue_id, "canceled", "Spec canceled")
 
 
 def purge(

@@ -16,6 +16,10 @@
 
 set -uo pipefail
 
+# Source the Hive event logger (fire-and-forget, non-blocking)
+# shellcheck source=/dev/null
+source "${HOME}/hive/tools/logging/log_event.sh"
+
 # Constants
 BOI_STATE_DIR="${HOME}/.boi"
 BOI_CONFIG="${BOI_STATE_DIR}/config.json"
@@ -276,63 +280,15 @@ PYEOF
             local outcome
             outcome=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('outcome','unknown'))" 2>/dev/null || echo "unknown")
             log_info "Spec ${queue_id} immediate completion — outcome: ${outcome}"
+            hive_log boi "${queue_id}" immediate_exit "Worker exited immediately — ${outcome}" "{\"outcome\": \"${outcome}\"}" info
 
             # Clean up exit file
             rm -f "${exit_file}"
-
-            # Handle critic_review outcome: launch a critic worker
-            # (Without this, the spec gets requeued but no critic runs,
-            # causing an infinite requeue loop for completed specs.)
-            if [[ "${outcome}" == "critic_review" ]]; then
-                local critic_pass
-                critic_pass=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('critic_pass',1))" 2>/dev/null || echo "1")
-                log_info "Spec ${queue_id} entering critic review (pass ${critic_pass})"
-
-                # Set phase to "critic" and status to "running" for the critic worker
-                local critic_iter
-                critic_iter=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" "${worker_id}" <<'PYEOF'
-import sys, os, json
-sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.queue import _read_entry, _write_entry, set_running
-entry = _read_entry(sys.argv[1], sys.argv[2])
-if entry:
-    entry["phase"] = "critic"
-    _write_entry(sys.argv[1], entry)
-set_running(sys.argv[1], sys.argv[2], sys.argv[3])
-entry = _read_entry(sys.argv[1], sys.argv[2])
-print(json.dumps({"iteration": entry.get("iteration", 1), "spec_path": entry.get("spec_path", "")}))
-PYEOF
-                )
-                local c_iteration c_spec_path
-                c_iteration=$(echo "${critic_iter}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['iteration'])")
-                c_spec_path=$(echo "${critic_iter}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['spec_path'])")
-
-                # Launch critic worker
-                bash "${WORKER_SCRIPT}" --critic "${queue_id}" "${worktree_path}" "${c_spec_path}" "${c_iteration}" >> "${DAEMON_LOG}" 2>&1
-
-                # Read PID from the PID file
-                local critic_pid_file="${QUEUE_DIR}/${queue_id}.pid"
-                local critic_pid=""
-                if [[ -f "${critic_pid_file}" ]]; then
-                    critic_pid=$(cat "${critic_pid_file}")
-                fi
-
-                if [[ -n "${critic_pid}" ]]; then
-                    WORKER_CURRENT_SPEC["${worker_id}"]="${queue_id}"
-                    WORKER_PIDS["${worker_id}"]="${critic_pid}"
-                    WORKER_START_TIME["${worker_id}"]="$(date +%s)"
-                    log_info "Critic worker launched for ${queue_id} (PID ${critic_pid}, pass ${critic_pass})"
-                else
-                    log_error "Failed to launch critic worker for ${queue_id}."
-                fi
-
-                return 0
-            fi
-
             return 0
         fi
 
         log_error "Failed to get PID for spec ${queue_id}."
+        hive_log boi "${queue_id}" worker_pid_fail "Failed to get PID for spec" "" error
         return 1
     fi
 
@@ -345,6 +301,7 @@ PYEOF
     write_event "type=spec_started" "queue_id=${queue_id}" "worker_id=${worker_id}" "iteration=${iteration}" "timestamp=${timestamp}"
 
     log_info "Spec ${queue_id} assigned to ${worker_id} (PID ${pid}, iteration ${iteration})"
+    hive_log boi "${queue_id}" spec_assigned "Spec assigned to ${worker_id}" "{\"worker\": \"${worker_id}\", \"iteration\": ${iteration}, \"pid\": ${pid}}" info
     return 0
 }
 
@@ -371,6 +328,7 @@ check_worker_completion() {
             local elapsed_min=$(( elapsed / 60 ))
             local timeout_min=$(( timeout / 60 ))
             log_warn "Worker ${worker_id} timed out after ${elapsed_min}m for spec ${queue_id} (limit: ${timeout_min}m)"
+            hive_log boi "${queue_id}" worker_timeout "Worker timed out after ${elapsed_min}m" "{\"worker\": \"${worker_id}\", \"elapsed_min\": ${elapsed_min}, \"timeout_min\": ${timeout_min}}" warn
 
             # Kill the tmux session
             local tmux_session="boi-${queue_id}"
@@ -430,6 +388,7 @@ PYEOF
 
     # Worker has exited. Process completion in a single Python call.
     log_info "Worker ${worker_id} (PID ${pid}) has exited for spec ${queue_id}"
+    hive_log boi "${queue_id}" worker_exited "Worker ${worker_id} exited" "{\"worker\": \"${worker_id}\", \"pid\": ${pid}}" info
 
     local exit_file="${QUEUE_DIR}/${queue_id}.exit"
 
@@ -517,11 +476,14 @@ PYEOF
 
     case "${outcome}" in
         completed)
-            log_info "Spec ${queue_id} completed" ;;
+            log_info "Spec ${queue_id} completed"
+            hive_log boi "${queue_id}" completed "Spec completed" "" info
+            ;;
         critic_review)
             local critic_pass
             critic_pass=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('critic_pass',1))" 2>/dev/null || echo "1")
             log_info "Spec ${queue_id} entering critic review (pass ${critic_pass})"
+            hive_log boi "${queue_id}" critic_started "Entering critic review" "{\"pass\": ${critic_pass}}" info
 
             # Set phase to "critic" and status to "running" for the critic worker
             local critic_iter critic_spec_path
@@ -556,8 +518,10 @@ PYEOF
                 WORKER_PIDS["${worker_id}"]="${critic_pid}"
                 WORKER_START_TIME["${worker_id}"]="$(date +%s)"
                 log_info "Critic worker launched for ${queue_id} (PID ${critic_pid}, pass ${critic_pass})"
+                hive_log boi "${queue_id}" critic_launched "Critic worker launched" "{\"pid\": ${critic_pid}, \"pass\": ${critic_pass}}" info
             else
                 log_error "Failed to launch critic worker for ${queue_id}. Freeing worker."
+                hive_log boi "${queue_id}" critic_launch_fail "Failed to launch critic worker" "" error
                 free_worker "${worker_id}" "${queue_id}"
             fi
 
@@ -565,15 +529,23 @@ PYEOF
             return 0
             ;;
         requeued)
-            log_info "Spec ${queue_id} requeued (still has pending tasks)" ;;
+            log_info "Spec ${queue_id} requeued (still has pending tasks)"
+            hive_log boi "${queue_id}" requeued "Spec requeued (pending tasks remain)" "" info
+            ;;
         failed)
             local reason
             reason=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('reason',''))" 2>/dev/null || echo "")
-            log_warn "Spec ${queue_id} failed: ${reason}" ;;
+            log_warn "Spec ${queue_id} failed: ${reason}"
+            hive_log boi "${queue_id}" failed "Spec failed: ${reason}" "{\"reason\": \"${reason}\"}" warn
+            ;;
         crashed)
-            log_warn "Spec ${queue_id} crashed, requeued with cooldown" ;;
+            log_warn "Spec ${queue_id} crashed, requeued with cooldown"
+            hive_log boi "${queue_id}" crashed "Spec crashed, requeued with cooldown" "" error
+            ;;
         needs_review)
-            log_info "Spec ${queue_id} paused for experiment review" ;;
+            log_info "Spec ${queue_id} paused for experiment review"
+            hive_log boi "${queue_id}" needs_review "Spec paused for experiment review" "" info
+            ;;
         decomposition_complete)
             local task_count
             task_count=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('task_count',0))" 2>/dev/null || echo "0")
@@ -597,11 +569,15 @@ PYEOF
         evaluate_crashed)
             log_warn "Spec ${queue_id} evaluation crashed, requeued." ;;
         critic_approved)
-            log_info "Spec ${queue_id} critic approved, marking completed" ;;
+            log_info "Spec ${queue_id} critic approved, marking completed"
+            hive_log boi "${queue_id}" critic_approved "Critic approved, marking completed" "" info
+            ;;
         critic_tasks_added)
             local critic_tasks
             critic_tasks=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('critic_tasks_added',0))" 2>/dev/null || echo "0")
-            log_info "Spec ${queue_id} critic added ${critic_tasks} task(s), requeued for execution" ;;
+            log_info "Spec ${queue_id} critic added ${critic_tasks} task(s), requeued for execution"
+            hive_log boi "${queue_id}" critic_tasks_added "Critic added ${critic_tasks} task(s), requeued" "{\"tasks_added\": ${critic_tasks}}" info
+            ;;
         *)
             log_error "Spec ${queue_id} unknown outcome: ${outcome}" ;;
     esac
@@ -723,6 +699,7 @@ PYEOF
             action_type=$(echo "${action_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('action',''))" 2>/dev/null || echo "")
             action_detail=$(echo "${action_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('detail',''))" 2>/dev/null || echo "")
             log_warn "Self-healed: ${action_detail}"
+            hive_log boi "-" self_healed "Self-healed: ${action_detail}" "{\"action\": \"${action_type}\"}" warn
 
             # Handle orphaned workers by freeing them in bash state
             if [[ "${action_type}" == "orphaned_worker" ]]; then
@@ -852,6 +829,7 @@ write_pid_file() {
 
 cleanup() {
     log_info "Daemon shutting down."
+    hive_log boi "-" daemon_stopped "Daemon shutting down" "{\"pid\": $$}" info
     rm -f "${PID_FILE}"
 }
 
@@ -919,10 +897,12 @@ main() {
 
     write_pid_file
     log_info "Daemon started (PID $$)"
+    hive_log boi "-" daemon_started "Daemon started (PID $$)" "{\"pid\": $$}" info
 
     load_workers_from_config
     local worker_count=${#WORKER_CHECKOUTS[@]}
     log_info "Loaded ${worker_count} workers from config"
+    hive_log boi "-" workers_loaded "Loaded ${worker_count} workers from config" "{\"count\": ${worker_count}}" info
 
     # Recover any specs stuck in "running" status from a previous daemon crash
     local recovered
@@ -936,6 +916,7 @@ PYEOF
     )
     if [[ "${recovered}" -gt 0 ]]; then
         log_warn "Recovered ${recovered} spec(s) stuck in 'running' status."
+        hive_log boi "-" specs_recovered "Recovered ${recovered} spec(s) stuck in running" "{\"count\": ${recovered}}" warn
     fi
 
     daemon_loop
