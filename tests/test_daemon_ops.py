@@ -1683,3 +1683,118 @@ class TestSelfHeal(DaemonOpsTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBugFixMaxIterAllTasksDone(DaemonOpsTestCase):
+    """Regression tests for Bug 1: max-iter not enforced when all tasks DONE."""
+
+    def test_max_iter_enforced_when_all_tasks_done(self):
+        """Max-iter should fail the spec even when pending_count == 0."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
+        entry = enqueue(self.queue_dir, spec_path, max_iterations=1)
+        set_running(self.queue_dir, entry["id"], "w-1")  # iteration becomes 1
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+        )
+
+        # With critic disabled, all tasks done + at max iter = should complete, not loop
+        # The key assertion: outcome must NOT be "critic_review" (which causes infinite requeue)
+        self.assertIn(result["outcome"], ("completed", "failed"))
+        updated = get_entry(self.queue_dir, entry["id"])
+        self.assertIn(updated["status"], ("completed", "failed"))
+        # Must NOT be requeued
+        self.assertNotEqual(updated["status"], "requeued")
+
+    def test_max_iter_enforced_with_critic_enabled(self):
+        """Even with critic enabled, max-iter should stop iteration.
+
+        The real bug: when critic is enabled and generate_critic_prompt succeeds,
+        the spec gets requeued at line 415. The max-iter check at line 458 is
+        structurally unreachable because it's in an elif after pending_count==0.
+        We mock generate_critic_prompt to succeed and verify requeue doesn't happen.
+        """
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
+        entry = enqueue(self.queue_dir, spec_path, max_iterations=1)
+        set_running(self.queue_dir, entry["id"], "w-1")  # iteration becomes 1
+
+        # Enable critic
+        critic_dir = os.path.join(self.boi_state, "critic")
+        config_path = os.path.join(critic_dir, "config.json")
+        Path(config_path).write_text(json.dumps({
+            "enabled": True,
+            "max_passes": 2,
+            "checks": [{"name": "test", "prompt": "check it"}],
+        }, indent=2) + "\n")
+
+        # Patch generate_critic_prompt to succeed (return a string, don't throw)
+        import unittest.mock as mock
+        with mock.patch("lib.daemon_ops.generate_critic_prompt", return_value="mock critic prompt"):
+            result = process_worker_completion(
+                queue_dir=self.queue_dir,
+                queue_id=entry["id"],
+                events_dir=self.events_dir,
+                log_dir=self.log_dir,
+                hooks_dir=self.hooks_dir,
+                script_dir=self.script_dir,
+                exit_code="0",
+            )
+
+        # At max-iter, should NOT requeue for critic — should fail or complete
+        updated = get_entry(self.queue_dir, entry["id"])
+        self.assertNotEqual(updated["status"], "requeued",
+                          "Spec should not be requeued when at max iterations, "
+                          "even if critic wants to run. "
+                          f"Got outcome={result['outcome']}, status={updated['status']}")
+
+    def test_max_iter_vastly_exceeded_still_stops(self):
+        """Simulate the actual bug: iteration=800, max_iter=10, all tasks done."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
+        entry = enqueue(self.queue_dir, spec_path, max_iterations=10)
+
+        # Manually set iteration to 800 to simulate the bug state
+        from lib.queue import _read_entry, _write_entry
+        e = _read_entry(self.queue_dir, entry["id"])
+        e["iteration"] = 800
+        e["status"] = "running"
+        _write_entry(self.queue_dir, e)
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+        )
+
+        updated = get_entry(self.queue_dir, entry["id"])
+        self.assertNotEqual(updated["status"], "requeued",
+                          f"Spec at iteration 800 (max 10) must not be requeued! "
+                          f"Got outcome={result['outcome']}, status={updated['status']}")
+
+
+class TestBugFixDoubleAssignment(DaemonOpsTestCase):
+    """Regression tests for Bug 2: TOCTOU race in dequeue."""
+
+    def test_dequeue_prevents_double_pickup(self):
+        """After dequeue returns a spec, the same spec should not be dequeued again."""
+        from lib.queue import dequeue as queue_dequeue
+
+        spec_path = self._create_spec(tasks_pending=2)
+        enqueue(self.queue_dir, spec_path)
+
+        first = queue_dequeue(self.queue_dir)
+        self.assertIsNotNone(first)
+
+        second = queue_dequeue(self.queue_dir)
+        # Second dequeue of the same spec must return None (already taken)
+        self.assertIsNone(second,
+                         "dequeue() returned the same spec twice — TOCTOU race condition!")

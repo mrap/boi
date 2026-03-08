@@ -199,7 +199,8 @@ class TestDequeue(QueueTestCase):
         result = dequeue(self.queue_dir)
         self.assertIsNotNone(result)
         self.assertEqual(result["id"], "q-001")
-        self.assertEqual(result["status"], "requeued")
+        # After dequeue, status is now "assigning" (atomic pickup)
+        self.assertEqual(result["status"], "assigning")
 
     def test_dequeue_skips_blocked_by_external_ids(self):
         enqueue(self.queue_dir, self._make_spec(), priority=50)
@@ -213,13 +214,14 @@ class TestDequeue(QueueTestCase):
         result = dequeue(self.queue_dir)
         self.assertIsNone(result)
 
-    def test_dequeue_does_not_change_status(self):
+    def test_dequeue_changes_status_to_assigning(self):
+        """Dequeue atomically marks the spec as 'assigning' to prevent TOCTOU races."""
         enqueue(self.queue_dir, self._make_spec())
         result = dequeue(self.queue_dir)
         self.assertIsNotNone(result)
 
         entry = get_entry(self.queue_dir, result["id"])
-        self.assertEqual(entry["status"], "queued")
+        self.assertEqual(entry["status"], "assigning")
 
 
 # ─── DAG Blocking Tests ──────────────────────────────────────────────────────

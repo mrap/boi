@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from lib.conflict_detector import check_conflicts_before_dequeue
 from lib.critic import (
     generate_critic_prompt,
     parse_critic_result,
@@ -38,15 +37,11 @@ from lib.hooks import get_tasks_added_from_telemetry, run_completion_hooks, run_
 from lib.queue import (
     _read_entry,
     _write_entry,
-    cleanup_spec_worktree,
     complete,
-    count_active_worktrees,
-    create_spec_worktree,
     dequeue,
     fail,
     get_entry,
     increment_experiment_usage,
-    merge_spec_worktree,
     record_failure,
     requeue,
     set_needs_review,
@@ -374,12 +369,11 @@ def process_worker_completion(
 
     # Step 3: Determine outcome and update queue entry
 
-    # Safety net: enforce max_iter cap FIRST, regardless of pending_count.
-    # Without this, specs with 0 pending tasks could loop forever if the
-    # critic keeps requeuing them (Bug: max_iter was in an elif branch that
-    # was unreachable when pending_count == 0).
-    if iteration >= max_iter:
-        # Max iterations reached
+    # Max-iter guard — must fire BEFORE any other outcome logic.
+    # Without this, specs with all tasks DONE bypass the max-iter check
+    # because it was in an elif after the pending_count==0 branch.
+    if iteration >= max_iter and pending_count > 0:
+        # Max iterations reached with pending tasks — fail
         fail(queue_dir, queue_id, "Max iterations reached")
         result["outcome"] = "failed"
         result["reason"] = "max_iterations"
@@ -398,9 +392,32 @@ def process_worker_completion(
         )
 
         run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=True)
+        return result
 
-    elif pending_count == 0:
-        # All tasks done — check if critic should run
+    if pending_count == 0:
+        # All tasks done — check if critic should run (only if under max-iter)
+        if iteration >= max_iter:
+            # Past max-iter: complete without critic, don't requeue
+            complete(queue_dir, queue_id, done_count, total_count)
+            result["outcome"] = "completed"
+
+            write_event(
+                events_dir,
+                {
+                    "type": "spec_completed",
+                    "queue_id": queue_id,
+                    "spec_path": spec_path,
+                    "iterations": iteration,
+                    "tasks_done": done_count,
+                    "tasks_added": tasks_added,
+                    "note": "completed_at_max_iter_without_critic",
+                    "timestamp": timestamp,
+                },
+            )
+
+            run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
+            return result
+
         state_dir = str(Path(queue_dir).parent)
         critic_config = load_critic_config(state_dir)
         boi_dir = script_dir  # script_dir points to ~/boi/
@@ -487,7 +504,7 @@ def process_worker_completion(
             run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
 
     else:
-        # Still has pending tasks, requeue
+        # Still has pending tasks (and under max-iter, checked above), requeue
         requeue(queue_dir, queue_id, done_count, total_count)
         result["outcome"] = "requeued"
 
@@ -507,91 +524,6 @@ def process_worker_completion(
         update_telemetry(queue_dir, queue_id)
     except Exception:
         pass  # Telemetry failure should never block the daemon
-
-    # Step 7: Handle worktree merge/cleanup based on outcome
-    result = _handle_worktree_post_completion(
-        queue_dir, queue_id, entry, events_dir, timestamp, result
-    )
-
-    return result
-
-
-def _handle_worktree_post_completion(
-    queue_dir: str,
-    queue_id: str,
-    entry: dict[str, Any],
-    events_dir: str,
-    timestamp: str,
-    result: dict[str, Any],
-) -> dict[str, Any]:
-    """Handle worktree merge or cleanup after a spec finishes.
-
-    - On "completed": attempt merge. If conflict, set status to needs_merge.
-    - On "failed"/"crashed" permanently: cleanup worktree without merge.
-    - On "requeued": do nothing (spec still running).
-    """
-    if not entry.get("worktree_isolate"):
-        return result
-
-    outcome = result.get("outcome", "")
-
-    if outcome == "completed":
-        # Attempt to merge the worktree branch back to main
-        try:
-            merge_result = merge_spec_worktree(queue_dir, queue_id)
-            merge_status = merge_result.get("merge_status", "error")
-            result["merge_status"] = merge_status
-
-            if merge_status == "merged":
-                write_event(
-                    events_dir,
-                    {
-                        "type": "worktree_merged",
-                        "queue_id": queue_id,
-                        "timestamp": timestamp,
-                    },
-                )
-            elif merge_status == "conflict":
-                # Set spec to needs_merge so user can resolve
-                from lib.queue import _read_entry, _write_entry
-
-                e = _read_entry(queue_dir, queue_id)
-                if e:
-                    e["status"] = "needs_merge"
-                    _write_entry(queue_dir, e)
-
-                result["outcome"] = "needs_merge"
-                result["conflicting_files"] = merge_result.get("conflicting_files", [])
-
-                write_event(
-                    events_dir,
-                    {
-                        "type": "worktree_conflict",
-                        "queue_id": queue_id,
-                        "conflicting_files": merge_result.get("conflicting_files", []),
-                        "timestamp": timestamp,
-                    },
-                )
-        except Exception as exc:
-            result["merge_error"] = str(exc)
-
-    elif outcome == "failed":
-        # Cleanup worktree without merging
-        try:
-            cleanup_spec_worktree(queue_dir, queue_id)
-            write_event(
-                events_dir,
-                {
-                    "type": "worktree_cleaned",
-                    "queue_id": queue_id,
-                    "reason": "spec_failed",
-                    "timestamp": timestamp,
-                },
-            )
-        except Exception:
-            pass
-
-    # "requeued" and "crashed" (with requeue): leave worktree in place
 
     return result
 
@@ -721,85 +653,21 @@ def _handle_crash(
     return result
 
 
-def pick_next_spec(
-    queue_dir: str,
-    for_worktree: bool = False,
-    max_worktrees: int = 5,
-) -> Optional[dict[str, Any]]:
+def pick_next_spec(queue_dir: str) -> Optional[dict[str, Any]]:
     """Dequeue and return the next eligible spec in one call.
 
-    Returns a dict with id, spec_path, iteration, max_iterations,
-    and worktree_isolate for the next eligible spec, or None if
-    no spec is available.
-
-    Args:
-        queue_dir: Path to queue directory.
-        for_worktree: If True, only return worktree-isolated specs
-            (used when no free shared workers are available).
-        max_worktrees: Maximum concurrent worktrees allowed.
+    Returns a dict with id, spec_path, iteration, max_iterations
+    for the next eligible spec, or None if no spec is available.
     """
-    from lib.queue import get_queue
-
-    if for_worktree:
-        # Check if we've hit the worktree limit
-        active_wt = count_active_worktrees(queue_dir)
-        if active_wt >= max_worktrees:
-            return None
-
-        # Look for worktree-isolated specs manually
-        # (dequeue doesn't know about worktree filtering)
-        entries = get_queue(queue_dir)
-        now = datetime.now(timezone.utc).isoformat()
-        for entry in entries:
-            status = entry.get("status", "")
-            if status not in ("queued", "requeued"):
-                continue
-            if not entry.get("worktree_isolate"):
-                continue
-            # Check cooldown
-            cooldown_until = entry.get("cooldown_until")
-            if cooldown_until and cooldown_until > now:
-                continue
-            # Check blocked_by
-            if entry.get("blocked_by"):
-                from lib.queue import _read_entry
-
-                all_deps_done = True
-                for dep_id in entry["blocked_by"]:
-                    dep = _read_entry(queue_dir, dep_id)
-                    if dep is None or dep.get("status") != "completed":
-                        all_deps_done = False
-                        break
-                if not all_deps_done:
-                    continue
-            return {
-                "id": entry["id"],
-                "spec_path": entry.get("spec_path", ""),
-                "iteration": entry.get("iteration", 0),
-                "max_iterations": entry.get("max_iterations", 30),
-                "worktree_isolate": True,
-            }
-        return None
-
     entry = dequeue(queue_dir)
     if entry is None:
         return None
-
-    # Re-check file-level conflicts against currently running specs.
-    # A spec that was unblocked at dispatch might now conflict with
-    # a spec that started running since then.
-    if not entry.get("worktree_isolate"):
-        conflicting_ids = check_conflicts_before_dequeue(queue_dir, entry["id"])
-        if conflicting_ids:
-            # Skip this spec for now; it will be retried next cycle
-            return None
 
     return {
         "id": entry["id"],
         "spec_path": entry.get("spec_path", ""),
         "iteration": entry.get("iteration", 0),
         "max_iterations": entry.get("max_iterations", 30),
-        "worktree_isolate": bool(entry.get("worktree_isolate")),
     }
 
 

@@ -33,7 +33,6 @@
 import json
 import os
 import shutil
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -215,7 +214,8 @@ def dequeue(
     """Pick the highest-priority unblocked spec with status 'queued' or 'requeued'.
 
     Returns the queue entry dict, or None if no eligible spec found.
-    Does NOT change the entry status (caller should call set_running).
+    Atomically marks the spec as 'assigning' to prevent TOCTOU double-pickup.
+    Caller should call set_running after launching the worker.
 
     blocked_ids: set of queue IDs that are blocked by incomplete dependencies.
     """
@@ -245,6 +245,9 @@ def dequeue(
                         break
                 if not all_deps_done:
                     continue
+            # Atomically mark as 'assigning' to prevent double-pickup
+            entry["status"] = "assigning"
+            _write_entry(queue_dir, entry)
             return entry
 
         return None
@@ -677,213 +680,3 @@ def increment_experiment_usage(
             "experiment_invocations_used": used,
             "remaining": max(0, max_budget - used),
         }
-
-
-# ─── Worktree Isolation ──────────────────────────────────────────────────────
-
-WORKTREES_DIR = os.path.join(os.path.expanduser("~"), ".boi", "worktrees")
-
-
-def create_spec_worktree(
-    queue_dir: str, queue_id: str, repo_path: str
-) -> dict[str, Any]:
-    """Create a dedicated git worktree for a spec.
-
-    Creates `~/.boi/worktrees/q-{id}` with a new branch `boi/q-{id}`
-    from the given repo_path. Updates the queue entry with worktree_path
-    and worktree_branch.
-
-    Returns dict with worktree_path and worktree_branch.
-    Raises RuntimeError on git failure.
-    """
-    branch = f"boi/{queue_id}"
-    worktree_path = os.path.join(WORKTREES_DIR, queue_id)
-
-    os.makedirs(WORKTREES_DIR, exist_ok=True)
-
-    # Create the worktree with a new branch
-    try:
-        subprocess.run(
-            ["git", "worktree", "add", worktree_path, "-b", branch],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            f"Failed to create worktree for {queue_id}: {exc.stderr.strip()}"
-        ) from exc
-
-    # Update queue entry
-    with queue_lock(queue_dir):
-        entry = _read_entry(queue_dir, queue_id)
-        if entry is None:
-            raise ValueError(f"Queue entry not found: {queue_id}")
-        entry["worktree_path"] = worktree_path
-        entry["worktree_branch"] = branch
-        entry["worktree_isolate"] = True
-        _write_entry(queue_dir, entry)
-
-    return {"worktree_path": worktree_path, "worktree_branch": branch}
-
-
-def merge_spec_worktree(queue_dir: str, queue_id: str) -> dict[str, Any]:
-    """Merge a spec's worktree branch back to the main branch.
-
-    On success: sets merge_status to "merged", removes worktree, deletes branch.
-    On conflict: sets merge_status to "conflict", keeps worktree, returns conflicting files.
-
-    Returns dict with merge_status and optionally conflicting_files.
-    """
-    entry = _read_entry(queue_dir, queue_id)
-    if entry is None:
-        raise ValueError(f"Queue entry not found: {queue_id}")
-
-    branch = entry.get("worktree_branch")
-    worktree_path = entry.get("worktree_path")
-    if not branch or not worktree_path:
-        return {"merge_status": "no_worktree"}
-
-    # Find the main repo path (parent of .boi/worktrees)
-    repo_path = _find_repo_from_worktree(worktree_path)
-    if not repo_path:
-        return {"merge_status": "error", "reason": "Cannot determine main repo path"}
-
-    # Try to merge the branch
-    result = subprocess.run(
-        ["git", "merge", "--no-edit", branch],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode == 0:
-        # Merge succeeded - clean up
-        _remove_worktree(repo_path, worktree_path, branch)
-
-        with queue_lock(queue_dir):
-            entry = _read_entry(queue_dir, queue_id)
-            if entry:
-                entry["merge_status"] = "merged"
-                _write_entry(queue_dir, entry)
-
-        return {"merge_status": "merged"}
-    else:
-        # Merge conflict - abort the merge and keep worktree
-        subprocess.run(
-            ["git", "merge", "--abort"],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-        )
-
-        # Get list of conflicting files
-        conflicting = _get_conflicting_files(repo_path, branch)
-
-        with queue_lock(queue_dir):
-            entry = _read_entry(queue_dir, queue_id)
-            if entry:
-                entry["merge_status"] = "conflict"
-                entry["conflicting_files"] = conflicting
-                _write_entry(queue_dir, entry)
-
-        return {"merge_status": "conflict", "conflicting_files": conflicting}
-
-
-def cleanup_spec_worktree(queue_dir: str, queue_id: str) -> bool:
-    """Force-remove a spec's worktree and branch (for cancel/fail).
-
-    Returns True if cleanup was performed, False if no worktree existed.
-    """
-    entry = _read_entry(queue_dir, queue_id)
-    if entry is None:
-        return False
-
-    branch = entry.get("worktree_branch")
-    worktree_path = entry.get("worktree_path")
-    if not branch or not worktree_path:
-        return False
-
-    repo_path = _find_repo_from_worktree(worktree_path)
-    if repo_path:
-        _remove_worktree(repo_path, worktree_path, branch)
-
-    with queue_lock(queue_dir):
-        entry = _read_entry(queue_dir, queue_id)
-        if entry:
-            entry["worktree_path"] = None
-            entry["worktree_branch"] = None
-            entry["merge_status"] = None
-            _write_entry(queue_dir, entry)
-
-    return True
-
-
-def _find_repo_from_worktree(worktree_path: str) -> str | None:
-    """Find the main git repo path from a worktree path.
-
-    Uses `git worktree list` to find the main working tree.
-    Falls back to checking common parent directories.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "worktree", "list", "--porcelain"],
-            cwd=worktree_path
-            if os.path.isdir(worktree_path)
-            else os.path.expanduser("~"),
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        # First "worktree" line is the main working tree
-        for line in result.stdout.splitlines():
-            if line.startswith("worktree "):
-                return line[len("worktree ") :]
-    except (subprocess.CalledProcessError, OSError):
-        pass
-    return None
-
-
-def _remove_worktree(repo_path: str, worktree_path: str, branch: str) -> None:
-    """Remove a git worktree and delete its branch."""
-    # Remove the worktree
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", worktree_path],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    # Delete the branch
-    subprocess.run(
-        ["git", "branch", "-D", branch],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _get_conflicting_files(repo_path: str, branch: str) -> list[str]:
-    """Get the list of files that would conflict when merging a branch."""
-    # Use merge-tree or diff to find conflicting files
-    result = subprocess.run(
-        ["git", "diff", "--name-only", f"HEAD...{branch}"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
-        return [f.strip() for f in result.stdout.splitlines() if f.strip()]
-    return []
-
-
-def count_active_worktrees(queue_dir: str) -> int:
-    """Count specs currently using dedicated worktrees."""
-    entries = get_queue(queue_dir)
-    return sum(
-        1
-        for e in entries
-        if e.get("worktree_isolate")
-        and e.get("worktree_path")
-        and e.get("status") in ("queued", "requeued", "running")
-    )
