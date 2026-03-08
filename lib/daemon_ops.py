@@ -1234,3 +1234,357 @@ def process_evaluation_completion(
         result["status"] = "goal_achieved"
         result["phase"] = "completed"
         return result
+
+
+# ─── Self-Healing ──────────────────────────────────────────────────────────────
+
+
+def self_heal(
+    queue_dir: str,
+    worker_specs: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Detect and recover from stuck states automatically.
+
+    Runs a battery of checks to find and fix deadlocked/stuck specs.
+
+    Args:
+        queue_dir: Path to ~/.boi/queue/
+        worker_specs: Dict mapping worker_id -> queue_id for currently
+                      assigned workers (from daemon's in-memory state).
+                      Empty string value means the worker is idle.
+
+    Returns:
+        A list of dicts describing each self-heal action taken:
+          {"action": str, "queue_id": str, "detail": str}
+    """
+    actions: list[dict[str, Any]] = []
+
+    actions.extend(_heal_stale_running_specs(queue_dir))
+    actions.extend(_heal_max_running_duration(queue_dir))
+    actions.extend(_heal_orphaned_workers(queue_dir, worker_specs))
+    actions.extend(_heal_circular_dependencies(queue_dir))
+    actions.extend(_heal_blocked_by_cleanup(queue_dir))
+    actions.extend(_heal_stale_lock(queue_dir))
+
+    return actions
+
+
+def _heal_stale_running_specs(queue_dir: str) -> list[dict[str, Any]]:
+    """Find specs with status 'running' where no worker PID is alive.
+
+    Reset them to 'requeued' so they can be picked up again.
+    """
+    from lib.queue import _is_pid_alive, get_queue
+
+    actions: list[dict[str, Any]] = []
+    entries = get_queue(queue_dir)
+
+    for entry in entries:
+        if entry.get("status") != "running":
+            continue
+
+        queue_id = entry["id"]
+        pid_file = os.path.join(queue_dir, f"{queue_id}.pid")
+        pid_alive = False
+
+        if os.path.isfile(pid_file):
+            try:
+                pid_str = Path(pid_file).read_text(encoding="utf-8").strip()
+                pid = int(pid_str)
+                pid_alive = _is_pid_alive(pid)
+            except (ValueError, OSError):
+                pid_alive = False
+        # else: no PID file means worker never started or exited without cleanup
+
+        if not pid_alive:
+            # Reset to requeued
+            entry["status"] = "requeued"
+            _write_entry(queue_dir, entry)
+
+            # Clean up stale PID/exit files
+            for suffix in [".pid", ".exit"]:
+                stale = os.path.join(queue_dir, f"{queue_id}{suffix}")
+                if os.path.isfile(stale):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+
+            actions.append(
+                {
+                    "action": "stale_running_recovered",
+                    "queue_id": queue_id,
+                    "detail": f"spec {queue_id} stuck in running with dead PID, reset to requeued",
+                }
+            )
+
+    return actions
+
+
+DEFAULT_WORKER_TIMEOUT_SECONDS = 1800  # 30 minutes
+
+
+def _heal_max_running_duration(queue_dir: str) -> list[dict[str, Any]]:
+    """Force-fail specs that have been running longer than their max duration.
+
+    If a spec has been in 'running' status for longer than
+    max_running_duration_seconds (default: worker_timeout_seconds * max_iterations),
+    force-fail it. This catches cases where the PID check is broken (PID file
+    missing, PID reused by another process) and the spec sits in 'running' forever.
+    """
+    from lib.queue import get_queue
+
+    actions: list[dict[str, Any]] = []
+    entries = get_queue(queue_dir)
+    now = datetime.now(timezone.utc)
+
+    for entry in entries:
+        if entry.get("status") != "running":
+            continue
+
+        first_running_at = entry.get("first_running_at")
+        if not first_running_at:
+            continue
+
+        try:
+            started = datetime.fromisoformat(first_running_at)
+            # Ensure timezone-aware comparison
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+
+        elapsed_seconds = (now - started).total_seconds()
+
+        # Compute max running duration
+        worker_timeout = entry.get(
+            "worker_timeout_seconds", DEFAULT_WORKER_TIMEOUT_SECONDS
+        )
+        max_iterations = entry.get("max_iterations", 30)
+        max_duration = entry.get(
+            "max_running_duration_seconds",
+            worker_timeout * max_iterations,
+        )
+
+        if elapsed_seconds >= max_duration:
+            queue_id = entry["id"]
+            elapsed_min = int(elapsed_seconds / 60)
+            max_min = int(max_duration / 60)
+
+            # Force-fail the spec
+            entry["status"] = "failed"
+            entry["failure_reason"] = "Maximum running duration exceeded"
+            _write_entry(queue_dir, entry)
+
+            # Clean up PID/exit files
+            for suffix in [".pid", ".exit"]:
+                stale = os.path.join(queue_dir, f"{queue_id}{suffix}")
+                if os.path.isfile(stale):
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
+
+            actions.append(
+                {
+                    "action": "max_running_duration_exceeded",
+                    "queue_id": queue_id,
+                    "detail": (
+                        f"spec {queue_id} running for {elapsed_min}m "
+                        f"(max: {max_min}m), force-failed"
+                    ),
+                }
+            )
+
+    return actions
+
+
+def _heal_orphaned_workers(
+    queue_dir: str,
+    worker_specs: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Find workers assigned to specs that are already in a terminal state.
+
+    Returns actions describing which workers should be freed. The actual
+    freeing of daemon-side state (WORKER_CURRENT_SPEC etc.) must be done
+    by the caller in bash since those are bash-level variables.
+    """
+    terminal_statuses = {"completed", "failed", "canceled"}
+    actions: list[dict[str, Any]] = []
+
+    for worker_id, queue_id in worker_specs.items():
+        if not queue_id:
+            continue
+
+        entry = _read_entry(queue_dir, queue_id)
+        if entry is None:
+            # Queue entry doesn't exist at all. Worker is orphaned.
+            actions.append(
+                {
+                    "action": "orphaned_worker",
+                    "queue_id": queue_id,
+                    "worker_id": worker_id,
+                    "detail": f"worker {worker_id} assigned to missing spec {queue_id}, should be freed",
+                }
+            )
+            continue
+
+        if entry.get("status") in terminal_statuses:
+            actions.append(
+                {
+                    "action": "orphaned_worker",
+                    "queue_id": queue_id,
+                    "worker_id": worker_id,
+                    "detail": f"worker {worker_id} assigned to {entry.get('status')} spec {queue_id}, should be freed",
+                }
+            )
+
+    return actions
+
+
+def _heal_circular_dependencies(queue_dir: str) -> list[dict[str, Any]]:
+    """Detect circular dependencies in blocked_by chains.
+
+    If spec A blocks B blocks C blocks A, cancel all specs in the cycle.
+    Must run BEFORE _heal_blocked_by_cleanup to detect cycles first.
+    """
+    from lib.queue import get_queue
+
+    actions: list[dict[str, Any]] = []
+    entries = get_queue(queue_dir)
+
+    # Build adjacency: spec_id -> set of specs it's blocked by
+    blocked_by_map: dict[str, list[str]] = {}
+    entry_map: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        qid = entry["id"]
+        entry_map[qid] = entry
+        deps = entry.get("blocked_by", [])
+        if deps:
+            blocked_by_map[qid] = deps
+
+    # Find all cycles using DFS
+    visited: set[str] = set()
+    in_cycle: set[str] = set()
+
+    def find_cycle(node: str, path: list[str], path_set: set[str]) -> None:
+        if node in path_set:
+            # Found a cycle. Extract the cycle portion.
+            cycle_start = path.index(node)
+            cycle = path[cycle_start:]
+            in_cycle.update(cycle)
+            return
+        if node in visited:
+            return
+        visited.add(node)
+        path.append(node)
+        path_set.add(node)
+        for dep in blocked_by_map.get(node, []):
+            find_cycle(dep, path, path_set)
+        path.pop()
+        path_set.discard(node)
+
+    for qid in blocked_by_map:
+        if qid not in visited:
+            find_cycle(qid, [], set())
+
+    # Cancel all specs in cycles
+    for qid in in_cycle:
+        entry = entry_map.get(qid)
+        if entry and entry.get("status") not in ("completed", "failed", "canceled"):
+            entry["status"] = "canceled"
+            entry["failure_reason"] = "Circular dependency detected"
+            _write_entry(queue_dir, entry)
+            actions.append(
+                {
+                    "action": "circular_dependency_canceled",
+                    "queue_id": qid,
+                    "detail": f"spec {qid} canceled due to circular dependency",
+                }
+            )
+
+    return actions
+
+
+def _heal_blocked_by_cleanup(queue_dir: str) -> list[dict[str, Any]]:
+    """Clean up blocked_by references to completed/failed/canceled/missing specs.
+
+    For each spec with blocked_by:
+    - If a blocking spec is in a terminal state, remove it from blocked_by.
+    - If a blocking spec ID doesn't exist, remove it from blocked_by.
+    """
+    from lib.queue import get_queue
+
+    terminal_statuses = {"completed", "failed", "canceled"}
+    actions: list[dict[str, Any]] = []
+    entries = get_queue(queue_dir)
+
+    for entry in entries:
+        blocked_by = entry.get("blocked_by", [])
+        if not blocked_by:
+            continue
+
+        queue_id = entry["id"]
+        new_blocked_by: list[str] = []
+        removed: list[str] = []
+
+        for dep_id in blocked_by:
+            dep = _read_entry(queue_dir, dep_id)
+            if dep is None:
+                removed.append(f"{dep_id} (missing)")
+            elif dep.get("status") in terminal_statuses:
+                removed.append(f"{dep_id} ({dep.get('status')})")
+            else:
+                new_blocked_by.append(dep_id)
+
+        if removed:
+            entry["blocked_by"] = new_blocked_by
+            _write_entry(queue_dir, entry)
+            actions.append(
+                {
+                    "action": "blocked_by_cleaned",
+                    "queue_id": queue_id,
+                    "detail": f"removed blocking deps: {', '.join(removed)}",
+                }
+            )
+
+    return actions
+
+
+def _heal_stale_lock(queue_dir: str) -> list[dict[str, Any]]:
+    """Remove queue/.lock if the PID holding it is dead.
+
+    Note: This checks the flock on the lock file. If the file exists but
+    no process holds the lock (flock is released on process death), we
+    leave it alone (the file itself is harmless; flock is what matters).
+
+    We check if we can acquire a non-blocking flock. If we can, the lock
+    is not held by anyone, so the file is stale and can be cleaned up.
+    If we can't, someone is actively holding it, which is fine.
+    """
+    import fcntl
+
+    lock_path = os.path.join(queue_dir, ".lock")
+    actions: list[dict[str, Any]] = []
+
+    if not os.path.isfile(lock_path):
+        return actions
+
+    try:
+        fd = open(lock_path, "w")
+        try:
+            # Try non-blocking lock. If we get it, no one holds it.
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # We got the lock. Release it immediately.
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            # The lock file exists but no one holds it. This is normal
+            # (the file persists between daemon runs). No action needed.
+        except (BlockingIOError, OSError):
+            # Lock is held by a live process. That's fine.
+            pass
+        finally:
+            fd.close()
+    except OSError:
+        pass
+
+    return actions

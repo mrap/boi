@@ -636,8 +636,71 @@ os.rename(tmp, state_file)
 PYEOF
 }
 
+run_self_heal() {
+    # Build worker_specs JSON from bash associative arrays
+    local worker_specs_json="{"
+    local first=true
+    for wid in "${!WORKER_CURRENT_SPEC[@]}"; do
+        local spec="${WORKER_CURRENT_SPEC[${wid}]}"
+        if [[ "${first}" == "true" ]]; then
+            first=false
+        else
+            worker_specs_json+=","
+        fi
+        worker_specs_json+="\"${wid}\":\"${spec}\""
+    done
+    worker_specs_json+="}"
+
+    local heal_result
+    heal_result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${worker_specs_json}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.daemon_ops import self_heal
+actions = self_heal(sys.argv[1], json.loads(sys.argv[2]))
+print(json.dumps(actions))
+PYEOF
+    )
+
+    # Log each action and handle orphaned workers
+    local action_count
+    action_count=$(echo "${heal_result}" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))" 2>/dev/null || echo "0")
+
+    if [[ "${action_count}" -gt 0 ]]; then
+        # Parse and log each action
+        while IFS= read -r action_json; do
+            local action_type action_detail action_worker
+            action_type=$(echo "${action_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('action',''))" 2>/dev/null || echo "")
+            action_detail=$(echo "${action_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('detail',''))" 2>/dev/null || echo "")
+            log_warn "Self-healed: ${action_detail}"
+
+            # Handle orphaned workers by freeing them in bash state
+            if [[ "${action_type}" == "orphaned_worker" ]]; then
+                action_worker=$(echo "${action_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('worker_id',''))" 2>/dev/null || echo "")
+                local action_qid
+                action_qid=$(echo "${action_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('queue_id',''))" 2>/dev/null || echo "")
+                if [[ -n "${action_worker}" ]]; then
+                    WORKER_CURRENT_SPEC["${action_worker}"]=""
+                    WORKER_PIDS["${action_worker}"]=""
+                    WORKER_START_TIME["${action_worker}"]=""
+                    rm -f "${QUEUE_DIR}/${action_qid}.pid"
+                    rm -f "${QUEUE_DIR}/${action_qid}.exit"
+                    log_info "Freed orphaned worker ${action_worker}"
+                fi
+            fi
+        done < <(echo "${heal_result}" | python3 -c "
+import json, sys
+actions = json.loads(sys.stdin.read())
+for a in actions:
+    print(json.dumps(a))
+" 2>/dev/null)
+    fi
+}
+
+SELF_HEAL_INTERVAL=10  # Run self-heal every N poll cycles
+
 daemon_loop() {
     log_info "Daemon loop started."
+    local poll_cycle=0
 
     while true; do
         # Check all active workers
@@ -717,6 +780,12 @@ PYEOF
         local heartbeat_file="${BOI_STATE_DIR}/daemon-heartbeat"
         date -u +"%Y-%m-%dT%H:%M:%SZ" > "${heartbeat_file}.tmp"
         mv "${heartbeat_file}.tmp" "${heartbeat_file}"
+
+        # Self-heal: detect and recover stuck states every N poll cycles
+        poll_cycle=$((poll_cycle + 1))
+        if [[ $((poll_cycle % SELF_HEAL_INTERVAL)) -eq 0 ]]; then
+            run_self_heal
+        fi
 
         sleep "${POLL_INTERVAL_S}"
     done

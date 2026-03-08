@@ -59,6 +59,14 @@ def _queue_filename(queue_id: str) -> str:
     return f"{queue_id}.json"
 
 
+def _spec_name_from_entry(entry: dict[str, Any]) -> str:
+    """Extract a human-readable spec name from a queue entry."""
+    spec_path = entry.get("original_spec_path", entry.get("spec_path", ""))
+    if spec_path:
+        return os.path.splitext(os.path.basename(spec_path))[0]
+    return ""
+
+
 def _next_queue_id(queue_dir: str) -> str:
     """Generate the next queue ID (q-001, q-002, etc.).
 
@@ -258,6 +266,10 @@ def set_running(queue_dir: str, queue_id: str, worker_id: str) -> None:
         entry["last_worker"] = worker_id
         entry["iteration"] += 1
         entry["last_iteration_at"] = datetime.now(timezone.utc).isoformat()
+
+        # Track when the spec first started running (for max duration timeout)
+        if "first_running_at" not in entry:
+            entry["first_running_at"] = datetime.now(timezone.utc).isoformat()
 
         # Snapshot task statuses before the iteration runs
         spec_path = entry.get("spec_path", "")
@@ -507,6 +519,7 @@ def purge(
                 {
                     "id": queue_id,
                     "status": entry.get("status", "unknown"),
+                    "spec_name": _spec_name_from_entry(entry),
                     "files_removed": files_removed,
                 }
             )
