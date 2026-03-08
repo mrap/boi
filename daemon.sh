@@ -396,6 +396,7 @@ result = process_worker_completion(
     hooks_dir=sys.argv[5],
     script_dir=sys.argv[6],
     exit_code=None,
+    timeout=True,
 )
 print(json.dumps(result))
 PYEOF

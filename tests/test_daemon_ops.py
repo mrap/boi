@@ -316,6 +316,224 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
         self.assertTrue(os.path.exists(marker))
 
 
+class TestFailureDiagnostics(DaemonOpsTestCase):
+    """Tests for failure reason and log_tail capture in iteration metadata."""
+
+    def _write_log_file(self, queue_id, iteration, lines):
+        """Write a mock log file for a worker iteration."""
+        log_file = os.path.join(self.log_dir, f"{queue_id}-iter-{iteration}.log")
+        Path(log_file).write_text("\n".join(lines) + "\n")
+        return log_file
+
+    def test_crash_captures_failure_reason_in_iteration_meta(self):
+        """When worker crashes (no exit file), failure_reason is written to iteration JSON."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = enqueue(self.queue_dir, spec_path)
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        # Write a mock log file
+        self._write_log_file(
+            entry["id"], 1, ["line 1", "line 2", "error: something broke"]
+        )
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code=None,
+        )
+
+        self.assertEqual(result["outcome"], "crashed")
+        self.assertIn("failure_reason", result)
+        self.assertIn("no exit file", result["failure_reason"])
+
+        # Check iteration metadata file
+        iter_file = os.path.join(self.queue_dir, f"{entry['id']}.iteration-1.json")
+        self.assertTrue(os.path.isfile(iter_file))
+        meta = json.loads(Path(iter_file).read_text())
+        self.assertIn("failure_reason", meta)
+        self.assertIn("no exit file", meta["failure_reason"])
+        self.assertIn("log_tail", meta)
+        self.assertIsInstance(meta["log_tail"], list)
+        self.assertIn("error: something broke", meta["log_tail"])
+        self.assertTrue(meta.get("crash", False))
+
+    def test_nonzero_exit_captures_failure_reason(self):
+        """Non-zero exit code captures specific exit code in failure_reason."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = enqueue(self.queue_dir, spec_path)
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        self._write_log_file(entry["id"], 1, ["running...", "segfault"])
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="137",
+        )
+
+        self.assertEqual(result["outcome"], "crashed")
+        self.assertIn("137", result["failure_reason"])
+
+        iter_file = os.path.join(self.queue_dir, f"{entry['id']}.iteration-1.json")
+        self.assertTrue(os.path.isfile(iter_file))
+        meta = json.loads(Path(iter_file).read_text())
+        self.assertEqual(meta["failure_reason"], "Worker exited with code 137.")
+        self.assertEqual(meta["exit_code"], 137)
+
+    def test_timeout_captures_failure_reason(self):
+        """Timeout passes specific timeout message as failure_reason."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = enqueue(self.queue_dir, spec_path)
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        self._write_log_file(entry["id"], 1, ["still running..."])
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code=None,
+            timeout=True,
+        )
+
+        self.assertEqual(result["outcome"], "crashed")
+        self.assertIn("timed out", result["failure_reason"])
+
+        iter_file = os.path.join(self.queue_dir, f"{entry['id']}.iteration-1.json")
+        meta = json.loads(Path(iter_file).read_text())
+        self.assertIn("timed out", meta["failure_reason"])
+
+    def test_consecutive_failures_include_last_error(self):
+        """When consecutive failure limit hit, failure_reason includes last error."""
+        from lib.queue import _read_entry, _write_entry
+
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = enqueue(self.queue_dir, spec_path)
+
+        # Simulate 4 prior failures
+        e = _read_entry(self.queue_dir, entry["id"])
+        e["consecutive_failures"] = 4
+        _write_entry(self.queue_dir, e)
+
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code=None,
+        )
+
+        self.assertEqual(result["outcome"], "failed")
+        self.assertIn("5 consecutive failures", result["failure_reason"])
+        self.assertIn("no exit file", result["failure_reason"])
+
+        # Check queue entry has the failure_reason
+        updated = get_entry(self.queue_dir, entry["id"])
+        self.assertEqual(updated["status"], "failed")
+        self.assertIn("failure_reason", updated)
+        self.assertIn("5 consecutive failures", updated["failure_reason"])
+
+    def test_log_tail_captures_last_20_lines(self):
+        """log_tail captures the last 20 lines from the worker log."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = enqueue(self.queue_dir, spec_path)
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        # Write a log with 30 lines
+        lines = [f"log line {i}" for i in range(30)]
+        self._write_log_file(entry["id"], 1, lines)
+
+        process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code=None,
+        )
+
+        iter_file = os.path.join(self.queue_dir, f"{entry['id']}.iteration-1.json")
+        meta = json.loads(Path(iter_file).read_text())
+        self.assertEqual(len(meta["log_tail"]), 20)
+        self.assertEqual(meta["log_tail"][0], "log line 10")
+        self.assertEqual(meta["log_tail"][-1], "log line 29")
+
+    def test_no_log_file_empty_log_tail(self):
+        """When no log file exists, log_tail is empty list."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = enqueue(self.queue_dir, spec_path)
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code=None,
+        )
+
+        iter_file = os.path.join(self.queue_dir, f"{entry['id']}.iteration-1.json")
+        meta = json.loads(Path(iter_file).read_text())
+        self.assertEqual(meta["log_tail"], [])
+
+    def test_existing_iteration_file_updated_with_diagnostics(self):
+        """If iteration file already exists (from worker.sh), diagnostics are merged in."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = enqueue(self.queue_dir, spec_path)
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        # Pre-create iteration file (as worker.sh would)
+        iter_file = os.path.join(self.queue_dir, f"{entry['id']}.iteration-1.json")
+        existing_meta = {
+            "queue_id": entry["id"],
+            "iteration": 1,
+            "exit_code": 1,
+            "duration_seconds": 120,
+            "tasks_completed": 0,
+        }
+        Path(iter_file).write_text(json.dumps(existing_meta, indent=2) + "\n")
+
+        self._write_log_file(entry["id"], 1, ["error line"])
+
+        process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="1",
+        )
+
+        meta = json.loads(Path(iter_file).read_text())
+        # Original fields preserved
+        self.assertEqual(meta["duration_seconds"], 120)
+        self.assertEqual(meta["tasks_completed"], 0)
+        # Diagnostics added
+        self.assertIn("failure_reason", meta)
+        self.assertEqual(meta["failure_reason"], "Worker exited with code 1.")
+        self.assertIn("log_tail", meta)
+        self.assertIn("error line", meta["log_tail"])
+
+
 class TestPickNextSpec(DaemonOpsTestCase):
     """Tests for pick_next_spec()."""
 

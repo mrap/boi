@@ -61,6 +61,62 @@ from lib.spec_validator import validate_spec_file
 from lib.telemetry import update_telemetry
 
 
+def _read_log_tail(
+    log_dir: str, queue_id: str, iteration: int, lines: int = 20
+) -> list[str]:
+    """Read the last N lines from a worker log file.
+
+    Returns a list of strings (one per line), or empty list if log not found.
+    """
+    log_file = Path(log_dir) / f"{queue_id}-iter-{iteration}.log"
+    if not log_file.is_file():
+        return []
+    try:
+        content = log_file.read_text(encoding="utf-8", errors="replace")
+        all_lines = content.splitlines()
+        return all_lines[-lines:] if len(all_lines) > lines else all_lines
+    except OSError:
+        return []
+
+
+def _write_failure_to_iteration_meta(
+    queue_dir: str,
+    queue_id: str,
+    iteration: int,
+    failure_reason: str,
+    log_tail: list[str],
+    exit_code: Optional[str] = None,
+) -> None:
+    """Write or update iteration metadata JSON with failure diagnostics.
+
+    If the iteration file already exists (written by worker.sh), adds
+    failure_reason and log_tail fields. Otherwise creates a new file.
+    """
+    iter_meta_path = Path(queue_dir) / f"{queue_id}.iteration-{iteration}.json"
+
+    if iter_meta_path.is_file():
+        try:
+            meta = json.loads(iter_meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+    else:
+        meta = {
+            "queue_id": queue_id,
+            "iteration": iteration,
+        }
+
+    meta["failure_reason"] = failure_reason
+    meta["log_tail"] = log_tail
+    if exit_code is not None:
+        meta["exit_code"] = int(exit_code) if exit_code.isdigit() else exit_code
+    else:
+        meta["crash"] = True
+
+    tmp = iter_meta_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    os.rename(str(tmp), str(iter_meta_path))
+
+
 def process_worker_completion(
     queue_dir: str,
     queue_id: str,
@@ -69,6 +125,7 @@ def process_worker_completion(
     hooks_dir: str,
     script_dir: str,
     exit_code: Optional[str] = None,
+    timeout: bool = False,
 ) -> dict[str, Any]:
     """Process a worker completion in a single call.
 
@@ -78,7 +135,7 @@ def process_worker_completion(
     3. Updates queue entry status
     4. Writes events
     5. Updates telemetry
-    6. Runs hooks
+    6. Captures failure diagnostics (failure_reason, log_tail)
 
     Args:
         queue_dir: Path to ~/.boi/queue/
@@ -88,6 +145,7 @@ def process_worker_completion(
         hooks_dir: Path to ~/.boi/hooks/
         script_dir: Path to the BOI script directory
         exit_code: Worker exit code as string, or None if no exit file found
+        timeout: True if the worker was killed due to timeout
 
     Returns:
         A dict with:
@@ -99,6 +157,7 @@ def process_worker_completion(
           total_count: total tasks
           spec_path: path to the spec file
           reason: failure reason (if failed)
+          failure_reason: human-readable failure reason (if failed/crashed)
     """
     timestamp = datetime.now(timezone.utc).isoformat()
 
@@ -119,6 +178,16 @@ def process_worker_completion(
 
     # Crash: no exit file
     if exit_code is None:
+        if timeout:
+            # Get timeout value for the message
+            timeout_seconds = entry.get("worker_timeout_seconds", 1800)
+            timeout_minutes = timeout_seconds // 60
+            failure_reason = f"Worker timed out after {timeout_minutes} minutes."
+        else:
+            failure_reason = (
+                "Worker crashed: no exit file. "
+                "Process may have been killed or timed out."
+            )
         crash_result = _handle_crash(
             queue_dir,
             queue_id,
@@ -130,12 +199,15 @@ def process_worker_completion(
             log_dir,
             spec_path,
             timestamp,
+            failure_reason=failure_reason,
+            exit_code_str=exit_code,
         )
         result.update(crash_result)
         return result
 
     # Non-zero exit code: worker failed
     if exit_code != "0":
+        failure_reason = f"Worker exited with code {exit_code}."
         crash_result = _handle_crash(
             queue_dir,
             queue_id,
@@ -147,6 +219,8 @@ def process_worker_completion(
             log_dir,
             spec_path,
             timestamp,
+            failure_reason=failure_reason,
+            exit_code_str=exit_code,
         )
         result.update(crash_result)
         return result
@@ -158,12 +232,16 @@ def process_worker_completion(
             # Spec is malformed — treat as crash
             result["validation_errors"] = validation.errors
 
+            error_summary = "; ".join(validation.errors[:3])
+            failure_reason = f"Post-iteration spec validation failed: {error_summary}"
+
             # Write validation errors to iteration metadata
             iter_meta_path = Path(queue_dir) / f"{queue_id}.iteration-{iteration}.json"
             if iter_meta_path.is_file():
                 try:
                     meta = json.loads(iter_meta_path.read_text(encoding="utf-8"))
                     meta["validation_errors"] = validation.errors
+                    meta["failure_reason"] = failure_reason
                     tmp = iter_meta_path.with_suffix(".json.tmp")
                     tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
                     os.rename(str(tmp), str(iter_meta_path))
@@ -181,6 +259,8 @@ def process_worker_completion(
                 log_dir,
                 spec_path,
                 timestamp,
+                failure_reason=failure_reason,
+                exit_code_str=exit_code,
             )
             result.update(crash_result)
             result["outcome"] = "validation_failed"
@@ -522,10 +602,13 @@ def _handle_crash(
     log_dir: str,
     spec_path: str,
     timestamp: str,
+    failure_reason: str = "",
+    exit_code_str: Optional[str] = None,
 ) -> dict[str, Any]:
     """Handle a crash or failed iteration.
 
     Records failure, applies cooldown or fails permanently.
+    Captures failure_reason and log_tail in iteration metadata.
     Returns a partial result dict to merge into the caller's result.
     """
     result: dict[str, Any] = {
@@ -534,13 +617,22 @@ def _handle_crash(
         "total_count": 0,
     }
 
+    # Capture log tail for diagnostics
+    log_tail = _read_log_tail(log_dir, queue_id, iteration)
+
     # Record the failure and check threshold
     max_exceeded = record_failure(queue_dir, queue_id)
 
     if max_exceeded:
-        fail(queue_dir, queue_id, "Consecutive failures exceeded threshold")
+        final_reason = (
+            f"5 consecutive failures. Last error: {failure_reason}"
+            if failure_reason
+            else "Consecutive failures exceeded threshold"
+        )
+        fail(queue_dir, queue_id, final_reason)
         result["outcome"] = "failed"
         result["reason"] = "consecutive_failures"
+        result["failure_reason"] = final_reason
 
         write_event(
             events_dir,
@@ -550,6 +642,7 @@ def _handle_crash(
                 "spec_path": spec_path,
                 "iterations": iteration,
                 "reason": "consecutive_failures",
+                "failure_reason": final_reason,
                 "timestamp": timestamp,
             },
         )
@@ -560,6 +653,9 @@ def _handle_crash(
         fail(queue_dir, queue_id, "Max iterations reached (with crashes)")
         result["outcome"] = "failed"
         result["reason"] = "max_iterations_with_crashes"
+        result["failure_reason"] = (
+            failure_reason or "Max iterations reached (with crashes)"
+        )
 
         write_event(
             events_dir,
@@ -569,6 +665,7 @@ def _handle_crash(
                 "spec_path": spec_path,
                 "iterations": iteration,
                 "reason": "max_iterations_with_crashes",
+                "failure_reason": failure_reason,
                 "timestamp": timestamp,
             },
         )
@@ -583,6 +680,7 @@ def _handle_crash(
             _write_entry(queue_dir, entry_now)
 
         result["outcome"] = "crashed"
+        result["failure_reason"] = failure_reason
 
         write_event(
             events_dir,
@@ -590,9 +688,24 @@ def _handle_crash(
                 "type": "spec_crash_requeued",
                 "queue_id": queue_id,
                 "iteration": iteration,
+                "failure_reason": failure_reason,
                 "timestamp": timestamp,
             },
         )
+
+    # Write failure diagnostics to iteration metadata
+    if failure_reason:
+        try:
+            _write_failure_to_iteration_meta(
+                queue_dir,
+                queue_id,
+                iteration,
+                failure_reason,
+                log_tail,
+                exit_code=exit_code_str,
+            )
+        except Exception:
+            pass  # Diagnostics failure should never block the daemon
 
     # Update telemetry
     try:
