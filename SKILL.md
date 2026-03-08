@@ -42,6 +42,7 @@ Options:
 - `--priority N` — Queue priority, lower = higher priority (default: 100)
 - `--max-iter N` — Maximum iterations before marking failed (default: 30)
 - `--worktree PATH` — Pin to a specific worktree
+- `--worktree-isolate` — Create a dedicated worktree and branch for this spec (enables parallel execution without blocking)
 - `--no-critic` — Skip critic validation when this spec completes
 - `--mode MODE` / `-m MODE` — Execution mode: `execute` (default), `challenge`, `discover`, `generate` (aliases: `e`, `c`, `d`, `g`)
 - `--experiment-budget N` — Override default experiment budget for the chosen mode
@@ -296,6 +297,45 @@ For each experiment, choose:
 - `[v]` View: see the full experiment details.
 
 Experiments auto-reject after 24 hours if not reviewed.
+
+### `/boi merge` — Resolve worktree isolation merges
+
+When an isolated spec (`--worktree-isolate`) completes but has merge conflicts, use `boi merge` to resolve them.
+
+```bash
+boi merge --list              # show all specs with pending merges
+boi merge q-003               # attempt merge of q-003's branch into main
+boi merge q-003 --abort       # discard changes, clean up worktree and branch
+```
+
+Flow:
+1. `boi merge q-003` runs `git merge boi/q-003` from the repo root
+2. If clean: updates queue entry, removes worktree, prints success
+3. If conflicts: prints conflicting files, tells user to resolve and run `boi merge q-003` again
+
+### Worktree Isolation
+
+Each spec can optionally get its own git worktree and branch via `--worktree-isolate`. This enables multiple specs to edit the same codebase in parallel without collisions.
+
+```bash
+boi dispatch --spec spec.md --worktree-isolate    # dedicated worktree
+boi dispatch --spec spec.md                        # shared checkout (default)
+```
+
+**How it works:**
+- Creates worktree at `~/.boi/worktrees/q-{id}` on branch `boi/q-{id}`
+- Worker operates in the isolated worktree, not the shared checkout
+- On completion, BOI auto-merges the branch into main
+- If merge conflicts arise, spec moves to `needs_merge` status (resolve with `boi merge`)
+
+**Smart conflict detection:** For non-isolated specs, BOI auto-detects file-level conflicts. If two specs reference the same files, the newer one is auto-blocked. Isolated specs skip this check since worktrees handle isolation.
+
+**Status output with worktree info:**
+```
+q-003  my-spec    isolate  w-2  3/30  5/8 done  running
+q-004  other-spec shared   w-1  1/30  0/3 done  running
+q-005  done-spec  isolate  —    —     3/3 done  needs_merge
+```
 
 ### Execution Modes
 

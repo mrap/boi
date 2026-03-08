@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from lib.conflict_detector import check_conflicts_before_dequeue
 from lib.critic import (
     generate_critic_prompt,
     parse_critic_result,
@@ -422,6 +423,91 @@ def process_worker_completion(
     except Exception:
         pass  # Telemetry failure should never block the daemon
 
+    # Step 7: Handle worktree merge/cleanup based on outcome
+    result = _handle_worktree_post_completion(
+        queue_dir, queue_id, entry, events_dir, timestamp, result
+    )
+
+    return result
+
+
+def _handle_worktree_post_completion(
+    queue_dir: str,
+    queue_id: str,
+    entry: dict[str, Any],
+    events_dir: str,
+    timestamp: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Handle worktree merge or cleanup after a spec finishes.
+
+    - On "completed": attempt merge. If conflict, set status to needs_merge.
+    - On "failed"/"crashed" permanently: cleanup worktree without merge.
+    - On "requeued": do nothing (spec still running).
+    """
+    if not entry.get("worktree_isolate"):
+        return result
+
+    outcome = result.get("outcome", "")
+
+    if outcome == "completed":
+        # Attempt to merge the worktree branch back to main
+        try:
+            merge_result = merge_spec_worktree(queue_dir, queue_id)
+            merge_status = merge_result.get("merge_status", "error")
+            result["merge_status"] = merge_status
+
+            if merge_status == "merged":
+                write_event(
+                    events_dir,
+                    {
+                        "type": "worktree_merged",
+                        "queue_id": queue_id,
+                        "timestamp": timestamp,
+                    },
+                )
+            elif merge_status == "conflict":
+                # Set spec to needs_merge so user can resolve
+                from lib.queue import _read_entry, _write_entry
+
+                e = _read_entry(queue_dir, queue_id)
+                if e:
+                    e["status"] = "needs_merge"
+                    _write_entry(queue_dir, e)
+
+                result["outcome"] = "needs_merge"
+                result["conflicting_files"] = merge_result.get("conflicting_files", [])
+
+                write_event(
+                    events_dir,
+                    {
+                        "type": "worktree_conflict",
+                        "queue_id": queue_id,
+                        "conflicting_files": merge_result.get("conflicting_files", []),
+                        "timestamp": timestamp,
+                    },
+                )
+        except Exception as exc:
+            result["merge_error"] = str(exc)
+
+    elif outcome == "failed":
+        # Cleanup worktree without merging
+        try:
+            cleanup_spec_worktree(queue_dir, queue_id)
+            write_event(
+                events_dir,
+                {
+                    "type": "worktree_cleaned",
+                    "queue_id": queue_id,
+                    "reason": "spec_failed",
+                    "timestamp": timestamp,
+                },
+            )
+        except Exception:
+            pass
+
+    # "requeued" and "crashed" (with requeue): leave worktree in place
+
     return result
 
 
@@ -580,6 +666,15 @@ def pick_next_spec(
     entry = dequeue(queue_dir)
     if entry is None:
         return None
+
+    # Re-check file-level conflicts against currently running specs.
+    # A spec that was unblocked at dispatch might now conflict with
+    # a spec that started running since then.
+    if not entry.get("worktree_isolate"):
+        conflicting_ids = check_conflicts_before_dequeue(queue_dir, entry["id"])
+        if conflicting_ids:
+            # Skip this spec for now; it will be retried next cycle
+            return None
 
     return {
         "id": entry["id"],

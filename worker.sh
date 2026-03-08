@@ -323,6 +323,19 @@ if project_name:
     if parts:
         project_context = "## Project Context\n\n" + "\n\n".join(parts)
 
+# --- Worktree isolation context ---
+worktree_context = ""
+worktree_path = queue_entry.get("worktree_path") or ""
+worktrees_dir = os.path.expanduser("~/.boi/worktrees")
+if worktree_path and worktree_path.startswith(worktrees_dir):
+    branch = queue_entry.get("worktree_branch", f"boi/{queue_id}")
+    worktree_context = (
+        f"## Worktree Isolation\n\n"
+        f"You are working in an isolated git worktree branch `{branch}`. "
+        f"Your changes will be merged to main when the spec completes. "
+        f"You can commit freely without affecting other workers.\n\n"
+    )
+
 # --- Replace template placeholders ---
 # Replace non-content placeholders first, then inject spec content LAST
 # so that any {{ }} patterns in the spec content are not processed.
@@ -333,6 +346,7 @@ result = result.replace("{{PENDING_COUNT}}", pending_count)
 result = result.replace("{{MODE_RULES}}", mode_fragment)
 result = result.replace("{{PROJECT}}", project_name)
 result = result.replace("{{PROJECT_CONTEXT}}", project_context)
+result = result.replace("{{WORKTREE_CONTEXT}}", worktree_context)
 result = result.replace("{{SPEC_CONTENT}}", spec_content)
 
 # Write atomically
@@ -354,6 +368,27 @@ generate_run_script() {
     local pre_done="$2"
     local pre_skipped="$3"
     local pre_total="$4"
+
+    # Check if this is an isolated worktree
+    local worktrees_dir="${HOME}/.boi/worktrees"
+    local is_isolated="false"
+    if [[ "${WORKTREE_PATH}" == "${worktrees_dir}/"* ]]; then
+        is_isolated="true"
+    fi
+
+    # Check rebase_before_iteration config (default: false)
+    local rebase_before="false"
+    local config_file="${BOI_STATE_DIR}/config.json"
+    if [[ "${is_isolated}" == "true" ]] && [[ -f "${config_file}" ]]; then
+        rebase_before=$(python3 -c "
+import json, sys
+try:
+    with open('${config_file}') as f:
+        print('true' if json.load(f).get('rebase_before_iteration', False) else 'false')
+except Exception:
+    print('false')
+" 2>/dev/null || echo "false")
+    fi
 
     cat > "${RUN_SCRIPT}" <<RUNEOF
 #!/bin/bash
@@ -382,6 +417,17 @@ _START_ISO=\$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # ── Run Claude ───────────────────────────────────────────────────────────
 cd "\${_WORKTREE_PATH}"
+
+# ── Optional rebase on main (isolated worktrees only) ───────────────────
+_IS_ISOLATED="${is_isolated}"
+_REBASE_BEFORE="${rebase_before}"
+if [[ "\${_IS_ISOLATED}" == "true" ]] && [[ "\${_REBASE_BEFORE}" == "true" ]]; then
+    echo "[boi-worker] Rebasing isolated worktree on main..."
+    git fetch origin main 2>&1 && \
+    git rebase origin/main 2>&1 || \
+    echo "[boi-worker] Rebase failed, continuing with current state."
+fi
+
 env -u CLAUDECODE claude -p "\$(cat "\${_PROMPT_FILE}")" --dangerously-skip-permissions > "\${_LOG_FILE}" 2>&1
 _CLAUDE_EXIT=\$?
 

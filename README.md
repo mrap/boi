@@ -61,6 +61,61 @@ You → boi dispatch --spec spec.md → Spec Queue (priority-sorted)
 
 **Self-evolving specs** are the key differentiator. A worker implementing a feature might discover it needs a database migration. It adds a new PENDING task for the migration right there in the spec file. The daemon detects the new task and keeps iterating. The system discovers work it couldn't foresee at planning time.
 
+## Worktree Isolation
+
+By default, specs share worker worktrees. When you need multiple specs to edit the same codebase in parallel, use **worktree isolation**. Each isolated spec gets its own git branch and worktree, so changes don't collide.
+
+### When to use it
+
+- Multiple specs targeting the same repo simultaneously
+- Long-running specs where you don't want to block other work
+- Specs that modify overlapping files
+
+### Dispatching with isolation
+
+```bash
+boi dispatch --spec spec.md --worktree-isolate    # dedicated worktree + branch
+boi dispatch --spec spec.md                        # shared checkout (default)
+```
+
+When `--worktree-isolate` is used, BOI creates a git worktree at `~/.boi/worktrees/q-{id}` on branch `boi/q-{id}`. The worker operates entirely within this isolated worktree. Multiple isolated specs can run in parallel without blocking each other (up to `max_concurrent_worktrees`, default 5).
+
+### Automatic merge on completion
+
+When an isolated spec finishes all tasks and passes the critic:
+- BOI automatically merges its branch into main
+- If the merge is clean, the worktree and branch are removed
+- If there are conflicts, the spec moves to `needs_merge` status
+
+### Resolving merge conflicts
+
+```bash
+boi merge --list              # show all specs with pending merges
+boi merge q-003               # attempt merge of q-003's branch
+boi merge q-003 --abort       # discard q-003's changes and clean up
+```
+
+When `boi merge q-003` encounters conflicts, it prints the conflicting files. Resolve them manually, then run `boi merge q-003` again to complete.
+
+### Smart conflict detection
+
+For specs dispatched **without** `--worktree-isolate`, BOI automatically detects file-level conflicts. If two specs reference the same files, the newer spec is auto-blocked until the conflicting spec completes. This prevents two shared-checkout specs from stomping on each other's work.
+
+```bash
+$ boi dispatch --spec api-refactor.md
+Auto-blocked by q-003 (both modify lib/api.py)
+```
+
+Isolated specs skip conflict detection entirely since worktrees handle isolation.
+
+### Status output with worktree info
+
+```
+q-003  my-spec    isolate  w-2  3/30  5/8 done  running
+q-004  other-spec shared   w-1  1/30  0/3 done  running
+q-005  done-spec  isolate  —    —     3/3 done  needs_merge
+```
+
 ## Quick Start
 
 ### 1. Install
@@ -169,6 +224,9 @@ cp ~/.boi/src/plugin/commands/boi.md ~/.claude/commands/
 | `boi telemetry <queue-id>` | Per-iteration task, quality, and timing breakdown |
 | `boi dashboard` | Compact tmux-friendly live view |
 | `boi review <queue-id>` | Review experiment proposals (adopt/reject/defer) |
+| `boi merge <queue-id>` | Merge an isolated spec's branch into main |
+| `boi merge <queue-id> --abort` | Discard spec's changes and clean up worktree |
+| `boi merge --list` | Show all specs with pending merges |
 | `boi purge` | Remove completed/failed/canceled specs from queue |
 | `boi purge --all` | Remove ALL specs (including queued/running) |
 | `boi purge --dry-run` | Preview what would be removed |
@@ -198,6 +256,7 @@ Options on `dispatch`:
 - `--priority N` — Lower number = higher priority (default: 100)
 - `--max-iter N` — Max iterations before marking failed (default: 30)
 - `--worktree PATH` — Pin to a specific worktree
+- `--worktree-isolate` — Create a dedicated worktree and branch for this spec (enables parallel execution)
 - `--no-critic` — Skip critic validation when this spec completes
 - `--project NAME` — Associate this spec with a BOI project
 - `--mode MODE` / `-m MODE` — Set execution mode: `execute` (default), `challenge`, `discover`, `generate` (aliases: `e`, `c`, `d`, `g`)
@@ -853,6 +912,7 @@ boi do --yes "skip t-4 in q-001"      # Executes without asking
   install.sh                    # One-time setup (git worktrees, config)
   lib/
     queue.py                    # Spec queue (enqueue, dequeue, requeue, priority, DAG)
+    conflict_detector.py        # File-level conflict detection between specs
     spec_parser.py              # Parse spec.md for task status counts
     spec_validator.py           # Validate spec format (standard + Generate specs)
     spec_editor.py              # Add, skip, reorder, block tasks in specs

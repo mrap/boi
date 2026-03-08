@@ -32,6 +32,7 @@ You are a BOI (Beginning of Infinity) worker executing one iteration of a self-e
 
 {{MODE_RULES}}
 
+{{WORKTREE_CONTEXT}}
 ## Fresh Context Note
 
 This is a clean Claude session. You have NO memory of previous iterations. The spec file contains all state. If previous iterations completed work, the spec tasks will be marked DONE. Read the spec to understand what has been accomplished and what remains.

@@ -35,6 +35,7 @@ STATUS_COLORS: dict[str, str] = {
     "failed": RED,
     "canceled": DIM,
     "needs_review": MAGENTA,
+    "needs_merge": MAGENTA,
 }
 
 
@@ -106,6 +107,7 @@ def build_queue_status(
         "failed": 0,
         "canceled": 0,
         "needs_review": 0,
+        "needs_merge": 0,
     }
 
     for entry in entries:
@@ -262,6 +264,7 @@ def _sort_entries_for_display(entries: list[dict[str, Any]]) -> list[dict[str, A
         "running": 0,
         "requeued": 0,
         "needs_review": 1,
+        "needs_merge": 1,
         "failed": 1,
         "queued": 2,
         "completed": 3,
@@ -296,13 +299,14 @@ def format_queue_table(
     term_w = width if width is not None else _get_terminal_width()
 
     # Fixed column widths (including trailing space as separator)
+    COL_ISO = 9  # "isolate  " (7 + 2 space)
     COL_MODE = 10  # "execute   " (8 + 2 space)
     COL_WORKER = 8  # "w-1     " (6 + 2 space)
     COL_ITER = 8  # "10/30   " (7 + 1 space)
     COL_TASKS = 13  # "6/6 done     " (12 + 1 space)
     COL_STATUS = 12  # "running" right-padded
 
-    fixed_cols = COL_MODE + COL_WORKER + COL_ITER + COL_TASKS + COL_STATUS
+    fixed_cols = COL_ISO + COL_MODE + COL_WORKER + COL_ITER + COL_TASKS + COL_STATUS
     # SPEC column gets remaining space, minimum 20
     col_spec = max(20, term_w - fixed_cols)
 
@@ -332,6 +336,7 @@ def format_queue_table(
     # Column header
     col_header = (
         f"{'SPEC':<{col_spec}}"
+        f"{'ISO':<{COL_ISO}}"
         f"{'MODE':<{COL_MODE}}"
         f"{'WORKER':<{COL_WORKER}}"
         f"{'ITER':<{COL_ITER}}"
@@ -369,6 +374,8 @@ def format_queue_table(
         mode = entry.get("mode", "execute")
         mode_str = mode
 
+        iso_type = "isolate" if entry.get("worktree_isolate") else "shared"
+
         worker = entry.get("last_worker") or "-"
         if entry.get("status") not in ("running", "requeued"):
             worker = "-"
@@ -385,6 +392,10 @@ def format_queue_table(
             tasks_str = "-"
 
         status = entry.get("status", "queued")
+        # Override display for specs needing merge
+        merge_st = entry.get("merge_status")
+        if merge_st == "conflict":
+            status = "needs_merge"
 
         # Track first running spec for hint
         if not first_running_id and status == "running":
@@ -399,6 +410,7 @@ def format_queue_table(
         # Build the plain-text row
         row_text = (
             f"{label:<{col_spec}}"
+            f"{iso_type:<{COL_ISO}}"
             f"{mode_str:<{COL_MODE}}"
             f"{worker:<{COL_WORKER}}"
             f"{iter_str:<{COL_ITER}}"
@@ -418,6 +430,7 @@ def format_queue_table(
                     # Rebuild with colored status
                     row_prefix = (
                         f"{label:<{col_spec}}"
+                        f"{iso_type:<{COL_ISO}}"
                         f"{mode_str:<{COL_MODE}}"
                         f"{worker:<{COL_WORKER}}"
                         f"{iter_str:<{COL_ITER}}"
@@ -453,6 +466,7 @@ def format_queue_table(
     queued = summary.get("queued", 0) + summary.get("requeued", 0)
     completed = summary.get("completed", 0)
     needs_review = summary.get("needs_review", 0)
+    needs_merge = summary.get("needs_merge", 0)
     failed = summary.get("failed", 0)
 
     parts: list[str] = []
@@ -466,6 +480,8 @@ def format_queue_table(
         count_parts.append(f"{queued} queued")
     if needs_review:
         count_parts.append(f"{needs_review} needs review")
+    if needs_merge:
+        count_parts.append(f"{needs_merge} needs merge")
     if failed:
         count_parts.append(f"{failed} failed")
     if completed:
@@ -701,6 +717,7 @@ STATUS_ICONS: dict[str, str] = {
     "failed": "\u2717",  # ✗
     "canceled": "\u2013",  # –
     "needs_review": "\u2757",  # ❗
+    "needs_merge": "\U0001f500",  # 🔀
 }
 
 

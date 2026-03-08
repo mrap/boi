@@ -197,6 +197,7 @@ cmd_dispatch() {
     local dry_run=false
     local project=""
     local experiment_budget=""
+    local worktree_isolate=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -253,8 +254,12 @@ cmd_dispatch() {
                 dry_run=true
                 shift
                 ;;
+            --worktree-isolate)
+                worktree_isolate=true
+                shift
+                ;;
             -h|--help)
-                echo "Usage: boi dispatch <spec.md> [--priority N] [--max-iter N] [--mode MODE] [--experiment-budget N] [--worktree <path>] [--timeout SECONDS] [--no-critic] [--project <name>] [--dry-run]"
+                echo "Usage: boi dispatch <spec.md> [--priority N] [--max-iter N] [--mode MODE] [--experiment-budget N] [--worktree <path>] [--worktree-isolate] [--timeout SECONDS] [--no-critic] [--project <name>] [--dry-run]"
                 echo "       boi dispatch --spec <spec.md> [options]   (explicit flag form)"
                 echo "       boi dispatch --tasks <tasks.md>"
                 echo ""
@@ -270,6 +275,7 @@ cmd_dispatch() {
                 echo "  --no-critic       Skip critic validation when spec completes"
                 echo "  --project NAME    Associate with a BOI project"
                 echo "  --dry-run         Validate and show what would be dispatched without enqueueing"
+                echo "  --worktree-isolate  Run in a dedicated git worktree branch (parallel-safe)"
                 exit 0
                 ;;
             *)
@@ -396,6 +402,9 @@ PYEOF
             info "[dry-run] Timeout: ${timeout}s"
         fi
         info "[dry-run] No critic: ${no_critic}"
+        if [[ "${worktree_isolate}" == "true" ]]; then
+            info "[dry-run] Worktree isolation: enabled"
+        fi
         if [[ -n "${experiment_budget}" ]]; then
             info "[dry-run] Experiment budget: ${experiment_budget}"
         fi
@@ -413,7 +422,7 @@ PYEOF
     fi
 
     local result
-    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${no_critic}" "${mode}" "${project}" "${experiment_budget}" <<'PYEOF'
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${no_critic}" "${mode}" "${project}" "${experiment_budget}" "${worktree_isolate}" <<'PYEOF'
 import sys, os, json
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
 from lib.queue import enqueue, DuplicateSpecError, get_experiment_budget
@@ -429,6 +438,7 @@ no_critic = sys.argv[7] == "true" if len(sys.argv) > 7 else False
 mode = sys.argv[8] if len(sys.argv) > 8 and sys.argv[8] else "execute"
 project_name = sys.argv[9] if len(sys.argv) > 9 and sys.argv[9] else None
 experiment_budget_str = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else None
+worktree_isolate = sys.argv[11] == "true" if len(sys.argv) > 11 else False
 
 # Count tasks in spec
 counts = count_boi_tasks(spec_path)
@@ -477,6 +487,10 @@ if timeout_str:
 if no_critic:
     entry["no_critic"] = True
 
+# Set worktree isolation flag
+if worktree_isolate:
+    entry["worktree_isolate"] = True
+
 # Re-write with updated counts
 from lib.queue import _write_entry
 _write_entry(queue_dir, entry)
@@ -511,6 +525,46 @@ PYEOF
 
     progress_done "${queue_id}, ${pending_count}/${task_count} tasks, priority ${priority}"
 
+    # Auto-detect file-level conflicts with running specs (non-isolated only)
+    if [[ -z "${worktree_arg}" ]] && [[ "${worktree_isolate}" != "true" ]]; then
+        local conflict_output
+        conflict_output=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.conflict_detector import should_block
+from lib.queue import _read_entry, _write_entry
+from lib.locking import queue_lock
+
+queue_dir = sys.argv[1]
+queue_id = sys.argv[2]
+
+blockers = should_block(queue_dir, queue_id)
+if blockers:
+    # Auto-add blocked_by entries
+    with queue_lock(queue_dir):
+        entry = _read_entry(queue_dir, queue_id)
+        if entry:
+            existing = set(entry.get("blocked_by", []))
+            for b in blockers:
+                existing.add(b["blocking_id"])
+            entry["blocked_by"] = sorted(existing)
+            _write_entry(queue_dir, entry)
+
+    # Print info about auto-blocks
+    for b in blockers:
+        files_str = ", ".join(b["shared_files"][:3])
+        if len(b["shared_files"]) > 3:
+            files_str += f" (+{len(b['shared_files']) - 3} more)"
+        print(f"Auto-blocked by {b['blocking_id']} (both modify {files_str})")
+PYEOF
+        )
+        if [[ -n "${conflict_output}" ]]; then
+            echo "${conflict_output}" | while read -r line; do
+                info "${line}"
+            done
+        fi
+    fi
+
     # Start daemon if not already running
     if require_daemon; then
         progress_step "Starting daemon"
@@ -528,6 +582,167 @@ PYEOF
 
     echo ""
     info "Dispatched. Monitor with: boi status"
+}
+
+# ─── Subcommand: merge ───────────────────────────────────────────────────────
+
+cmd_merge() {
+    local queue_id=""
+    local abort_merge=false
+    local list_merges=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --abort)
+                abort_merge=true
+                shift
+                ;;
+            --list)
+                list_merges=true
+                shift
+                ;;
+            -h|--help)
+                echo "Usage: boi merge <queue-id> [--abort]"
+                echo "       boi merge --list"
+                echo ""
+                echo "Merge a completed spec's worktree branch back to main."
+                echo ""
+                echo "Options:"
+                echo "  --abort   Discard the spec's changes and clean up worktree"
+                echo "  --list    Show all specs with pending merges"
+                exit 0
+                ;;
+            -*)
+                die_usage "Unknown option: $1"
+                ;;
+            *)
+                if [[ -z "${queue_id}" ]]; then
+                    queue_id="$1"
+                    shift
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    require_config
+
+    # --list mode: show specs needing merge
+    if [[ "${list_merges}" == "true" ]]; then
+        BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.queue import get_queue
+
+queue_dir = sys.argv[1]
+entries = get_queue(queue_dir)
+
+pending = [e for e in entries if e.get("merge_status") == "conflict" or
+           (e.get("worktree_isolate") and e.get("status") in ("completed", "needs_merge") and e.get("merge_status") != "merged")]
+
+if not pending:
+    print("No specs with pending merges.")
+    sys.exit(0)
+
+print(f"{'ID':<10}{'SPEC':<25}{'MERGE STATUS':<16}{'CONFLICTING FILES'}")
+for e in pending:
+    qid = e.get("id", "?")
+    spec_path = e.get("original_spec_path", e.get("spec_path", ""))
+    spec_name = os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
+    merge_st = e.get("merge_status", "pending")
+    conflicts = e.get("conflicting_files", [])
+    conflict_str = ", ".join(conflicts[:3])
+    if len(conflicts) > 3:
+        conflict_str += f" (+{len(conflicts) - 3} more)"
+    if not conflict_str:
+        conflict_str = "-"
+    print(f"{qid:<10}{spec_name:<25}{merge_st:<16}{conflict_str}")
+PYEOF
+        return
+    fi
+
+    # Require queue-id for merge/abort
+    if [[ -z "${queue_id}" ]]; then
+        die "Specify a queue-id. Use 'boi merge --list' to see pending merges."
+    fi
+
+    # --abort mode: discard changes and clean up
+    if [[ "${abort_merge}" == "true" ]]; then
+        progress_step "Aborting merge for ${queue_id}"
+        local abort_result
+        abort_result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.queue import cleanup_spec_worktree
+
+queue_dir = sys.argv[1]
+queue_id = sys.argv[2]
+
+result = cleanup_spec_worktree(queue_dir, queue_id)
+if result:
+    print("cleaned")
+else:
+    print("no_worktree")
+PYEOF
+        )
+
+        if [[ "${abort_result}" == "cleaned" ]]; then
+            progress_done "worktree removed, changes discarded"
+        else
+            progress_fail "no worktree found for ${queue_id}"
+        fi
+        return
+    fi
+
+    # Normal merge: attempt to merge the spec's branch
+    progress_step "Merging ${queue_id}"
+    local merge_result
+    merge_result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.queue import merge_spec_worktree
+
+queue_dir = sys.argv[1]
+queue_id = sys.argv[2]
+
+result = merge_spec_worktree(queue_dir, queue_id)
+print(json.dumps(result))
+PYEOF
+    )
+
+    local merge_status
+    merge_status=$(echo "${merge_result}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('merge_status','error'))")
+
+    case "${merge_status}" in
+        merged)
+            progress_done "branch merged, worktree cleaned up"
+            ;;
+        conflict)
+            progress_fail "merge conflicts detected"
+            echo ""
+            local conflict_files
+            conflict_files=$(echo "${merge_result}" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for f in d.get('conflicting_files', []):
+    print(f'  {f}')
+")
+            if [[ -n "${conflict_files}" ]]; then
+                echo "Conflicting files:"
+                echo "${conflict_files}"
+            fi
+            echo ""
+            info "Resolve conflicts manually, then run: boi merge ${queue_id}"
+            info "To discard changes: boi merge ${queue_id} --abort"
+            ;;
+        no_worktree)
+            progress_fail "no worktree found for ${queue_id}"
+            ;;
+        *)
+            progress_fail "merge failed: ${merge_status}"
+            ;;
+    esac
 }
 
 # ─── Subcommand: queue ──────────────────────────────────────────────────────
@@ -2998,6 +3213,7 @@ usage() {
     echo "  status      Show workers + queue progress"
     echo "  log         View logs for a spec"
     echo "  cancel      Cancel a queued/running spec"
+    echo "  merge       Merge a spec's worktree branch back to main"
     echo "  stop        Stop daemon and all workers"
     echo "  workers     Show worker/worktree status"
     echo "  telemetry   Show per-iteration breakdown"
@@ -3024,6 +3240,9 @@ usage() {
     echo "  boi review q-001                    # review experiments"
     echo "  boi cancel                          # cancel most recent"
     echo "  boi cancel q-001                    # cancel specific spec"
+    echo "  boi merge --list                    # show pending merges"
+    echo "  boi merge q-001                     # merge spec branch"
+    echo "  boi merge q-001 --abort             # discard spec changes"
     echo "  boi stop                            # stop everything"
     echo "  boi workers                         # show worktrees"
     echo "  boi telemetry                       # iteration breakdown"
@@ -3058,6 +3277,7 @@ main() {
         status)     cmd_status "$@" ;;
         log)        cmd_log "$@" ;;
         cancel)     cmd_cancel "$@" ;;
+        merge)      cmd_merge "$@" ;;
         review)     cmd_review "$@" ;;
         stop)       cmd_stop "$@" ;;
         purge)      cmd_purge "$@" ;;

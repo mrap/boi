@@ -184,6 +184,44 @@ assign_spec_to_worker() {
     local worker_id="$2"
     local worktree_path="${WORKER_CHECKOUTS[${worker_id}]}"
 
+    # Check if this spec uses worktree isolation
+    local is_worktree_isolate
+    is_worktree_isolate=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.queue import get_entry
+entry = get_entry(sys.argv[1], sys.argv[2])
+print("true" if entry and entry.get("worktree_isolate") else "false")
+PYEOF
+    )
+
+    if [[ "${is_worktree_isolate}" == "true" ]]; then
+        # Create a dedicated worktree for this spec
+        local wt_json
+        wt_json=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" "${worktree_path}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.queue import create_spec_worktree
+try:
+    result = create_spec_worktree(sys.argv[1], sys.argv[2], sys.argv[3])
+    print(json.dumps(result))
+except Exception as exc:
+    print(json.dumps({"error": str(exc)}))
+PYEOF
+        )
+
+        local wt_error
+        wt_error=$(echo "${wt_json}" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('error',''))" 2>/dev/null || echo "")
+        if [[ -n "${wt_error}" ]]; then
+            log_error "Failed to create worktree for spec ${queue_id}: ${wt_error}"
+            return 1
+        fi
+
+        # Use the spec's dedicated worktree path instead of the shared checkout
+        worktree_path=$(echo "${wt_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['worktree_path'])" 2>/dev/null)
+        log_info "Created worktree for spec ${queue_id} at ${worktree_path}"
+    fi
+
     log_info "Assigning spec ${queue_id} to worker ${worker_id} (${worktree_path})"
 
     # Set running and get iteration + spec_path + phase in one Python call
@@ -551,6 +589,10 @@ PYEOF
             local critic_tasks
             critic_tasks=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('critic_tasks_added',0))" 2>/dev/null || echo "0")
             log_info "Spec ${queue_id} critic added ${critic_tasks} task(s), requeued for execution" ;;
+        needs_merge)
+            local conflicting_files
+            conflicting_files=$(echo "${result_json}" | python3 -c "import json,sys; print(', '.join(json.loads(sys.stdin.read()).get('conflicting_files',[])))" 2>/dev/null || echo "")
+            log_warn "Spec ${queue_id} completed but merge has conflicts: ${conflicting_files}. Run 'boi merge ${queue_id}' to resolve." ;;
         *)
             log_error "Spec ${queue_id} unknown outcome: ${outcome}" ;;
     esac
@@ -732,6 +774,33 @@ PYEOF
             assign_spec_to_worker "${next_spec}" "${free_worker}"
             free_worker=$(get_free_worker 2>/dev/null || true)
         done
+
+        # Also try to dispatch worktree-isolated specs even if all shared workers are busy.
+        # Worktree-isolated specs create their own worktree, so they can use any worker
+        # (we pick a free one if available, but the key point is they don't block on checkout).
+        local wt_free_worker
+        wt_free_worker=$(get_free_worker 2>/dev/null || true)
+        if [[ -n "${wt_free_worker}" ]]; then
+            while [[ -n "${wt_free_worker}" ]]; do
+                local wt_next_spec
+                wt_next_spec=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.daemon_ops import pick_next_spec
+result = pick_next_spec(sys.argv[1], for_worktree=True)
+if result:
+    print(result["id"])
+PYEOF
+                )
+
+                if [[ -z "${wt_next_spec}" ]]; then
+                    break
+                fi
+
+                assign_spec_to_worker "${wt_next_spec}" "${wt_free_worker}"
+                wt_free_worker=$(get_free_worker 2>/dev/null || true)
+            done
+        fi
 
         # Check if queue is fully drained (all completed/failed/canceled)
         local active_count

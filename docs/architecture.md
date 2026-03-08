@@ -115,6 +115,7 @@ Computes quality scores across 18 signals in 4 categories (Code Quality, Test Qu
   install-public.sh             # Public install script (curl | bash)
   lib/
     queue.py                    # Spec queue operations
+    conflict_detector.py        # File-level conflict detection between specs
     spec_parser.py              # Parse spec.md for task statuses
     spec_validator.py           # Validate spec format
     spec_editor.py              # Add, skip, reorder, block tasks
@@ -193,6 +194,22 @@ Workers need to run Claude headlessly (no interactive terminal). tmux provides i
 ### Why git worktrees?
 
 Each worker needs an isolated copy of the codebase. Git worktrees provide this without the cost of full clones. All worktrees share the same git objects, so they're fast to create and disk-efficient.
+
+### Worktree Isolation (per-spec worktrees)
+
+By default, workers use shared worktrees assigned at install time. When `--worktree-isolate` is used, each spec gets its own dedicated worktree and branch (`boi/q-{id}`), created at `~/.boi/worktrees/q-{id}`.
+
+**Lifecycle:**
+1. On dispatch with `--worktree-isolate`: `create_spec_worktree()` creates the worktree and branch
+2. During execution: the worker operates in the isolated worktree, not a shared one
+3. On completion: `merge_spec_worktree()` merges the branch into main and cleans up
+4. On conflict: the spec moves to `needs_merge` status, the worktree is preserved for manual resolution
+5. On cancel/fail: `cleanup_spec_worktree()` removes the worktree and branch without merging
+
+**Conflict detection (`lib/conflict_detector.py`):**
+For specs dispatched without isolation, BOI parses `**Spec:**` and `**Files:**` sections to extract target file paths. If two specs reference the same files, the newer one is automatically blocked. Isolated specs bypass this check since worktrees provide full isolation.
+
+**Concurrency limit:** Max concurrent isolated worktrees is configurable (default 5) to prevent disk exhaustion.
 
 ### Why Markdown specs?
 
