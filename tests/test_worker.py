@@ -266,6 +266,77 @@ class TestWorkerNoPending(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertIn("No PENDING tasks", result.stdout)
 
+    def test_all_done_writes_exit_file(self):
+        """Worker should write exit file with code 0 when no PENDING tasks."""
+        with tempfile.TemporaryDirectory(prefix="boi-test-") as tmp_dir:
+            spec_path = os.path.join(tmp_dir, "spec.md")
+            with open(spec_path, "w") as f:
+                f.write(ALL_DONE_SPEC)
+
+            queue_dir = os.path.join(tmp_dir, ".boi", "queue")
+            os.makedirs(queue_dir, exist_ok=True)
+            os.makedirs(os.path.join(tmp_dir, ".boi", "logs"), exist_ok=True)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    os.path.join(BOI_ROOT, "worker.sh"),
+                    "q-test",
+                    tmp_dir,
+                    spec_path,
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "HOME": tmp_dir},
+            )
+            self.assertEqual(result.returncode, 0)
+
+            # Verify exit file was written
+            exit_file = os.path.join(queue_dir, "q-test.exit")
+            self.assertTrue(
+                os.path.isfile(exit_file),
+                "Exit file should be written when 0 PENDING tasks",
+            )
+            with open(exit_file) as f:
+                exit_code = f.read().strip()
+            self.assertEqual(exit_code, "0")
+
+    def test_all_done_does_not_write_pid_file(self):
+        """Worker should NOT write a PID file when no PENDING tasks (no tmux)."""
+        with tempfile.TemporaryDirectory(prefix="boi-test-") as tmp_dir:
+            spec_path = os.path.join(tmp_dir, "spec.md")
+            with open(spec_path, "w") as f:
+                f.write(ALL_DONE_SPEC)
+
+            queue_dir = os.path.join(tmp_dir, ".boi", "queue")
+            os.makedirs(queue_dir, exist_ok=True)
+            os.makedirs(os.path.join(tmp_dir, ".boi", "logs"), exist_ok=True)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    os.path.join(BOI_ROOT, "worker.sh"),
+                    "q-test",
+                    tmp_dir,
+                    spec_path,
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "HOME": tmp_dir},
+            )
+            self.assertEqual(result.returncode, 0)
+
+            # No PID file should exist
+            pid_file = os.path.join(queue_dir, "q-test.pid")
+            self.assertFalse(
+                os.path.isfile(pid_file),
+                "PID file should NOT be written when 0 PENDING tasks",
+            )
+
 
 # ── Prompt Template Tests ────────────────────────────────────────────────
 

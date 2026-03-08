@@ -176,6 +176,10 @@ class TestQueueStatusFormatting(unittest.TestCase):
         output = format_queue_table(status, color=False)
         self.assertIn("BOI", output)
         self.assertIn("No specs in queue", output)
+        self.assertIn("Ready to dispatch", output)
+        self.assertIn("Quick start:", output)
+        self.assertIn("boi dispatch", output)
+        self.assertIn("boi do", output)
 
     def test_empty_queue_json(self):
         status = build_queue_status(self.queue_dir)
@@ -529,7 +533,10 @@ class TestDashboardFormat(unittest.TestCase):
 
         self.assertIn("BOI", output)
         self.assertIn("No specs in queue", output)
+        self.assertIn("Ready to dispatch", output)
         self.assertIn("Workers: 0/2 idle", output)
+        self.assertIn("Quick start:", output)
+        self.assertIn("boi dispatch", output)
 
     def test_single_running_spec(self):
         from lib.status import build_queue_status, format_dashboard

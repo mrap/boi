@@ -1139,5 +1139,329 @@ class TestCriticReviewDaemonIntegration(DaemonOpsTestCase):
         self.assertEqual(updated["status"], "requeued")
 
 
+class TestSelfHeal(DaemonOpsTestCase):
+    """Tests for self_heal() and its sub-functions."""
+
+    def test_stale_running_spec_recovered(self):
+        """Running spec with dead PID should be reset to requeued."""
+        from lib.daemon_ops import self_heal
+
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = enqueue(self.queue_dir, spec_path)
+        qid = entry["id"]
+        set_running(self.queue_dir, qid, "w-1")
+
+        # Write a PID file with a definitely-dead PID
+        pid_file = os.path.join(self.queue_dir, f"{qid}.pid")
+        Path(pid_file).write_text("999999999\n")
+
+        actions = self_heal(self.queue_dir, {"w-1": qid})
+
+        # Should have recovered the spec
+        stale_actions = [a for a in actions if a["action"] == "stale_running_recovered"]
+        self.assertEqual(len(stale_actions), 1)
+        self.assertIn(qid, stale_actions[0]["detail"])
+
+        # Entry should now be requeued
+        updated = get_entry(self.queue_dir, qid)
+        self.assertEqual(updated["status"], "requeued")
+
+        # PID file should be cleaned up
+        self.assertFalse(os.path.isfile(pid_file))
+
+    def test_stale_running_no_pid_file(self):
+        """Running spec with no PID file at all should be recovered."""
+        from lib.daemon_ops import self_heal
+
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = enqueue(self.queue_dir, spec_path)
+        qid = entry["id"]
+        set_running(self.queue_dir, qid, "w-1")
+
+        # No PID file exists at all
+        actions = self_heal(self.queue_dir, {"w-1": qid})
+
+        stale_actions = [a for a in actions if a["action"] == "stale_running_recovered"]
+        self.assertEqual(len(stale_actions), 1)
+
+        updated = get_entry(self.queue_dir, qid)
+        self.assertEqual(updated["status"], "requeued")
+
+    def test_orphaned_worker_freed(self):
+        """Worker assigned to completed spec should be reported as orphaned."""
+        from lib.daemon_ops import self_heal
+        from lib.queue import complete
+
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
+        entry = enqueue(self.queue_dir, spec_path)
+        qid = entry["id"]
+        set_running(self.queue_dir, qid, "w-1")
+        complete(self.queue_dir, qid, 3, 3)
+
+        # Worker still thinks it's assigned to this spec
+        worker_specs = {"w-1": qid, "w-2": ""}
+        actions = self_heal(self.queue_dir, worker_specs)
+
+        orphan_actions = [a for a in actions if a["action"] == "orphaned_worker"]
+        self.assertEqual(len(orphan_actions), 1)
+        self.assertEqual(orphan_actions[0]["worker_id"], "w-1")
+        self.assertEqual(orphan_actions[0]["queue_id"], qid)
+
+    def test_orphaned_worker_missing_spec(self):
+        """Worker assigned to nonexistent spec should be reported as orphaned."""
+        from lib.daemon_ops import self_heal
+
+        worker_specs = {"w-1": "q-nonexistent", "w-2": ""}
+        actions = self_heal(self.queue_dir, worker_specs)
+
+        orphan_actions = [a for a in actions if a["action"] == "orphaned_worker"]
+        self.assertEqual(len(orphan_actions), 1)
+        self.assertIn("missing", orphan_actions[0]["detail"])
+
+    def test_blocked_by_completed_spec_unblocked(self):
+        """Spec blocked by a completed spec should have that dep removed."""
+        from lib.daemon_ops import self_heal
+        from lib.queue import complete
+
+        # Create blocker spec and complete it
+        blocker_path = self._create_spec(tasks_pending=0, tasks_done=1)
+        blocker = enqueue(self.queue_dir, blocker_path)
+        set_running(self.queue_dir, blocker["id"], "w-1")
+        complete(self.queue_dir, blocker["id"], 1, 1)
+
+        # Create blocked spec
+        blocked_path = self._create_spec(tasks_pending=2)
+        blocked = enqueue(self.queue_dir, blocked_path, blocked_by=[blocker["id"]])
+
+        # Verify it's blocked
+        entry = get_entry(self.queue_dir, blocked["id"])
+        self.assertEqual(entry["blocked_by"], [blocker["id"]])
+
+        actions = self_heal(self.queue_dir, {})
+
+        cleanup_actions = [a for a in actions if a["action"] == "blocked_by_cleaned"]
+        self.assertEqual(len(cleanup_actions), 1)
+
+        updated = get_entry(self.queue_dir, blocked["id"])
+        self.assertEqual(updated["blocked_by"], [])
+
+    def test_blocked_by_missing_spec_unblocked(self):
+        """Spec blocked by a nonexistent spec should have that dep removed."""
+        from lib.daemon_ops import self_heal
+        from lib.queue import _read_entry, _write_entry
+
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = enqueue(self.queue_dir, spec_path)
+        qid = entry["id"]
+
+        # Manually set blocked_by to a nonexistent spec
+        raw = _read_entry(self.queue_dir, qid)
+        raw["blocked_by"] = ["q-999"]
+        _write_entry(self.queue_dir, raw)
+
+        actions = self_heal(self.queue_dir, {})
+
+        cleanup_actions = [a for a in actions if a["action"] == "blocked_by_cleaned"]
+        self.assertEqual(len(cleanup_actions), 1)
+        self.assertIn("missing", cleanup_actions[0]["detail"])
+
+        updated = get_entry(self.queue_dir, qid)
+        self.assertEqual(updated["blocked_by"], [])
+
+    def test_circular_dependency_detected(self):
+        """Circular dependency A->B->C->A should cancel all specs in cycle."""
+        from lib.daemon_ops import self_heal
+        from lib.queue import _read_entry, _write_entry
+
+        # Create 3 specs
+        specs = []
+        for _ in range(3):
+            path = self._create_spec(tasks_pending=1)
+            specs.append(enqueue(self.queue_dir, path))
+
+        a_id, b_id, c_id = specs[0]["id"], specs[1]["id"], specs[2]["id"]
+
+        # Create cycle: A blocked by C, B blocked by A, C blocked by B
+        for qid, dep in [(a_id, c_id), (b_id, a_id), (c_id, b_id)]:
+            raw = _read_entry(self.queue_dir, qid)
+            raw["blocked_by"] = [dep]
+            _write_entry(self.queue_dir, raw)
+
+        actions = self_heal(self.queue_dir, {})
+
+        cycle_actions = [
+            a for a in actions if a["action"] == "circular_dependency_canceled"
+        ]
+        # All 3 should be canceled
+        self.assertEqual(len(cycle_actions), 3)
+
+        for spec in specs:
+            updated = get_entry(self.queue_dir, spec["id"])
+            self.assertEqual(updated["status"], "canceled")
+            self.assertIn("Circular", updated.get("failure_reason", ""))
+
+    def test_stale_lock_no_action_when_no_lock(self):
+        """No lock file should produce no action."""
+        from lib.daemon_ops import self_heal
+
+        actions = self_heal(self.queue_dir, {})
+
+        lock_actions = [a for a in actions if "lock" in a.get("action", "")]
+        self.assertEqual(len(lock_actions), 0)
+
+    def test_idle_workers_no_false_orphans(self):
+        """Idle workers (empty spec assignment) should NOT be reported as orphaned."""
+        from lib.daemon_ops import self_heal
+
+        worker_specs = {"w-1": "", "w-2": ""}
+        actions = self_heal(self.queue_dir, worker_specs)
+
+        orphan_actions = [a for a in actions if a["action"] == "orphaned_worker"]
+        self.assertEqual(len(orphan_actions), 0)
+
+    def test_self_heal_multiple_issues(self):
+        """Self-heal should fix multiple issues in a single call."""
+        from lib.daemon_ops import self_heal
+        from lib.queue import _read_entry, _write_entry, complete
+
+        # Issue 1: stale running spec
+        spec1_path = self._create_spec(tasks_pending=2)
+        entry1 = enqueue(self.queue_dir, spec1_path)
+        set_running(self.queue_dir, entry1["id"], "w-1")
+        pid_file = os.path.join(self.queue_dir, f"{entry1['id']}.pid")
+        Path(pid_file).write_text("999999999\n")
+
+        # Issue 2: blocked by missing spec
+        spec2_path = self._create_spec(tasks_pending=1)
+        entry2 = enqueue(self.queue_dir, spec2_path)
+        raw2 = _read_entry(self.queue_dir, entry2["id"])
+        raw2["blocked_by"] = ["q-missing"]
+        _write_entry(self.queue_dir, raw2)
+
+        # Issue 3: orphaned worker
+        spec3_path = self._create_spec(tasks_pending=0, tasks_done=1)
+        entry3 = enqueue(self.queue_dir, spec3_path)
+        set_running(self.queue_dir, entry3["id"], "w-2")
+        complete(self.queue_dir, entry3["id"], 1, 1)
+
+        worker_specs = {"w-1": entry1["id"], "w-2": entry3["id"]}
+        actions = self_heal(self.queue_dir, worker_specs)
+
+        # Should have at least 3 actions (one for each issue)
+        self.assertGreaterEqual(len(actions), 3)
+
+        action_types = {a["action"] for a in actions}
+        self.assertIn("stale_running_recovered", action_types)
+        self.assertIn("blocked_by_cleaned", action_types)
+        self.assertIn("orphaned_worker", action_types)
+
+    def test_max_running_duration_exceeded(self):
+        """Spec running longer than max duration should be force-failed."""
+        from datetime import datetime, timedelta, timezone
+
+        from lib.daemon_ops import self_heal
+        from lib.queue import _read_entry, _write_entry
+
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = enqueue(self.queue_dir, spec_path)
+        qid = entry["id"]
+        set_running(self.queue_dir, qid, "w-1")
+
+        # Manually backdate first_running_at to exceed the max duration
+        e = _read_entry(self.queue_dir, qid)
+        # Set worker_timeout_seconds=60, max_iterations=5 -> max_duration=300s
+        e["worker_timeout_seconds"] = 60
+        e["max_iterations"] = 5
+        # Set first_running_at to 10 minutes ago (600s > 300s limit)
+        e["first_running_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=600)
+        ).isoformat()
+        _write_entry(self.queue_dir, e)
+
+        # Write a PID file with a live PID (our own) so stale_running doesn't
+        # trigger first
+        pid_file = os.path.join(self.queue_dir, f"{qid}.pid")
+        Path(pid_file).write_text(str(os.getpid()) + "\n")
+
+        actions = self_heal(self.queue_dir, {"w-1": qid})
+
+        # Should have force-failed
+        duration_actions = [
+            a for a in actions if a["action"] == "max_running_duration_exceeded"
+        ]
+        self.assertEqual(len(duration_actions), 1)
+        self.assertIn(qid, duration_actions[0]["detail"])
+
+        # Entry should now be failed with the right reason
+        updated = get_entry(self.queue_dir, qid)
+        self.assertEqual(updated["status"], "failed")
+        self.assertEqual(updated["failure_reason"], "Maximum running duration exceeded")
+
+        # PID file should be cleaned up
+        self.assertFalse(os.path.isfile(pid_file))
+
+    def test_max_running_duration_not_exceeded(self):
+        """Spec running within max duration should NOT be force-failed."""
+        from datetime import datetime, timedelta, timezone
+
+        from lib.daemon_ops import self_heal
+        from lib.queue import _read_entry, _write_entry
+
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = enqueue(self.queue_dir, spec_path)
+        qid = entry["id"]
+        set_running(self.queue_dir, qid, "w-1")
+
+        # Set first_running_at to just 10 seconds ago (well within default limit)
+        e = _read_entry(self.queue_dir, qid)
+        e["first_running_at"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        ).isoformat()
+        _write_entry(self.queue_dir, e)
+
+        # Write a live PID so stale_running doesn't trigger
+        pid_file = os.path.join(self.queue_dir, f"{qid}.pid")
+        Path(pid_file).write_text(str(os.getpid()) + "\n")
+
+        actions = self_heal(self.queue_dir, {"w-1": qid})
+
+        # Should NOT have any max_running_duration actions
+        duration_actions = [
+            a for a in actions if a["action"] == "max_running_duration_exceeded"
+        ]
+        self.assertEqual(len(duration_actions), 0)
+
+        # Entry should still be running
+        updated = get_entry(self.queue_dir, qid)
+        self.assertEqual(updated["status"], "running")
+
+    def test_first_running_at_set_on_first_run(self):
+        """first_running_at should be set when spec first enters running status."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = enqueue(self.queue_dir, spec_path)
+        qid = entry["id"]
+
+        # Before running, no first_running_at
+        pre = get_entry(self.queue_dir, qid)
+        self.assertNotIn("first_running_at", pre)
+
+        # After first set_running, first_running_at should be set
+        set_running(self.queue_dir, qid, "w-1")
+        post = get_entry(self.queue_dir, qid)
+        self.assertIn("first_running_at", post)
+        first_time = post["first_running_at"]
+
+        # After requeue and second set_running, first_running_at should be preserved
+        from lib.queue import _read_entry, _write_entry
+
+        e = _read_entry(self.queue_dir, qid)
+        e["status"] = "requeued"
+        _write_entry(self.queue_dir, e)
+
+        set_running(self.queue_dir, qid, "w-2")
+        post2 = get_entry(self.queue_dir, qid)
+        self.assertEqual(post2["first_running_at"], first_time)
+
+
 if __name__ == "__main__":
     unittest.main()

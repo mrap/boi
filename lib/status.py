@@ -246,18 +246,30 @@ def _get_quality_alerts(entries: list[dict[str, Any]], color: bool = True) -> li
 
 
 def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
-    """Format queue status as a human-readable table with quality and progress.
+    """Format queue status as a human-readable table.
+
+    Designed to fit in 80-char terminal width.
 
     Output:
         BOI
 
-        QUEUE                         MODE       WORKER  ITER   TASKS       QUALITY    PROGRESS   STATUS
-        q-001  ai-profile-v2          discover   w-1     7/30   5/8 done    B (0.78)   51%        running
+        QUEUE                    MODE     WORKER ITER  TASKS      STATUS
+        q-001  ai-profile-v2     disc     w-1    7/30  5/8 done   running
         ...
+
+        Hint: Run 'boi log q-001' to see worker output
     """
     entries = status_data.get("entries", [])
     summary = status_data.get("summary", {})
     workers = status_data.get("workers", [])
+
+    # Mode abbreviations for compact display
+    mode_abbrev: dict[str, str] = {
+        "execute": "exec",
+        "challenge": "chal",
+        "discover": "disc",
+        "generate": "gen",
+    }
 
     lines = []
 
@@ -268,22 +280,32 @@ def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
     lines.append("")
 
     if not entries:
-        lines.append("No specs in queue.")
+        lines.append("No specs in queue. Ready to dispatch.")
         total_workers = len(workers)
         if total_workers:
             lines.append(f"Workers: 0/{total_workers} busy")
+        lines.append("")
+        lines.append("Quick start:")
+        lines.append("  boi dispatch my-spec.md          Dispatch a spec file")
+        lines.append(
+            '  boi do "build a REST API"        Describe what you want (uses AI)'
+        )
+        lines.append("  boi status                       Check progress")
+        lines.append("  boi --help                       See all commands")
         return "\n".join(lines)
 
-    # Build rows with new columns: QUALITY and PROGRESS
+    # Column widths: QUEUE(25) MODE(9) WORKER(7) ITER(6) TASKS(11) STATUS = ~68
     col_header = (
-        f"{'QUEUE':<30}{'MODE':<11}{'WORKER':<8}{'ITER':<7}"
-        f"{'TASKS':<12}{'QUALITY':<11}{'PROGRESS':<11}{'STATUS'}"
+        f"{'QUEUE':<25}{'MODE':<9}{'WORKER':<7}{'ITER':<6}{'TASKS':<11}{'STATUS'}"
     )
     if color:
         col_header = f"{BOLD}{col_header}{NC}"
     lines.append(col_header)
 
     generate_details: list[tuple[int, list[str]]] = []
+
+    # Find first running spec for the hint
+    first_running_id = ""
 
     for idx, entry in enumerate(entries):
         qid = entry.get("id", "?")
@@ -292,17 +314,16 @@ def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
             os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
         )
         label = f"{qid}  {spec_name}"
-        if len(label) > 28:
-            label = label[:28]
+        if len(label) > 23:
+            label = label[:23]
 
         mode = entry.get("mode", "execute")
+        mode_str = mode_abbrev.get(mode, mode[:4])
 
-        worker = entry.get("last_worker") or "\u2014"
+        worker = entry.get("last_worker") or "-"
         iteration = entry.get("iteration", 0)
         max_iter = entry.get("max_iterations", 30)
-        iter_str = (
-            f"{iteration}/{max_iter}" if entry.get("status") != "queued" else "\u2014"
-        )
+        iter_str = f"{iteration}/{max_iter}" if entry.get("status") != "queued" else "-"
 
         # Task progress
         tasks_done = entry.get("tasks_done", 0)
@@ -310,21 +331,30 @@ def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
         if tasks_total > 0:
             tasks_str = f"{tasks_done}/{tasks_total} done"
         else:
-            tasks_str = "\u2014"
-
-        # Quality and progress from telemetry
-        quality_str, progress_str = _get_quality_display(entry, color)
+            tasks_str = "-"
 
         status = entry.get("status", "queued")
         status_display = status
 
+        # Track first running spec for hint
+        if not first_running_id and status == "running":
+            first_running_id = qid
+
+        # Quality annotation (compact, appended to status)
+        quality_str, progress_str = _get_quality_display(entry, color=False)
+        quality_suffix = ""
+        if quality_str != "\u2014" and quality_str != "-":
+            quality_suffix = f" [{quality_str}]"
+
         if color:
             status_color = STATUS_COLORS.get(status, "")
-            status_display = _colorize(status, status_color)
+            status_display = _colorize(status + quality_suffix, status_color)
+        else:
+            status_display = status + quality_suffix
 
         lines.append(
-            f"{label:<30}{mode:<11}{worker:<8}{iter_str:<7}"
-            f"{tasks_str:<12}{quality_str:<11}{progress_str:<11}{status_display}"
+            f"{label:<25}{mode_str:<9}{worker:<7}{iter_str:<6}"
+            f"{tasks_str:<11}{status_display}"
         )
 
         # Collect Generate mode detail blocks
@@ -363,14 +393,21 @@ def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
     if queued:
         queue_parts.append(f"{queued} queued")
     if needs_review:
-        queue_parts.append(f"{needs_review} needs_review")
+        queue_parts.append(f"{needs_review} needs review")
     if completed:
-        queue_parts.append(f"{completed} completed")
+        queue_parts.append(f"{completed} done")
 
     if queue_parts:
         parts.append(f"Queue: {', '.join(queue_parts)}")
 
     lines.append("  |  ".join(parts) if parts else f"Total: {summary.get('total', 0)}")
+
+    # Footer hint
+    if first_running_id:
+        hint = f"Run 'boi log {first_running_id}' to see worker output"
+        if color:
+            hint = f"{DIM}{hint}{NC}"
+        lines.append(hint)
 
     return "\n".join(lines)
 
@@ -625,10 +662,18 @@ def format_dashboard(status_data: dict[str, Any], color: bool = True) -> str:
     lines.append(header_line)
 
     if not entries:
-        lines.append(" No specs in queue.")
+        lines.append(" No specs in queue. Ready to dispatch.")
         total_workers = len(workers)
         if total_workers:
             lines.append(f" Workers: 0/{total_workers} idle")
+        lines.append("")
+        lines.append(" Quick start:")
+        lines.append("   boi dispatch my-spec.md          Dispatch a spec file")
+        lines.append(
+            '   boi do "build a REST API"        Describe what you want (uses AI)'
+        )
+        lines.append("   boi status                       Check progress")
+        lines.append("   boi --help                       See all commands")
         return "\n".join(lines)
 
     # Mode abbreviations for compact display

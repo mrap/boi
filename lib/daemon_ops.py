@@ -37,11 +37,15 @@ from lib.hooks import get_tasks_added_from_telemetry, run_completion_hooks, run_
 from lib.queue import (
     _read_entry,
     _write_entry,
+    cleanup_spec_worktree,
     complete,
+    count_active_worktrees,
+    create_spec_worktree,
     dequeue,
     fail,
     get_entry,
     increment_experiment_usage,
+    merge_spec_worktree,
     record_failure,
     requeue,
     set_needs_review,
@@ -513,12 +517,66 @@ def _handle_crash(
     return result
 
 
-def pick_next_spec(queue_dir: str) -> Optional[dict[str, Any]]:
+def pick_next_spec(
+    queue_dir: str,
+    for_worktree: bool = False,
+    max_worktrees: int = 5,
+) -> Optional[dict[str, Any]]:
     """Dequeue and return the next eligible spec in one call.
 
-    Returns a dict with id, spec_path, iteration, max_iterations
-    for the next eligible spec, or None if no spec is available.
+    Returns a dict with id, spec_path, iteration, max_iterations,
+    and worktree_isolate for the next eligible spec, or None if
+    no spec is available.
+
+    Args:
+        queue_dir: Path to queue directory.
+        for_worktree: If True, only return worktree-isolated specs
+            (used when no free shared workers are available).
+        max_worktrees: Maximum concurrent worktrees allowed.
     """
+    from lib.queue import get_queue
+
+    if for_worktree:
+        # Check if we've hit the worktree limit
+        active_wt = count_active_worktrees(queue_dir)
+        if active_wt >= max_worktrees:
+            return None
+
+        # Look for worktree-isolated specs manually
+        # (dequeue doesn't know about worktree filtering)
+        entries = get_queue(queue_dir)
+        now = datetime.now(timezone.utc).isoformat()
+        for entry in entries:
+            status = entry.get("status", "")
+            if status not in ("queued", "requeued"):
+                continue
+            if not entry.get("worktree_isolate"):
+                continue
+            # Check cooldown
+            cooldown_until = entry.get("cooldown_until")
+            if cooldown_until and cooldown_until > now:
+                continue
+            # Check blocked_by
+            if entry.get("blocked_by"):
+                from lib.queue import _read_entry
+
+                all_deps_done = True
+                for dep_id in entry["blocked_by"]:
+                    dep = _read_entry(queue_dir, dep_id)
+                    if dep is None or dep.get("status") != "completed":
+                        all_deps_done = False
+                        break
+                if not all_deps_done:
+                    continue
+            return {
+                "id": entry["id"],
+                "spec_path": entry.get("spec_path", ""),
+                "iteration": entry.get("iteration", 0),
+                "max_iterations": entry.get("max_iterations", 30),
+                "worktree_isolate": True,
+            }
+        return None
+
     entry = dequeue(queue_dir)
     if entry is None:
         return None
@@ -528,6 +586,7 @@ def pick_next_spec(queue_dir: str) -> Optional[dict[str, Any]]:
         "spec_path": entry.get("spec_path", ""),
         "iteration": entry.get("iteration", 0),
         "max_iterations": entry.get("max_iterations", 30),
+        "worktree_isolate": bool(entry.get("worktree_isolate")),
     }
 
 

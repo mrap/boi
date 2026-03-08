@@ -54,6 +54,9 @@ log_info()  { echo -e "${GREEN}[boi]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[boi]${NC} $1"; }
 log_error() { echo -e "${RED}[boi]${NC} $1" >&2; }
 log_step()  { echo -e "${BOLD}==> $1${NC}"; }
+progress_step() { printf "  %s... " "$1"; }
+progress_done() { local d="${1:-}"; if [[ -n "${d}" ]]; then echo -e "${GREEN}✓${NC} (${d})"; else echo -e "${GREEN}✓${NC}"; fi; }
+progress_fail() { local d="${1:-}"; if [[ -n "${d}" ]]; then echo -e "${RED}✗${NC} (${d})"; else echo -e "${RED}✗${NC}"; fi; }
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -195,23 +198,24 @@ create_worktree() {
     local index="$1"
     local dest="${WORKTREE_PREFIX}${index}"
 
+    progress_step "Creating worktree ${index}/${WORKER_COUNT}"
+
     if [[ -d "${dest}" ]]; then
-        log_info "Worktree ${dest} already exists, skipping."
+        progress_done "already exists"
         return 0
     fi
 
-    log_info "Creating worktree ${index}/${WORKER_COUNT}: ${dest}"
     if [[ "${DRY_RUN}" == "true" ]]; then
-        log_info "[dry-run] Would run: git -C ${REPO_PATH} worktree add ${dest}"
+        progress_done "dry-run"
         return 0
     fi
 
     if ! git -C "${REPO_PATH}" worktree add "${dest}" 2>/dev/null; then
-        log_error "Failed to create worktree at ${dest}"
+        progress_fail "${dest}"
         return 1
     fi
 
-    log_info "Worktree ${dest} created."
+    progress_done
 }
 
 create_worktrees() {
@@ -532,7 +536,7 @@ main() {
     if [[ "${DRY_RUN}" == "true" ]]; then
         log_info "Dry run complete. No changes were made."
     else
-        echo -e "${GREEN}${BOLD}BOI installed successfully.${NC}"
+        echo -e "${GREEN}${BOLD}BOI installed successfully.${NC} Run 'boi doctor' to verify."
         echo ""
         echo "  State dir:  ${BOI_STATE_DIR}"
         echo "  Config:     ${BOI_CONFIG}"

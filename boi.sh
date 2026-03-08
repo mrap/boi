@@ -60,12 +60,40 @@ die() {
     exit 1
 }
 
+die_usage() {
+    echo -e "${RED}Error:${NC} $1" >&2
+    exit 2
+}
+
 warn() {
     echo -e "${YELLOW}Warning:${NC} $1"
 }
 
 info() {
     echo -e "${GREEN}boi:${NC} $1"
+}
+
+# Progress step: prints "  Description... " without newline, then call progress_done or progress_fail
+progress_step() {
+    printf "  %s... " "$1"
+}
+
+progress_done() {
+    local detail="${1:-}"
+    if [[ -n "${detail}" ]]; then
+        echo -e "${GREEN}✓${NC} (${detail})"
+    else
+        echo -e "${GREEN}✓${NC}"
+    fi
+}
+
+progress_fail() {
+    local detail="${1:-}"
+    if [[ -n "${detail}" ]]; then
+        echo -e "${RED}✗${NC} (${detail})"
+    else
+        echo -e "${RED}✗${NC}"
+    fi
 }
 
 require_config() {
@@ -84,6 +112,69 @@ require_daemon() {
         return 0
     fi
     return 1
+}
+
+# resolve_queue_id — Find the most recent running or last-completed spec.
+# Used by log, cancel, telemetry, spec when no queue-id is provided.
+# Prints the queue-id and spec name to stderr for context, and the queue-id to stdout.
+# Returns 1 if no spec can be resolved.
+resolve_queue_id() {
+    local result
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.queue import get_queue
+
+queue_dir = sys.argv[1]
+entries = get_queue(queue_dir)
+
+if not entries:
+    sys.exit(1)
+
+# Prefer: running > queued > needs_review > completed > failed > canceled
+priority_order = {"running": 0, "queued": 1, "needs_review": 2, "completed": 3, "failed": 4, "canceled": 5}
+
+# Sort by status priority, then by most recent activity
+def sort_key(e):
+    status = e.get("status", "unknown")
+    status_rank = priority_order.get(status, 99)
+    # Use last_iteration_at or submitted_at for recency
+    ts = e.get("last_iteration_at") or e.get("submitted_at") or ""
+    return (status_rank, ts)  # lower rank = better, later ts = better (but we reverse ts)
+
+# Sort: best status first, then most recent within that status
+sorted_entries = sorted(entries, key=lambda e: (
+    priority_order.get(e.get("status", "unknown"), 99),
+    -(hash(e.get("last_iteration_at") or e.get("submitted_at") or "")),
+))
+
+# If multiple specs are actively running, we can't auto-select
+running = [e for e in entries if e.get("status") == "running"]
+if len(running) > 1:
+    ids = ", ".join(e["id"] for e in running)
+    print(f"MULTIPLE:{ids}", end="")
+    sys.exit(2)
+
+best = sorted_entries[0]
+spec_name = os.path.splitext(os.path.basename(best.get("original_spec_path", best.get("spec_path", ""))))[0]
+print(f"{best['id']}|{spec_name}", end="")
+PYEOF
+    )
+
+    local exit_code=$?
+
+    if [[ ${exit_code} -eq 1 ]]; then
+        return 1
+    fi
+
+    if [[ ${exit_code} -eq 2 ]]; then
+        # Multiple running specs — caller must handle
+        echo "${result}"
+        return 2
+    fi
+
+    echo "${result}"
+    return 0
 }
 
 # ─── Subcommand: install ─────────────────────────────────────────────────────
@@ -110,32 +201,32 @@ cmd_dispatch() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --spec)
-                [[ -z "${2:-}" ]] && die "--spec requires a file path"
+                [[ -z "${2:-}" ]] && die_usage "--spec requires a file path"
                 spec_file="$2"
                 shift 2
                 ;;
             --tasks)
-                [[ -z "${2:-}" ]] && die "--tasks requires a file path"
+                [[ -z "${2:-}" ]] && die_usage "--tasks requires a file path"
                 tasks_file="$2"
                 shift 2
                 ;;
             --priority)
-                [[ -z "${2:-}" ]] && die "--priority requires a number"
+                [[ -z "${2:-}" ]] && die_usage "--priority requires a number"
                 priority="$2"
                 shift 2
                 ;;
             --max-iter)
-                [[ -z "${2:-}" ]] && die "--max-iter requires a number"
+                [[ -z "${2:-}" ]] && die_usage "--max-iter requires a number"
                 max_iter="$2"
                 shift 2
                 ;;
             --checkout|--worktree)
-                [[ -z "${2:-}" ]] && die "--worktree requires a path"
+                [[ -z "${2:-}" ]] && die_usage "--worktree requires a path"
                 worktree="$2"
                 shift 2
                 ;;
             --timeout)
-                [[ -z "${2:-}" ]] && die "--timeout requires seconds"
+                [[ -z "${2:-}" ]] && die_usage "--timeout requires seconds"
                 timeout="$2"
                 shift 2
                 ;;
@@ -144,17 +235,17 @@ cmd_dispatch() {
                 shift
                 ;;
             --mode|-m)
-                [[ -z "${2:-}" ]] && die "--mode requires a value (execute, challenge, discover, generate)"
+                [[ -z "${2:-}" ]] && die_usage "--mode requires a value (execute, challenge, discover, generate)"
                 mode="$2"
                 shift 2
                 ;;
             --project)
-                [[ -z "${2:-}" ]] && die "--project requires a project name"
+                [[ -z "${2:-}" ]] && die_usage "--project requires a project name"
                 project="$2"
                 shift 2
                 ;;
             --experiment-budget)
-                [[ -z "${2:-}" ]] && die "--experiment-budget requires a number"
+                [[ -z "${2:-}" ]] && die_usage "--experiment-budget requires a number"
                 experiment_budget="$2"
                 shift 2
                 ;;
@@ -163,7 +254,8 @@ cmd_dispatch() {
                 shift
                 ;;
             -h|--help)
-                echo "Usage: boi dispatch --spec <spec.md> [--priority N] [--max-iter N] [--mode MODE] [--experiment-budget N] [--worktree <path>] [--timeout SECONDS] [--no-critic] [--project <name>] [--dry-run]"
+                echo "Usage: boi dispatch <spec.md> [--priority N] [--max-iter N] [--mode MODE] [--experiment-budget N] [--worktree <path>] [--timeout SECONDS] [--no-critic] [--project <name>] [--dry-run]"
+                echo "       boi dispatch --spec <spec.md> [options]   (explicit flag form)"
                 echo "       boi dispatch --tasks <tasks.md>"
                 echo ""
                 echo "Options:"
@@ -181,7 +273,13 @@ cmd_dispatch() {
                 exit 0
                 ;;
             *)
-                die "Unknown option: $1. Use 'boi dispatch --help' for usage."
+                # Smart default: if first positional arg is a .md file, treat as --spec
+                if [[ -z "${spec_file}" ]] && [[ -z "${tasks_file}" ]] && [[ "$1" == *.md ]] && [[ -f "$1" ]]; then
+                    spec_file="$1"
+                    shift
+                else
+                    die_usage "Unknown option: $1. Use 'boi dispatch --help' for usage."
+                fi
                 ;;
         esac
     done
@@ -251,6 +349,7 @@ PYEOF
     fi
 
     # Validate the spec before enqueueing
+    progress_step "Validating spec"
     local validation_output
     validation_output=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" <<'PYEOF'
 import sys, os
@@ -276,12 +375,13 @@ PYEOF
     )
 
     if [[ $? -ne 0 ]]; then
+        progress_fail
         echo -e "${RED}Spec validation failed:${NC}" >&2
         echo "${validation_output}" >&2
         die "Fix the spec and try again."
     fi
 
-    info "Spec validated: ${validation_output}"
+    progress_done "${validation_output}"
 
     # Dry-run mode: show what would happen and exit
     if [[ "${dry_run}" == "true" ]]; then
@@ -306,6 +406,7 @@ PYEOF
     fi
 
     # Enqueue the spec
+    progress_step "Queuing"
     local worktree_arg=""
     if [[ -n "${worktree}" ]]; then
         worktree_arg="${worktree}"
@@ -388,12 +489,14 @@ PYEOF
 
     if [[ ${enqueue_exit} -eq 2 ]]; then
         # Duplicate spec error
+        progress_fail
         local dup_msg
         dup_msg=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['message'])")
         die "${dup_msg}"
     fi
 
     if [[ ${enqueue_exit} -ne 0 ]]; then
+        progress_fail
         die "Failed to enqueue spec."
     fi
 
@@ -406,42 +509,57 @@ PYEOF
     pending_count=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pending'])")
     enqueued_mode=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mode','execute'))")
 
-    info "Spec queued: ${queue_id} (${pending_count}/${task_count} tasks pending, priority ${priority}, mode ${enqueued_mode})"
+    progress_done "${queue_id}, ${pending_count}/${task_count} tasks, priority ${priority}"
 
     # Start daemon if not already running
     if require_daemon; then
-        info "Daemon already running. It will pick up the new spec."
+        progress_step "Starting daemon"
+        progress_done "already running"
     else
-        info "Starting daemon..."
+        progress_step "Starting daemon"
         nohup bash "${SCRIPT_DIR}/daemon.sh" > "${LOG_DIR}/daemon-startup.log" 2>&1 < /dev/null &
         sleep 1
         if require_daemon; then
-            info "Daemon started."
+            progress_done
         else
-            warn "Daemon may not have started. Check ${LOG_DIR}/daemon-startup.log"
+            progress_fail "check ${LOG_DIR}/daemon-startup.log"
         fi
     fi
 
     echo ""
-    info "Monitor progress with: boi status"
+    info "Dispatched. Monitor with: boi status"
 }
 
 # ─── Subcommand: queue ──────────────────────────────────────────────────────
 
 cmd_queue() {
     local json_mode=false
+    local watch_mode=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --json) json_mode=true; shift ;;
+            --watch) watch_mode=true; shift ;;
             -h|--help)
-                echo "Usage: boi queue [--json]"
+                echo "Usage: boi queue [--json] [--watch]"
+                echo ""
+                echo "Options:"
+                echo "  --json    Output machine-readable JSON"
+                echo "  --watch   Auto-refresh every 2s"
                 exit 0
                 ;;
-            *) die "Unknown option: $1" ;;
+            *) die_usage "Unknown option: $1" ;;
         esac
     done
 
     require_config
+
+    if [[ "${watch_mode}" == "true" ]]; then
+        while true; do
+            clear
+            cmd_queue_inner "${json_mode}"
+            sleep 2
+        done
+    fi
 
     cmd_queue_inner "${json_mode}"
 }
@@ -464,7 +582,7 @@ cmd_status() {
                 echo "  --json    Output machine-readable JSON"
                 exit 0
                 ;;
-            *) die "Unknown option: $1" ;;
+            *) die_usage "Unknown option: $1" ;;
         esac
     done
 
@@ -555,20 +673,22 @@ cmd_log() {
         case "$1" in
             --full) full_mode=true; shift ;;
             -h|--help)
-                echo "Usage: boi log <queue-id> [--full]"
+                echo "Usage: boi log [queue-id] [--full]"
                 echo ""
                 echo "Options:"
                 echo "  --full    Show full output (default: tail last 50 lines)"
+                echo ""
+                echo "If no queue-id is given, shows logs for the most recent spec."
                 exit 0
                 ;;
             -*)
-                die "Unknown option: $1"
+                die_usage "Unknown option: $1"
                 ;;
             *)
                 if [[ -z "${queue_id}" ]]; then
                     queue_id="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -578,7 +698,23 @@ cmd_log() {
     require_config
 
     if [[ -z "${queue_id}" ]]; then
-        die "Queue ID required. Usage: boi log <queue-id> [--full]"
+        # Auto-resolve to most recent spec
+        local resolved
+        resolved=$(resolve_queue_id) || true
+        local resolve_exit=$?
+
+        if [[ -z "${resolved}" ]]; then
+            die "No specs in queue. Nothing to show logs for."
+        fi
+
+        if [[ "${resolved}" == MULTIPLE:* ]]; then
+            local ids="${resolved#MULTIPLE:}"
+            die "Multiple specs running (${ids}). Specify a queue-id: boi log <queue-id>"
+        fi
+
+        queue_id="${resolved%%|*}"
+        local spec_name="${resolved#*|}"
+        echo -e "${DIM}Showing log for ${queue_id} (${spec_name})...${NC}"
     fi
 
     # Find the latest iteration log
@@ -625,17 +761,24 @@ cmd_cancel() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
-                echo "Usage: boi cancel <queue-id>"
+                echo "Usage: boi cancel [queue-id]"
+                echo ""
+                echo "Cancel a queued or running spec."
+                echo "The spec will be marked as canceled and its worker released."
+                echo ""
+                echo "If no queue-id is given, cancels the most recent spec (with confirmation)."
+                echo ""
+                echo "Use 'boi queue' to see available queue IDs."
                 exit 0
                 ;;
             -*)
-                die "Unknown option: $1"
+                die_usage "Unknown option: $1"
                 ;;
             *)
                 if [[ -z "${queue_id}" ]]; then
                     queue_id="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -645,7 +788,28 @@ cmd_cancel() {
     require_config
 
     if [[ -z "${queue_id}" ]]; then
-        die "Queue ID required. Usage: boi cancel <queue-id>"
+        # Auto-resolve to most recent running spec
+        local resolved
+        resolved=$(resolve_queue_id) || true
+
+        if [[ -z "${resolved}" ]]; then
+            die "No specs in queue. Nothing to cancel."
+        fi
+
+        if [[ "${resolved}" == MULTIPLE:* ]]; then
+            local ids="${resolved#MULTIPLE:}"
+            die "Multiple specs running (${ids}). Specify a queue-id: boi cancel <queue-id>"
+        fi
+
+        queue_id="${resolved%%|*}"
+        local spec_name="${resolved#*|}"
+
+        echo -e "Cancel ${BOLD}${queue_id}${NC} (${spec_name})? [y/N] "
+        read -r confirm
+        if [[ "${confirm}" != "y" ]] && [[ "${confirm}" != "Y" ]]; then
+            info "Canceled."
+            exit 0
+        fi
     fi
 
     # Cancel in queue
@@ -695,13 +859,13 @@ cmd_review() {
                 exit 0
                 ;;
             -*)
-                die "Unknown option: $1"
+                die_usage "Unknown option: $1"
                 ;;
             *)
                 if [[ -z "${queue_id}" ]]; then
                     queue_id="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -920,7 +1084,7 @@ cmd_purge() {
                 exit 0
                 ;;
             *)
-                die "Unknown option: $1. Use 'boi purge --help' for usage."
+                die_usage "Unknown option: $1. Use 'boi purge --help' for usage."
                 ;;
         esac
     done
@@ -948,12 +1112,20 @@ if not results:
     print("Nothing to purge.")
     sys.exit(0)
 
-prefix = "[dry-run] Would remove" if dry_run else "Purged"
+prefix = "[dry-run] Would remove" if dry_run else "Purging"
+print(f"{prefix} {len(results)} spec(s)...")
 for r in results:
     file_count = len(r["files_removed"])
-    print(f"{prefix}: {r['id']} ({r['status']}) — {file_count} file(s)")
+    spec_name = r.get("spec_name", "")
+    name_part = f" {spec_name}" if spec_name else ""
+    task_count = r.get("tasks_total", "?")
+    iteration = r.get("iteration", "?")
+    print(f"  {r['id']}{name_part} ({task_count} tasks, {iteration} iterations)")
 
-if not dry_run:
+if dry_run:
+    total = sum(len(r["files_removed"]) for r in results)
+    print(f"\nWould remove {len(results)} spec(s), {total} file(s).")
+else:
     total = sum(len(r["files_removed"]) for r in results)
     print(f"\nRemoved {len(results)} spec(s), {total} file(s) total.")
 PYEOF
@@ -1022,7 +1194,7 @@ cmd_workers() {
                 echo "Usage: boi workers [--json]"
                 exit 0
                 ;;
-            *) die "Unknown option: $1" ;;
+            *) die_usage "Unknown option: $1" ;;
         esac
     done
 
@@ -1125,17 +1297,19 @@ cmd_telemetry() {
         case "$1" in
             --json) json_mode=true; shift ;;
             -h|--help)
-                echo "Usage: boi telemetry <queue-id> [--json]"
+                echo "Usage: boi telemetry [queue-id] [--json]"
+                echo ""
+                echo "If no queue-id is given, shows telemetry for the most recent spec."
                 exit 0
                 ;;
             -*)
-                die "Unknown option: $1"
+                die_usage "Unknown option: $1"
                 ;;
             *)
                 if [[ -z "${queue_id}" ]]; then
                     queue_id="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -1143,7 +1317,22 @@ cmd_telemetry() {
     done
 
     if [[ -z "${queue_id}" ]]; then
-        die "Queue ID required. Usage: boi telemetry <queue-id>"
+        # Auto-resolve to most recent spec
+        local resolved
+        resolved=$(resolve_queue_id) || true
+
+        if [[ -z "${resolved}" ]]; then
+            die "No specs in queue. Nothing to show telemetry for."
+        fi
+
+        if [[ "${resolved}" == MULTIPLE:* ]]; then
+            local ids="${resolved#MULTIPLE:}"
+            die "Multiple specs running (${ids}). Specify a queue-id: boi telemetry <queue-id>"
+        fi
+
+        queue_id="${resolved%%|*}"
+        local spec_name="${resolved#*|}"
+        echo -e "${DIM}Showing telemetry for ${queue_id} (${spec_name})...${NC}"
     fi
 
     BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" "${json_mode}" <<'PYEOF'
@@ -1180,30 +1369,80 @@ cmd_dashboard() {
 # ─── Subcommand: doctor ──────────────────────────────────────────────────────
 
 cmd_doctor() {
-    echo -e "${BOLD}BOI Doctor${NC}"
-    echo ""
+    local json_mode=false
+    # Handle flags before running checks
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json_mode=true; shift ;;
+            -h|--help)
+                echo "Usage: boi doctor [--json]"
+                echo ""
+                echo "Check prerequisites and environment health."
+                echo ""
+                echo "Options:"
+                echo "  --json    Output machine-readable JSON"
+                echo ""
+                echo "Checks:"
+                echo "  tmux, claude CLI, Python version"
+                echo "  State directory, config, workers"
+                echo "  Daemon status, heartbeat"
+                echo "  Critic configuration"
+                exit 0
+                ;;
+            *) die_usage "Unknown option: $1. Use 'boi doctor --help' for usage." ;;
+        esac
+    done
+
+    # Collect results into arrays for JSON output
+    local -a check_names=()
+    local -a check_statuses=()
+    local -a check_details=()
+    local -a check_fixes=()
+
+    if [[ "${json_mode}" == "false" ]]; then
+        echo -e "${BOLD}BOI Doctor${NC}"
+        echo ""
+    fi
 
     local pass_count=0
     local fail_count=0
     local warn_count=0
 
     _doctor_pass() {
-        echo -e "  ${GREEN}[PASS]${NC} $1"
+        check_names+=("$1")
+        check_statuses+=("pass")
+        check_details+=("$1")
+        check_fixes+=("")
+        if [[ "${json_mode}" == "false" ]]; then
+            echo -e "  ${GREEN}[PASS]${NC} $1"
+        fi
         pass_count=$((pass_count + 1))
     }
 
     _doctor_fail() {
-        echo -e "  ${RED}[FAIL]${NC} $1"
-        if [[ -n "${2:-}" ]]; then
-            echo -e "         Fix: $2"
+        check_names+=("$1")
+        check_statuses+=("fail")
+        check_details+=("$1")
+        check_fixes+=("${2:-}")
+        if [[ "${json_mode}" == "false" ]]; then
+            echo -e "  ${RED}[FAIL]${NC} $1"
+            if [[ -n "${2:-}" ]]; then
+                echo -e "         Fix: $2"
+            fi
         fi
         fail_count=$((fail_count + 1))
     }
 
     _doctor_warn() {
-        echo -e "  ${YELLOW}[WARN]${NC} $1"
-        if [[ -n "${2:-}" ]]; then
-            echo -e "         Fix: $2"
+        check_names+=("$1")
+        check_statuses+=("warn")
+        check_details+=("$1")
+        check_fixes+=("${2:-}")
+        if [[ "${json_mode}" == "false" ]]; then
+            echo -e "  ${YELLOW}[WARN]${NC} $1"
+            if [[ -n "${2:-}" ]]; then
+                echo -e "         Fix: $2"
+            fi
         fi
         warn_count=$((warn_count + 1))
     }
@@ -1300,10 +1539,10 @@ for w in c.get('workers', []):
         if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then
             _doctor_pass "Daemon running (PID ${daemon_pid})"
         else
-            _doctor_warn "Daemon not running (stale PID file)" "Run 'boi dispatch' to start the daemon, or 'boi start-daemon'"
+            _doctor_warn "Daemon not running (stale PID file)" "Run 'boi dispatch' to start the daemon"
         fi
     else
-        _doctor_warn "Daemon not running" "Run 'boi dispatch' to start the daemon, or 'boi start-daemon'"
+        _doctor_warn "Daemon not running" "Run 'boi dispatch' to start the daemon"
     fi
 
     # 10. Daemon heartbeat check
@@ -1375,8 +1614,26 @@ except Exception as e:
         _doctor_warn "Critic not configured" "Run 'boi install' or create ~/.boi/critic/config.json"
     fi
 
-    echo ""
-    echo -e "Results: ${GREEN}${pass_count} passed${NC}, ${RED}${fail_count} failed${NC}, ${YELLOW}${warn_count} warning(s)${NC}"
+    if [[ "${json_mode}" == "true" ]]; then
+        # Build JSON output
+        python3 -c "
+import json, sys
+names = sys.argv[1].split('|') if sys.argv[1] else []
+statuses = sys.argv[2].split('|') if sys.argv[2] else []
+fixes = sys.argv[3].split('|') if sys.argv[3] else []
+checks = []
+for i in range(len(names)):
+    entry = {'check': names[i], 'status': statuses[i] if i < len(statuses) else 'unknown'}
+    if i < len(fixes) and fixes[i]:
+        entry['fix'] = fixes[i]
+    checks.append(entry)
+result = {'pass': int(sys.argv[4]), 'fail': int(sys.argv[5]), 'warn': int(sys.argv[6]), 'checks': checks}
+print(json.dumps(result, indent=2))
+" "$(IFS='|'; echo "${check_names[*]}")" "$(IFS='|'; echo "${check_statuses[*]}")" "$(IFS='|'; echo "${check_fixes[*]}")" "${pass_count}" "${fail_count}" "${warn_count}"
+    else
+        echo ""
+        echo -e "Results: ${GREEN}${pass_count} passed${NC}, ${RED}${fail_count} failed${NC}, ${YELLOW}${warn_count} warning(s)${NC}"
+    fi
 }
 
 # ─── Subcommand: critic ──────────────────────────────────────────────────────
@@ -1399,7 +1656,7 @@ cmd_critic() {
         benchmark) _critic_benchmark "$@" ;;
         -h|--help|help) _critic_usage; exit 0 ;;
         *)
-            die "Unknown critic subcommand: ${subcommand}. Use 'boi critic --help' for usage."
+            die_usage "Unknown critic subcommand: ${subcommand}. Use 'boi critic --help' for usage."
             ;;
     esac
 }
@@ -1427,7 +1684,24 @@ _critic_usage() {
 }
 
 _critic_status() {
-    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${BOI_STATE_DIR}" "${QUEUE_DIR}" "${SCRIPT_DIR}" <<'PYEOF'
+    local json_mode=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json_mode=true; shift ;;
+            -h|--help)
+                echo "Usage: boi critic status [--json]"
+                echo ""
+                echo "Show critic configuration, active checks, and pass counts."
+                echo ""
+                echo "Options:"
+                echo "  --json    Output machine-readable JSON"
+                exit 0
+                ;;
+            *) die_usage "Unknown option: $1" ;;
+        esac
+    done
+
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${BOI_STATE_DIR}" "${QUEUE_DIR}" "${SCRIPT_DIR}" "${json_mode}" <<'PYEOF'
 import json
 import os
 import sys
@@ -1438,6 +1712,7 @@ from lib.critic_config import load_critic_config, get_active_checks
 state_dir = sys.argv[1]
 queue_dir = sys.argv[2]
 boi_dir = sys.argv[3]
+json_mode = sys.argv[4] == "true" or sys.argv[4] == "True"
 
 config = load_critic_config(state_dir)
 
@@ -1453,27 +1728,8 @@ custom_count = sum(1 for c in checks if c["source"] == "custom")
 # Check for custom prompt override
 prompt_override = os.path.isfile(os.path.join(state_dir, "critic", "prompt.md"))
 
-print("BOI Critic")
-print()
-print(f"  Enabled: {'yes' if enabled else 'no'}")
-print(f"  Trigger: {trigger}")
-print(f"  Max passes: {max_passes}")
-
-if custom_count > 0:
-    print(f"  Active checks: {len(checks)} ({default_count} default + {custom_count} custom)")
-else:
-    print(f"  Active checks: {len(checks)}")
-
-for check in checks:
-    label = "default" if check["source"] == "default" else "custom"
-    print(f"    [{label}] {check['name']}")
-
-if prompt_override:
-    print()
-    print("  Prompt: custom override (~/.boi/critic/prompt.md)")
-
-# Show critic pass counts for active specs
-entries = []
+# Collect critic pass info for active specs
+pass_entries = []
 if os.path.isdir(queue_dir):
     for fname in sorted(os.listdir(queue_dir)):
         if not fname.endswith(".json"):
@@ -1484,15 +1740,48 @@ if os.path.isdir(queue_dir):
                 entry = json.load(f)
             passes = entry.get("critic_passes", 0)
             if passes > 0:
-                entries.append((entry.get("id", "?"), entry.get("status", "?"), passes))
+                pass_entries.append((entry.get("id", "?"), entry.get("status", "?"), passes))
         except (json.JSONDecodeError, OSError):
             continue
 
-if entries:
+if json_mode:
+    result = {
+        "enabled": enabled,
+        "trigger": trigger,
+        "max_passes": max_passes,
+        "checks": [{"name": c["name"], "source": c["source"]} for c in checks],
+        "default_checks": default_count,
+        "custom_checks": custom_count,
+        "prompt_override": prompt_override,
+    }
+    if pass_entries:
+        result["spec_passes"] = [{"id": qid, "status": status, "passes": passes} for qid, status, passes in pass_entries]
+    print(json.dumps(result, indent=2))
+else:
+    print("BOI Critic")
     print()
-    print("  Critic passes:")
-    for qid, status, passes in entries:
-        print(f"    {qid} ({status}): {passes} pass(es)")
+    print(f"  Enabled: {'yes' if enabled else 'no'}")
+    print(f"  Trigger: {trigger}")
+    print(f"  Max passes: {max_passes}")
+
+    if custom_count > 0:
+        print(f"  Active checks: {len(checks)} ({default_count} default + {custom_count} custom)")
+    else:
+        print(f"  Active checks: {len(checks)}")
+
+    for check in checks:
+        label = "default" if check["source"] == "default" else "custom"
+        print(f"    [{label}] {check['name']}")
+
+    if prompt_override:
+        print()
+        print("  Prompt: custom override (~/.boi/critic/prompt.md)")
+
+    if pass_entries:
+        print()
+        print("  Critic passes:")
+        for qid, status, passes in pass_entries:
+            print(f"    {qid} ({status}): {passes} pass(es)")
 PYEOF
 }
 
@@ -1508,13 +1797,13 @@ _critic_run() {
                 exit 0
                 ;;
             -*)
-                die "Unknown option: $1"
+                die_usage "Unknown option: $1"
                 ;;
             *)
                 if [[ -z "${queue_id}" ]]; then
                     queue_id="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -1743,7 +2032,9 @@ PYEOF
 _spec_usage() {
     echo -e "${BOLD}BOI Spec${NC} — Live spec management"
     echo ""
-    echo "Usage: boi spec <queue-id> [subcommand] [options]"
+    echo "Usage: boi spec [queue-id] [subcommand] [options]"
+    echo ""
+    echo "If no queue-id is given, uses the most recent spec."
     echo ""
     echo "Subcommands:"
     echo "  (none)                          Show tasks with status"
@@ -1770,7 +2061,34 @@ cmd_spec() {
     local queue_id=""
     local json_mode=false
 
-    if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]] || [[ "$1" == "help" ]]; then
+    if [[ $# -eq 0 ]]; then
+        # No args: auto-resolve queue-id and show tasks
+        local resolved
+        resolved=$(resolve_queue_id) || true
+
+        if [[ -z "${resolved}" ]]; then
+            _spec_usage
+            exit 0
+        fi
+
+        if [[ "${resolved}" == MULTIPLE:* ]]; then
+            local ids="${resolved#MULTIPLE:}"
+            die "Multiple specs running (${ids}). Specify a queue-id: boi spec <queue-id>"
+        fi
+
+        queue_id="${resolved%%|*}"
+        local spec_name="${resolved#*|}"
+        echo -e "${DIM}Showing spec for ${queue_id} (${spec_name})...${NC}"
+
+        local spec_file="${QUEUE_DIR}/${queue_id}.spec.md"
+        if [[ ! -f "${spec_file}" ]]; then
+            die "Spec file not found: ${spec_file}."
+        fi
+        _spec_show "${spec_file}" false
+        return
+    fi
+
+    if [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]] || [[ "$1" == "help" ]]; then
         _spec_usage
         exit 0
     fi
@@ -1819,7 +2137,7 @@ cmd_spec() {
             exit 0
             ;;
         *)
-            die "Unknown spec subcommand: ${subcommand}. Use 'boi spec --help' for usage."
+            die_usage "Unknown spec subcommand: ${subcommand}. Use 'boi spec --help' for usage."
             ;;
     esac
 }
@@ -1902,13 +2220,13 @@ _spec_add() {
                 shift 2
                 ;;
             -*)
-                die "Unknown option for 'add': $1"
+                die_usage "Unknown option for 'add': $1"
                 ;;
             *)
                 if [[ -z "${title}" ]]; then
                     title="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -1953,13 +2271,13 @@ _spec_skip() {
                 shift 2
                 ;;
             -*)
-                die "Unknown option for 'skip': $1"
+                die_usage "Unknown option for 'skip': $1"
                 ;;
             *)
                 if [[ -z "${task_id}" ]]; then
                     task_id="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -1998,12 +2316,12 @@ _spec_next() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) echo "Usage: boi spec <id> next <task-id>"; exit 0 ;;
-            -*) die "Unknown option for 'next': $1" ;;
+            -*) die_usage "Unknown option for 'next': $1" ;;
             *)
                 if [[ -z "${task_id}" ]]; then
                     task_id="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -2046,12 +2364,12 @@ _spec_block() {
                 shift 2
                 ;;
             -h|--help) echo "Usage: boi spec <id> block <task-id> --on <dep-id>"; exit 0 ;;
-            -*) die "Unknown option for 'block': $1" ;;
+            -*) die_usage "Unknown option for 'block': $1" ;;
             *)
                 if [[ -z "${task_id}" ]]; then
                     task_id="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -2093,12 +2411,12 @@ _spec_edit() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) echo "Usage: boi spec <id> edit [<task-id>]"; exit 0 ;;
-            -*) die "Unknown option for 'edit': $1" ;;
+            -*) die_usage "Unknown option for 'edit': $1" ;;
             *)
                 if [[ -z "${task_id}" ]]; then
                     task_id="$1"
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 shift
                 ;;
@@ -2238,7 +2556,7 @@ cmd_project() {
         delete)  _project_delete "$@" ;;
         -h|--help|help) _project_usage; exit 0 ;;
         *)
-            die "Unknown project subcommand: ${subcommand}. Use 'boi project --help' for usage."
+            die_usage "Unknown project subcommand: ${subcommand}. Use 'boi project --help' for usage."
             ;;
     esac
 }
@@ -2251,12 +2569,12 @@ _project_create() {
         case "$1" in
             --description) description="$2"; shift 2 ;;
             -h|--help) _project_usage; exit 0 ;;
-            -*) die "Unknown option: $1" ;;
+            -*) die_usage "Unknown option: $1" ;;
             *)
                 if [[ -z "${name}" ]]; then
                     name="$1"; shift
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 ;;
         esac
@@ -2291,8 +2609,8 @@ _project_list() {
         case "$1" in
             --json) json_mode=true; shift ;;
             -h|--help) _project_usage; exit 0 ;;
-            -*) die "Unknown option: $1" ;;
-            *) die "Unexpected argument: $1" ;;
+            -*) die_usage "Unknown option: $1" ;;
+            *) die_usage "Unexpected argument: $1" ;;
         esac
     done
 
@@ -2335,12 +2653,12 @@ _project_status() {
         case "$1" in
             --json) json_mode=true; shift ;;
             -h|--help) _project_usage; exit 0 ;;
-            -*) die "Unknown option: $1" ;;
+            -*) die_usage "Unknown option: $1" ;;
             *)
                 if [[ -z "${name}" ]]; then
                     name="$1"; shift
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 ;;
         esac
@@ -2419,12 +2737,12 @@ _project_context() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) _project_usage; exit 0 ;;
-            -*) die "Unknown option: $1" ;;
+            -*) die_usage "Unknown option: $1" ;;
             *)
                 if [[ -z "${name}" ]]; then
                     name="$1"; shift
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 ;;
         esac
@@ -2460,12 +2778,12 @@ _project_delete() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help) _project_usage; exit 0 ;;
-            -*) die "Unknown option: $1" ;;
+            -*) die_usage "Unknown option: $1" ;;
             *)
                 if [[ -z "${name}" ]]; then
                     name="$1"; shift
                 else
-                    die "Unexpected argument: $1"
+                    die_usage "Unexpected argument: $1"
                 fi
                 ;;
         esac
@@ -2538,7 +2856,7 @@ cmd_do() {
                 echo "  boi do --yes \"skip task t-5 on q-007\"   # auto-confirm"
                 exit 0
                 ;;
-            -*) die "Unknown option: $1" ;;
+            -*) die_usage "Unknown option: $1" ;;
             *) user_input="$1"; shift ;;
         esac
     done
@@ -2694,18 +3012,23 @@ usage() {
     echo ""
     echo "Examples:"
     echo "  boi install                         # one-time setup"
-    echo "  boi dispatch --spec spec.md         # submit a spec"
-    echo "  boi dispatch --spec s.md --priority 50  # high priority"
+    echo "  boi dispatch spec.md                # submit a spec"
+    echo "  boi dispatch spec.md --priority 50  # high priority"
+    echo "  boi dispatch --spec s.md            # explicit flag form"
     echo "  boi queue                           # view queue"
     echo "  boi status                          # check progress"
     echo "  boi status --watch                  # live dashboard"
-    echo "  boi log q-001                       # tail spec output"
+    echo "  boi log                             # tail most recent spec"
+    echo "  boi log q-001                       # tail specific spec"
     echo "  boi log q-001 --full                # full output"
     echo "  boi review q-001                    # review experiments"
-    echo "  boi cancel q-001                    # cancel a spec"
+    echo "  boi cancel                          # cancel most recent"
+    echo "  boi cancel q-001                    # cancel specific spec"
     echo "  boi stop                            # stop everything"
     echo "  boi workers                         # show worktrees"
-    echo "  boi telemetry q-001                 # iteration breakdown"
+    echo "  boi telemetry                       # iteration breakdown"
+    echo "  boi spec                            # show tasks"
+    echo "  boi spec q-001 add \"Fix tests\"      # add a task"
     echo "  boi purge                           # clean finished specs"
     echo "  boi purge --dry-run                 # preview purge"
     echo "  boi critic status                   # show critic config"
@@ -2746,10 +3069,18 @@ main() {
         project)    cmd_project "$@" ;;
         do)         cmd_do "$@" ;;
         dashboard)  cmd_dashboard "$@" ;;
-        -h|--help|help) usage; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        help)
+            # 'boi help' shows usage; 'boi help <cmd>' shows <cmd> --help
+            if [[ $# -eq 0 ]]; then
+                usage
+                exit 0
+            fi
+            main "$1" --help
+            ;;
         --version) echo "boi ${BOI_VERSION}"; exit 0 ;;
         *)
-            die "Unknown command: ${command}. Use 'boi --help' for usage."
+            die_usage "Unknown command: ${command}. Use 'boi --help' for usage."
             ;;
     esac
 }
