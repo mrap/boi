@@ -382,6 +382,83 @@ class TestTelemetryFormatting(unittest.TestCase):
         iterations = load_iteration_files(self.queue_dir, "q-999")
         self.assertEqual(iterations, [])
 
+    def test_telemetry_shows_crash_in_iteration_breakdown(self):
+        """Iteration breakdown should show CRASH for failed iterations."""
+        entry = enqueue(self.queue_dir, self._make_spec("crash-test.md"))
+        entry["iteration"] = 3
+        entry["tasks_done"] = 2
+        entry["tasks_total"] = 5
+        entry["status"] = "failed"
+        entry["failure_reason"] = (
+            "5 consecutive failures. Last error: Worker crashed: no exit file."
+        )
+        _write_entry(self.queue_dir, entry)
+
+        # Write iterations: 1 success, 2 crashes
+        self._write_iteration("q-001", 1, tasks_completed=2, duration=600)
+        # Write crash iteration metadata with failure_reason
+        crash_meta_2 = {
+            "queue_id": "q-001",
+            "iteration": 2,
+            "tasks_completed": 0,
+            "tasks_added": 0,
+            "tasks_skipped": 0,
+            "duration_seconds": 0,
+            "crash": True,
+            "failure_reason": "Worker crashed: no exit file. Process may have been killed or timed out.",
+        }
+        crash_meta_3 = {
+            "queue_id": "q-001",
+            "iteration": 3,
+            "tasks_completed": 0,
+            "tasks_added": 0,
+            "tasks_skipped": 0,
+            "duration_seconds": 0,
+            "crash": True,
+            "failure_reason": "Worker crashed: no exit file. Process may have been killed or timed out.",
+        }
+        for meta in [(2, crash_meta_2), (3, crash_meta_3)]:
+            filepath = os.path.join(self.queue_dir, f"q-001.iteration-{meta[0]}.json")
+            with open(filepath, "w") as f:
+                json.dump(meta[1], f)
+
+        telemetry = build_telemetry(self.queue_dir, "q-001")
+        output = format_telemetry_table(telemetry, color=False)
+
+        self.assertIn("Iteration breakdown:", output)
+        self.assertIn("#1:", output)
+        self.assertIn("2 tasks done", output)
+        # Crash iterations should show CRASH label
+        self.assertIn("CRASH", output)
+        self.assertIn("Worker crashed", output)
+
+    def test_queue_table_shows_failure_reason(self):
+        """format_queue_table should show failure reason on a second line for failed specs."""
+        entry = enqueue(self.queue_dir, self._make_spec("fail-test.md"))
+        entry["status"] = "failed"
+        entry["failure_reason"] = (
+            "5 consecutive failures. Last error: Worker crashed: no exit file."
+        )
+        _write_entry(self.queue_dir, entry)
+
+        status = build_queue_status(self.queue_dir)
+        output = format_queue_table(status, color=False)
+
+        self.assertIn("failed", output)
+        self.assertIn("Reason:", output)
+        self.assertIn("5 consecutive failures", output)
+
+    def test_queue_table_no_reason_for_non_failed(self):
+        """format_queue_table should NOT show Reason: line for non-failed specs."""
+        entry = enqueue(self.queue_dir, self._make_spec("running-test.md"))
+        entry["status"] = "running"
+        _write_entry(self.queue_dir, entry)
+
+        status = build_queue_status(self.queue_dir)
+        output = format_queue_table(status, color=False)
+
+        self.assertNotIn("Reason:", output)
+
 
 class TestTasksToSpecConversion(unittest.TestCase):
     """Test backward-compat conversion from tasks.md to spec.md format."""

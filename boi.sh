@@ -23,7 +23,7 @@
 #   boi dispatch --tasks tasks.md
 #   boi queue
 #   boi status [--watch]
-#   boi log <queue-id> [--full]
+#   boi log <queue-id> [--full] [--failures]
 #   boi cancel <queue-id>
 #   boi stop
 #   boi workers
@@ -43,7 +43,7 @@ QUEUE_DIR="${BOI_STATE_DIR}/queue"
 EVENTS_DIR="${BOI_STATE_DIR}/events"
 LOG_DIR="${BOI_STATE_DIR}/logs"
 PID_FILE="${BOI_STATE_DIR}/daemon.pid"
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Colors
 RED='\033[0;31m'
@@ -197,7 +197,6 @@ cmd_dispatch() {
     local dry_run=false
     local project=""
     local experiment_budget=""
-    local worktree_isolate=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -254,12 +253,8 @@ cmd_dispatch() {
                 dry_run=true
                 shift
                 ;;
-            --worktree-isolate)
-                worktree_isolate=true
-                shift
-                ;;
             -h|--help)
-                echo "Usage: boi dispatch <spec.md> [--priority N] [--max-iter N] [--mode MODE] [--experiment-budget N] [--worktree <path>] [--worktree-isolate] [--timeout SECONDS] [--no-critic] [--project <name>] [--dry-run]"
+                echo "Usage: boi dispatch <spec.md> [--priority N] [--max-iter N] [--mode MODE] [--experiment-budget N] [--worktree <path>] [--timeout SECONDS] [--no-critic] [--project <name>] [--dry-run]"
                 echo "       boi dispatch --spec <spec.md> [options]   (explicit flag form)"
                 echo "       boi dispatch --tasks <tasks.md>"
                 echo ""
@@ -275,7 +270,6 @@ cmd_dispatch() {
                 echo "  --no-critic       Skip critic validation when spec completes"
                 echo "  --project NAME    Associate with a BOI project"
                 echo "  --dry-run         Validate and show what would be dispatched without enqueueing"
-                echo "  --worktree-isolate  Run in a dedicated git worktree branch (parallel-safe)"
                 exit 0
                 ;;
             *)
@@ -402,9 +396,6 @@ PYEOF
             info "[dry-run] Timeout: ${timeout}s"
         fi
         info "[dry-run] No critic: ${no_critic}"
-        if [[ "${worktree_isolate}" == "true" ]]; then
-            info "[dry-run] Worktree isolation: enabled"
-        fi
         if [[ -n "${experiment_budget}" ]]; then
             info "[dry-run] Experiment budget: ${experiment_budget}"
         fi
@@ -422,7 +413,7 @@ PYEOF
     fi
 
     local result
-    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${no_critic}" "${mode}" "${project}" "${experiment_budget}" "${worktree_isolate}" <<'PYEOF'
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${no_critic}" "${mode}" "${project}" "${experiment_budget}" <<'PYEOF'
 import sys, os, json
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
 from lib.queue import enqueue, DuplicateSpecError, get_experiment_budget
@@ -438,7 +429,6 @@ no_critic = sys.argv[7] == "true" if len(sys.argv) > 7 else False
 mode = sys.argv[8] if len(sys.argv) > 8 and sys.argv[8] else "execute"
 project_name = sys.argv[9] if len(sys.argv) > 9 and sys.argv[9] else None
 experiment_budget_str = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else None
-worktree_isolate = sys.argv[11] == "true" if len(sys.argv) > 11 else False
 
 # Count tasks in spec
 counts = count_boi_tasks(spec_path)
@@ -487,10 +477,6 @@ if timeout_str:
 if no_critic:
     entry["no_critic"] = True
 
-# Set worktree isolation flag
-if worktree_isolate:
-    entry["worktree_isolate"] = True
-
 # Re-write with updated counts
 from lib.queue import _write_entry
 _write_entry(queue_dir, entry)
@@ -525,46 +511,6 @@ PYEOF
 
     progress_done "${queue_id}, ${pending_count}/${task_count} tasks, priority ${priority}"
 
-    # Auto-detect file-level conflicts with running specs (non-isolated only)
-    if [[ -z "${worktree_arg}" ]] && [[ "${worktree_isolate}" != "true" ]]; then
-        local conflict_output
-        conflict_output=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
-import sys, os, json
-sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.conflict_detector import should_block
-from lib.queue import _read_entry, _write_entry
-from lib.locking import queue_lock
-
-queue_dir = sys.argv[1]
-queue_id = sys.argv[2]
-
-blockers = should_block(queue_dir, queue_id)
-if blockers:
-    # Auto-add blocked_by entries
-    with queue_lock(queue_dir):
-        entry = _read_entry(queue_dir, queue_id)
-        if entry:
-            existing = set(entry.get("blocked_by", []))
-            for b in blockers:
-                existing.add(b["blocking_id"])
-            entry["blocked_by"] = sorted(existing)
-            _write_entry(queue_dir, entry)
-
-    # Print info about auto-blocks
-    for b in blockers:
-        files_str = ", ".join(b["shared_files"][:3])
-        if len(b["shared_files"]) > 3:
-            files_str += f" (+{len(b['shared_files']) - 3} more)"
-        print(f"Auto-blocked by {b['blocking_id']} (both modify {files_str})")
-PYEOF
-        )
-        if [[ -n "${conflict_output}" ]]; then
-            echo "${conflict_output}" | while read -r line; do
-                info "${line}"
-            done
-        fi
-    fi
-
     # Start daemon if not already running
     if require_daemon; then
         progress_step "Starting daemon"
@@ -582,167 +528,6 @@ PYEOF
 
     echo ""
     info "Dispatched. Monitor with: boi status"
-}
-
-# ─── Subcommand: merge ───────────────────────────────────────────────────────
-
-cmd_merge() {
-    local queue_id=""
-    local abort_merge=false
-    local list_merges=false
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --abort)
-                abort_merge=true
-                shift
-                ;;
-            --list)
-                list_merges=true
-                shift
-                ;;
-            -h|--help)
-                echo "Usage: boi merge <queue-id> [--abort]"
-                echo "       boi merge --list"
-                echo ""
-                echo "Merge a completed spec's worktree branch back to main."
-                echo ""
-                echo "Options:"
-                echo "  --abort   Discard the spec's changes and clean up worktree"
-                echo "  --list    Show all specs with pending merges"
-                exit 0
-                ;;
-            -*)
-                die_usage "Unknown option: $1"
-                ;;
-            *)
-                if [[ -z "${queue_id}" ]]; then
-                    queue_id="$1"
-                    shift
-                else
-                    die_usage "Unexpected argument: $1"
-                fi
-                ;;
-        esac
-    done
-
-    require_config
-
-    # --list mode: show specs needing merge
-    if [[ "${list_merges}" == "true" ]]; then
-        BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
-import sys, os, json
-sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.queue import get_queue
-
-queue_dir = sys.argv[1]
-entries = get_queue(queue_dir)
-
-pending = [e for e in entries if e.get("merge_status") == "conflict" or
-           (e.get("worktree_isolate") and e.get("status") in ("completed", "needs_merge") and e.get("merge_status") != "merged")]
-
-if not pending:
-    print("No specs with pending merges.")
-    sys.exit(0)
-
-print(f"{'ID':<10}{'SPEC':<25}{'MERGE STATUS':<16}{'CONFLICTING FILES'}")
-for e in pending:
-    qid = e.get("id", "?")
-    spec_path = e.get("original_spec_path", e.get("spec_path", ""))
-    spec_name = os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
-    merge_st = e.get("merge_status", "pending")
-    conflicts = e.get("conflicting_files", [])
-    conflict_str = ", ".join(conflicts[:3])
-    if len(conflicts) > 3:
-        conflict_str += f" (+{len(conflicts) - 3} more)"
-    if not conflict_str:
-        conflict_str = "-"
-    print(f"{qid:<10}{spec_name:<25}{merge_st:<16}{conflict_str}")
-PYEOF
-        return
-    fi
-
-    # Require queue-id for merge/abort
-    if [[ -z "${queue_id}" ]]; then
-        die "Specify a queue-id. Use 'boi merge --list' to see pending merges."
-    fi
-
-    # --abort mode: discard changes and clean up
-    if [[ "${abort_merge}" == "true" ]]; then
-        progress_step "Aborting merge for ${queue_id}"
-        local abort_result
-        abort_result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
-import sys, os
-sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.queue import cleanup_spec_worktree
-
-queue_dir = sys.argv[1]
-queue_id = sys.argv[2]
-
-result = cleanup_spec_worktree(queue_dir, queue_id)
-if result:
-    print("cleaned")
-else:
-    print("no_worktree")
-PYEOF
-        )
-
-        if [[ "${abort_result}" == "cleaned" ]]; then
-            progress_done "worktree removed, changes discarded"
-        else
-            progress_fail "no worktree found for ${queue_id}"
-        fi
-        return
-    fi
-
-    # Normal merge: attempt to merge the spec's branch
-    progress_step "Merging ${queue_id}"
-    local merge_result
-    merge_result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
-import sys, os, json
-sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.queue import merge_spec_worktree
-
-queue_dir = sys.argv[1]
-queue_id = sys.argv[2]
-
-result = merge_spec_worktree(queue_dir, queue_id)
-print(json.dumps(result))
-PYEOF
-    )
-
-    local merge_status
-    merge_status=$(echo "${merge_result}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('merge_status','error'))")
-
-    case "${merge_status}" in
-        merged)
-            progress_done "branch merged, worktree cleaned up"
-            ;;
-        conflict)
-            progress_fail "merge conflicts detected"
-            echo ""
-            local conflict_files
-            conflict_files=$(echo "${merge_result}" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-for f in d.get('conflicting_files', []):
-    print(f'  {f}')
-")
-            if [[ -n "${conflict_files}" ]]; then
-                echo "Conflicting files:"
-                echo "${conflict_files}"
-            fi
-            echo ""
-            info "Resolve conflicts manually, then run: boi merge ${queue_id}"
-            info "To discard changes: boi merge ${queue_id} --abort"
-            ;;
-        no_worktree)
-            progress_fail "no worktree found for ${queue_id}"
-            ;;
-        *)
-            progress_fail "merge failed: ${merge_status}"
-            ;;
-    esac
 }
 
 # ─── Subcommand: queue ──────────────────────────────────────────────────────
@@ -784,39 +569,84 @@ cmd_queue() {
 cmd_status() {
     local watch_mode=false
     local json_mode=false
+    local sort_mode=""
+    local filter_status=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --watch) watch_mode=true; shift ;;
             --json) json_mode=true; shift ;;
+            --sort)
+                if [[ $# -lt 2 ]]; then
+                    die_usage "--sort requires a value (queue, status, progress, dag, name, recent)"
+                fi
+                sort_mode="$2"; shift 2 ;;
+            --sort=*) sort_mode="${1#--sort=}"; shift ;;
+            --filter)
+                if [[ $# -lt 2 ]]; then
+                    die_usage "--filter requires a value (all, running, queued, completed)"
+                fi
+                filter_status="$2"; shift 2 ;;
+            --filter=*) filter_status="${1#--filter=}"; shift ;;
             -h|--help)
-                echo "Usage: boi status [--watch] [--json]"
+                echo "Usage: boi status [--watch] [--json] [--sort MODE] [--filter STATUS]"
                 echo ""
                 echo "Options:"
-                echo "  --watch   Auto-refresh every 2s"
-                echo "  --json    Output machine-readable JSON"
+                echo "  --watch           Auto-refresh interactive dashboard"
+                echo "  --json            Output machine-readable JSON"
+                echo "  --sort MODE       Sort by: queue, status, progress, dag, name, recent"
+                echo "  --filter STATUS   Filter by: all, running, queued, completed"
+                echo ""
+                echo "Examples:"
+                echo "  boi status --sort progress          # One-shot sorted output"
+                echo "  boi status --filter running         # One-shot filtered output"
+                echo "  boi status --watch --sort dag       # Interactive with initial sort"
                 exit 0
                 ;;
             *) die_usage "Unknown option: $1" ;;
         esac
     done
 
+    # Validate sort mode if provided
+    if [[ -n "${sort_mode}" ]]; then
+        case "${sort_mode}" in
+            queue|status|progress|dag|name|recent) ;;
+            *) die_usage "Invalid sort mode '${sort_mode}'. Must be: queue, status, progress, dag, name, recent" ;;
+        esac
+    fi
+
+    # Validate filter status if provided
+    if [[ -n "${filter_status}" ]]; then
+        case "${filter_status}" in
+            all|running|queued|completed) ;;
+            *) die_usage "Invalid filter '${filter_status}'. Must be: all, running, queued, completed" ;;
+        esac
+    fi
+
     require_config
 
     if [[ "${watch_mode}" == "true" ]]; then
         if [[ -f "${SCRIPT_DIR}/dashboard.sh" ]]; then
+            # Pass initial sort/filter to dashboard via environment variables
+            [[ -n "${sort_mode}" ]] && export BOI_SORT_MODE="${sort_mode}"
+            [[ -n "${filter_status}" ]] && export BOI_FILTER_STATUS="${filter_status}"
             exec bash "${SCRIPT_DIR}/dashboard.sh"
         else
             # Fallback: loop with clear + queue display
             while true; do
                 clear
-                cmd_queue_inner "${json_mode}"
+                cmd_queue_inner "${json_mode}" "${sort_mode}" "${filter_status}"
                 sleep 2
             done
         fi
     fi
 
-    cmd_queue_inner "${json_mode}"
+    # Non-interactive: if sort or filter specified, use dashboard format for richer output
+    if [[ -n "${sort_mode}" || -n "${filter_status}" ]]; then
+        cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}"
+    else
+        cmd_queue_inner "${json_mode}"
+    fi
 
     # Check daemon heartbeat staleness
     local heartbeat_file="${BOI_STATE_DIR}/daemon-heartbeat"
@@ -878,20 +708,62 @@ else:
 PYEOF
 }
 
+# Non-interactive sorted/filtered output using format_dashboard
+cmd_queue_sorted() {
+    local sort_mode="${1:-queue}"
+    local filter_status="${2:-all}"
+
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${BOI_CONFIG}" "${sort_mode}" "${filter_status}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.status import build_queue_status, format_dashboard
+
+queue_dir = sys.argv[1]
+config_path = sys.argv[2]
+sort_mode = sys.argv[3]
+filter_status = sys.argv[4]
+
+config = None
+if os.path.isfile(config_path):
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except Exception:
+        pass
+
+status_data = build_queue_status(queue_dir, config)
+output = format_dashboard(
+    status_data,
+    sort_mode=sort_mode,
+    filter_status=filter_status,
+    show_completed=True,
+    selected_row=-1,
+)
+
+# Strip __QUEUE_IDS__ metadata line from output
+for line in output.splitlines():
+    if not line.startswith("__QUEUE_IDS__:"):
+        print(line)
+PYEOF
+}
+
 # ─── Subcommand: log ─────────────────────────────────────────────────────────
 
 cmd_log() {
     local queue_id=""
     local full_mode=false
+    local failures_mode=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --full) full_mode=true; shift ;;
+            --failures) failures_mode=true; shift ;;
             -h|--help)
-                echo "Usage: boi log [queue-id] [--full]"
+                echo "Usage: boi log [queue-id] [--full] [--failures]"
                 echo ""
                 echo "Options:"
-                echo "  --full    Show full output (default: tail last 50 lines)"
+                echo "  --full       Show full output (default: tail last 50 lines)"
+                echo "  --failures   Show only failed iteration logs"
                 echo ""
                 echo "If no queue-id is given, shows logs for the most recent spec."
                 exit 0
@@ -954,6 +826,50 @@ cmd_log() {
         else
             die "Unknown spec '${queue_id}'. Use 'boi queue' to see queued specs."
         fi
+    fi
+
+    # --failures mode: show tail of each failed iteration's log
+    if [[ "${failures_mode}" == "true" ]]; then
+        local found_failures=false
+        for log_file in $(ls "${LOG_DIR}/${queue_id}"-iter-*.log 2>/dev/null | sort -t- -k4 -n); do
+            if [[ ! -f "${log_file}" ]]; then
+                continue
+            fi
+            local iter_num
+            iter_num=$(echo "${log_file}" | sed -n "s/.*-iter-\([0-9]*\)\.log/\1/p")
+            # Check if this iteration has a failure_reason in its metadata
+            local iter_meta="${QUEUE_DIR}/${queue_id}.iteration-${iter_num}.json"
+            if [[ -f "${iter_meta}" ]]; then
+                local has_failure
+                has_failure=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('${iter_meta}'))
+    if d.get('failure_reason') or d.get('crash'):
+        print('yes')
+    else:
+        print('no')
+except Exception:
+    print('no')
+" 2>/dev/null)
+                if [[ "${has_failure}" == "yes" ]]; then
+                    found_failures=true
+                    local reason
+                    reason=$(python3 -c "
+import json
+d = json.load(open('${iter_meta}'))
+print(d.get('failure_reason', 'Unknown error'))
+" 2>/dev/null)
+                    echo -e "${RED}── Iteration ${iter_num}: ${reason}${NC}"
+                    tail -n 20 "${log_file}"
+                    echo ""
+                fi
+            fi
+        done
+        if [[ "${found_failures}" == "false" ]]; then
+            echo "No failed iterations found for ${queue_id}."
+        fi
+        return
     fi
 
     echo -e "${DIM}Log: ${latest_log} (iteration ${latest_iter})${NC}"
@@ -3213,7 +3129,6 @@ usage() {
     echo "  status      Show workers + queue progress"
     echo "  log         View logs for a spec"
     echo "  cancel      Cancel a queued/running spec"
-    echo "  merge       Merge a spec's worktree branch back to main"
     echo "  stop        Stop daemon and all workers"
     echo "  workers     Show worker/worktree status"
     echo "  telemetry   Show per-iteration breakdown"
@@ -3237,12 +3152,10 @@ usage() {
     echo "  boi log                             # tail most recent spec"
     echo "  boi log q-001                       # tail specific spec"
     echo "  boi log q-001 --full                # full output"
+    echo "  boi log q-001 --failures            # show only failed iterations"
     echo "  boi review q-001                    # review experiments"
     echo "  boi cancel                          # cancel most recent"
     echo "  boi cancel q-001                    # cancel specific spec"
-    echo "  boi merge --list                    # show pending merges"
-    echo "  boi merge q-001                     # merge spec branch"
-    echo "  boi merge q-001 --abort             # discard spec changes"
     echo "  boi stop                            # stop everything"
     echo "  boi workers                         # show worktrees"
     echo "  boi telemetry                       # iteration breakdown"
@@ -3277,7 +3190,6 @@ main() {
         status)     cmd_status "$@" ;;
         log)        cmd_log "$@" ;;
         cancel)     cmd_cancel "$@" ;;
-        merge)      cmd_merge "$@" ;;
         review)     cmd_review "$@" ;;
         stop)       cmd_stop "$@" ;;
         purge)      cmd_purge "$@" ;;
