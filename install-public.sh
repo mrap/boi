@@ -2,7 +2,7 @@
 # install-public.sh — Public installer for BOI (Beginning of Infinity).
 #
 # Install BOI on any macOS or Linux machine:
-#   curl -fsSL https://raw.githubusercontent.com/your-org/boi/main/install-public.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/mrap/boi/main/install-public.sh | bash
 #   bash install-public.sh
 #
 # This script:
@@ -16,7 +16,7 @@ set -uo pipefail
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
-BOI_REPO="https://github.com/your-org/boi.git"
+BOI_REPO="https://github.com/mrap/boi.git"
 DEFAULT_PREFIX="${HOME}/.boi"
 BOI_SRC_DIR=""  # set after prefix is known
 BOI_STATE_DIR=""  # set after prefix is known

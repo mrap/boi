@@ -21,8 +21,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/boi-dev/boi"
-Issues = "https://github.com/boi-dev/boi/issues"
+Homepage = "https://github.com/mrap/boi"
+Issues = "https://github.com/mrap/boi/issues"
 
 [tool.setuptools.packages.find]
 include = ["lib*"]

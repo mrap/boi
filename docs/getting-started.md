@@ -14,13 +14,13 @@ This guide walks you through installing BOI, writing your first spec, dispatchin
 ### Quick install (curl)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/boi-dev/boi/main/install-public.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mrap/boi/main/install-public.sh | bash
 ```
 
 ### Manual install (clone)
 
 ```bash
-git clone https://github.com/boi-dev/boi.git ~/boi
+git clone https://github.com/mrap/boi.git ~/boi
 bash ~/boi/install.sh --workers 3
 ```
 

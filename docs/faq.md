@@ -29,12 +29,12 @@ No pip packages, no Docker (optional), no cloud services.
 ### How do I install BOI?
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/boi-dev/boi/main/install-public.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mrap/boi/main/install-public.sh | bash
 ```
 
 Or manually:
 ```bash
-git clone https://github.com/boi-dev/boi.git ~/boi
+git clone https://github.com/mrap/boi.git ~/boi
 bash ~/boi/install.sh --workers 3
 ```
 
