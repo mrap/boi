@@ -528,6 +528,8 @@ main() {
 
     if [[ "${pre_pending}" == "0" ]] && [[ "${CRITIC_MODE}" != "true" ]] && [[ "${DECOMPOSE_MODE}" != "true" ]] && [[ "${EVALUATE_MODE}" != "true" ]]; then
         log_info "No PENDING tasks in spec. Exiting with success."
+        # Write exit file so the daemon can detect completion without a PID
+        echo "0" > "${EXIT_FILE}"
         exit 0
     fi
 

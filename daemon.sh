@@ -243,12 +243,45 @@ PYEOF
 
     # Read PID from the PID file
     local pid_file="${QUEUE_DIR}/${queue_id}.pid"
+    local exit_file="${QUEUE_DIR}/${queue_id}.exit"
     local pid=""
     if [[ -f "${pid_file}" ]]; then
         pid=$(cat "${pid_file}")
     fi
 
     if [[ -z "${pid}" ]]; then
+        # Worker exited immediately (e.g., 0 PENDING tasks). Check for exit file.
+        if [[ -f "${exit_file}" ]]; then
+            log_info "Worker for spec ${queue_id} exited immediately (exit file found). Processing completion."
+
+            # Process completion inline since there's no PID to monitor
+            local result_json
+            result_json=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" "${EVENTS_DIR}" "${LOG_DIR}" "${BOI_STATE_DIR}/hooks" "${SCRIPT_DIR}" "$(cat "${exit_file}")" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.daemon_ops import process_worker_completion
+result = process_worker_completion(
+    queue_dir=sys.argv[1],
+    queue_id=sys.argv[2],
+    events_dir=sys.argv[3],
+    log_dir=sys.argv[4],
+    hooks_dir=sys.argv[5],
+    script_dir=sys.argv[6],
+    exit_code=sys.argv[7] if sys.argv[7] != "__none__" else None,
+)
+print(json.dumps(result))
+PYEOF
+            )
+
+            local outcome
+            outcome=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('outcome','unknown'))" 2>/dev/null || echo "unknown")
+            log_info "Spec ${queue_id} immediate completion — outcome: ${outcome}"
+
+            # Clean up exit file
+            rm -f "${exit_file}"
+            return 0
+        fi
+
         log_error "Failed to get PID for spec ${queue_id}."
         return 1
     fi
@@ -395,6 +428,23 @@ elif phase == "evaluate":
         spec_path=entry.get("spec_path", "") if entry else "",
         exit_code=exit_code,
     )
+elif phase == "critic":
+    if exit_code is not None and exit_code == "0":
+        from lib.daemon_ops import process_critic_completion
+        result = process_critic_completion(
+            queue_dir=queue_dir,
+            queue_id=queue_id,
+            events_dir=events_dir,
+            hooks_dir=sys.argv[5],
+            spec_path=entry.get("spec_path", "") if entry else "",
+        )
+    else:
+        # Critic crashed — complete the spec anyway to avoid infinite loops
+        from lib.queue import complete as _complete
+        from lib.spec_parser import count_boi_tasks as _count
+        _counts = _count(entry.get("spec_path", "")) if entry and entry.get("spec_path") else {"done": 0, "total": 0}
+        _complete(queue_dir, queue_id, _counts["done"], _counts["total"])
+        result = {"outcome": "critic_approved", "critic_crashed": True}
 else:
     from lib.daemon_ops import process_worker_completion
     result = process_worker_completion(
@@ -417,6 +467,52 @@ PYEOF
     case "${outcome}" in
         completed)
             log_info "Spec ${queue_id} completed" ;;
+        critic_review)
+            local critic_pass
+            critic_pass=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('critic_pass',1))" 2>/dev/null || echo "1")
+            log_info "Spec ${queue_id} entering critic review (pass ${critic_pass})"
+
+            # Set phase to "critic" and status to "running" for the critic worker
+            local critic_iter critic_spec_path
+            critic_iter=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" "${worker_id}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.queue import _read_entry, _write_entry, set_running
+entry = _read_entry(sys.argv[1], sys.argv[2])
+if entry:
+    entry["phase"] = "critic"
+    _write_entry(sys.argv[1], entry)
+set_running(sys.argv[1], sys.argv[2], sys.argv[3])
+entry = _read_entry(sys.argv[1], sys.argv[2])
+print(json.dumps({"iteration": entry.get("iteration", 1), "spec_path": entry.get("spec_path", "")}))
+PYEOF
+            )
+            local c_iteration c_spec_path
+            c_iteration=$(echo "${critic_iter}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['iteration'])")
+            c_spec_path=$(echo "${critic_iter}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['spec_path'])")
+
+            # Launch critic worker
+            bash "${WORKER_SCRIPT}" --critic "${queue_id}" "${WORKER_CHECKOUTS[${worker_id}]}" "${c_spec_path}" "${c_iteration}" >> "${DAEMON_LOG}" 2>&1
+
+            # Read PID from the PID file
+            local critic_pid_file="${QUEUE_DIR}/${queue_id}.pid"
+            local critic_pid=""
+            if [[ -f "${critic_pid_file}" ]]; then
+                critic_pid=$(cat "${critic_pid_file}")
+            fi
+
+            if [[ -n "${critic_pid}" ]]; then
+                WORKER_PIDS["${worker_id}"]="${critic_pid}"
+                WORKER_START_TIME["${worker_id}"]="$(date +%s)"
+                log_info "Critic worker launched for ${queue_id} (PID ${critic_pid}, pass ${critic_pass})"
+            else
+                log_error "Failed to launch critic worker for ${queue_id}. Freeing worker."
+                free_worker "${worker_id}" "${queue_id}"
+            fi
+
+            # Return early — do NOT free the worker (critic is running)
+            return 0
+            ;;
         requeued)
             log_info "Spec ${queue_id} requeued (still has pending tasks)" ;;
         failed)
@@ -449,6 +545,12 @@ PYEOF
             log_info "Spec ${queue_id} evaluation found ${pending} unmet criteria. Looping back to execute phase." ;;
         evaluate_crashed)
             log_warn "Spec ${queue_id} evaluation crashed, requeued." ;;
+        critic_approved)
+            log_info "Spec ${queue_id} critic approved, marking completed" ;;
+        critic_tasks_added)
+            local critic_tasks
+            critic_tasks=$(echo "${result_json}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read()).get('critic_tasks_added',0))" 2>/dev/null || echo "0")
+            log_info "Spec ${queue_id} critic added ${critic_tasks} task(s), requeued for execution" ;;
         *)
             log_error "Spec ${queue_id} unknown outcome: ${outcome}" ;;
     esac

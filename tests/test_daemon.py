@@ -894,5 +894,50 @@ class TestWorkerTimeout(DaemonTestCase):
         self.assertIn("cooldown_until", entry)
 
 
+# ─── Zero-Pending Immediate Completion Tests ────────────────────────────────
+
+
+class TestZeroPendingImmediateCompletion(DaemonTestCase):
+    """Test the daemon handles workers that exit immediately with 0 PENDING tasks.
+
+    When worker.sh finds 0 PENDING tasks, it writes an exit file (code 0)
+    and exits without creating a tmux session or PID file. The daemon's
+    assign_spec_to_worker() must detect this and process completion
+    immediately instead of waiting for a PID-based poll cycle.
+    """
+
+    def test_zero_pending_exit_file_triggers_completion(self):
+        """A spec with 0 PENDING tasks should complete via exit file without PID."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
+        e = enqueue(self.queue_dir, spec_path)
+        set_running(self.queue_dir, e["id"], "w-1")
+
+        # Simulate what worker.sh does: write exit file, no PID file
+        self._write_exit_file(e["id"], 0)
+        pid_file = os.path.join(self.queue_dir, f"{e['id']}.pid")
+        self.assertFalse(os.path.isfile(pid_file))
+
+        # The daemon should be able to process completion from the exit file
+        exit_file = os.path.join(self.queue_dir, f"{e['id']}.exit")
+        self.assertTrue(os.path.isfile(exit_file))
+        exit_code = Path(exit_file).read_text().strip()
+        self.assertEqual(exit_code, "0")
+
+        # Process completion as the daemon would
+        complete(self.queue_dir, e["id"], tasks_done=3, tasks_total=3)
+        entry = get_entry(self.queue_dir, e["id"])
+        self.assertEqual(entry["status"], "completed")
+
+    def test_zero_pending_no_pid_file_no_exit_file_is_error(self):
+        """If neither PID nor exit file exist after worker, it's an error."""
+        spec_path = self._create_spec(tasks_pending=3)
+        e = enqueue(self.queue_dir, spec_path)
+
+        pid_file = os.path.join(self.queue_dir, f"{e['id']}.pid")
+        exit_file = os.path.join(self.queue_dir, f"{e['id']}.exit")
+        self.assertFalse(os.path.isfile(pid_file))
+        self.assertFalse(os.path.isfile(exit_file))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1037,5 +1037,107 @@ class TestCriticHelpers(unittest.TestCase):
             self.assertIn("1", result)
 
 
+class TestCriticReviewDaemonIntegration(DaemonOpsTestCase):
+    """Tests for daemon handling of critic_review outcome.
+
+    Verifies that when process_worker_completion returns critic_review,
+    the daemon's expected follow-up actions (phase transition, critic worker
+    launch, and critic completion processing) work correctly.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Enable critic
+        self.critic_dir = os.path.join(self.boi_state, "critic")
+        os.makedirs(self.critic_dir, exist_ok=True)
+        os.makedirs(os.path.join(self.critic_dir, "custom"), exist_ok=True)
+        config = {
+            "enabled": True,
+            "trigger": "on_complete",
+            "max_passes": 2,
+            "checks": ["spec-integrity"],
+            "custom_checks_dir": "custom",
+            "timeout_seconds": 600,
+        }
+        config_path = os.path.join(self.critic_dir, "config.json")
+        Path(config_path).write_text(json.dumps(config, indent=2) + "\n")
+        checks_dir = os.path.join(self.script_dir, "templates", "checks")
+        os.makedirs(checks_dir, exist_ok=True)
+
+    def test_critic_review_triggers_phase_transition(self):
+        """After critic_review outcome, setting phase to 'critic' enables
+        process_critic_completion to be called on next completion."""
+        from lib.queue import _read_entry, _write_entry
+
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
+        entry = enqueue(self.queue_dir, spec_path)
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        # Step 1: Process worker completion — should return critic_review
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+        )
+        self.assertEqual(result["outcome"], "critic_review")
+
+        # Step 2: Simulate daemon setting phase to "critic" (as daemon.sh now does)
+        e = _read_entry(self.queue_dir, entry["id"])
+        e["phase"] = "critic"
+        _write_entry(self.queue_dir, e)
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        # Step 3: Simulate critic worker completing with approval
+        # Add "## Critic Approved" to spec
+        content = Path(spec_path).read_text()
+        content += "\n## Critic Approved\n\nAll checks passed.\n"
+        Path(spec_path).write_text(content)
+
+        from lib.daemon_ops import process_critic_completion
+
+        critic_result = process_critic_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            spec_path=spec_path,
+        )
+        self.assertEqual(critic_result["outcome"], "critic_approved")
+
+        # Verify spec is now completed
+        updated = get_entry(self.queue_dir, entry["id"])
+        self.assertEqual(updated["status"], "completed")
+
+    def test_critic_review_requeues_for_critic_worker(self):
+        """critic_review outcome requeues spec so daemon can launch critic worker."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
+        entry = enqueue(self.queue_dir, spec_path)
+        set_running(self.queue_dir, entry["id"], "w-1")
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+        )
+
+        self.assertEqual(result["outcome"], "critic_review")
+
+        # Verify prompt file exists for critic worker
+        prompt_path = result.get("critic_prompt_path", "")
+        self.assertTrue(os.path.isfile(prompt_path))
+
+        # Entry should be requeued (daemon will pick it up and launch critic)
+        updated = get_entry(self.queue_dir, entry["id"])
+        self.assertEqual(updated["status"], "requeued")
+
+
 if __name__ == "__main__":
     unittest.main()
