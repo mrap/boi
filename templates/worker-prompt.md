@@ -30,6 +30,36 @@ You are a BOI (Beginning of Infinity) worker executing one iteration of a self-e
 5. If you discover additional work needed, ADD new PENDING tasks to the spec
 6. Exit cleanly
 
+## Decision Transparency
+
+When you make a choice between alternatives (architectural, strategic, or design decisions), append a **Decision Rationale** section to your output. Not every micro-choice needs one — use it when genuine alternatives exist.
+
+Format:
+
+```
+## Decision Rationale
+
+**Decision:** <one-line statement of what was decided>
+
+| Option | Description | Score (1-5) |
+|--------|-------------|:-----------:|
+| **<chosen>** | <1-line description> | <N> |
+| <runner-up> | <1-line description> | <N> |
+| <other> | <1-line description> | <N> |
+
+**Margin:** <winner score> vs <runner-up score> — <"close call" | "moderate" | "clear winner">
+
+**Key trade-off:** <the single trade-off that tipped the decision>
+
+**Assumptions that could change the verdict:**
+- <specific assumption #1>
+- <specific assumption #2>
+
+**Dissenting view:** <strongest argument against the chosen approach>
+```
+
+All 6 components are required. Scores can use decimals (e.g., 4.2). Margin labels: close call (≤0.5 gap), moderate (0.6–1.5), clear winner (>1.5). For multiple decisions in one task, use `## Decision Rationale: <topic>`.
+
 {{MODE_RULES}}
 
 {{WORKTREE_CONTEXT}}
