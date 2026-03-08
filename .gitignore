@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+.boi/
+.env
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Internal development files (not for public repo)
+specs/
+reports/
+__pycache__/
+*.pyc
+.boi/

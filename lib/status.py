@@ -1,0 +1,714 @@
+# status.py — Format status output for BOI CLI.
+#
+# Reads from the queue directory and builds a status snapshot.
+# Two output modes:
+#   - Human-readable table (for terminal, with color)
+#   - JSON (for programmatic consumption)
+
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from lib.telemetry import load_iteration_files
+
+
+# ANSI color codes
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+RED = "\033[0;31m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+NC = "\033[0m"
+
+# ANSI codes for specific use
+CYAN = "\033[0;36m"
+MAGENTA = "\033[0;35m"
+
+# Status -> color mapping
+STATUS_COLORS: dict[str, str] = {
+    "completed": GREEN,
+    "running": YELLOW,
+    "queued": DIM,
+    "requeued": YELLOW,
+    "failed": RED,
+    "canceled": DIM,
+    "needs_review": MAGENTA,
+}
+
+
+def format_duration(seconds: int | float) -> str:
+    """Format seconds into a human-readable duration string."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    remaining = seconds % 60
+    if minutes < 60:
+        return f"{minutes}m {remaining:02d}s"
+    hours = minutes // 60
+    remaining_mins = minutes % 60
+    return f"{hours}h {remaining_mins:02d}m"
+
+
+def _colorize(text: str, color: str) -> str:
+    """Wrap text in ANSI color codes."""
+    if not color:
+        return text
+    return f"{color}{text}{NC}"
+
+
+def load_queue(queue_dir: str) -> list[dict[str, Any]]:
+    """Load all queue entries from the queue directory.
+
+    Returns a list of queue entry dicts sorted by priority (lower first).
+    """
+    path = Path(queue_dir)
+    if not path.is_dir():
+        return []
+
+    entries = []
+    for f in sorted(path.iterdir()):
+        if not f.name.startswith("q-") or not f.name.endswith(".json"):
+            continue
+        # Skip telemetry and iteration files
+        if ".telemetry" in f.name or ".iteration-" in f.name:
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            if "id" in data:
+                entries.append(data)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    entries.sort(key=lambda e: e.get("priority", 100))
+    return entries
+
+
+def build_queue_status(
+    queue_dir: str, config: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build a status snapshot from the queue directory.
+
+    Returns a dict with:
+        - entries: list of queue entry dicts
+        - summary: counts by status
+        - workers: worker info from config
+    """
+    entries = load_queue(queue_dir)
+
+    status_counts: dict[str, int] = {
+        "queued": 0,
+        "requeued": 0,
+        "running": 0,
+        "completed": 0,
+        "failed": 0,
+        "canceled": 0,
+        "needs_review": 0,
+    }
+
+    for entry in entries:
+        status = entry.get("status", "queued")
+        if status in status_counts:
+            status_counts[status] += 1
+
+    workers = []
+    if config:
+        workers = config.get("workers", [])
+
+    # Enrich entries with telemetry data (quality, progress)
+    for entry in entries:
+        qid = entry.get("id", "")
+        if not qid:
+            continue
+        telem = _load_telemetry_for_entry(queue_dir, qid)
+        if telem:
+            entry["_telemetry"] = telem
+
+    return {
+        "entries": entries,
+        "summary": {
+            "total": len(entries),
+            **status_counts,
+        },
+        "workers": workers,
+    }
+
+
+def _load_telemetry_for_entry(queue_dir: str, queue_id: str) -> dict[str, Any] | None:
+    """Load telemetry data for a queue entry if available."""
+    from lib.telemetry import read_telemetry
+
+    return read_telemetry(queue_dir, queue_id)
+
+
+def _get_quality_display(entry: dict[str, Any], color: bool = True) -> tuple[str, str]:
+    """Get quality and progress display strings for a queue entry.
+
+    Returns (quality_str, progress_str).
+    """
+    telem = entry.get("_telemetry")
+    if not telem:
+        return ("\u2014", "\u2014")  # em dash
+
+    # Quality: use latest non-null score
+    scores = telem.get("quality_score_per_iteration", [])
+    valid_scores = [s for s in scores if s is not None]
+    if not valid_scores:
+        quality_str = "\u2014"
+    else:
+        from lib.quality import format_quality_display, grade
+
+        latest_score = valid_scores[-1]
+        letter = grade(latest_score)
+        quality_str = format_quality_display(latest_score, letter)
+        # Colorize quality grade
+        if color:
+            if latest_score >= 0.85:
+                quality_str = _colorize(quality_str, GREEN)
+            elif latest_score < 0.50:
+                quality_str = _colorize(quality_str, RED)
+
+    # Progress: completion * quality
+    tasks_done = entry.get("tasks_done", 0)
+    tasks_total = entry.get("tasks_total", 0)
+    if tasks_total > 0 and valid_scores:
+        from lib.quality import compute_progress_score
+
+        completion = tasks_done / tasks_total
+        progress = compute_progress_score(completion, valid_scores[-1])
+        progress_str = f"{int(progress * 100)}%"
+    elif tasks_total > 0:
+        # No quality data, show raw completion
+        progress_str = f"{int(tasks_done / tasks_total * 100)}%"
+    else:
+        progress_str = "0%"
+
+    return (quality_str, progress_str)
+
+
+def _get_generate_detail(entry: dict[str, Any]) -> list[str]:
+    """Get Generate mode detail lines for an entry.
+
+    Returns a list of indented detail lines, or empty list if not Generate.
+    """
+    mode = entry.get("mode", "execute")
+    if mode != "generate":
+        return []
+
+    lines = []
+    phase = entry.get("phase", "execute")
+    phase_display = phase.upper()
+
+    # Phase progress (rough: decompose=1, execute=2, evaluate=3)
+    phase_nums = {"decompose": 1, "execute": 2, "evaluate": 3}
+    phase_num = phase_nums.get(phase, 2)
+    lines.append(f"  Phase: {phase_display} ({phase_num}/3)")
+
+    # Success criteria (from queue entry if tracked)
+    criteria_met = entry.get("criteria_met", 0)
+    criteria_total = entry.get("criteria_total", 0)
+    if criteria_total > 0:
+        lines.append(f"  Success Criteria: {criteria_met}/{criteria_total} met")
+
+    # Experiment budget
+    max_exp = entry.get("max_experiment_invocations", 0)
+    used_exp = entry.get("experiment_invocations_used", 0)
+    if max_exp > 0:
+        remaining = max_exp - used_exp
+        lines.append(f"  Experiment budget: {remaining}/{max_exp} remaining")
+
+    return lines
+
+
+def _get_quality_alerts(entries: list[dict[str, Any]], color: bool = True) -> list[str]:
+    """Get quality alert warning lines from all entries.
+
+    Returns warning lines like:
+      ⚠ q-001: Quality declining (dropped 0.18 in last iteration)
+    """
+    alert_lines = []
+    for entry in entries:
+        telem = entry.get("_telemetry")
+        if not telem:
+            continue
+
+        alerts = telem.get("quality_alerts", [])
+        qid = entry.get("id", "?")
+        for alert in alerts:
+            msg = alert.get("message", "Unknown alert")
+            line = f"  \u26a0 {qid}: {msg}"
+            if color:
+                line = _colorize(line, YELLOW)
+            alert_lines.append(line)
+    return alert_lines
+
+
+def format_queue_table(status_data: dict[str, Any], color: bool = True) -> str:
+    """Format queue status as a human-readable table with quality and progress.
+
+    Output:
+        BOI
+
+        QUEUE                         MODE       WORKER  ITER   TASKS       QUALITY    PROGRESS   STATUS
+        q-001  ai-profile-v2          discover   w-1     7/30   5/8 done    B (0.78)   51%        running
+        ...
+    """
+    entries = status_data.get("entries", [])
+    summary = status_data.get("summary", {})
+    workers = status_data.get("workers", [])
+
+    lines = []
+
+    header = "BOI"
+    if color:
+        header = f"{BOLD}{header}{NC}"
+    lines.append(header)
+    lines.append("")
+
+    if not entries:
+        lines.append("No specs in queue.")
+        total_workers = len(workers)
+        if total_workers:
+            lines.append(f"Workers: 0/{total_workers} busy")
+        return "\n".join(lines)
+
+    # Build rows with new columns: QUALITY and PROGRESS
+    col_header = (
+        f"{'QUEUE':<30}{'MODE':<11}{'WORKER':<8}{'ITER':<7}"
+        f"{'TASKS':<12}{'QUALITY':<11}{'PROGRESS':<11}{'STATUS'}"
+    )
+    if color:
+        col_header = f"{BOLD}{col_header}{NC}"
+    lines.append(col_header)
+
+    generate_details: list[tuple[int, list[str]]] = []
+
+    for idx, entry in enumerate(entries):
+        qid = entry.get("id", "?")
+        spec_path = entry.get("original_spec_path", entry.get("spec_path", ""))
+        spec_name = (
+            os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
+        )
+        label = f"{qid}  {spec_name}"
+        if len(label) > 28:
+            label = label[:28]
+
+        mode = entry.get("mode", "execute")
+
+        worker = entry.get("last_worker") or "\u2014"
+        iteration = entry.get("iteration", 0)
+        max_iter = entry.get("max_iterations", 30)
+        iter_str = (
+            f"{iteration}/{max_iter}" if entry.get("status") != "queued" else "\u2014"
+        )
+
+        # Task progress
+        tasks_done = entry.get("tasks_done", 0)
+        tasks_total = entry.get("tasks_total", 0)
+        if tasks_total > 0:
+            tasks_str = f"{tasks_done}/{tasks_total} done"
+        else:
+            tasks_str = "\u2014"
+
+        # Quality and progress from telemetry
+        quality_str, progress_str = _get_quality_display(entry, color)
+
+        status = entry.get("status", "queued")
+        status_display = status
+
+        if color:
+            status_color = STATUS_COLORS.get(status, "")
+            status_display = _colorize(status, status_color)
+
+        lines.append(
+            f"{label:<30}{mode:<11}{worker:<8}{iter_str:<7}"
+            f"{tasks_str:<12}{quality_str:<11}{progress_str:<11}{status_display}"
+        )
+
+        # Collect Generate mode detail blocks
+        gen_detail = _get_generate_detail(entry)
+        if gen_detail:
+            generate_details.append((len(lines), gen_detail))
+
+    # Insert Generate mode detail blocks (after their parent row)
+    for insert_idx, detail_lines in reversed(generate_details):
+        for i, dl in enumerate(detail_lines):
+            lines.insert(insert_idx + i, dl)
+
+    lines.append("")
+
+    # Quality alerts
+    alert_lines = _get_quality_alerts(entries, color)
+    if alert_lines:
+        for al in alert_lines:
+            lines.append(al)
+        lines.append("")
+
+    # Summary line
+    total_workers = len(workers)
+    running = summary.get("running", 0)
+    queued = summary.get("queued", 0) + summary.get("requeued", 0)
+    completed = summary.get("completed", 0)
+    needs_review = summary.get("needs_review", 0)
+
+    parts = []
+    if total_workers:
+        parts.append(f"Workers: {running}/{total_workers} busy")
+
+    queue_parts = []
+    if running:
+        queue_parts.append(f"{running} running")
+    if queued:
+        queue_parts.append(f"{queued} queued")
+    if needs_review:
+        queue_parts.append(f"{needs_review} needs_review")
+    if completed:
+        queue_parts.append(f"{completed} completed")
+
+    if queue_parts:
+        parts.append(f"Queue: {', '.join(queue_parts)}")
+
+    lines.append("  |  ".join(parts) if parts else f"Total: {summary.get('total', 0)}")
+
+    return "\n".join(lines)
+
+
+def format_queue_json(status_data: dict[str, Any]) -> str:
+    """Format queue status as JSON."""
+    return json.dumps(status_data, indent=2, sort_keys=False)
+
+
+# ─── Telemetry ──────────────────────────────────────────────────────────────
+
+
+def build_telemetry(queue_dir: str, queue_id: str) -> dict[str, Any] | None:
+    """Build telemetry data for a single spec.
+
+    Prefers the dedicated telemetry file ({id}.telemetry.json) if available.
+    Falls back to aggregating from iteration-N.json files.
+    Returns None if the queue entry doesn't exist.
+    """
+    entry_path = Path(queue_dir) / f"{queue_id}.json"
+    if not entry_path.is_file():
+        return None
+
+    try:
+        entry = json.loads(entry_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    spec_path = entry.get("original_spec_path", entry.get("spec_path", ""))
+    spec_name = os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
+
+    # Try dedicated telemetry file first
+    from lib.telemetry import read_telemetry as _read_telem
+
+    telem = _read_telem(queue_dir, queue_id)
+    if telem is not None:
+        return {
+            "queue_id": queue_id,
+            "spec_name": spec_name,
+            "spec_path": spec_path,
+            "status": entry.get("status", "?"),
+            "iteration": entry.get("iteration", 0),
+            "max_iterations": entry.get("max_iterations", 30),
+            "tasks_done": entry.get("tasks_done", 0),
+            "tasks_total": entry.get("tasks_total", 0),
+            "total_time_seconds": telem.get("total_time_seconds", 0),
+            "total_tasks_completed": sum(
+                telem.get("tasks_completed_per_iteration", [])
+            ),
+            "total_tasks_added": sum(telem.get("tasks_added_per_iteration", [])),
+            "total_tasks_skipped": sum(telem.get("tasks_skipped_per_iteration", [])),
+            "consecutive_failures": telem.get(
+                "consecutive_failures", entry.get("consecutive_failures", 0)
+            ),
+            "iterations": _telem_to_iteration_list(telem),
+            # Deutschian progress metrics
+            "evolution_ratio": telem.get("evolution_ratio"),
+            "productive_failure_rate": telem.get("productive_failure_rate"),
+            "first_pass_rate": telem.get("first_pass_rate"),
+        }
+
+    # Fallback: aggregate from iteration files
+    iterations = load_iteration_files(queue_dir, queue_id)
+
+    total_time = sum(it.get("duration_seconds", 0) for it in iterations)
+    total_tasks_completed = sum(it.get("tasks_completed", 0) for it in iterations)
+    total_tasks_added = sum(it.get("tasks_added", 0) for it in iterations)
+    total_tasks_skipped = sum(it.get("tasks_skipped", 0) for it in iterations)
+
+    return {
+        "queue_id": queue_id,
+        "spec_name": spec_name,
+        "spec_path": spec_path,
+        "status": entry.get("status", "?"),
+        "iteration": entry.get("iteration", 0),
+        "max_iterations": entry.get("max_iterations", 30),
+        "tasks_done": entry.get("tasks_done", 0),
+        "tasks_total": entry.get("tasks_total", 0),
+        "total_time_seconds": total_time,
+        "total_tasks_completed": total_tasks_completed,
+        "total_tasks_added": total_tasks_added,
+        "total_tasks_skipped": total_tasks_skipped,
+        "consecutive_failures": entry.get("consecutive_failures", 0),
+        "iterations": iterations,
+    }
+
+
+def _telem_to_iteration_list(telem: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert per-iteration arrays from telemetry.json to iteration dicts.
+
+    This bridges the telemetry file format (arrays of values per metric)
+    to the iteration list format used by format_telemetry_table.
+    """
+    completed = telem.get("tasks_completed_per_iteration", [])
+    added = telem.get("tasks_added_per_iteration", [])
+    skipped = telem.get("tasks_skipped_per_iteration", [])
+    count = max(len(completed), len(added), len(skipped))
+
+    result = []
+    for i in range(count):
+        result.append(
+            {
+                "iteration": i + 1,
+                "tasks_completed": completed[i] if i < len(completed) else 0,
+                "tasks_added": added[i] if i < len(added) else 0,
+                "tasks_skipped": skipped[i] if i < len(skipped) else 0,
+                "duration_seconds": 0,  # Not stored per-iteration in telemetry arrays
+                "exit_code": 0,
+            }
+        )
+    return result
+
+
+def format_telemetry_table(telemetry: dict[str, Any], color: bool = True) -> str:
+    """Format telemetry data as a human-readable report."""
+    lines = []
+
+    spec_name = telemetry.get("spec_name", "?")
+    queue_id = telemetry.get("queue_id", "?")
+    iteration = telemetry.get("iteration", 0)
+    max_iter = telemetry.get("max_iterations", 30)
+    tasks_done = telemetry.get("tasks_done", 0)
+    tasks_total = telemetry.get("tasks_total", 0)
+    total_added = telemetry.get("total_tasks_added", 0)
+    total_skipped = telemetry.get("total_tasks_skipped", 0)
+    total_time = telemetry.get("total_time_seconds", 0)
+    status = telemetry.get("status", "?")
+
+    header = f"Spec: {spec_name} ({queue_id})"
+    if color:
+        header = f"{BOLD}{header}{NC}"
+    lines.append(header)
+
+    status_color = STATUS_COLORS.get(status, "")
+    status_display = _colorize(status, status_color) if color else status
+    lines.append(f"Status: {status_display}")
+    lines.append(f"Iterations: {iteration} of {max_iter}")
+    lines.append(f"Total time: {format_duration(total_time)}")
+
+    task_parts = [f"{tasks_done}/{tasks_total} done"]
+    if total_added:
+        task_parts.append(f"{total_added} added (self-evolved)")
+    if total_skipped:
+        task_parts.append(f"{total_skipped} skipped")
+    lines.append(f"Tasks: {', '.join(task_parts)}")
+
+    failures = telemetry.get("consecutive_failures", 0)
+    if failures:
+        lines.append(f"Consecutive failures: {failures}")
+
+    # Deutschian progress metrics
+    evo_ratio = telemetry.get("evolution_ratio")
+    pfr = telemetry.get("productive_failure_rate")
+    fpr = telemetry.get("first_pass_rate")
+    if evo_ratio is not None or pfr is not None or fpr is not None:
+        lines.append("")
+        lines.append("Progress metrics:")
+        if evo_ratio is not None:
+            pct = f"{evo_ratio:.0%}"
+            lines.append(f"  Evolution ratio: {pct} (self-evolved tasks / total done)")
+        if pfr is not None:
+            pct = f"{pfr:.0%}"
+            lines.append(
+                f"  Productive failure rate: {pct} (failed iters that added tasks)"
+            )
+        if fpr is not None:
+            pct = f"{fpr:.0%}"
+            lines.append(
+                f"  First-pass rate: {pct} (tasks done without critic rejection)"
+            )
+
+    iterations = telemetry.get("iterations", [])
+    if iterations:
+        lines.append("")
+        lines.append("Iteration breakdown:")
+        for it in iterations:
+            it_num = it.get("iteration", "?")
+            it_done = it.get("tasks_completed", 0)
+            it_added = it.get("tasks_added", 0)
+            it_skipped = it.get("tasks_skipped", 0)
+            it_duration = it.get("duration_seconds", 0)
+            it_exit = it.get("exit_code", 0)
+
+            parts = [f"{it_done} tasks done"]
+            parts.append(f"{it_added} added")
+            parts.append(f"{it_skipped} skipped")
+            time_str = format_duration(it_duration)
+
+            suffix_parts = [f"({time_str})"]
+
+            exit_note = ""
+            if it_exit != 0:
+                exit_note = f" [exit {it_exit}]"
+                if color:
+                    exit_note = _colorize(exit_note, RED)
+
+            suffix = " ".join(suffix_parts)
+            lines.append(f"  #{it_num}: {', '.join(parts)} {suffix}{exit_note}")
+
+    return "\n".join(lines)
+
+
+def format_telemetry_json(telemetry: dict[str, Any]) -> str:
+    """Format telemetry data as JSON."""
+    return json.dumps(telemetry, indent=2, sort_keys=False)
+
+
+# ─── Dashboard (compact view) ──────────────────────────────────────────────
+
+
+# Status icons (no color — color is applied separately)
+STATUS_ICONS: dict[str, str] = {
+    "completed": "\u2713",  # ✓
+    "running": "\u25b6",  # ▶
+    "queued": "\u00b7",  # ·
+    "requeued": "\u25b6",  # ▶ (same as running, will be picked up soon)
+    "failed": "\u2717",  # ✗
+    "canceled": "\u2013",  # –
+    "needs_review": "\u2757",  # ❗
+}
+
+
+def format_dashboard(status_data: dict[str, Any], color: bool = True) -> str:
+    """Format queue status as a compact dashboard for tmux panes.
+
+    Designed for 80-char width. Color-coded by status. Shows mode and quality.
+
+    Output:
+        ═══ BOI ═══════════════════════════════════════════════ 08:23 ══
+         ✓ q-001 ios-recording    disc  5/8  3i  B(0.78)
+         ▶ q-002 topic-chats      exec  2/9  1i  ---      w-1
+         · q-003 heartbeat        chal  0/5  0i  ---
+        Workers: 1/3 busy | Queue: 3
+    """
+    entries = status_data.get("entries", [])
+    summary = status_data.get("summary", {})
+    workers = status_data.get("workers", [])
+
+    lines: list[str] = []
+
+    # Header bar
+    now = datetime.now()
+    time_str = now.strftime("%H:%M")
+    header_text = "\u2550\u2550\u2550 BOI "
+    right = f" {time_str} \u2550\u2550"
+    fill_len = 72 - len(header_text) - len(right)
+    if fill_len < 1:
+        fill_len = 1
+    header_line = header_text + ("\u2550" * fill_len) + right
+    if color:
+        header_line = f"{BOLD}{header_line}{NC}"
+    lines.append(header_line)
+
+    if not entries:
+        lines.append(" No specs in queue.")
+        total_workers = len(workers)
+        if total_workers:
+            lines.append(f" Workers: 0/{total_workers} idle")
+        return "\n".join(lines)
+
+    # Mode abbreviations for compact display
+    mode_abbrev: dict[str, str] = {
+        "execute": "exec",
+        "challenge": "chal",
+        "discover": "disc",
+        "generate": "gen",
+    }
+
+    for entry in entries:
+        status = entry.get("status", "queued")
+        icon = STATUS_ICONS.get(status, "?")
+
+        qid = entry.get("id", "?")
+        spec_path = entry.get("original_spec_path", entry.get("spec_path", ""))
+        spec_name = (
+            os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
+        )
+        max_name_len = 20
+        if len(spec_name) > max_name_len:
+            spec_name = spec_name[:max_name_len]
+
+        mode = entry.get("mode", "execute")
+        mode_str = mode_abbrev.get(mode, mode[:4])
+
+        tasks_done = entry.get("tasks_done", 0)
+        tasks_total = entry.get("tasks_total", 0)
+        tasks_str = f"{tasks_done}/{tasks_total}" if tasks_total > 0 else "\u2014"
+
+        iteration = entry.get("iteration", 0)
+        iter_str = f"{iteration}i"
+
+        # Quality compact display
+        telem = entry.get("_telemetry")
+        quality_compact = "\u2014"
+        if telem:
+            scores = telem.get("quality_score_per_iteration", [])
+            valid = [s for s in scores if s is not None]
+            if valid:
+                from lib.quality import grade as _grade
+
+                latest = valid[-1]
+                quality_compact = f"{_grade(latest)}({latest:.2f})"
+
+        worker = entry.get("last_worker") or ""
+        worker_str = f"  {worker}" if worker and status == "running" else ""
+
+        # Build the line
+        label = f"{qid} {spec_name}"
+        right_part = f"{tasks_str}  {iter_str}  {quality_compact}{worker_str}"
+        pad_len = 68 - len(icon) - 2 - len(mode_str) - 2 - len(right_part)
+        if pad_len < len(label) + 1:
+            pad_len = len(label) + 1
+        padded_label = label.ljust(pad_len)
+        row = f" {icon} {padded_label}{mode_str}  {right_part}"
+
+        if color:
+            status_color = STATUS_COLORS.get(status, "")
+            if status_color:
+                row = f"{status_color}{row}{NC}"
+
+        lines.append(row)
+
+    # Quality alerts (compact)
+    alert_lines = _get_quality_alerts(entries, color)
+    if alert_lines:
+        for al in alert_lines:
+            lines.append(al)
+
+    # Summary line
+    total_workers = len(workers)
+    running = summary.get("running", 0)
+    total_specs = summary.get("total", 0)
+
+    parts: list[str] = []
+    if total_workers:
+        parts.append(f"Workers: {running}/{total_workers} busy")
+    parts.append(f"Queue: {total_specs}")
+    summary_line = " | ".join(parts)
+    lines.append(summary_line)
+
+    return "\n".join(lines)

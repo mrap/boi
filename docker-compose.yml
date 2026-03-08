@@ -1,0 +1,23 @@
+# BOI Docker Compose — Run BOI in an isolated container
+#
+# Usage:
+#   docker compose run boi dispatch --spec /project/spec.md
+#   docker compose run boi status
+#   docker compose run boi log
+#
+# The ./project directory (or your project path) is mounted at /project
+# inside the container. Reference spec files as /project/spec.md.
+
+services:
+  boi:
+    build: .
+    volumes:
+      # Mount your project directory into the container
+      - ./project:/project
+    environment:
+      - HOME=/home/boi
+      - TERM=xterm-256color
+    # No ports exposed — BOI is CLI-only
+    # No privileged mode — runs as non-root user
+    stdin_open: true
+    tty: true
