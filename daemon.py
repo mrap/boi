@@ -625,8 +625,9 @@ class Daemon:
                 events_dir=events_dir,
                 log_dir=self.log_dir,
                 hooks_dir=self.hooks_dir,
-                spec_path=spec_path,
+                script_dir=os.path.dirname(os.path.abspath(__file__)),
                 exit_code=str(exit_code),
+                db=self.db,
             )
         elif phase == "critic":
             daemon_ops.process_critic_completion(
