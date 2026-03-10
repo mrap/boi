@@ -1503,7 +1503,6 @@ def process_evaluation_completion(
         write_completion_summary_to_spec(spec_path, summary)
 
         if db:
-            db.update_spec_fields(queue_id, phase="completed")
             db.complete(queue_id, counts["done"], counts["total"])
         else:
             entry["phase"] = "completed"
@@ -1571,7 +1570,6 @@ def process_evaluation_completion(
         write_completion_summary_to_spec(spec_path, summary)
 
         if db:
-            db.update_spec_fields(queue_id, phase="completed")
             db.complete(queue_id, counts["done"], counts["total"])
         else:
             entry["phase"] = "completed"
