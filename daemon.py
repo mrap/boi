@@ -636,7 +636,7 @@ class Daemon:
                 events_dir=events_dir,
                 hooks_dir=self.hooks_dir,
                 spec_path=spec_path,
-                exit_code=str(exit_code),
+                db=self.db,
             )
         elif phase == "decompose":
             daemon_ops.process_decomposition_completion(
@@ -645,6 +645,7 @@ class Daemon:
                 events_dir=events_dir,
                 spec_path=spec_path,
                 exit_code=str(exit_code),
+                db=self.db,
             )
         elif phase == "evaluate":
             daemon_ops.process_evaluation_completion(
@@ -654,6 +655,7 @@ class Daemon:
                 hooks_dir=self.hooks_dir,
                 spec_path=spec_path,
                 exit_code=str(exit_code),
+                db=self.db,
             )
         else:
             logger.warning("Unknown phase '%s' for %s", phase, spec_id)

@@ -519,6 +519,7 @@ def process_worker_completion(
                 # Requeue so daemon can pick it up for critic worker
                 if db:
                     db.requeue(queue_id, done_count, total_count)
+                    db.update_spec_fields(queue_id, phase="critic")
                 else:
                     requeue(queue_dir, queue_id, done_count, total_count)
 
@@ -935,12 +936,13 @@ def process_critic_completion(
         return {"outcome": "critic_approved"}
 
     elif critic_result["critic_tasks_added"] > 0:
-        # Critic added tasks — requeue for regular workers
+        # Critic added tasks — requeue for regular workers (execute phase)
         from lib.spec_parser import count_boi_tasks
 
         counts = count_boi_tasks(spec_path)
         if db:
             db.requeue(queue_id, counts["done"], counts["total"])
+            db.update_spec_fields(queue_id, phase="execute")
         else:
             requeue(queue_dir, queue_id, counts["done"], counts["total"])
 
