@@ -5,6 +5,31 @@ All notable changes to BOI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-03-09
+
+### Changed
+- Rewrote daemon from bash (`daemon.sh`) to Python (`daemon.py`) with SQLite state management
+- Rewrote worker from bash (`worker.sh`) to Python (`worker.py`)
+- Replaced JSON-file queue (`queue.py`) with SQLite database layer (`db.py`)
+- All state transitions are now atomic SQLite transactions (eliminates TOCTOU races)
+- Iteration counter now counts execute phases only (critic/evaluate/decompose phases do not increment)
+- Workers spawned with `start_new_session=True` for clean process-group kill on shutdown/timeout
+- PID validation uses `/proc/{pid}/stat` start time comparison to prevent PID reuse false positives
+
+### Added
+- `lib/db.py`: SQLite database layer with WAL mode for concurrent reads
+- `lib/queue_compat.py`: Compatibility layer routing to SQLite or JSON queue
+- `lib/cli_ops.py`: Thin CLI operations layer called by `boi.sh`
+- `lib/db_migrate.py`: JSON-to-SQLite migration (`boi migrate-db`)
+- `lib/db_to_json.py`: SQLite-to-JSON export for rollback (`boi export-db`)
+- Integration test suite covering full lifecycle, crash recovery, concurrency, phases, and self-heal
+- Worker timeout via `--timeout` flag (defense in depth alongside daemon-side timeout)
+- Stuck-assigning recovery in self-heal (specs in 'assigning' for >60s reset to 'requeued')
+
+### Deprecated
+- `lib/queue.py`: JSON-file queue kept for rollback but no longer actively used
+- `daemon.sh` and `worker.sh`: Moved to `archive/` for reference
+
 ## [0.1.0] - 2026-03-07
 
 ### Added

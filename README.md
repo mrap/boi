@@ -906,12 +906,13 @@ boi do --yes "skip t-4 in q-001"      # Executes without asking
 ```
 ~/boi/                          # Source code (standalone, no external deps)
   boi.sh                        # CLI entry point
-  daemon.sh                     # Queue-aware dispatch daemon
-  worker.sh                     # Iterative worker (one claude -p per iteration)
+  daemon.py                     # Queue-aware dispatch daemon (Python/SQLite)
+  worker.py                     # Iterative worker (one claude -p per iteration)
   dashboard.sh                  # Live-updating compact display
   install.sh                    # One-time setup (git worktrees, config)
   lib/
-    queue.py                    # Spec queue (enqueue, dequeue, requeue, priority, DAG)
+    db.py                       # SQLite database layer (replaces queue.py)
+    queue.py                    # [DEPRECATED] JSON-file queue (kept for rollback)
     conflict_detector.py        # File-level conflict detection between specs
     spec_parser.py              # Parse spec.md for task status counts
     spec_validator.py           # Validate spec format (standard + Generate specs)

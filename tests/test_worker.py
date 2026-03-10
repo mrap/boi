@@ -103,7 +103,7 @@ ALL_DONE_SPEC = textwrap.dedent("""\
 
 
 class TestTaskCounting(unittest.TestCase):
-    """Tests for the spec parsing that worker.sh relies on."""
+    """Tests for the spec parsing that the worker relies on."""
 
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp(prefix="boi-test-")
@@ -180,12 +180,13 @@ class TestTaskCounting(unittest.TestCase):
 # ── Worker Script Argument Validation ────────────────────────────────────
 
 
+@unittest.skip("worker.sh archived; see test_worker_new.py for Python worker tests")
 class TestWorkerArgValidation(unittest.TestCase):
-    """Test that worker.sh validates arguments correctly."""
+    """Test that archived worker.sh validates arguments correctly."""
 
     def test_missing_args_exits_with_2(self):
         result = subprocess.run(
-            ["bash", os.path.join(BOI_ROOT, "worker.sh")],
+            ["bash", os.path.join(BOI_ROOT, "archive", "worker.sh")],
             capture_output=True,
             text=True,
             timeout=10,
@@ -198,7 +199,7 @@ class TestWorkerArgValidation(unittest.TestCase):
             result = subprocess.run(
                 [
                     "bash",
-                    os.path.join(BOI_ROOT, "worker.sh"),
+                    os.path.join(BOI_ROOT, "archive", "worker.sh"),
                     "q-test",
                     tmp_dir,
                     os.path.join(tmp_dir, "nonexistent.md"),
@@ -219,7 +220,7 @@ class TestWorkerArgValidation(unittest.TestCase):
             result = subprocess.run(
                 [
                     "bash",
-                    os.path.join(BOI_ROOT, "worker.sh"),
+                    os.path.join(BOI_ROOT, "archive", "worker.sh"),
                     "q-test",
                     "/nonexistent/worktree",
                     spec_path,
@@ -236,6 +237,7 @@ class TestWorkerArgValidation(unittest.TestCase):
 # ── Worker Exits on No Pending Tasks ─────────────────────────────────────
 
 
+@unittest.skip("worker.sh archived; see test_worker_new.py for Python worker tests")
 class TestWorkerNoPending(unittest.TestCase):
     """Test that worker exits cleanly when no PENDING tasks remain."""
 
@@ -252,7 +254,7 @@ class TestWorkerNoPending(unittest.TestCase):
             result = subprocess.run(
                 [
                     "bash",
-                    os.path.join(BOI_ROOT, "worker.sh"),
+                    os.path.join(BOI_ROOT, "archive", "worker.sh"),
                     "q-test",
                     tmp_dir,
                     spec_path,
@@ -280,7 +282,7 @@ class TestWorkerNoPending(unittest.TestCase):
             result = subprocess.run(
                 [
                     "bash",
-                    os.path.join(BOI_ROOT, "worker.sh"),
+                    os.path.join(BOI_ROOT, "archive", "worker.sh"),
                     "q-test",
                     tmp_dir,
                     spec_path,
@@ -317,7 +319,7 @@ class TestWorkerNoPending(unittest.TestCase):
             result = subprocess.run(
                 [
                     "bash",
-                    os.path.join(BOI_ROOT, "worker.sh"),
+                    os.path.join(BOI_ROOT, "archive", "worker.sh"),
                     "q-test",
                     tmp_dir,
                     spec_path,
@@ -398,11 +400,12 @@ class TestPromptTemplate(unittest.TestCase):
 # ── Run Script / Prompt Generation (end-to-end) ─────────────────────────
 
 
+@unittest.skip("worker.sh archived; see test_worker_new.py for Python worker tests")
 class TestWorkerEndToEnd(unittest.TestCase):
-    """Test worker.sh generates the right artifacts before launching Claude."""
+    """Test archived worker.sh generates the right artifacts before launching Claude."""
 
     def _run_worker(self, spec_content):
-        """Run worker.sh with a spec. Returns (result, tmp_dir)."""
+        """Run archived worker.sh with a spec. Returns (result, tmp_dir)."""
         tmp_dir = tempfile.mkdtemp(prefix="boi-test-")
         spec_path = os.path.join(tmp_dir, "spec.md")
         with open(spec_path, "w") as f:
@@ -414,7 +417,7 @@ class TestWorkerEndToEnd(unittest.TestCase):
         result = subprocess.run(
             [
                 "bash",
-                os.path.join(BOI_ROOT, "worker.sh"),
+                os.path.join(BOI_ROOT, "archive", "worker.sh"),
                 "q-test",
                 tmp_dir,
                 spec_path,

@@ -29,21 +29,21 @@ You → boi dispatch --spec spec.md → Spec Queue (priority-sorted)
 
 The entry point. Routes subcommands to their implementations. Handles argument parsing, validation, and output formatting. Calls into Python libraries in `lib/` for business logic.
 
-### Daemon (`daemon.sh`)
+### Daemon (`daemon.py`)
 
 The orchestration loop. Runs in the background (or foreground with `--foreground`).
 
 Every 5 seconds, the daemon:
-1. Scans `~/.boi/queue/` for specs with status `queued` or `requeued`
+1. Queries SQLite for specs with status `queued` or `requeued`
 2. Sorts by priority (lower number = higher priority)
 3. Filters out specs blocked by DAG dependencies
 4. Assigns the highest-priority spec to a free worker
-5. Monitors running workers by PID
+5. Monitors running workers by PID (with process-group management)
 6. Detects completion, requeues unfinished specs, handles crashes
 
-The daemon writes events to `~/.boi/events/` for every state transition.
+All state transitions are atomic SQLite transactions. Events are stored in the `events` table.
 
-### Worker (`worker.sh`)
+### Worker (`worker.py`)
 
 Executes one iteration of one spec. Launched by the daemon.
 
@@ -56,25 +56,31 @@ For each iteration:
 6. After Claude exits, writes iteration metadata (tasks done, duration, quality)
 7. Writes exit code file for daemon monitoring
 
-Workers are isolated. Each runs in its own git worktree with its own tmux session. Multiple workers can process different specs simultaneously.
+Workers are isolated. Each runs in its own git worktree with its own tmux session. Multiple workers can process different specs simultaneously. Workers accept a `--timeout` flag for self-termination (defense in depth alongside daemon-side timeout).
 
-### Queue (`lib/queue.py`)
+### Database (`lib/db.py`)
 
-The spec queue. Each spec in the queue is a JSON file at `~/.boi/queue/{queue-id}.json` containing:
+All mutable state lives in a SQLite database at `~/.boi/boi.db` (WAL mode for concurrent reads). The `specs` table holds queue entries with fields including:
 - `spec_path`: Path to the spec.md file
-- `status`: `queued`, `running`, `requeued`, `completed`, `failed`, `canceled`, `needs_review`
+- `status`: `queued`, `running`, `requeued`, `completed`, `failed`, `canceled`, `needs_review`, `assigning`
 - `priority`: Lower = higher priority
-- `iteration`: Current iteration count
+- `iteration`: Current iteration count (incremented only for execute phases)
 - `max_iterations`: Hard stop
-- `mode`: Execution mode (execute, challenge, discover, generate)
-- `worker_id`: Currently assigned worker (if running)
+- `phase`: Current phase (`execute`, `critic`, `evaluate`, `decompose`)
+- `last_worker`: Currently assigned worker (if running)
 - `project`: Associated project name (optional)
 
-The queue supports:
+The database supports:
 - Priority ordering
-- DAG-based blocking (one spec can block another)
+- DAG-based blocking (via `spec_dependencies` table)
 - Automatic requeuing when PENDING tasks remain
 - Consecutive failure tracking with cooldown
+- Atomic state transitions (all status changes are SQLite transactions)
+- Process lineage tracking (via `processes` table)
+- Iteration metadata (via `iterations` table)
+- Event logging (via `events` table)
+
+> **Note:** `lib/queue.py` (JSON-file queue) is deprecated but kept for rollback. Use `lib/queue_compat.py` for automatic routing.
 
 ### Spec Parser (`lib/spec_parser.py`)
 
@@ -108,13 +114,18 @@ Computes quality scores across 18 signals in 4 categories (Code Quality, Test Qu
 ```
 ~/boi/
   boi.sh                        # CLI entry point
-  daemon.sh                     # Queue-aware dispatch daemon
-  worker.sh                     # Iterative worker (one claude -p per iteration)
+  daemon.py                     # Queue-aware dispatch daemon (Python/SQLite)
+  worker.py                     # Iterative worker (one claude -p per iteration)
   dashboard.sh                  # Live-updating compact display
   install.sh                    # Setup (git worktrees, config)
   install-public.sh             # Public install script (curl | bash)
+  archive/
+    daemon.sh                   # [ARCHIVED] Original bash daemon
+    worker.sh                   # [ARCHIVED] Original bash worker
   lib/
-    queue.py                    # Spec queue operations
+    db.py                       # SQLite database layer
+    queue.py                    # [DEPRECATED] JSON-file queue (kept for rollback)
+    queue_compat.py             # Compatibility layer (routes to db.py or queue.py)
     conflict_detector.py        # File-level conflict detection between specs
     spec_parser.py              # Parse spec.md for task statuses
     spec_validator.py           # Validate spec format
@@ -149,19 +160,14 @@ Computes quality scores across 18 signals in 4 categories (Code Quality, Test Qu
 ~/.boi/
   config.json                   # Worker/worktree mappings
   daemon.pid                    # Daemon process ID
+  boi.db                        # SQLite database (WAL mode)
   queue/                        # Spec queue
-    q-001.json                  # Queue entry metadata
     q-001.spec.md               # Copy of spec file
-    q-001.telemetry.json        # Per-iteration metrics
-    q-001.iteration-1.json      # Iteration 1 metadata
-    q-001.pid                   # Worker PID (while running)
     q-001.prompt.md             # Generated worker prompt
     q-001.run.sh                # Worker run script
-    q-001.exit                  # Exit code after iteration
   logs/
     daemon.log                  # Daemon log
     q-001-iter-1.log            # Worker output per iteration
-  events/                       # Lifecycle events (JSON)
   hooks/                        # Optional: on-complete.sh, on-fail.sh
   worktrees/                    # Git worktrees (one per worker)
     boi-worker-1/

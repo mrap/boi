@@ -24,7 +24,7 @@ from pathlib import Path
 
 def check_installation(boi_dir):
     """Verify all required BOI files exist."""
-    required = ["boi.sh", "worker.sh", "daemon.sh", "lib/queue.py", "lib/spec_parser.py"]
+    required = ["boi.sh", "daemon.py", "worker.py", "lib/db.py", "lib/spec_parser.py"]
     missing = []
     for f in required:
         path = os.path.join(boi_dir, f)
@@ -36,7 +36,7 @@ def check_installation(boi_dir):
 
 def check_permissions(boi_dir):
     """Verify scripts are executable."""
-    scripts = ["boi.sh", "worker.sh", "daemon.sh"]
+    scripts = ["boi.sh", "daemon.py", "worker.py"]
     issues = []
     for s in scripts:
         path = os.path.join(boi_dir, s)
@@ -119,7 +119,7 @@ DONE
 ```python
 def fix_permissions(boi_dir):
     """Make scripts executable."""
-    scripts = ["boi.sh", "worker.sh", "daemon.sh"]
+    scripts = ["boi.sh", "daemon.py", "worker.py"]
     fixed = []
     for s in scripts:
         path = os.path.join(boi_dir, s)

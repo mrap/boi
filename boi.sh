@@ -181,7 +181,7 @@ resolve_queue_id() {
     result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
 import sys, os, json
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.queue import get_queue
+from lib.queue_compat import get_queue
 
 queue_dir = sys.argv[1]
 entries = get_queue(queue_dir)
@@ -471,11 +471,11 @@ PYEOF
     fi
 
     local result
-    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${no_critic}" "${mode}" "${project}" "${experiment_budget}" <<'PYEOF'
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${mode}" "${project}" "${experiment_budget}" <<'PYEOF'
 import sys, os, json
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.queue import enqueue, DuplicateSpecError, get_experiment_budget
-from lib.spec_parser import count_boi_tasks
+from lib.cli_ops import dispatch
+from lib.db import DuplicateSpecError
 
 spec_path = sys.argv[1]
 queue_dir = sys.argv[2]
@@ -483,63 +483,26 @@ priority = int(sys.argv[3])
 max_iter = int(sys.argv[4])
 checkout = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
 timeout_str = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else None
-no_critic = sys.argv[7] == "true" if len(sys.argv) > 7 else False
-mode = sys.argv[8] if len(sys.argv) > 8 and sys.argv[8] else "execute"
-project_name = sys.argv[9] if len(sys.argv) > 9 and sys.argv[9] else None
-experiment_budget_str = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else None
-
-# Count tasks in spec
-counts = count_boi_tasks(spec_path)
+mode = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] else "execute"
+project_name = sys.argv[8] if len(sys.argv) > 8 and sys.argv[8] else None
+experiment_budget_str = sys.argv[9] if len(sys.argv) > 9 and sys.argv[9] else None
 
 try:
-    entry = enqueue(
+    result = dispatch(
         queue_dir=queue_dir,
         spec_path=spec_path,
         priority=priority,
         max_iterations=max_iter,
         checkout=checkout,
+        timeout=int(timeout_str) if timeout_str else None,
+        mode=mode,
         project=project_name,
+        experiment_budget=int(experiment_budget_str) if experiment_budget_str else None,
     )
+    print(json.dumps(result))
 except DuplicateSpecError as e:
     print(json.dumps({"error": "duplicate", "message": str(e)}))
     sys.exit(2)
-
-# Update task counts
-entry["tasks_total"] = counts["total"]
-entry["tasks_done"] = counts["done"]
-
-# Set mode
-entry["mode"] = mode
-
-# Set experiment budget (user override or mode default)
-if experiment_budget_str:
-    entry["max_experiment_invocations"] = int(experiment_budget_str)
-else:
-    entry["max_experiment_invocations"] = get_experiment_budget(mode)
-entry["experiment_invocations_used"] = 0
-
-# Set phase based on spec type
-from lib.spec_validator import is_generate_spec
-from pathlib import Path as _Path
-_spec_content = _Path(entry["spec_path"]).read_text(encoding="utf-8")
-if is_generate_spec(_spec_content):
-    entry["phase"] = "decompose"
-else:
-    entry["phase"] = "execute"
-
-# Set per-spec timeout if provided
-if timeout_str:
-    entry["worker_timeout_seconds"] = int(timeout_str)
-
-# Set no-critic flag if provided
-if no_critic:
-    entry["no_critic"] = True
-
-# Re-write with updated counts
-from lib.queue import _write_entry
-_write_entry(queue_dir, entry)
-
-print(json.dumps({"id": entry["id"], "tasks": counts["total"], "pending": counts["pending"], "mode": mode, "phase": entry.get("phase", "execute")}))
 PYEOF
     )
 
@@ -575,7 +538,7 @@ PYEOF
         progress_done "already running"
     else
         progress_step "Starting daemon"
-        nohup bash "${SCRIPT_DIR}/daemon.sh" > "${LOG_DIR}/daemon-startup.log" 2>&1 < /dev/null &
+        nohup python3 "${SCRIPT_DIR}/daemon.py" > "${LOG_DIR}/daemon-startup.log" 2>&1 < /dev/null &
         sleep 1
         if require_daemon; then
             progress_done
@@ -1008,13 +971,13 @@ cmd_cancel() {
     BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
 import sys, os
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.queue import cancel
+from lib.cli_ops import cancel_spec
 
 queue_dir = sys.argv[1]
 queue_id = sys.argv[2]
 
 try:
-    cancel(queue_dir, queue_id)
+    cancel_spec(queue_dir, queue_id)
     print(f"Spec '{queue_id}' canceled.")
 except ValueError as e:
     print(f"Error: {e}", file=sys.stderr)
@@ -1284,21 +1247,16 @@ cmd_purge() {
     require_config
 
     BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${LOG_DIR}" "${all_mode}" "${dry_run}" <<'PYEOF'
-import sys, os, json
+import sys, os
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.queue import purge
+from lib.cli_ops import purge_specs
 
 queue_dir = sys.argv[1]
 log_dir = sys.argv[2]
 all_mode = sys.argv[3] == "true"
 dry_run = sys.argv[4] == "true"
 
-if all_mode:
-    statuses = ["queued", "running", "requeued", "completed", "failed", "canceled"]
-else:
-    statuses = ["completed", "failed", "canceled"]
-
-results = purge(queue_dir, log_dir, statuses=statuses, dry_run=dry_run)
+results = purge_specs(queue_dir, log_dir, all_mode=all_mode, dry_run=dry_run)
 
 if not results:
     print("Nothing to purge.")
@@ -1320,6 +1278,82 @@ if dry_run:
 else:
     total = sum(len(r["files_removed"]) for r in results)
     print(f"\nRemoved {len(results)} spec(s), {total} file(s) total.")
+PYEOF
+}
+
+# ─── Subcommand: migrate-db ───────────────────────────────────────────────────
+
+cmd_migrate_db() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: boi migrate-db"
+                echo ""
+                echo "Migrate JSON queue and event files to SQLite."
+                echo "Archives original JSON files to queue/archive/ and events/archive/."
+                echo "Inverse of export-db."
+                exit 0
+                ;;
+            *)
+                die_usage "Unknown option: $1. Use 'boi migrate-db --help' for usage."
+                ;;
+        esac
+    done
+
+    require_config
+
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${EVENTS_DIR}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import migrate_db
+
+queue_dir = sys.argv[1]
+events_dir = sys.argv[2]
+result = migrate_db(queue_dir, events_dir)
+
+specs = result.get("specs", 0)
+events = result.get("events", 0)
+total = specs + events
+
+if total == 0:
+    print("Nothing to migrate.")
+else:
+    print(f"Migrated {specs} spec(s) and {events} event(s) to SQLite.")
+PYEOF
+}
+
+# ─── Subcommand: export-db ────────────────────────────────────────────────────
+
+cmd_export_db() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: boi export-db"
+                echo ""
+                echo "Export all specs from SQLite to q-NNN.json files."
+                echo "Inverse of migrate-db. Enables rollback to bash daemon."
+                exit 0
+                ;;
+            *)
+                die_usage "Unknown option: $1. Use 'boi export-db --help' for usage."
+                ;;
+        esac
+    done
+
+    require_config
+
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import export_db
+
+queue_dir = sys.argv[1]
+count = export_db(queue_dir)
+
+if count == 0:
+    print("No specs to export.")
+else:
+    print(f"Exported {count} spec(s) to JSON.")
 PYEOF
 }
 
@@ -1543,7 +1577,7 @@ cmd_upgrade() {
     if [[ "${daemon_was_running}" == "true" ]]; then
         progress_step "Restarting daemon with upgraded code"
         # start_daemon() uses SCRIPT_DIR which now points to updated ~/.boi/src/
-        nohup bash "${src_dir}/daemon.sh" > "${LOG_DIR}/daemon-startup.log" 2>&1 < /dev/null &
+        nohup python3 "${src_dir}/daemon.py" > "${LOG_DIR}/daemon-startup.log" 2>&1 < /dev/null &
         sleep 1
         if require_daemon; then
             progress_done
@@ -1913,12 +1947,28 @@ for w in c.get('workers', []):
         _doctor_fail "Config file missing (~/.boi/config.json)" "Run 'boi install' to create config"
     fi
 
-    # 9. Daemon PID file check
+    # 9. daemon.py exists
+    if [[ -f "${SCRIPT_DIR}/daemon.py" ]]; then
+        _doctor_pass "daemon.py found"
+    else
+        _doctor_fail "daemon.py not found in ${SCRIPT_DIR}" "Reinstall BOI or check your installation"
+    fi
+
+    # 10. Daemon PID file check (Python daemon)
     if [[ -f "${PID_FILE}" ]]; then
         local daemon_pid
         daemon_pid=$(cat "${PID_FILE}" 2>/dev/null || true)
         if [[ -n "${daemon_pid}" ]] && kill -0 "${daemon_pid}" 2>/dev/null; then
-            _doctor_pass "Daemon running (PID ${daemon_pid})"
+            # Verify it's a Python daemon process (not legacy bash)
+            local daemon_cmd
+            daemon_cmd=$(ps -p "${daemon_pid}" -o args= 2>/dev/null || true)
+            if [[ "${daemon_cmd}" == *"python"*"daemon.py"* ]]; then
+                _doctor_pass "Python daemon running (PID ${daemon_pid})"
+            elif [[ "${daemon_cmd}" == *"daemon.sh"* ]]; then
+                _doctor_warn "Legacy bash daemon running (PID ${daemon_pid})" "Stop and restart: 'boi stop && boi dispatch --spec <spec>'"
+            else
+                _doctor_pass "Daemon running (PID ${daemon_pid})"
+            fi
         else
             _doctor_warn "Daemon not running (stale PID file)" "Run 'boi dispatch' to start the daemon"
         fi
@@ -1926,7 +1976,7 @@ for w in c.get('workers', []):
         _doctor_warn "Daemon not running" "Run 'boi dispatch' to start the daemon"
     fi
 
-    # 10. Daemon heartbeat check
+    # 11. Daemon heartbeat check
     local heartbeat_file="${BOI_STATE_DIR}/daemon-heartbeat"
     if [[ -f "${heartbeat_file}" ]]; then
         local heartbeat_ts
@@ -1956,7 +2006,38 @@ except Exception:
         _doctor_warn "No heartbeat file (daemon may be pre-heartbeat version)" ""
     fi
 
-    # 11. Critic configuration
+    # 12. SQLite database check
+    local db_file="${BOI_STATE_DIR}/boi.db"
+    if [[ -f "${db_file}" ]]; then
+        local db_status
+        db_status=$(python3 -c "
+import sqlite3, sys
+try:
+    conn = sqlite3.connect('${db_file}')
+    tables = [r[0] for r in conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\").fetchall()]
+    required = {'specs', 'workers', 'processes', 'iterations', 'events'}
+    missing = required - set(tables)
+    if missing:
+        print(f'WARN|missing tables: {\", \".join(sorted(missing))}')
+    else:
+        spec_count = conn.execute('SELECT COUNT(*) FROM specs').fetchone()[0]
+        print(f'PASS|{len(tables)} tables, {spec_count} specs')
+    conn.close()
+except Exception as e:
+    print(f'FAIL|{e}')
+" 2>/dev/null || echo "FAIL|could not check database")
+        local db_level="${db_status%%|*}"
+        local db_detail="${db_status#*|}"
+        case "${db_level}" in
+            PASS) _doctor_pass "SQLite database: ${db_detail}" ;;
+            WARN) _doctor_warn "SQLite database: ${db_detail}" "Run 'boi migrate-db' to initialize" ;;
+            *) _doctor_fail "SQLite database: ${db_detail}" "Check ~/.boi/boi.db" ;;
+        esac
+    else
+        _doctor_warn "SQLite database not found (~/.boi/boi.db)" "Database will be created on first dispatch"
+    fi
+
+    # 13. Critic configuration
     local critic_config="${BOI_STATE_DIR}/critic/config.json"
     if [[ -f "${critic_config}" ]]; then
         local critic_status
@@ -2203,7 +2284,7 @@ import sys
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
 from lib.critic_config import load_critic_config
 from lib.critic import run_critic
-from lib.queue import get_entry
+from lib.queue_compat import get_entry
 
 state_dir = sys.argv[1]
 queue_dir = sys.argv[2]
@@ -3455,6 +3536,8 @@ main() {
         project)    cmd_project "$@" ;;
         do)         cmd_do "$@" ;;
         dashboard)  cmd_dashboard "$@" ;;
+        migrate-db) cmd_migrate_db "$@" ;;
+        export-db)  cmd_export_db "$@" ;;
         -h|--help) usage; exit 0 ;;
         help)
             # 'boi help' shows usage; 'boi help <cmd>' shows <cmd> --help

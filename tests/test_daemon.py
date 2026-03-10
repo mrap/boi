@@ -3,9 +3,9 @@
 # Tests the daemon's decision-making: crash detection, worker completion,
 # requeue logic, consecutive failures, cooldown, and daemon state writing.
 #
-# These tests exercise the queue.py functions that the daemon.sh calls,
-# since the daemon's logic is implemented via Python calls. The shell
-# script is the orchestrator; the logic lives in lib/queue.py.
+# These tests exercise the queue.py functions that the daemon calls.
+# The daemon logic is now in daemon.py (Python). These tests validate
+# the queue operations that underpin daemon decisions.
 #
 # Uses stdlib unittest only (no pytest dependency).
 
@@ -900,7 +900,7 @@ class TestWorkerTimeout(DaemonTestCase):
 class TestZeroPendingImmediateCompletion(DaemonTestCase):
     """Test the daemon handles workers that exit immediately with 0 PENDING tasks.
 
-    When worker.sh finds 0 PENDING tasks, it writes an exit file (code 0)
+    When the worker finds 0 PENDING tasks, it writes an exit file (code 0)
     and exits without creating a tmux session or PID file. The daemon's
     assign_spec_to_worker() must detect this and process completion
     immediately instead of waiting for a PID-based poll cycle.
@@ -912,7 +912,7 @@ class TestZeroPendingImmediateCompletion(DaemonTestCase):
         e = enqueue(self.queue_dir, spec_path)
         set_running(self.queue_dir, e["id"], "w-1")
 
-        # Simulate what worker.sh does: write exit file, no PID file
+        # Simulate what the worker does: write exit file, no PID file
         self._write_exit_file(e["id"], 0)
         pid_file = os.path.join(self.queue_dir, f"{e['id']}.pid")
         self.assertFalse(os.path.isfile(pid_file))

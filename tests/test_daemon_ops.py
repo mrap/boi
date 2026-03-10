@@ -495,12 +495,12 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
         self.assertEqual(meta["log_tail"], [])
 
     def test_existing_iteration_file_updated_with_diagnostics(self):
-        """If iteration file already exists (from worker.sh), diagnostics are merged in."""
+        """If iteration file already exists (from worker), diagnostics are merged in."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
         entry = enqueue(self.queue_dir, spec_path)
         set_running(self.queue_dir, entry["id"], "w-1")
 
-        # Pre-create iteration file (as worker.sh would)
+        # Pre-create iteration file (as the worker would)
         iter_file = os.path.join(self.queue_dir, f"{entry['id']}.iteration-1.json")
         existing_meta = {
             "queue_id": entry["id"],
@@ -623,7 +623,7 @@ class TestBatchedCallCount(DaemonOpsTestCase):
     def test_completion_is_single_call(self):
         """process_worker_completion does everything in one function call.
 
-        Before the optimization, check_worker_completion in daemon.sh
+        Before the optimization, check_worker_completion in the daemon
         would make 5-10 separate Python invocations per cycle. Now it
         makes a single call to process_worker_completion.
         """
@@ -1303,7 +1303,7 @@ class TestCriticReviewDaemonIntegration(DaemonOpsTestCase):
         )
         self.assertEqual(result["outcome"], "critic_review")
 
-        # Step 2: Simulate daemon setting phase to "critic" (as daemon.sh now does)
+        # Step 2: Simulate daemon setting phase to "critic" (as daemon.py does)
         e = _read_entry(self.queue_dir, entry["id"])
         e["phase"] = "critic"
         _write_entry(self.queue_dir, e)
@@ -1798,3 +1798,994 @@ class TestBugFixDoubleAssignment(DaemonOpsTestCase):
         # Second dequeue of the same spec must return None (already taken)
         self.assertIsNone(second,
                          "dequeue() returned the same spec twice — TOCTOU race condition!")
+
+
+# ─── Database-backed tests ─────────────────────────────────────────────────
+
+
+from lib.db import Database
+
+
+class DaemonOpsDBTestCase(unittest.TestCase):
+    """Base test case that creates a Database + temp dirs for db-backed tests."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.boi_state = self._tmpdir.name
+        self.queue_dir = os.path.join(self.boi_state, "queue")
+        self.events_dir = os.path.join(self.boi_state, "events")
+        self.log_dir = os.path.join(self.boi_state, "logs")
+        self.hooks_dir = os.path.join(self.boi_state, "hooks")
+        self.script_dir = str(Path(__file__).resolve().parent.parent)
+        os.makedirs(self.queue_dir, exist_ok=True)
+        os.makedirs(self.events_dir)
+        os.makedirs(self.log_dir)
+        os.makedirs(self.hooks_dir)
+
+        # Disable critic by default
+        critic_dir = os.path.join(self.boi_state, "critic")
+        os.makedirs(critic_dir, exist_ok=True)
+        os.makedirs(os.path.join(critic_dir, "custom"), exist_ok=True)
+        config_path = os.path.join(critic_dir, "config.json")
+        Path(config_path).write_text(
+            json.dumps({"enabled": False}, indent=2) + "\n"
+        )
+
+        db_path = os.path.join(self.boi_state, "boi.db")
+        self.db = Database(db_path, self.queue_dir)
+
+    def tearDown(self):
+        self.db.close()
+        self._tmpdir.cleanup()
+
+    def _create_spec(self, tasks_pending=3, tasks_done=0, tasks_skipped=0):
+        """Create a temp spec.md file with the given task counts."""
+        if not hasattr(self, "_spec_counter"):
+            self._spec_counter = 0
+        self._spec_counter += 1
+        spec_path = os.path.join(
+            self._tmpdir.name, f"spec-{self._spec_counter}.md"
+        )
+        lines = ["# Test Spec\n\n## Tasks\n"]
+        tid = 1
+        for _ in range(tasks_done):
+            lines.append(
+                f"\n### t-{tid}: Done task {tid}\nDONE\n\n"
+                "**Spec:** Did it.\n**Verify:** true\n"
+            )
+            tid += 1
+        for _ in range(tasks_pending):
+            lines.append(
+                f"\n### t-{tid}: Pending task {tid}\nPENDING\n\n"
+                "**Spec:** Do it.\n**Verify:** true\n"
+            )
+            tid += 1
+        for _ in range(tasks_skipped):
+            lines.append(
+                f"\n### t-{tid}: Skipped task {tid}\nSKIPPED\n\n"
+                "**Spec:** Skip.\n**Verify:** true\n"
+            )
+            tid += 1
+        Path(spec_path).write_text("".join(lines))
+        return spec_path
+
+    def _enqueue_and_run(self, spec_path, max_iterations=30):
+        """Enqueue a spec into the database and set it running."""
+        entry = self.db.enqueue(spec_path, max_iterations=max_iterations)
+        spec = self.db.pick_next_spec()
+        self.db.set_running(spec["id"], "w-1", phase="execute")
+        return entry
+
+
+class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
+    """Tests for process_worker_completion() with Database backend."""
+
+    def test_all_tasks_done_marks_completed(self):
+        """When all tasks DONE, outcome is 'completed' via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
+        entry = self._enqueue_and_run(spec_path)
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "completed")
+        self.assertEqual(result["pending_count"], 0)
+        self.assertEqual(result["done_count"], 3)
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "completed")
+
+    def test_pending_tasks_requeues(self):
+        """When pending tasks remain, outcome is 'requeued' via db."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = self._enqueue_and_run(spec_path)
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "requeued")
+        self.assertEqual(result["pending_count"], 2)
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "requeued")
+
+    def test_max_iterations_fails(self):
+        """When max iterations reached with pending tasks, fails via db."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = self._enqueue_and_run(spec_path, max_iterations=1)
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["reason"], "max_iterations")
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "failed")
+
+    def test_no_exit_code_crashes(self):
+        """When exit_code is None, outcome is 'crashed' via db."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = self._enqueue_and_run(spec_path)
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code=None,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "crashed")
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "requeued")
+        self.assertEqual(updated["consecutive_failures"], 1)
+
+    def test_nonzero_exit_code_crashes(self):
+        """When exit_code is non-zero, outcome is 'crashed' via db."""
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = self._enqueue_and_run(spec_path)
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="1",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "crashed")
+
+    def test_consecutive_failures_exceed_threshold(self):
+        """When too many consecutive failures, outcome is 'failed' via db."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        # Simulate 4 prior failures via db
+        for _ in range(4):
+            self.db.record_failure(entry["id"])
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code=None,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["reason"], "consecutive_failures")
+
+    def test_writes_events(self):
+        """process_worker_completion writes events to events_dir via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+            db=self.db,
+        )
+
+        event_files = [
+            f for f in os.listdir(self.events_dir) if f.endswith(".json")
+        ]
+        self.assertGreater(len(event_files), 0)
+
+    def test_missing_entry_returns_error(self):
+        """When queue_id doesn't exist, returns error via db."""
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id="q-999",
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "error")
+
+    def test_timeout_crash_has_failure_reason(self):
+        """Timeout crash should include timeout duration in reason."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code=None,
+            timeout=True,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "crashed")
+        self.assertIn("timed out", result["failure_reason"])
+
+    def test_all_done_at_max_iter_completes_without_critic(self):
+        """All tasks DONE at max-iter completes without critic via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
+        entry = self._enqueue_and_run(spec_path, max_iterations=1)
+
+        result = process_worker_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            log_dir=self.log_dir,
+            hooks_dir=self.hooks_dir,
+            script_dir=self.script_dir,
+            exit_code="0",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "completed")
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "completed")
+
+
+class TestPickNextSpecDB(DaemonOpsDBTestCase):
+    """Tests for pick_next_spec() with Database backend."""
+
+    def test_returns_next_spec(self):
+        """pick_next_spec returns the next queued spec via db."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self.db.enqueue(spec_path)
+
+        result = pick_next_spec(self.queue_dir, db=self.db)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["id"], entry["id"])
+        self.assertIn("spec_path", result)
+        self.assertIn("iteration", result)
+        self.assertIn("max_iterations", result)
+
+    def test_returns_none_when_empty(self):
+        """pick_next_spec returns None when no specs are queued."""
+        result = pick_next_spec(self.queue_dir, db=self.db)
+        self.assertIsNone(result)
+
+    def test_returns_none_when_all_running(self):
+        """pick_next_spec returns None when all specs are running."""
+        spec_path = self._create_spec(tasks_pending=2)
+        self.db.enqueue(spec_path)
+        spec = self.db.pick_next_spec()
+        self.db.set_running(spec["id"], "w-1")
+
+        result = pick_next_spec(self.queue_dir, db=self.db)
+        self.assertIsNone(result)
+
+    def test_priority_ordering(self):
+        """Higher priority (lower number) specs are returned first."""
+        spec1 = self._create_spec(tasks_pending=2)
+        spec2 = self._create_spec(tasks_pending=2)
+
+        self.db.enqueue(spec1, priority=200)
+        entry2 = self.db.enqueue(spec2, priority=50)
+
+        result = pick_next_spec(self.queue_dir, db=self.db)
+        self.assertEqual(result["id"], entry2["id"])
+
+
+class TestGetActiveCountDB(DaemonOpsDBTestCase):
+    """Tests for get_active_count() with Database backend."""
+
+    def test_counts_active_specs(self):
+        """Active count includes queued, requeued, running, needs_review."""
+        spec1 = self._create_spec(tasks_pending=2)
+        spec2 = self._create_spec(tasks_pending=2)
+        spec3 = self._create_spec(tasks_pending=0, tasks_done=3)
+
+        self.db.enqueue(spec1)  # queued
+        self.db.enqueue(spec2)  # queued
+        entry3 = self.db.enqueue(spec3)
+        self.db.complete(entry3["id"], 3, 3)  # completed
+
+        count = get_active_count(self.queue_dir, db=self.db)
+        self.assertEqual(count, 2)
+
+    def test_empty_queue_returns_zero(self):
+        """Empty queue returns 0."""
+        count = get_active_count(self.queue_dir, db=self.db)
+        self.assertEqual(count, 0)
+
+    def test_excludes_terminal_statuses(self):
+        """Completed, failed, canceled specs not counted."""
+        spec1 = self._create_spec(tasks_pending=2)
+        spec2 = self._create_spec(tasks_pending=2)
+        spec3 = self._create_spec(tasks_pending=2)
+
+        e1 = self.db.enqueue(spec1)
+        e2 = self.db.enqueue(spec2)
+        e3 = self.db.enqueue(spec3)
+
+        self.db.fail(e1["id"], "test")
+        self.db.cancel(e2["id"])
+        self.db.complete(e3["id"], 0, 0)
+
+        count = get_active_count(self.queue_dir, db=self.db)
+        self.assertEqual(count, 0)
+
+
+class TestCrashRequeueDB(DaemonOpsDBTestCase):
+    """Tests for crash_requeue preserving failure state."""
+
+    def test_crash_requeue_preserves_consecutive_failures(self):
+        """crash_requeue sets status to requeued without resetting failures."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        # Record a failure (sets consecutive_failures=1, cooldown)
+        self.db.record_failure(entry["id"])
+
+        # crash_requeue should keep the failure count
+        self.db.crash_requeue(entry["id"])
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "requeued")
+        self.assertEqual(updated["consecutive_failures"], 1)
+        self.assertIsNotNone(updated["cooldown_until"])
+
+    def test_normal_requeue_resets_failures(self):
+        """Normal requeue resets consecutive_failures to 0."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        self.db.record_failure(entry["id"])
+        self.db.requeue(entry["id"], 0, 2)
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "requeued")
+        self.assertEqual(updated["consecutive_failures"], 0)
+        self.assertIsNone(updated["cooldown_until"])
+
+
+class TestParseJsonField(unittest.TestCase):
+    """Tests for _parse_json_field helper."""
+
+    def test_dict_passthrough(self):
+        """Dict values are returned as-is."""
+        from lib.daemon_ops import _parse_json_field
+        self.assertEqual(_parse_json_field({"a": 1}), {"a": 1})
+
+    def test_list_passthrough(self):
+        """List values are returned as-is."""
+        from lib.daemon_ops import _parse_json_field
+        self.assertEqual(_parse_json_field([1, 2]), [1, 2])
+
+    def test_json_string_parsed(self):
+        """JSON strings are parsed."""
+        from lib.daemon_ops import _parse_json_field
+        self.assertEqual(
+            _parse_json_field('{"t-1": "DONE"}'), {"t-1": "DONE"}
+        )
+
+    def test_none_returns_default(self):
+        """None returns the default value."""
+        from lib.daemon_ops import _parse_json_field
+        self.assertEqual(_parse_json_field(None, default={}), {})
+
+    def test_invalid_json_returns_default(self):
+        """Invalid JSON string returns the default."""
+        from lib.daemon_ops import _parse_json_field
+        self.assertEqual(_parse_json_field("not json", default={}), {})
+
+
+# ─── DB-backed tests for phase handlers and self-heal ─────────────────────────
+
+from lib.daemon_ops import (
+    check_needs_review_timeouts,
+    process_critic_completion,
+    process_decomposition_completion,
+    process_evaluation_completion,
+    self_heal,
+)
+from lib.db import Database
+
+
+class TestProcessCriticCompletionDB(DaemonOpsDBTestCase):
+    """Tests for process_critic_completion() with Database backend."""
+
+    def test_critic_approval_marks_completed(self):
+        """Critic approved marks spec completed via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        # Append Critic Approved to the copied spec
+        copied_spec = self.db.get_spec(entry["id"])["spec_path"]
+        content = Path(copied_spec).read_text()
+        content += "\n## Critic Approved\n\n2026-03-09\n"
+        Path(copied_spec).write_text(content)
+
+        result = process_critic_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            spec_path=copied_spec,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "critic_approved")
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["critic_passes"], 1)
+
+    def test_critic_tasks_added_requeues(self):
+        """When critic adds tasks, spec is requeued via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        # Add a CRITIC task to the spec
+        copied_spec = self.db.get_spec(entry["id"])["spec_path"]
+        content = Path(copied_spec).read_text()
+        content += (
+            "\n### t-99: [CRITIC] Fix issue\n"
+            "PENDING\n\n"
+            "**Spec:** Fix it.\n\n"
+            "**Verify:** true\n"
+        )
+        Path(copied_spec).write_text(content)
+
+        result = process_critic_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            spec_path=copied_spec,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "critic_tasks_added")
+        self.assertEqual(result["critic_tasks_added"], 1)
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "requeued")
+        self.assertEqual(updated["critic_passes"], 1)
+
+    def test_critic_no_output_completes(self):
+        """When critic has no valid output, completes via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        copied_spec = self.db.get_spec(entry["id"])["spec_path"]
+
+        result = process_critic_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            spec_path=copied_spec,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "critic_approved")
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "completed")
+
+    def test_critic_passes_increment_db(self):
+        """critic_passes increments correctly via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        # Set prior passes
+        self.db.update_spec_fields(entry["id"], critic_passes=2)
+
+        copied_spec = self.db.get_spec(entry["id"])["spec_path"]
+        content = Path(copied_spec).read_text()
+        content += "\n## Critic Approved\n"
+        Path(copied_spec).write_text(content)
+
+        process_critic_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            spec_path=copied_spec,
+            db=self.db,
+        )
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["critic_passes"], 3)
+
+    def test_missing_entry_returns_error(self):
+        """When queue_id doesn't exist, returns error via db."""
+        result = process_critic_completion(
+            queue_dir=self.queue_dir,
+            queue_id="q-999",
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            spec_path="/nonexistent",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "error")
+
+
+class TestProcessDecompositionCompletionDB(DaemonOpsDBTestCase):
+    """Tests for process_decomposition_completion() with Database backend."""
+
+    def _create_decomposed_spec(self, task_count=5):
+        """Create a valid decomposed spec file."""
+        if not hasattr(self, "_spec_counter"):
+            self._spec_counter = 0
+        self._spec_counter += 1
+        spec_path = os.path.join(
+            self._tmpdir.name, f"spec-{self._spec_counter}.md"
+        )
+        lines = ["# Decomposed Spec\n\n## Approach\n\nDo stuff.\n\n## Tasks\n"]
+        for i in range(1, task_count + 1):
+            lines.append(
+                f"\n### t-{i}: Task {i}\n"
+                "PENDING\n\n"
+                f"**Spec:** Do task {i}.\n\n"
+                "**Verify:** true\n"
+            )
+        Path(spec_path).write_text("".join(lines))
+        return spec_path
+
+    def test_valid_decomposition_transitions_to_execute(self):
+        """Valid decomposition transitions phase to execute via db."""
+        spec_path = self._create_decomposed_spec(task_count=5)
+        entry = self.db.enqueue(spec_path)
+        self.db.update_spec_fields(entry["id"], phase="decompose")
+        # Pick and run
+        spec = self.db.pick_next_spec()
+        self.db.set_running(spec["id"], "w-1", phase="decompose")
+
+        copied_spec = self.db.get_spec(entry["id"])["spec_path"]
+        # Write a valid decomposed spec to the copied location
+        decomposed = self._create_decomposed_spec(task_count=5)
+        import shutil
+        shutil.copy2(decomposed, copied_spec)
+
+        result = process_decomposition_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            spec_path=copied_spec,
+            exit_code="0",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "decomposition_complete")
+        self.assertEqual(result["phase"], "execute")
+        self.assertEqual(result["task_count"], 5)
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["phase"], "execute")
+        self.assertEqual(updated["status"], "requeued")
+
+    def test_crash_retries_once(self):
+        """Crash retries once, then fails on second crash via db."""
+        spec_path = self._create_spec(tasks_pending=0)
+        entry = self.db.enqueue(spec_path)
+        self.db.update_spec_fields(entry["id"], phase="decompose")
+        spec = self.db.pick_next_spec()
+        self.db.set_running(spec["id"], "w-1", phase="decompose")
+
+        copied_spec = self.db.get_spec(entry["id"])["spec_path"]
+
+        # First crash — should retry
+        result = process_decomposition_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            spec_path=copied_spec,
+            exit_code=None,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "decomposition_retry")
+        self.assertEqual(result["retry_count"], 1)
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "requeued")
+        self.assertEqual(updated["decomposition_retries"], 1)
+
+    def test_second_crash_fails_permanently(self):
+        """Second crash after retry fails permanently via db."""
+        spec_path = self._create_spec(tasks_pending=0)
+        entry = self.db.enqueue(spec_path)
+        self.db.update_spec_fields(
+            entry["id"], phase="decompose", decomposition_retries=1
+        )
+        spec = self.db.pick_next_spec()
+        self.db.set_running(spec["id"], "w-1", phase="decompose")
+
+        copied_spec = self.db.get_spec(entry["id"])["spec_path"]
+
+        result = process_decomposition_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            spec_path=copied_spec,
+            exit_code=None,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "decomposition_failed")
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "failed")
+
+    def test_missing_entry_returns_error(self):
+        """When queue_id doesn't exist, returns error via db."""
+        result = process_decomposition_completion(
+            queue_dir=self.queue_dir,
+            queue_id="q-999",
+            events_dir=self.events_dir,
+            spec_path="/nonexistent",
+            exit_code="0",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "error")
+
+
+class TestProcessEvaluationCompletionDB(DaemonOpsDBTestCase):
+    """Tests for process_evaluation_completion() with Database backend."""
+
+    def test_crash_records_failure_via_db(self):
+        """Crash records failure and requeues via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
+        entry = self._enqueue_and_run(spec_path)
+        self.db.update_spec_fields(entry["id"], phase="evaluate")
+
+        result = process_evaluation_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            spec_path=self.db.get_spec(entry["id"])["spec_path"],
+            exit_code=None,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "evaluate_crashed")
+        self.assertEqual(result.get("phase"), "evaluate")
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "requeued")
+
+    def test_consecutive_crash_failures_fail_permanently(self):
+        """Consecutive evaluation crashes fail permanently via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
+        entry = self._enqueue_and_run(spec_path)
+        self.db.update_spec_fields(entry["id"], phase="evaluate")
+
+        # Simulate 4 prior failures
+        for _ in range(4):
+            self.db.record_failure(entry["id"])
+
+        result = process_evaluation_completion(
+            queue_dir=self.queue_dir,
+            queue_id=entry["id"],
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            spec_path=self.db.get_spec(entry["id"])["spec_path"],
+            exit_code=None,
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "evaluate_crashed")
+        self.assertIn("consecutive_failures", result.get("reason", ""))
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "failed")
+
+    def test_missing_entry_returns_error(self):
+        """When queue_id doesn't exist, returns error via db."""
+        result = process_evaluation_completion(
+            queue_dir=self.queue_dir,
+            queue_id="q-999",
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            spec_path="/nonexistent",
+            exit_code="0",
+            db=self.db,
+        )
+
+        self.assertEqual(result["outcome"], "error")
+
+
+class TestCheckNeedsReviewTimeoutsDB(DaemonOpsDBTestCase):
+    """Tests for check_needs_review_timeouts() with Database backend."""
+
+    def test_no_needs_review_specs(self):
+        """Returns empty list when no specs need review via db."""
+        spec_path = self._create_spec(tasks_pending=2)
+        self.db.enqueue(spec_path)
+
+        result = check_needs_review_timeouts(
+            queue_dir=self.queue_dir,
+            events_dir=self.events_dir,
+            state_dir=self.boi_state,
+            db=self.db,
+        )
+
+        self.assertEqual(result, [])
+
+    def test_timed_out_spec_auto_rejected(self):
+        """Spec in needs_review past timeout is auto-rejected via db."""
+        from datetime import datetime, timedelta, timezone
+
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = self._enqueue_and_run(spec_path)
+
+        # Manually set needs_review with old timestamp
+        old_time = (
+            datetime.now(timezone.utc) - timedelta(hours=25)
+        ).isoformat()
+        self.db.update_spec_fields(
+            entry["id"],
+            status="needs_review",
+            needs_review_since=old_time,
+        )
+
+        result = check_needs_review_timeouts(
+            queue_dir=self.queue_dir,
+            events_dir=self.events_dir,
+            state_dir=self.boi_state,
+            db=self.db,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], entry["id"])
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "requeued")
+        self.assertIsNone(updated["needs_review_since"])
+        self.assertIsNone(updated["experiment_tasks"])
+
+    def test_not_timed_out_spec_untouched(self):
+        """Spec in needs_review within timeout is not rejected via db."""
+        from datetime import datetime, timedelta, timezone
+
+        spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
+        entry = self._enqueue_and_run(spec_path)
+
+        # Set needs_review with recent timestamp
+        recent_time = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat()
+        self.db.update_spec_fields(
+            entry["id"],
+            status="needs_review",
+            needs_review_since=recent_time,
+        )
+
+        result = check_needs_review_timeouts(
+            queue_dir=self.queue_dir,
+            events_dir=self.events_dir,
+            state_dir=self.boi_state,
+            db=self.db,
+        )
+
+        self.assertEqual(result, [])
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "needs_review")
+
+
+class TestSelfHealDB(DaemonOpsDBTestCase):
+    """Tests for self_heal() and _heal_* functions with Database backend."""
+
+    def test_empty_queue_no_actions(self):
+        """Self-heal on empty queue produces no actions via db."""
+        actions = self_heal(
+            queue_dir=self.queue_dir,
+            worker_specs={},
+            db=self.db,
+        )
+        self.assertEqual(actions, [])
+
+    def test_orphaned_worker_detected_via_db(self):
+        """Worker assigned to completed spec detected as orphaned via db."""
+        spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
+        entry = self._enqueue_and_run(spec_path)
+        self.db.complete(entry["id"], 2, 2)
+
+        actions = self_heal(
+            queue_dir=self.queue_dir,
+            worker_specs={"w-1": entry["id"]},
+            db=self.db,
+        )
+
+        orphan_actions = [a for a in actions if a["action"] == "orphaned_worker"]
+        self.assertEqual(len(orphan_actions), 1)
+        self.assertEqual(orphan_actions[0]["queue_id"], entry["id"])
+        self.assertEqual(orphan_actions[0]["worker_id"], "w-1")
+
+    def test_orphaned_worker_missing_spec_via_db(self):
+        """Worker assigned to nonexistent spec detected via db."""
+        actions = self_heal(
+            queue_dir=self.queue_dir,
+            worker_specs={"w-1": "q-nonexistent"},
+            db=self.db,
+        )
+
+        orphan_actions = [a for a in actions if a["action"] == "orphaned_worker"]
+        self.assertEqual(len(orphan_actions), 1)
+        self.assertEqual(orphan_actions[0]["queue_id"], "q-nonexistent")
+
+    def test_idle_workers_no_false_orphans_via_db(self):
+        """Idle workers (empty spec) not reported as orphaned via db."""
+        actions = self_heal(
+            queue_dir=self.queue_dir,
+            worker_specs={"w-1": "", "w-2": ""},
+            db=self.db,
+        )
+
+        orphan_actions = [a for a in actions if a["action"] == "orphaned_worker"]
+        self.assertEqual(len(orphan_actions), 0)
+
+    def test_max_running_duration_exceeded_via_db(self):
+        """Spec running too long is force-failed via db."""
+        from datetime import datetime, timedelta, timezone
+
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        # Set first_running_at to long ago (force exceed the limit)
+        old_time = (
+            datetime.now(timezone.utc) - timedelta(hours=100)
+        ).isoformat()
+        self.db.conn.execute(
+            "UPDATE specs SET first_running_at = ? WHERE id = ?",
+            (old_time, entry["id"]),
+        )
+        self.db.conn.commit()
+
+        actions = self_heal(
+            queue_dir=self.queue_dir,
+            worker_specs={},
+            db=self.db,
+        )
+
+        max_dur_actions = [
+            a for a in actions
+            if a["action"] == "max_running_duration_exceeded"
+        ]
+        self.assertEqual(len(max_dur_actions), 1)
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "failed")
+
+    def test_max_running_duration_not_exceeded_via_db(self):
+        """Spec running within limit is not force-failed via db."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self._enqueue_and_run(spec_path)
+
+        actions = self_heal(
+            queue_dir=self.queue_dir,
+            worker_specs={},
+            db=self.db,
+        )
+
+        max_dur_actions = [
+            a for a in actions
+            if a["action"] == "max_running_duration_exceeded"
+        ]
+        self.assertEqual(len(max_dur_actions), 0)
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["status"], "running")
+
+
+class TestUpdateSpecFieldsDB(DaemonOpsDBTestCase):
+    """Tests for Database.update_spec_fields()."""
+
+    def test_update_single_field(self):
+        """Update a single field."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self.db.enqueue(spec_path)
+
+        self.db.update_spec_fields(entry["id"], phase="critic")
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["phase"], "critic")
+
+    def test_update_multiple_fields(self):
+        """Update multiple fields at once."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self.db.enqueue(spec_path)
+
+        self.db.update_spec_fields(
+            entry["id"],
+            phase="evaluate",
+            critic_passes=3,
+            tasks_done=5,
+        )
+
+        updated = self.db.get_spec(entry["id"])
+        self.assertEqual(updated["phase"], "evaluate")
+        self.assertEqual(updated["critic_passes"], 3)
+        self.assertEqual(updated["tasks_done"], 5)
+
+    def test_invalid_column_raises(self):
+        """Updating an invalid column raises ValueError."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self.db.enqueue(spec_path)
+
+        with self.assertRaises(ValueError):
+            self.db.update_spec_fields(
+                entry["id"], nonexistent_column="value"
+            )
+
+    def test_missing_spec_raises(self):
+        """Updating a nonexistent spec raises ValueError."""
+        with self.assertRaises(ValueError):
+            self.db.update_spec_fields("q-nonexistent", phase="critic")
+
+    def test_update_no_fields_is_noop(self):
+        """Calling with no fields is a no-op."""
+        spec_path = self._create_spec(tasks_pending=2)
+        entry = self.db.enqueue(spec_path)
+
+        # Should not raise
+        self.db.update_spec_fields(entry["id"])

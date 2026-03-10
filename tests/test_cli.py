@@ -1021,5 +1021,423 @@ class TestCriticEnableDisable(unittest.TestCase):
         self.assertIn("security-review", check_names)
 
 
+class TestDaemonLaunchesAsPython(unittest.TestCase):
+    """Verify boi.sh launches daemon.py (Python) instead of daemon.sh (bash)."""
+
+    def test_boi_sh_references_daemon_py(self):
+        """boi.sh should call daemon.py, not daemon.sh, for daemon startup."""
+        content = Path(BOI_SH).read_text(encoding="utf-8")
+        # Should reference daemon.py
+        self.assertIn("daemon.py", content)
+        # Should not reference daemon.sh in any launch command
+        # (daemon.sh may appear in comments, but not in nohup lines)
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            if "nohup" in stripped and "daemon" in stripped:
+                self.assertIn(
+                    "daemon.py",
+                    stripped,
+                    f"Daemon launch line should reference daemon.py: {stripped}",
+                )
+                self.assertNotIn(
+                    "daemon.sh",
+                    stripped,
+                    f"Daemon launch line should NOT reference daemon.sh: {stripped}",
+                )
+
+    def test_daemon_py_exists(self):
+        """daemon.py should exist at the script root."""
+        daemon_path = Path(BOI_SH).parent / "daemon.py"
+        self.assertTrue(
+            daemon_path.is_file(),
+            f"daemon.py not found at {daemon_path}",
+        )
+
+    def test_daemon_py_importable(self):
+        """daemon.py should be importable (valid Python syntax)."""
+        result = subprocess.run(
+            [sys.executable, "-c", "from daemon import Daemon; print('ok')"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(Path(BOI_SH).parent),
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Failed to import daemon.py: {result.stderr}",
+        )
+        self.assertIn("ok", result.stdout)
+
+
+class TestStatusSQLiteFallback(unittest.TestCase):
+    """Verify status.py reads from SQLite when boi.db exists, falls back to JSON."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.queue_dir = os.path.join(self.tmpdir, "queue")
+        os.makedirs(self.queue_dir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _create_db_with_specs(self, specs: list[dict]):
+        """Create a boi.db in tmpdir with the given spec rows."""
+        import sqlite3 as _sqlite3
+
+        db_path = os.path.join(self.tmpdir, "boi.db")
+        schema_path = Path(__file__).resolve().parent.parent / "lib" / "schema.sql"
+        schema_sql = schema_path.read_text(encoding="utf-8")
+
+        conn = _sqlite3.connect(db_path)
+        conn.executescript(schema_sql)
+
+        for spec in specs:
+            conn.execute(
+                "INSERT INTO specs ("
+                "  id, spec_path, original_spec_path, priority,"
+                "  status, phase, submitted_at, iteration, max_iterations,"
+                "  tasks_done, tasks_total"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    spec["id"],
+                    spec.get("spec_path", "/tmp/spec.md"),
+                    spec.get("original_spec_path", "/tmp/spec.md"),
+                    spec.get("priority", 100),
+                    spec.get("status", "queued"),
+                    spec.get("phase", "execute"),
+                    spec.get("submitted_at", "2026-03-09T00:00:00Z"),
+                    spec.get("iteration", 0),
+                    spec.get("max_iterations", 30),
+                    spec.get("tasks_done", 0),
+                    spec.get("tasks_total", 5),
+                ),
+            )
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_reads_from_sqlite_when_db_exists(self):
+        """build_queue_status should read from SQLite when boi.db exists."""
+        self._create_db_with_specs([
+            {"id": "q-001", "status": "running", "tasks_done": 2, "tasks_total": 5},
+            {"id": "q-002", "status": "queued", "tasks_done": 0, "tasks_total": 3},
+        ])
+
+        status = build_queue_status(self.queue_dir)
+        self.assertEqual(status["summary"]["total"], 2)
+        self.assertEqual(status["summary"]["running"], 1)
+        self.assertEqual(status["summary"]["queued"], 1)
+
+        ids = [e["id"] for e in status["entries"]]
+        self.assertIn("q-001", ids)
+        self.assertIn("q-002", ids)
+
+    def test_falls_back_to_json_when_no_db(self):
+        """build_queue_status should read JSON files when no boi.db exists."""
+        # No boi.db created. Create a JSON entry instead.
+        enqueue(self.queue_dir, self._make_spec())
+
+        status = build_queue_status(self.queue_dir)
+        self.assertEqual(status["summary"]["total"], 1)
+        self.assertEqual(status["summary"]["queued"], 1)
+
+    def test_prefers_sqlite_over_json(self):
+        """When both boi.db and JSON files exist, SQLite takes precedence."""
+        # Create a JSON entry
+        enqueue(self.queue_dir, self._make_spec())
+
+        # Create a DB with different entries
+        self._create_db_with_specs([
+            {"id": "q-100", "status": "completed", "tasks_done": 5, "tasks_total": 5},
+        ])
+
+        status = build_queue_status(self.queue_dir)
+        # Should see SQLite entry, not JSON entry
+        ids = [e["id"] for e in status["entries"]]
+        self.assertIn("q-100", ids)
+        self.assertEqual(status["summary"]["total"], 1)
+        self.assertEqual(status["summary"]["completed"], 1)
+
+    def test_empty_db_returns_empty(self):
+        """An empty boi.db should return zero entries."""
+        self._create_db_with_specs([])
+
+        status = build_queue_status(self.queue_dir)
+        self.assertEqual(status["summary"]["total"], 0)
+        self.assertEqual(status["entries"], [])
+
+    def _make_spec(self):
+        path = os.path.join(self.tmpdir, "test-spec.md")
+        Path(path).write_text(
+            "# Spec\n\n## Tasks\n\n### t-1: Task\nPENDING\n\n**Spec:** Do.\n**Verify:** ok\n"
+        )
+        return path
+
+
+class TestCliOps(unittest.TestCase):
+    """Tests for lib/cli_ops.py dispatch, cancel, and purge operations."""
+
+    def setUp(self):
+        import shutil
+
+        self.tmpdir = tempfile.mkdtemp()
+        self.queue_dir = os.path.join(self.tmpdir, "queue")
+        self.log_dir = os.path.join(self.tmpdir, "logs")
+        os.makedirs(self.queue_dir)
+        os.makedirs(self.log_dir)
+        self.spec_path = os.path.join(self.tmpdir, "test-spec.md")
+        Path(self.spec_path).write_text(
+            "# Spec\n\n## Tasks\n\n"
+            "### t-1: First task\nPENDING\n\n"
+            "**Spec:** Do first thing.\n**Verify:** check\n\n"
+            "### t-2: Second task\nPENDING\n\n"
+            "**Spec:** Do second thing.\n**Verify:** check\n\n"
+            "### t-3: Third task\nDONE\n\n"
+            "**Spec:** Already done.\n**Verify:** check\n"
+        )
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_dispatch_creates_spec_in_db(self):
+        """dispatch() should create a spec row in SQLite."""
+        from lib.cli_ops import dispatch
+
+        result = dispatch(
+            queue_dir=self.queue_dir,
+            spec_path=self.spec_path,
+            priority=50,
+            max_iterations=10,
+        )
+        self.assertIn("id", result)
+        self.assertEqual(result["id"], "q-001")
+        self.assertEqual(result["tasks"], 3)
+        self.assertEqual(result["pending"], 2)
+        self.assertEqual(result["mode"], "execute")
+        self.assertEqual(result["phase"], "execute")
+
+    def test_dispatch_sets_experiment_budget(self):
+        """dispatch() should set experiment budget in the DB."""
+        from lib.cli_ops import dispatch, _get_db
+
+        dispatch(
+            queue_dir=self.queue_dir,
+            spec_path=self.spec_path,
+            experiment_budget=5,
+        )
+        db = _get_db(self.queue_dir)
+        try:
+            spec = db.get_spec("q-001")
+            self.assertEqual(spec["max_experiment_invocations"], 5)
+            self.assertEqual(spec["experiment_invocations_used"], 0)
+        finally:
+            db.close()
+
+    def test_dispatch_sets_timeout(self):
+        """dispatch() should set worker_timeout_seconds when provided."""
+        from lib.cli_ops import dispatch, _get_db
+
+        dispatch(
+            queue_dir=self.queue_dir,
+            spec_path=self.spec_path,
+            timeout=600,
+        )
+        db = _get_db(self.queue_dir)
+        try:
+            spec = db.get_spec("q-001")
+            self.assertEqual(spec["worker_timeout_seconds"], 600)
+        finally:
+            db.close()
+
+    def test_dispatch_sets_task_counts(self):
+        """dispatch() should update tasks_done and tasks_total."""
+        from lib.cli_ops import dispatch, _get_db
+
+        dispatch(
+            queue_dir=self.queue_dir,
+            spec_path=self.spec_path,
+        )
+        db = _get_db(self.queue_dir)
+        try:
+            spec = db.get_spec("q-001")
+            self.assertEqual(spec["tasks_done"], 1)
+            self.assertEqual(spec["tasks_total"], 3)
+        finally:
+            db.close()
+
+    def test_dispatch_sets_project(self):
+        """dispatch() should set the project field."""
+        from lib.cli_ops import dispatch, _get_db
+
+        dispatch(
+            queue_dir=self.queue_dir,
+            spec_path=self.spec_path,
+            project="test-proj",
+        )
+        db = _get_db(self.queue_dir)
+        try:
+            spec = db.get_spec("q-001")
+            self.assertEqual(spec["project"], "test-proj")
+        finally:
+            db.close()
+
+    def test_dispatch_duplicate_raises(self):
+        """dispatch() should raise DuplicateSpecError for active duplicates."""
+        from lib.cli_ops import dispatch
+        from lib.db import DuplicateSpecError
+
+        dispatch(queue_dir=self.queue_dir, spec_path=self.spec_path)
+        with self.assertRaises(DuplicateSpecError):
+            dispatch(queue_dir=self.queue_dir, spec_path=self.spec_path)
+
+    def test_dispatch_copies_spec_to_queue(self):
+        """dispatch() should copy the spec file into the queue directory."""
+        from lib.cli_ops import dispatch
+
+        dispatch(queue_dir=self.queue_dir, spec_path=self.spec_path)
+        copied = os.path.join(self.queue_dir, "q-001.spec.md")
+        self.assertTrue(os.path.isfile(copied))
+
+    def test_cancel_spec_marks_canceled(self):
+        """cancel_spec() should set the spec status to canceled."""
+        from lib.cli_ops import cancel_spec, dispatch, _get_db
+
+        dispatch(queue_dir=self.queue_dir, spec_path=self.spec_path)
+        result = cancel_spec(self.queue_dir, "q-001")
+        self.assertEqual(result, "q-001")
+
+        db = _get_db(self.queue_dir)
+        try:
+            spec = db.get_spec("q-001")
+            self.assertEqual(spec["status"], "canceled")
+        finally:
+            db.close()
+
+    def test_cancel_spec_not_found_raises(self):
+        """cancel_spec() should raise ValueError for non-existent spec."""
+        from lib.cli_ops import cancel_spec
+
+        with self.assertRaises(ValueError):
+            cancel_spec(self.queue_dir, "q-999")
+
+    def test_purge_removes_completed(self):
+        """purge_specs() should remove completed specs from DB."""
+        from lib.cli_ops import dispatch, _get_db, purge_specs
+
+        dispatch(queue_dir=self.queue_dir, spec_path=self.spec_path)
+
+        # Mark the spec as completed
+        db = _get_db(self.queue_dir)
+        try:
+            db.update_spec_fields("q-001", status="completed")
+        finally:
+            db.close()
+
+        results = purge_specs(self.queue_dir, self.log_dir)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], "q-001")
+
+        # Verify the spec is gone from DB
+        db = _get_db(self.queue_dir)
+        try:
+            spec = db.get_spec("q-001")
+            self.assertIsNone(spec)
+        finally:
+            db.close()
+
+    def test_purge_dry_run_does_not_delete(self):
+        """purge_specs(dry_run=True) should not actually delete."""
+        from lib.cli_ops import dispatch, _get_db, purge_specs
+
+        dispatch(queue_dir=self.queue_dir, spec_path=self.spec_path)
+        db = _get_db(self.queue_dir)
+        try:
+            db.update_spec_fields("q-001", status="completed")
+        finally:
+            db.close()
+
+        results = purge_specs(self.queue_dir, self.log_dir, dry_run=True)
+        self.assertEqual(len(results), 1)
+
+        # Spec should still exist in DB
+        db = _get_db(self.queue_dir)
+        try:
+            spec = db.get_spec("q-001")
+            self.assertIsNotNone(spec)
+        finally:
+            db.close()
+
+    def test_purge_skips_active_specs(self):
+        """purge_specs() should not remove queued/running specs by default."""
+        from lib.cli_ops import dispatch, purge_specs
+
+        dispatch(queue_dir=self.queue_dir, spec_path=self.spec_path)
+        results = purge_specs(self.queue_dir, self.log_dir)
+        self.assertEqual(len(results), 0)
+
+    def test_purge_all_mode_removes_active(self):
+        """purge_specs(all_mode=True) should remove all specs."""
+        from lib.cli_ops import dispatch, _get_db, purge_specs
+
+        dispatch(queue_dir=self.queue_dir, spec_path=self.spec_path)
+        results = purge_specs(self.queue_dir, self.log_dir, all_mode=True)
+        self.assertEqual(len(results), 1)
+
+        db = _get_db(self.queue_dir)
+        try:
+            spec = db.get_spec("q-001")
+            self.assertIsNone(spec)
+        finally:
+            db.close()
+
+    def test_purge_cleans_log_files(self):
+        """purge_specs() should remove log files for purged specs."""
+        from lib.cli_ops import dispatch, _get_db, purge_specs
+
+        dispatch(queue_dir=self.queue_dir, spec_path=self.spec_path)
+
+        # Create a fake log file
+        log_file = os.path.join(self.log_dir, "q-001-iter-1.log")
+        Path(log_file).write_text("log content")
+        self.assertTrue(os.path.isfile(log_file))
+
+        db = _get_db(self.queue_dir)
+        try:
+            db.update_spec_fields("q-001", status="completed")
+        finally:
+            db.close()
+
+        results = purge_specs(self.queue_dir, self.log_dir)
+        self.assertEqual(len(results), 1)
+        self.assertFalse(os.path.isfile(log_file))
+        # Log file should be in files_removed list
+        self.assertIn(log_file, results[0]["files_removed"])
+
+    def test_cli_ops_importable(self):
+        """cli_ops module should be importable."""
+        result = subprocess.run(
+            [
+                sys.executable, "-c",
+                "from lib.cli_ops import dispatch, cancel_spec, purge_specs; print('ok')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(Path(BOI_SH).parent),
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Failed to import cli_ops: {result.stderr}",
+        )
+        self.assertIn("ok", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

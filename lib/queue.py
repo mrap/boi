@@ -1,4 +1,9 @@
-# queue.py — Spec queue operations for BOI.
+# queue.py — [DEPRECATED] JSON-file spec queue operations for BOI.
+#
+# DEPRECATED: This module is superseded by lib/db.py (SQLite).
+# Kept for rollback compatibility. Use lib/queue_compat.py for
+# automatic routing between SQLite and JSON backends.
+# New code should use lib/db.py directly.
 #
 # The queue lives at ~/.boi/queue/. Each queued spec is a JSON file
 # named {queue-id}.json. Operations are atomic (write .tmp, then mv).

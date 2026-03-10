@@ -1,12 +1,16 @@
 # status.py — Format status output for BOI CLI.
 #
-# Reads from the queue directory and builds a status snapshot.
+# Reads from the queue directory (JSON) or SQLite database and
+# builds a status snapshot. Prefers SQLite when boi.db exists in
+# the state directory (parent of queue_dir), falling back to JSON.
+#
 # Two output modes:
 #   - Human-readable table (for terminal, with color)
 #   - JSON (for programmatic consumption)
 
 import json
 import os
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -60,7 +64,7 @@ def _colorize(text: str, color: str) -> str:
 
 
 def load_queue(queue_dir: str) -> list[dict[str, Any]]:
-    """Load all queue entries from the queue directory.
+    """Load all queue entries from the queue directory (JSON files).
 
     Returns a list of queue entry dicts sorted by priority (lower first).
     """
@@ -86,17 +90,63 @@ def load_queue(queue_dir: str) -> list[dict[str, Any]]:
     return entries
 
 
+def load_queue_from_db(db_path: str) -> list[dict[str, Any]]:
+    """Load all queue entries from the SQLite database.
+
+    Opens a read-only connection and returns all specs sorted by
+    priority. Falls back to an empty list on any database error.
+    """
+    try:
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            cursor = conn.execute(
+                "SELECT * FROM specs ORDER BY priority ASC, submitted_at ASC"
+            )
+            return [dict(row) for row in cursor]
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return []
+
+
+def _get_db_path(queue_dir: str) -> str | None:
+    """Return the path to boi.db if it exists in the state directory.
+
+    The state directory is the parent of the queue directory.
+    Returns None if boi.db does not exist.
+    """
+    state_dir = str(Path(queue_dir).parent)
+    db_path = os.path.join(state_dir, "boi.db")
+    if os.path.isfile(db_path):
+        return db_path
+    return None
+
+
 def build_queue_status(
     queue_dir: str, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    """Build a status snapshot from the queue directory.
+    """Build a status snapshot from SQLite or the queue directory.
+
+    Prefers SQLite (boi.db in state dir) when available, falling
+    back to JSON queue files.
 
     Returns a dict with:
         - entries: list of queue entry dicts
         - summary: counts by status
         - workers: worker info from config
     """
-    entries = load_queue(queue_dir)
+    db_path = _get_db_path(queue_dir)
+    if db_path is not None:
+        entries = load_queue_from_db(db_path)
+    else:
+        entries = load_queue(queue_dir)
 
     status_counts: dict[str, int] = {
         "queued": 0,

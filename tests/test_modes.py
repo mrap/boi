@@ -392,7 +392,7 @@ class TestModePrecedence(unittest.TestCase):
     """Spec header mode overrides queue entry mode overrides default."""
 
     def _generate_prompt_mode(self, spec_content, queue_mode=None):
-        """Simulate the mode determination logic from worker.sh."""
+        """Simulate the mode determination logic from the worker."""
         mode = "execute"  # default
 
         # 1. Queue entry mode
@@ -494,7 +494,7 @@ class TestExperimentBudget(unittest.TestCase):
 
     def test_exhaustion_notice_in_prompt(self):
         """When budget is exhausted, the prompt should indicate it."""
-        # Simulate the worker.sh budget text logic
+        # Simulate the worker budget text logic
         max_budget = 2
         used_budget = 2
         remaining = max(0, max_budget - used_budget)
