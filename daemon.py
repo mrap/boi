@@ -625,7 +625,7 @@ class Daemon:
                 events_dir=events_dir,
                 log_dir=self.log_dir,
                 hooks_dir=self.hooks_dir,
-                script_dir=os.path.dirname(os.path.abspath(__file__)),
+                script_dir=self.script_dir,
                 exit_code=str(exit_code),
                 db=self.db,
             )
