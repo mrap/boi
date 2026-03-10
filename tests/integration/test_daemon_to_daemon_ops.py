@@ -182,5 +182,103 @@ class TestDaemonToDaemonOpsConcurrent(IntegrationTestCase):
         self.assertEqual(spec2["status"], "completed")
 
 
+class TestDaemonToDaemonOpsEvaluatePhase(IntegrationTestCase):
+    """Test that evaluate phase completion works through real daemon_ops.
+
+    Regression test for IntegrityError: process_evaluation_completion()
+    was setting phase="completed" via db.update_spec_fields(), but the
+    SQLite CHECK constraint only allows execute|critic|evaluate|decompose.
+    This left specs stuck in running status forever.
+    """
+
+    NUM_WORKERS = 1
+
+    def mock_claude_factory(
+        self, spec_id: str, phase: str, iteration: int
+    ) -> MockClaude:
+        """Execute completes tasks, critic approves, evaluate checks all criteria."""
+        if phase == "execute":
+            return MockClaude(
+                phase="execute", tasks_to_complete=1, exit_code=0
+            )
+        elif phase == "critic":
+            return MockClaude(
+                phase="critic", critic_approve=True, exit_code=0
+            )
+        elif phase == "evaluate":
+            # Check off both criteria (indices 0 and 1)
+            return MockClaude(
+                phase="evaluate", criteria_to_meet=[0, 1], exit_code=0
+            )
+        return MockClaude(exit_code=0)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.harness.start()
+
+    def _create_generate_spec(
+        self, tasks_pending: int = 1, criteria_pre_checked: bool = False
+    ) -> str:
+        """Create a generate-mode spec with success criteria.
+
+        Args:
+            tasks_pending: Number of PENDING tasks.
+            criteria_pre_checked: If True, criteria are already checked [x].
+        """
+        check = "[x]" if criteria_pre_checked else "[ ]"
+        content = (
+            "# [Generate] Test Generate Spec\n\n"
+            "**Mode:** generate\n\n"
+            "## Success Criteria\n\n"
+            f"- {check} First criterion is met\n"
+            f"- {check} Second criterion is met\n\n"
+            "## Tasks\n"
+        )
+        for i in range(1, tasks_pending + 1):
+            content += (
+                f"\n### t-{i}: Pending task {i}\n"
+                "PENDING\n\n"
+                f"**Spec:** Do task {i}.\n\n"
+                "**Verify:** true\n"
+            )
+        return self.create_spec(content=content)
+
+    def test_evaluate_convergence_completes(self) -> None:
+        """Generate spec completes after evaluate phase confirms all criteria met.
+
+        Flow: execute (complete task) -> critic (approve) -> evaluate (check criteria)
+        -> convergence reached -> status=completed.
+
+        This triggers the convergence path (should_stop=True) in
+        process_evaluation_completion, which hits the IntegrityError bug.
+        """
+        spec_path = self._create_generate_spec(tasks_pending=1)
+        spec_id = self.dispatch_spec(spec_path, max_iterations=10)
+
+        spec = self.harness.wait_for_status(
+            spec_id, "completed", timeout=60
+        )
+        self.assertEqual(spec["status"], "completed")
+
+    def test_evaluate_goal_achieved_completes(self) -> None:
+        """Generate spec completes when evaluator finds all criteria already met.
+
+        This tests the goal-achieved path (no new tasks, no convergence stop)
+        in process_evaluation_completion — the else branch that also hits
+        the IntegrityError bug.
+        """
+        # Pre-check criteria so evaluate finds them already met
+        # but there's still 1 pending task for execute to complete
+        spec_path = self._create_generate_spec(
+            tasks_pending=1, criteria_pre_checked=True
+        )
+        spec_id = self.dispatch_spec(spec_path, max_iterations=10)
+
+        spec = self.harness.wait_for_status(
+            spec_id, "completed", timeout=60
+        )
+        self.assertEqual(spec["status"], "completed")
+
+
 if __name__ == "__main__":
     unittest.main()
