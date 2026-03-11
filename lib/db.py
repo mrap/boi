@@ -45,7 +45,7 @@ class DuplicateSpecError(Exception):
             f"Spec '{original_spec_path}' is already in the queue as "
             f"{existing_id} (status: {existing_status}). "
             f"Cancel it first with 'boi cancel {existing_id}' "
-            f"or wait for it to finish."
+            "or wait for it to finish."
         )
 
 
@@ -123,9 +123,7 @@ class Database:
         Scans the specs table for the highest existing numeric suffix
         and returns one higher. Must be called while holding self.lock.
         """
-        cursor = self.conn.execute(
-            "SELECT id FROM specs ORDER BY id DESC"
-        )
+        cursor = self.conn.execute("SELECT id FROM specs ORDER BY id DESC")
         max_num = 0
         for row in cursor:
             spec_id = row["id"]
@@ -147,6 +145,44 @@ class Database:
         if spec_path:
             return os.path.splitext(os.path.basename(spec_path))[0]
         return ""
+
+    def _find_dependency_path(
+        self, from_id: str, target_id: str
+    ) -> Optional[list[str]]:
+        """Walk the spec_dependencies chain from from_id looking for target_id.
+
+        Checks if target_id is reachable from from_id by following
+        blocks_on edges (i.e., does from_id transitively depend on
+        target_id?). Used to detect circular dependencies before
+        inserting new edges.
+
+        Returns the path (list of spec IDs) from from_id to target_id
+        if reachable, or None if no path exists. Must be called while
+        holding self.lock.
+        """
+        from collections import deque
+
+        queue: deque[list[str]] = deque([[from_id]])
+        visited: set[str] = {from_id}
+
+        while queue:
+            path = queue.popleft()
+            current = path[-1]
+
+            rows = self.conn.execute(
+                "SELECT blocks_on FROM spec_dependencies WHERE spec_id = ?",
+                (current,),
+            ).fetchall()
+
+            for row in rows:
+                next_id = row["blocks_on"]
+                if next_id == target_id:
+                    return path
+                if next_id not in visited:
+                    visited.add(next_id)
+                    queue.append(path + [next_id])
+
+        return None
 
     # ── Spec CRUD operations ────────────────────────────────────────
 
@@ -196,9 +232,10 @@ class Database:
 
             # Snapshot initial task IDs
             initial_task_ids: list[str] = []
+            content = Path(spec_copy_path).read_text(encoding="utf-8")
             try:
                 from lib.spec_parser import parse_boi_spec
-                content = Path(spec_copy_path).read_text(encoding="utf-8")
+
                 initial_tasks = parse_boi_spec(content)
                 initial_task_ids = [t.id for t in initial_tasks]
             except Exception:
@@ -230,8 +267,40 @@ class Database:
                 ),
             )
 
-            # Insert dependency edges
+            # Validate and insert dependency edges
             if blocked_by:
+                # Missing dependency validation
+                missing = []
+                warned = []
+                for dep_id in blocked_by:
+                    row = self.conn.execute(
+                        "SELECT status FROM specs WHERE id = ?",
+                        (dep_id,),
+                    ).fetchone()
+                    if row is None:
+                        missing.append(dep_id)
+                    elif row["status"] in ("canceled", "failed"):
+                        warned.append((dep_id, row["status"]))
+                if missing:
+                    raise ValueError(f"Dependency not found: {', '.join(missing)}")
+                if warned:
+                    import sys
+
+                    for wid, wstatus in warned:
+                        print(
+                            f"Warning: dependency {wid} has status '{wstatus}'"
+                            " — dependent spec may fail",
+                            file=sys.stderr,
+                        )
+
+                # Circular dependency detection
+                for dep_id in blocked_by:
+                    path = self._find_dependency_path(dep_id, queue_id)
+                    if path is not None:
+                        cycle = [queue_id] + path + [queue_id]
+                        cycle_str = " \u2192 ".join(cycle)
+                        raise ValueError(f"Circular dependency detected: {cycle_str}")
+
                 for dep_id in blocked_by:
                     self.conn.execute(
                         "INSERT INTO spec_dependencies (spec_id, blocks_on) "
@@ -258,9 +327,7 @@ class Database:
 
     def get_spec(self, spec_id: str) -> Optional[dict[str, Any]]:
         """Get a single spec by ID. Returns None if not found."""
-        cursor = self.conn.execute(
-            "SELECT * FROM specs WHERE id = ?", (spec_id,)
-        )
+        cursor = self.conn.execute("SELECT * FROM specs WHERE id = ?", (spec_id,))
         row = cursor.fetchone()
         return self._row_to_dict(row) if row else None
 
@@ -284,9 +351,8 @@ class Database:
                 "UPDATE specs SET status = 'canceled' WHERE id = ?",
                 (spec_id,),
             )
-            self._log_event(
-                "canceled", "Spec canceled", spec_id=spec_id
-            )
+            self._log_event("canceled", "Spec canceled", spec_id=spec_id)
+            self._cascade_dependency_failure(spec_id, "canceled")
             self.conn.commit()
 
     def purge(
@@ -330,9 +396,8 @@ class Database:
 
                 # Iteration files
                 for f in sorted(qpath.iterdir()):
-                    if (
-                        f.name.startswith(f"{sid}.iteration-")
-                        and f.name.endswith(".json")
+                    if f.name.startswith(f"{sid}.iteration-") and f.name.endswith(
+                        ".json"
                     ):
                         files_removed.append(str(f))
 
@@ -355,16 +420,18 @@ class Database:
                         except OSError:
                             pass
 
-                purged.append({
-                    "id": sid,
-                    "status": entry.get("status", "unknown"),
-                    "spec_name": self._spec_name_from_path(
-                        entry.get("original_spec_path", "")
-                    ),
-                    "tasks_total": entry.get("tasks_total", 0),
-                    "iteration": entry.get("iteration", 0),
-                    "files_removed": files_removed,
-                })
+                purged.append(
+                    {
+                        "id": sid,
+                        "status": entry.get("status", "unknown"),
+                        "spec_name": self._spec_name_from_path(
+                            entry.get("original_spec_path", "")
+                        ),
+                        "tasks_total": entry.get("tasks_total", 0),
+                        "iteration": entry.get("iteration", 0),
+                        "files_removed": files_removed,
+                    }
+                )
 
             # Delete rows from DB
             if not dry_run and entries:
@@ -424,9 +491,7 @@ class Database:
         # Sync back (file I/O outside the lock)
         if do_sync and spec_path and original_path:
             if os.path.isfile(spec_path):
-                if os.path.abspath(spec_path) != os.path.abspath(
-                    original_path
-                ):
+                if os.path.abspath(spec_path) != os.path.abspath(original_path):
                     try:
                         shutil.copy2(spec_path, original_path)
                     except OSError:
@@ -472,8 +537,7 @@ class Database:
 
                 # Check dependencies (all must be completed)
                 deps = self.conn.execute(
-                    "SELECT blocks_on FROM spec_dependencies "
-                    "WHERE spec_id = ?",
+                    "SELECT blocks_on FROM spec_dependencies WHERE spec_id = ?",
                     (sid,),
                 ).fetchall()
                 if deps:
@@ -550,6 +614,7 @@ class Database:
             if spec_path and os.path.isfile(spec_path):
                 try:
                     from lib.spec_parser import parse_boi_spec
+
                     content = Path(spec_path).read_text(encoding="utf-8")
                     tasks = parse_boi_spec(content)
                     pre_tasks = {t.id: t.status for t in tasks}
@@ -640,6 +705,48 @@ class Database:
             )
             self.conn.commit()
 
+    def _cascade_dependency_failure(self, spec_id: str, terminal_status: str) -> None:
+        """Fail all specs that depend on spec_id (transitively).
+
+        Must be called inside a transaction (caller holds self.lock).
+        When a spec reaches a terminal failed/canceled state, any spec
+        that lists it in spec_dependencies should also be failed with
+        a clear dependency_failed reason.
+        """
+        queue: list[tuple[str, str]] = [(spec_id, terminal_status)]
+        while queue:
+            failed_id, status = queue.pop(0)
+            # Find specs that depend on failed_id
+            dependents = self.conn.execute(
+                "SELECT spec_id FROM spec_dependencies WHERE blocks_on = ?",
+                (failed_id,),
+            ).fetchall()
+            for dep_row in dependents:
+                dep_id = dep_row["spec_id"]
+                # Only cascade to specs still waiting
+                dep_spec = self.conn.execute(
+                    "SELECT status FROM specs WHERE id = ?", (dep_id,)
+                ).fetchone()
+                if dep_spec and dep_spec["status"] in ("queued", "requeued"):
+                    failure_reason = f"dependency_failed: {failed_id} ({status})"
+                    self.conn.execute(
+                        "UPDATE specs SET status = 'failed', "
+                        "failure_reason = ? WHERE id = ?",
+                        (failure_reason, dep_id),
+                    )
+                    self._log_event(
+                        "dependency_failed",
+                        failure_reason,
+                        spec_id=dep_id,
+                        data={
+                            "blocked_on": failed_id,
+                            "blocked_on_status": status,
+                        },
+                        level="warn",
+                    )
+                    # Transitively cascade
+                    queue.append((dep_id, "failed"))
+
     def fail(self, spec_id: str, reason: str = "") -> None:
         """Set a spec's status to 'failed'."""
         with self.lock:
@@ -650,8 +757,7 @@ class Database:
                 raise ValueError(f"Spec not found: {spec_id}")
 
             self.conn.execute(
-                "UPDATE specs SET status = 'failed', "
-                "failure_reason = ? WHERE id = ?",
+                "UPDATE specs SET status = 'failed', failure_reason = ? WHERE id = ?",
                 (reason or None, spec_id),
             )
             self._log_event(
@@ -661,6 +767,7 @@ class Database:
                 data={"reason": reason},
                 level="warn",
             )
+            self._cascade_dependency_failure(spec_id, "failed")
             self.conn.commit()
 
     def record_failure(self, spec_id: str) -> bool:
@@ -679,8 +786,7 @@ class Database:
 
             new_count = (row["consecutive_failures"] or 0) + 1
             cooldown_end = (
-                datetime.now(timezone.utc)
-                + timedelta(seconds=COOLDOWN_SECONDS)
+                datetime.now(timezone.utc) + timedelta(seconds=COOLDOWN_SECONDS)
             ).isoformat()
 
             self.conn.execute(
@@ -768,7 +874,7 @@ class Database:
             )
             self._log_event(
                 "needs_review",
-                f"Spec paused for experiment review "
+                "Spec paused for experiment review "
                 f"({len(experiment_tasks)} experiments)",
                 spec_id=spec_id,
                 data={"experiment_tasks": experiment_tasks},
@@ -798,8 +904,7 @@ class Database:
             max_budget = row["max_experiment_invocations"] or 0
 
             self.conn.execute(
-                "UPDATE specs SET experiment_invocations_used = ? "
-                "WHERE id = ?",
+                "UPDATE specs SET experiment_invocations_used = ? WHERE id = ?",
                 (used, spec_id),
             )
             self._log_event(
@@ -816,9 +921,7 @@ class Database:
                 "remaining": max(0, max_budget - used),
             }
 
-    def recover_stale_assigning(
-        self, timeout_seconds: int = 60
-    ) -> list[str]:
+    def recover_stale_assigning(self, timeout_seconds: int = 60) -> list[str]:
         """Reset specs stuck in 'assigning' to 'requeued'.
 
         If a spec has been in 'assigning' for longer than
@@ -829,8 +932,7 @@ class Database:
         Returns list of spec IDs that were recovered.
         """
         cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(seconds=timeout_seconds)
+            datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)
         ).isoformat()
 
         recovered: list[str] = []
@@ -868,12 +970,22 @@ class Database:
     # ── General field updates ─────────────────────────────────────
 
     # Columns that may be updated via update_spec_fields().
-    _UPDATABLE_COLUMNS = frozenset({
-        "phase", "critic_passes", "decomposition_retries",
-        "tasks_done", "tasks_total", "worker_timeout_seconds",
-        "failure_reason", "needs_review_since", "experiment_tasks",
-        "status", "max_experiment_invocations", "experiment_invocations_used",
-    })
+    _UPDATABLE_COLUMNS = frozenset(
+        {
+            "phase",
+            "critic_passes",
+            "decomposition_retries",
+            "tasks_done",
+            "tasks_total",
+            "worker_timeout_seconds",
+            "failure_reason",
+            "needs_review_since",
+            "experiment_tasks",
+            "status",
+            "max_experiment_invocations",
+            "experiment_invocations_used",
+        }
+    )
 
     def update_spec_fields(
         self,
@@ -888,9 +1000,7 @@ class Database:
         """
         invalid = set(fields) - self._UPDATABLE_COLUMNS
         if invalid:
-            raise ValueError(
-                f"Cannot update columns: {', '.join(sorted(invalid))}"
-            )
+            raise ValueError(f"Cannot update columns: {', '.join(sorted(invalid))}")
         if not fields:
             return
 
@@ -918,7 +1028,9 @@ class Database:
     # ── Worker management ──────────────────────────────────────────
 
     def register_worker(
-        self, worker_id: str, worktree_path: str
+        self,
+        worker_id: str,
+        worktree_path: str,
     ) -> None:
         """Register a worker slot in the database.
 
@@ -944,8 +1056,7 @@ class Database:
         Returns the worker dict or None if all workers are busy.
         """
         cursor = self.conn.execute(
-            "SELECT * FROM workers WHERE current_spec_id IS NULL "
-            "ORDER BY id ASC"
+            "SELECT * FROM workers WHERE current_spec_id IS NULL ORDER BY id ASC"
         )
         row = cursor.fetchone()
         return self._row_to_dict(row) if row else None
@@ -974,8 +1085,7 @@ class Database:
             )
             self._log_event(
                 "worker_assigned",
-                f"Worker {worker_id} assigned to {spec_id} "
-                f"(pid={pid}, phase={phase})",
+                f"Worker {worker_id} assigned to {spec_id} (pid={pid}, phase={phase})",
                 spec_id=spec_id,
                 data={
                     "worker_id": worker_id,
@@ -1006,15 +1116,11 @@ class Database:
 
     def get_worker(self, worker_id: str) -> Optional[dict[str, Any]]:
         """Get a single worker by ID. Returns None if not found."""
-        cursor = self.conn.execute(
-            "SELECT * FROM workers WHERE id = ?", (worker_id,)
-        )
+        cursor = self.conn.execute("SELECT * FROM workers WHERE id = ?", (worker_id,))
         row = cursor.fetchone()
         return self._row_to_dict(row) if row else None
 
-    def get_worker_current_spec(
-        self, worker_id: str
-    ) -> Optional[dict[str, Any]]:
+    def get_worker_current_spec(self, worker_id: str) -> Optional[dict[str, Any]]:
         """Get the spec currently assigned to a worker.
 
         Returns the spec dict or None if the worker is idle or
@@ -1077,17 +1183,13 @@ class Database:
 
     def get_active_processes(self) -> list[dict[str, Any]]:
         """Get all processes that have not ended yet."""
-        cursor = self.conn.execute(
-            "SELECT * FROM processes WHERE ended_at IS NULL"
-        )
+        cursor = self.conn.execute("SELECT * FROM processes WHERE ended_at IS NULL")
         return [self._row_to_dict(row) for row in cursor]
 
     # ── PID validation ─────────────────────────────────────────────
 
     @staticmethod
-    def _is_pid_alive_and_ours(
-        pid: int, started_at: str
-    ) -> bool:
+    def _is_pid_alive_and_ours(pid: int, started_at: str) -> bool:
         """Check if a PID is alive AND belongs to the process we started.
 
         Uses /proc/{pid}/stat start time comparison on Linux to detect
@@ -1123,7 +1225,7 @@ class Database:
                 if close_paren == -1:
                     # Can't parse; assume alive (conservative)
                     return True
-                fields_after_comm = stat_line[close_paren + 2:].split()
+                fields_after_comm = stat_line[close_paren + 2 :].split()
                 # starttime is field index 19 after the comm block
                 # (fields_after_comm[0] = state, [1] = ppid, ... [19] = starttime)
                 if len(fields_after_comm) > 19:
@@ -1165,7 +1267,7 @@ class Database:
             close_paren = stat_line.rfind(")")
             if close_paren == -1:
                 return None
-            fields_after_comm = stat_line[close_paren + 2:].split()
+            fields_after_comm = stat_line[close_paren + 2 :].split()
             if len(fields_after_comm) > 19:
                 return int(fields_after_comm[19])
         except (OSError, ValueError, IndexError):
@@ -1214,8 +1316,7 @@ class Database:
             )
         elif spec_id is not None:
             cursor = self.conn.execute(
-                "SELECT * FROM events WHERE spec_id = ? "
-                "ORDER BY seq ASC",
+                "SELECT * FROM events WHERE spec_id = ? ORDER BY seq ASC",
                 (spec_id,),
             )
         elif limit is not None:
@@ -1226,9 +1327,7 @@ class Database:
                 (limit,),
             )
         else:
-            cursor = self.conn.execute(
-                "SELECT * FROM events ORDER BY seq ASC"
-            )
+            cursor = self.conn.execute("SELECT * FROM events ORDER BY seq ASC")
         return [self._row_to_dict(row) for row in cursor]
 
     # ── Iteration metadata ────────────────────────────────────────
@@ -1396,9 +1495,7 @@ class Database:
                         entry.get("last_iteration_at"),
                         entry.get("last_worker"),
                         entry.get("iteration", 0),
-                        entry.get(
-                            "max_iterations", DEFAULT_MAX_ITERATIONS
-                        ),
+                        entry.get("max_iterations", DEFAULT_MAX_ITERATIONS),
                         entry.get("consecutive_failures", 0),
                         entry.get("cooldown_until"),
                         entry.get("tasks_done", 0),
@@ -1446,9 +1543,7 @@ class Database:
 
         return imported
 
-    def _migrate_iteration_files(
-        self, queue_dir: Path, spec_id: str
-    ) -> int:
+    def _migrate_iteration_files(self, queue_dir: Path, spec_id: str) -> int:
         """Import iteration-N.json files for a spec into the iterations table.
 
         Called during migrate_from_json(). Must be called while
@@ -1581,9 +1676,7 @@ class Database:
                     # No PID recorded; treat as dead
                     alive = False
                 else:
-                    alive = self._is_pid_alive_and_ours(
-                        pid, proc_started_at
-                    )
+                    alive = self._is_pid_alive_and_ours(pid, proc_started_at)
 
                 if not alive:
                     self.conn.execute(
