@@ -36,7 +36,8 @@ That's it. BOI creates `~/.boi/` with worker worktrees, config, and a daemon tha
 Conversational flow: describe a task, Claude decomposes it into a spec, you confirm, it dispatches.
 
 ```bash
-boi dispatch --spec <path/to/spec.md> [options]
+boi dispatch spec.md                    # shorthand (positional arg)
+boi dispatch --spec <path/to/spec.md>   # explicit flag form
 ```
 
 | Option | Description | Default |
@@ -47,7 +48,9 @@ boi dispatch --spec <path/to/spec.md> [options]
 | `--worktree PATH` | Pin to a specific worktree | auto |
 | `--no-critic` | Skip critic validation on completion | - |
 | `--mode MODE` | Execution mode: `execute`, `challenge`, `discover`, `generate` | execute |
-| `--after QUEUE_ID` | Wait for another spec to complete first | - |
+| `--after QUEUE_ID` | Wait for another spec to complete first (comma-separated for multiple) | - |
+| `--timeout SECS` | Per-iteration timeout in seconds | 1800 |
+| `--dry-run` | Validate and show what would be dispatched without enqueueing | - |
 
 #### Spec Dependencies (`--after`)
 
@@ -72,8 +75,10 @@ boi status --json    # machine-readable
 ### `/boi log <queue-id>` — View worker output
 
 ```bash
-boi log q-001          # tail last 50 lines
+boi log                # tail most recent spec
+boi log q-001          # tail last 50 lines of specific spec
 boi log q-001 --full   # full output
+boi log q-001 --failures  # show only failed iterations
 ```
 
 ### `/boi spec <queue-id>` — View and modify tasks
@@ -86,7 +91,9 @@ boi spec q-001 next t-6                           # reorder: run t-6 next
 boi spec q-001 block t-5 --on t-3                 # t-5 waits for t-3
 ```
 
-### `/boi cancel <queue-id>` — Cancel a spec
+### `/boi cancel [queue-id]` — Cancel a spec
+
+Without a queue-id, cancels the most recent spec.
 
 ### `/boi stop` — Stop all workers and daemon
 
@@ -95,6 +102,12 @@ boi spec q-001 block t-5 --on t-3                 # t-5 waits for t-3
 ### `/boi telemetry <queue-id>` — Iteration breakdown
 
 ### `/boi dashboard` — Live compact dashboard
+
+### `/boi doctor` — Check prerequisites and environment health
+
+### `/boi purge` — Remove completed/failed/canceled specs from queue
+
+### `/boi upgrade` — Update BOI to the latest version
 
 ### `/boi do "..."` — Natural language interface
 
