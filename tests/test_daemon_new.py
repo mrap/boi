@@ -1485,5 +1485,114 @@ class TestSelfHeal(DaemonTestCase):
         self.daemon.self_heal()
 
 
+# ─── Regression: _dispatch_phase_completion must not pass spec_path ────
+
+
+SAMPLE_SPEC_WITH_DONE_T1 = """\
+# Test Spec
+
+## Tasks
+
+### t-1: First task
+DONE
+
+**Spec:** Do the first thing.
+
+**Verify:** echo ok
+
+### t-2: Second task
+PENDING
+
+**Spec:** Do the second thing.
+
+**Verify:** echo ok
+"""
+
+
+class TestDispatchPhaseCompletionExecute(DaemonTestCase):
+    """Regression tests for _dispatch_phase_completion with phase=execute.
+
+    Bug: daemon.py passed spec_path= to daemon_ops.process_worker_completion()
+    which does not accept that parameter, causing TypeError on every iteration
+    completion. This blocked all specs from progressing past iteration 1.
+    """
+
+    @patch.object(Daemon, "launch_worker")
+    def test_execute_phase_does_not_raise_type_error(
+        self,
+        mock_launch: MagicMock,
+    ) -> None:
+        """Calling _dispatch_phase_completion(phase='execute') must not
+        raise TypeError from mismatched kwargs to daemon_ops."""
+        # Create spec with one DONE task (simulating worker completed t-1)
+        done_spec = os.path.join(self.state_dir, "done-t1-spec.md")
+        with open(done_spec, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_SPEC_WITH_DONE_T1)
+
+        mock_launch.return_value = self._make_mock_proc(pid=20001)
+        spec_id = self._enqueue_spec(spec_path=done_spec)
+        self.daemon.dispatch_specs()
+
+        # Create necessary queue files that process_worker_completion reads
+        exit_file = os.path.join(self.queue_dir, f"{spec_id}.exit")
+        with open(exit_file, "w") as f:
+            f.write("0")
+
+        # This is the call that used to raise:
+        # TypeError: process_worker_completion() got an unexpected keyword
+        #   argument 'spec_path'
+        try:
+            self.daemon._dispatch_phase_completion(
+                spec_id=spec_id,
+                phase="execute",
+                exit_code=0,
+                worker_id="w1",
+            )
+        except TypeError as e:
+            if "spec_path" in str(e):
+                self.fail(
+                    f"Regression: daemon still passes spec_path= to "
+                    f"process_worker_completion: {e}"
+                )
+            raise  # re-raise unexpected TypeErrors
+
+    @patch.object(Daemon, "launch_worker")
+    def test_execute_phase_passes_db_for_state_update(
+        self,
+        mock_launch: MagicMock,
+    ) -> None:
+        """process_worker_completion must receive db= so it updates the
+        database state (tasks_done, status). Without db=, it only updates
+        file-based queue entries and the daemon never requeues the spec."""
+        done_spec = os.path.join(self.state_dir, "done-t1-spec.md")
+        with open(done_spec, "w", encoding="utf-8") as f:
+            f.write(SAMPLE_SPEC_WITH_DONE_T1)
+
+        mock_launch.return_value = self._make_mock_proc(pid=20002)
+        spec_id = self._enqueue_spec(spec_path=done_spec)
+        self.daemon.dispatch_specs()
+
+        exit_file = os.path.join(self.queue_dir, f"{spec_id}.exit")
+        with open(exit_file, "w") as f:
+            f.write("0")
+
+        self.daemon._dispatch_phase_completion(
+            spec_id=spec_id,
+            phase="execute",
+            exit_code=0,
+            worker_id="w1",
+        )
+
+        # Verify DB was updated (not just file-based queue)
+        spec = self.daemon.db.get_spec(spec_id)
+        # After completion with 1 pending task remaining, spec should be
+        # requeued (not stuck in "running")
+        self.assertIn(
+            spec["status"],
+            ("requeued", "queued", "completed"),
+            f"Spec should be requeued or completed, got: {spec['status']}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
