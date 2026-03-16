@@ -339,7 +339,7 @@ class Database:
         return [self._row_to_dict(row) for row in cursor]
 
     def cancel(self, spec_id: str) -> None:
-        """Set a spec's status to 'canceled'."""
+        """Set a spec's status to 'canceled' and clean up resources."""
         with self.lock:
             row = self.conn.execute(
                 "SELECT id FROM specs WHERE id = ?", (spec_id,)
@@ -351,6 +351,26 @@ class Database:
                 "UPDATE specs SET status = 'canceled' WHERE id = ?",
                 (spec_id,),
             )
+
+            # End any active process records for this spec
+            now = self._now_iso()
+            self.conn.execute(
+                "UPDATE processes SET ended_at = ?, exit_code = -1 "
+                "WHERE spec_id = ? AND ended_at IS NULL",
+                (now, spec_id),
+            )
+
+            # Free any worker assigned to this spec
+            self.conn.execute(
+                "UPDATE workers SET "
+                "current_spec_id = NULL, "
+                "current_pid = NULL, "
+                "start_time = NULL, "
+                "current_phase = NULL "
+                "WHERE current_spec_id = ?",
+                (spec_id,),
+            )
+
             self._log_event("canceled", "Spec canceled", spec_id=spec_id)
             self._cascade_dependency_failure(spec_id, "canceled")
             self.conn.commit()

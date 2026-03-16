@@ -596,6 +596,53 @@ class TestCancel(CrudTestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["spec_id"], "q-001")
 
+    def test_cancel_ends_active_process(self) -> None:
+        """Canceling a spec must end any active process record.
+
+        Bug: cancel() only set status to 'canceled' but left the process
+        record with ended_at=NULL. Ghost processes accumulated and caused
+        worker starvation (workers appeared busy with dead specs).
+        """
+        spec = self._make_spec_file()
+        self.db.enqueue(spec)
+        self.db.register_worker("w-1", "/tmp/wt-1")
+        self.db.assign_worker("w-1", "q-001", pid=12345)
+        # Start a process (iteration + phase are NOT NULL in schema)
+        self.db.conn.execute(
+            "INSERT INTO processes (spec_id, worker_id, pid, iteration, phase, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("q-001", "w-1", 12345, 1, "execute", "2026-03-16T00:00:00Z"),
+        )
+        self.db.conn.commit()
+
+        self.db.cancel("q-001")
+
+        # Process should be ended
+        active = self.db.conn.execute(
+            "SELECT * FROM processes WHERE spec_id = 'q-001' AND ended_at IS NULL"
+        ).fetchall()
+        self.assertEqual(len(active), 0, "Cancel should end active processes")
+
+    def test_cancel_frees_assigned_worker(self) -> None:
+        """Canceling a spec must free the worker assigned to it.
+
+        Bug: cancel() left the worker's current_spec_id pointing to the
+        canceled spec. The worker appeared busy and couldn't be assigned
+        new work.
+        """
+        spec = self._make_spec_file()
+        self.db.enqueue(spec)
+        self.db.register_worker("w-1", "/tmp/wt-1")
+        self.db.assign_worker("w-1", "q-001", pid=12345)
+
+        self.db.cancel("q-001")
+
+        worker = self.db.get_worker("w-1")
+        self.assertIsNone(
+            worker["current_spec_id"],
+            "Cancel should free the worker assigned to the canceled spec",
+        )
+
 
 # ─── Purge Tests ───────────────────────────────────────────────────────
 
