@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import os
+import resource
 import signal
 import subprocess
 import sys
@@ -38,6 +39,21 @@ DEFAULT_WORKER_TIMEOUT = 1800  # 30 minutes
 SELF_HEAL_INTERVAL = 10  # Run self-heal every N poll cycles
 
 logger = logging.getLogger("boi.daemon")
+
+
+def _raise_fd_limit(target: int = 1024) -> None:
+    """Raise the file descriptor soft limit if needed.
+
+    At 10+ parallel workers (each with claude -p subprocess + pipes),
+    the default 256 FD limit on some systems causes SIGTERM kills.
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(target, hard), hard))
+            logger.info("Raised FD limit from %d to %d (hard: %d)", soft, target, hard)
+    except (ValueError, OSError) as e:
+        logger.warning("Could not raise FD limit: %s", e)
 
 
 class Daemon:
@@ -93,6 +109,9 @@ class Daemon:
         # Install signal handlers
         signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
+
+        # Raise FD limit to prevent SIGTERM at 10+ parallel workers
+        _raise_fd_limit()
 
     # ── Signal handling ──────────────────────────────────────────────
 

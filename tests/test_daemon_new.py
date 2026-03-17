@@ -1594,5 +1594,72 @@ class TestDispatchPhaseCompletionExecute(DaemonTestCase):
         )
 
 
+# ─── Resource limit tests ──────────────────────────────────────────────
+
+
+class TestDaemonResourceLimits(DaemonTestCase):
+    """Verify daemon sets appropriate resource limits at startup."""
+
+    def test_fd_limit_raised_on_init(self) -> None:
+        """Daemon should raise FD limit to at least 1024 on startup."""
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        # After daemon init, soft limit should be >= 1024
+        self.assertGreaterEqual(soft, 1024,
+            f"FD soft limit {soft} < 1024. Daemon should raise it on init.")
+
+    @patch("daemon.resource.getrlimit", return_value=(256, 10240))
+    @patch("daemon.resource.setrlimit")
+    def test_raise_fd_limit_called_when_low(
+        self,
+        mock_setrlimit: MagicMock,
+        mock_getrlimit: MagicMock,
+    ) -> None:
+        """_raise_fd_limit raises soft limit when below target."""
+        from daemon import _raise_fd_limit
+        _raise_fd_limit(1024)
+        mock_setrlimit.assert_called_once_with(
+            __import__("resource").RLIMIT_NOFILE, (1024, 10240)
+        )
+
+    @patch("daemon.resource.getrlimit", return_value=(2560, 10240))
+    @patch("daemon.resource.setrlimit")
+    def test_raise_fd_limit_skipped_when_sufficient(
+        self,
+        mock_setrlimit: MagicMock,
+        mock_getrlimit: MagicMock,
+    ) -> None:
+        """_raise_fd_limit does nothing when soft limit is already >= target."""
+        from daemon import _raise_fd_limit
+        _raise_fd_limit(1024)
+        mock_setrlimit.assert_not_called()
+
+    @patch("daemon.resource.getrlimit", return_value=(256, 512))
+    @patch("daemon.resource.setrlimit")
+    def test_raise_fd_limit_caps_at_hard(
+        self,
+        mock_setrlimit: MagicMock,
+        mock_getrlimit: MagicMock,
+    ) -> None:
+        """_raise_fd_limit caps at hard limit when hard < target."""
+        from daemon import _raise_fd_limit
+        _raise_fd_limit(1024)
+        mock_setrlimit.assert_called_once_with(
+            __import__("resource").RLIMIT_NOFILE, (512, 512)
+        )
+
+    @patch("daemon.resource.getrlimit", return_value=(256, 10240))
+    @patch("daemon.resource.setrlimit", side_effect=OSError("permission denied"))
+    def test_raise_fd_limit_handles_oserror(
+        self,
+        mock_setrlimit: MagicMock,
+        mock_getrlimit: MagicMock,
+    ) -> None:
+        """_raise_fd_limit does not crash on OSError."""
+        from daemon import _raise_fd_limit
+        # Should not raise
+        _raise_fd_limit(1024)
+
+
 if __name__ == "__main__":
     unittest.main()
