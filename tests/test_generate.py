@@ -286,6 +286,8 @@ class TestAutoValidateDispatch(unittest.TestCase):
         content = textwrap.dedent("""\
             # Regular Spec
 
+            **Workspace:** in-place
+
             ### t-1: Do something
             PENDING
 
@@ -352,6 +354,8 @@ class TestDecompositionOutputValidation(unittest.TestCase):
             - [ ] Can write config
             - [ ] Has tests
 
+            **Workspace:** in-place
+
             ### t-1: Scaffold project structure
             PENDING
 
@@ -386,7 +390,7 @@ PENDING
 **Spec:** Do task {i}.
 **Verify:** echo ok
 """)
-        content = "# Test\n\n" + "\n".join(tasks)
+        content = "# Test\n\n**Workspace:** in-place\n\n" + "\n".join(tasks)
         result = validate_spec(content)
         self.assertTrue(result.valid)
         self.assertEqual(result.total, 3)
@@ -395,6 +399,8 @@ PENDING
         """If decomposition produces < 3 tasks, we can detect it via count."""
         content = textwrap.dedent("""\
             # Test
+
+            **Workspace:** in-place
 
             ### t-1: Only task
             PENDING

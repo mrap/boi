@@ -51,7 +51,7 @@ class DaemonOpsTestCase(unittest.TestCase):
             self._spec_counter = 0
         self._spec_counter += 1
         spec_path = os.path.join(self._tmpdir.name, f"spec-{self._spec_counter}.md")
-        lines = ["# Test Spec\n\n## Tasks\n"]
+        lines = ["# Test Spec\n\n**Workspace:** in-place\n\n## Tasks\n"]
         tid = 1
         for _ in range(tasks_done):
             lines.append(
@@ -756,7 +756,7 @@ class TestPostIterationValidation(DaemonOpsTestCase):
         # Now modify the copied spec to regress t-1 from DONE to PENDING
         copied_spec = updated_entry["spec_path"]
         regressed_content = (
-            "# Test Spec\n\n## Tasks\n\n"
+            "# Test Spec\n\n**Workspace:** in-place\n\n## Tasks\n\n"
             "### t-1: Done task 1\nPENDING\n\n"
             "**Spec:** Did it.\n**Verify:** true\n\n"
             "### t-2: Pending task 2\nPENDING\n\n"
@@ -1846,7 +1846,7 @@ class DaemonOpsDBTestCase(unittest.TestCase):
         spec_path = os.path.join(
             self._tmpdir.name, f"spec-{self._spec_counter}.md"
         )
-        lines = ["# Test Spec\n\n## Tasks\n"]
+        lines = ["# Test Spec\n\n**Workspace:** in-place\n\n## Tasks\n"]
         tid = 1
         for _ in range(tasks_done):
             lines.append(
@@ -2377,7 +2377,7 @@ class TestProcessDecompositionCompletionDB(DaemonOpsDBTestCase):
         spec_path = os.path.join(
             self._tmpdir.name, f"spec-{self._spec_counter}.md"
         )
-        lines = ["# Decomposed Spec\n\n## Approach\n\nDo stuff.\n\n## Tasks\n"]
+        lines = ["# Decomposed Spec\n\n**Workspace:** in-place\n\n## Approach\n\nDo stuff.\n\n## Tasks\n"]
         for i in range(1, task_count + 1):
             lines.append(
                 f"\n### t-{i}: Task {i}\n"

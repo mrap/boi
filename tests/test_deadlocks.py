@@ -75,7 +75,7 @@ class DeadlockTestCase(unittest.TestCase):
             Path(spec_path).write_text(content, encoding="utf-8")
             return spec_path
 
-        lines = ["# Test Spec\n\n## Tasks\n"]
+        lines = ["# Test Spec\n\n**Workspace:** in-place\n\n## Tasks\n"]
         tid = 1
         for _ in range(tasks_done):
             lines.append(

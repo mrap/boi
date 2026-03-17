@@ -691,7 +691,7 @@ class TestCriticIntegration(unittest.TestCase):
         spec_path = os.path.join(self.tmpdir, "spec.md")
         _write_spec(
             spec_path,
-            "# Test Spec\n\n## Tasks\n\n"
+            "# Test Spec\n\n**Workspace:** in-place\n\n## Tasks\n\n"
             "### t-1: Do thing\nDONE\n\n"
             "**Spec:** Did it.\n**Verify:** true\n",
         )
@@ -731,7 +731,7 @@ class TestCriticIntegration(unittest.TestCase):
         spec_path = os.path.join(self.tmpdir, "spec.md")
         _write_spec(
             spec_path,
-            "# Test Spec\n\n## Tasks\n\n"
+            "# Test Spec\n\n**Workspace:** in-place\n\n## Tasks\n\n"
             "### t-1: Do thing\nDONE\n\n"
             "**Spec:** Did it.\n**Verify:** true\n",
         )
@@ -772,7 +772,7 @@ class TestCriticIntegration(unittest.TestCase):
         spec_path = os.path.join(self.tmpdir, "spec.md")
         _write_spec(
             spec_path,
-            "# Test Spec\n\n## Tasks\n\n"
+            "# Test Spec\n\n**Workspace:** in-place\n\n## Tasks\n\n"
             "### t-1: Do thing\nDONE\n\n"
             "**Spec:** Did it.\n**Verify:** true\n",
         )
@@ -808,7 +808,7 @@ class TestCriticIntegration(unittest.TestCase):
         spec_path = os.path.join(self.tmpdir, "spec.md")
         _write_spec(
             spec_path,
-            "# Test Spec\n\n"
+            "# Test Spec\n\n**Workspace:** in-place\n\n"
             "## Tasks\n\n"
             "### t-1: Do thing\nDONE\n\n"
             "## Critic Approved\n\n2026-03-06\n",
@@ -847,7 +847,7 @@ class TestCriticIntegration(unittest.TestCase):
         # Step 1: Critic adds tasks
         _write_spec(
             spec_path,
-            "# Test Spec\n\n"
+            "# Test Spec\n\n**Workspace:** in-place\n\n"
             "## Tasks\n\n"
             "### t-1: Original\nDONE\n\n"
             "**Spec:** Did it.\n\n**Verify:** true\n\n"
@@ -883,7 +883,7 @@ class TestCriticIntegration(unittest.TestCase):
         # Step 2: Worker fixes the task (simulate by marking DONE)
         _write_spec(
             spec_path,
-            "# Test Spec\n\n"
+            "# Test Spec\n\n**Workspace:** in-place\n\n"
             "## Tasks\n\n"
             "### t-1: Original\nDONE\n\n"
             "**Spec:** Did it.\n\n**Verify:** true\n\n"

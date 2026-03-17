@@ -36,6 +36,8 @@ from lib.queue import _read_entry, _write_entry, enqueue, set_running
 VALID_DECOMPOSED_SPEC = textwrap.dedent("""\
     # Test Generate Spec
 
+    **Workspace:** in-place
+
     ## Approach
 
     We will do it in three steps.
