@@ -204,39 +204,9 @@ def process_worker_completion(
         "spec_path": spec_path,
     }
 
-    # Crash: no exit file
-    if exit_code is None:
-        if timeout:
-            # Get timeout value for the message
-            timeout_seconds = entry.get("worker_timeout_seconds") or 1800
-            timeout_minutes = timeout_seconds // 60
-            failure_reason = f"Worker timed out after {timeout_minutes} minutes."
-        else:
-            failure_reason = (
-                "Worker crashed: no exit file. "
-                "Process may have been killed or timed out."
-            )
-        crash_result = _handle_crash(
-            queue_dir,
-            queue_id,
-            entry,
-            iteration,
-            max_iter,
-            events_dir,
-            hooks_dir,
-            log_dir,
-            spec_path,
-            timestamp,
-            failure_reason=failure_reason,
-            exit_code_str=exit_code,
-            db=db,
-        )
-        result.update(crash_result)
-        return result
-
-    # Non-zero exit code: worker failed
-    if exit_code != "0":
-        failure_reason = f"Worker exited with code {exit_code}."
+    # Crash: no exit file, or non-zero exit code
+    if exit_code is None or exit_code != "0":
+        failure_reason = _get_failure_reason(exit_code, timeout, entry)
         crash_result = _handle_crash(
             queue_dir,
             queue_id,
@@ -256,80 +226,37 @@ def process_worker_completion(
         return result
 
     # Step 2: Normal exit — validate spec first
-    if spec_path:
-        validation = validate_spec_file(spec_path)
-        if not validation.valid:
-            # Spec is malformed — treat as crash
-            result["validation_errors"] = validation.errors
-
-            error_summary = "; ".join(validation.errors[:3])
-            failure_reason = f"Post-iteration spec validation failed: {error_summary}"
-
-            # Write validation errors to iteration metadata
-            iter_meta_path = Path(queue_dir) / f"{queue_id}.iteration-{iteration}.json"
-            if iter_meta_path.is_file():
-                try:
-                    meta = json.loads(iter_meta_path.read_text(encoding="utf-8"))
-                    meta["validation_errors"] = validation.errors
-                    meta["failure_reason"] = failure_reason
-                    tmp = iter_meta_path.with_suffix(".json.tmp")
-                    tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-                    os.rename(str(tmp), str(iter_meta_path))
-                except Exception:
-                    pass
-
-            crash_result = _handle_crash(
-                queue_dir,
-                queue_id,
-                entry,
-                iteration,
-                max_iter,
-                events_dir,
-                hooks_dir,
-                log_dir,
-                spec_path,
-                timestamp,
-                failure_reason=failure_reason,
-                exit_code_str=exit_code,
-                db=db,
-            )
-            result.update(crash_result)
-            result["outcome"] = "validation_failed"
-            return result
+    validation_error = _validate_spec_or_get_error(
+        queue_dir, queue_id, spec_path, iteration
+    )
+    if validation_error is not None:
+        result["validation_errors"] = validation_error["validation_errors"]
+        failure_reason = validation_error["failure_reason"]
+        crash_result = _handle_crash(
+            queue_dir,
+            queue_id,
+            entry,
+            iteration,
+            max_iter,
+            events_dir,
+            hooks_dir,
+            log_dir,
+            spec_path,
+            timestamp,
+            failure_reason=failure_reason,
+            exit_code_str=exit_code,
+            db=db,
+        )
+        result.update(crash_result)
+        result["outcome"] = "validation_failed"
+        return result
 
     # Check for status regression (DONE -> PENDING)
-    pre_iteration_tasks = _parse_json_field(
-        entry.get("pre_iteration_tasks"), default={}
+    regressions = _check_regression_and_record(
+        entry, spec_path, queue_id, iteration, timestamp, events_dir
     )
-    if spec_path and pre_iteration_tasks:
-        try:
-            content = Path(spec_path).read_text(encoding="utf-8")
-            current_tasks = parse_boi_spec(content)
-            # Reconstruct previous BoiTask objects from the snapshot
-            previous_tasks = [
-                BoiTask(id=tid, title="", status=status)
-                for tid, status in pre_iteration_tasks.items()
-            ]
-            regressions = check_status_regression(previous_tasks, current_tasks)
-            if regressions:
-                regression_list = [
-                    f"{r.task_id}: {r.previous_status} -> {r.current_status}"
-                    for r in regressions
-                ]
-                result["status_regressions"] = regression_list
-
-                write_event(
-                    events_dir,
-                    {
-                        "type": "status_regression_detected",
-                        "queue_id": queue_id,
-                        "regressions": regression_list,
-                        "iteration": iteration,
-                        "timestamp": timestamp,
-                    },
-                )
-        except Exception:
-            pass  # Regression detection failure should never block the daemon
+    if regressions:
+        result["status_regressions"] = regressions
 
     # Count tasks from spec
     counts = (
@@ -354,69 +281,22 @@ def process_worker_completion(
     tasks_added = get_tasks_added_from_telemetry(queue_dir, queue_id)
 
     # Check for EXPERIMENT_PROPOSED tasks — pause for human review
-    experiment_proposed_tasks: list[str] = []
-    if spec_path:
-        try:
-            content = Path(spec_path).read_text(encoding="utf-8")
-            current_tasks = parse_boi_spec(content)
-            experiment_proposed_tasks = [
-                t.id for t in current_tasks if t.status == "EXPERIMENT_PROPOSED"
-            ]
-        except Exception:
-            pass
-
+    experiment_proposed_tasks = _get_experiment_proposed_tasks(spec_path)
     if experiment_proposed_tasks:
-        # Increment experiment usage count
-        if db:
-            db.increment_experiment_usage(
-                queue_id, count=len(experiment_proposed_tasks)
-            )
-        else:
-            increment_experiment_usage(
-                queue_dir, queue_id, count=len(experiment_proposed_tasks)
-            )
-
-        # Pause spec for human review
-        if db:
-            db.set_needs_review(
-                queue_id,
-                experiment_proposed_tasks,
-                done_count,
-                total_count,
-            )
-        else:
-            set_needs_review(
-                queue_dir,
-                queue_id,
-                experiment_proposed_tasks,
-                done_count,
-                total_count,
-            )
-        result["outcome"] = "needs_review"
-        result["experiment_tasks"] = experiment_proposed_tasks
-
-        write_event(
+        return _handle_experiment_proposed_return(
+            result,
+            experiment_proposed_tasks,
+            db,
+            queue_dir,
+            queue_id,
+            done_count,
+            total_count,
+            hooks_dir,
             events_dir,
-            {
-                "type": "experiment_proposed",
-                "queue_id": queue_id,
-                "spec_path": spec_path,
-                "experiment_tasks": experiment_proposed_tasks,
-                "iteration": iteration,
-                "timestamp": timestamp,
-            },
+            spec_path,
+            iteration,
+            timestamp,
         )
-
-        # Run on-experiment hook if present
-        run_hook(hooks_dir, "on-experiment", queue_id, spec_path)
-
-        # Update telemetry
-        try:
-            update_telemetry(queue_dir, queue_id)
-        except Exception:
-            pass
-
-        return result
 
     # Step 3: Determine outcome and update queue entry
 
@@ -475,100 +355,23 @@ def process_worker_completion(
             run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
             return result
 
-        state_dir = str(Path(queue_dir).parent)
-        critic_config = load_critic_config(state_dir)
-        boi_dir = script_dir  # script_dir points to ~/boi/
-
-        if should_run_critic(entry, critic_config):
-            # Generate critic prompt and signal daemon to launch critic worker
-            critic_passes = entry.get("critic_passes", 0)
-            try:
-                critic_start = time.monotonic()
-                prompt = generate_critic_prompt(
-                    spec_path=spec_path,
-                    queue_id=queue_id,
-                    iteration=critic_passes + 1,
-                    config=critic_config,
-                    boi_dir=boi_dir,
-                    state_dir=state_dir,
-                    queue_entry=entry,
-                )
-                prompt_path = os.path.join(queue_dir, f"{queue_id}.critic-prompt.md")
-                tmp_path = prompt_path + ".tmp"
-                Path(tmp_path).write_text(prompt, encoding="utf-8")
-                os.replace(tmp_path, prompt_path)
-
-                critic_elapsed = round(time.monotonic() - critic_start, 3)
-
-                result["outcome"] = "critic_review"
-                result["critic_prompt_path"] = prompt_path
-                result["critic_pass"] = critic_passes + 1
-
-                write_event(
-                    events_dir,
-                    {
-                        "type": "critic_review_triggered",
-                        "queue_id": queue_id,
-                        "spec_path": spec_path,
-                        "critic_pass": critic_passes + 1,
-                        "critic_elapsed_seconds": critic_elapsed,
-                        "timestamp": timestamp,
-                    },
-                )
-
-                # Requeue so daemon can pick it up for critic worker
-                if db:
-                    db.requeue(queue_id, done_count, total_count)
-                    db.update_spec_fields(queue_id, phase="critic")
-                else:
-                    requeue(queue_dir, queue_id, done_count, total_count)
-
-            except Exception as exc:
-                # If critic prompt generation fails, complete anyway
-                result["critic_error"] = str(exc)
-                if db:
-                    db.complete(queue_id, done_count, total_count)
-                else:
-                    complete(queue_dir, queue_id, done_count, total_count)
-                result["outcome"] = "completed"
-
-                write_event(
-                    events_dir,
-                    {
-                        "type": "spec_completed",
-                        "queue_id": queue_id,
-                        "spec_path": spec_path,
-                        "iterations": iteration,
-                        "tasks_done": done_count,
-                        "tasks_added": tasks_added,
-                        "critic_error": str(exc),
-                        "timestamp": timestamp,
-                    },
-                )
-
-                run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
-        else:
-            # Critic disabled or max passes reached — complete normally
-            if db:
-                db.complete(queue_id, done_count, total_count)
-            else:
-                complete(queue_dir, queue_id, done_count, total_count)
-            result["outcome"] = "completed"
-
-            write_event(
+        result.update(
+            _apply_critic_or_complete(
+                entry,
+                db,
+                queue_dir,
+                queue_id,
+                done_count,
+                total_count,
+                hooks_dir,
                 events_dir,
-                {
-                    "type": "spec_completed",
-                    "queue_id": queue_id,
-                    "spec_path": spec_path,
-                    "iterations": iteration,
-                    "tasks_done": done_count,
-                    "tasks_added": tasks_added,
-                    "timestamp": timestamp,
-                },
+                spec_path,
+                iteration,
+                tasks_added,
+                timestamp,
+                script_dir,
             )
-
-            run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
+        )
 
     else:
         # Still has pending tasks (and under max-iter, checked above), requeue
@@ -761,6 +564,312 @@ def _handle_crash(
         pass
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Helpers extracted from process_worker_completion to reduce cyclomatic
+# complexity. Each helper handles one cohesive sub-concern.
+# ---------------------------------------------------------------------------
+
+
+def _get_failure_reason(
+    exit_code: Optional[str],
+    timeout: bool,
+    entry: dict[str, Any],
+) -> str:
+    """Map crash/failure exit conditions to a human-readable failure reason."""
+    if exit_code is None:
+        if timeout:
+            timeout_seconds = entry.get("worker_timeout_seconds") or 1800
+            timeout_minutes = timeout_seconds // 60
+            return f"Worker timed out after {timeout_minutes} minutes."
+        return (
+            "Worker crashed: no exit file. "
+            "Process may have been killed or timed out."
+        )
+    return f"Worker exited with code {exit_code}."
+
+
+def _validate_spec_or_get_error(
+    queue_dir: str,
+    queue_id: str,
+    spec_path: str,
+    iteration: int,
+) -> Optional[dict[str, Any]]:
+    """Validate the spec file post-iteration.
+
+    Returns a dict with 'validation_errors' and 'failure_reason' keys
+    if the spec is invalid, or None if valid (or no spec_path).
+    """
+    if not spec_path:
+        return None
+    validation = validate_spec_file(spec_path)
+    if validation.valid:
+        return None
+
+    error_summary = "; ".join(validation.errors[:3])
+    failure_reason = f"Post-iteration spec validation failed: {error_summary}"
+
+    # Write validation errors to iteration metadata
+    iter_meta_path = Path(queue_dir) / f"{queue_id}.iteration-{iteration}.json"
+    if iter_meta_path.is_file():
+        try:
+            meta = json.loads(iter_meta_path.read_text(encoding="utf-8"))
+            meta["validation_errors"] = validation.errors
+            meta["failure_reason"] = failure_reason
+            tmp = iter_meta_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+            os.rename(str(tmp), str(iter_meta_path))
+        except Exception:
+            pass
+
+    return {"validation_errors": validation.errors, "failure_reason": failure_reason}
+
+
+def _check_regression_and_record(
+    entry: dict[str, Any],
+    spec_path: str,
+    queue_id: str,
+    iteration: int,
+    timestamp: str,
+    events_dir: str,
+) -> Optional[list[str]]:
+    """Check for task status regressions (DONE -> PENDING).
+
+    Writes a status_regression_detected event if regressions are found.
+    Returns a list of regression descriptions, or None if none found.
+    """
+    pre_iteration_tasks = _parse_json_field(
+        entry.get("pre_iteration_tasks"), default={}
+    )
+    if not spec_path or not pre_iteration_tasks:
+        return None
+    try:
+        content = Path(spec_path).read_text(encoding="utf-8")
+        current_tasks = parse_boi_spec(content)
+        previous_tasks = [
+            BoiTask(id=tid, title="", status=status)
+            for tid, status in pre_iteration_tasks.items()
+        ]
+        regressions = check_status_regression(previous_tasks, current_tasks)
+        if regressions:
+            regression_list = [
+                f"{r.task_id}: {r.previous_status} -> {r.current_status}"
+                for r in regressions
+            ]
+            write_event(
+                events_dir,
+                {
+                    "type": "status_regression_detected",
+                    "queue_id": queue_id,
+                    "regressions": regression_list,
+                    "iteration": iteration,
+                    "timestamp": timestamp,
+                },
+            )
+            return regression_list
+    except Exception:
+        pass  # Regression detection failure should never block the daemon
+    return None
+
+
+def _get_experiment_proposed_tasks(spec_path: str) -> list[str]:
+    """Return IDs of tasks with EXPERIMENT_PROPOSED status in the spec."""
+    if not spec_path:
+        return []
+    try:
+        content = Path(spec_path).read_text(encoding="utf-8")
+        current_tasks = parse_boi_spec(content)
+        return [t.id for t in current_tasks if t.status == "EXPERIMENT_PROPOSED"]
+    except Exception:
+        return []
+
+
+def _handle_experiment_proposed_return(
+    result: dict[str, Any],
+    experiment_proposed_tasks: list[str],
+    db: "Optional[Database]",
+    queue_dir: str,
+    queue_id: str,
+    done_count: int,
+    total_count: int,
+    hooks_dir: str,
+    events_dir: str,
+    spec_path: str,
+    iteration: int,
+    timestamp: str,
+) -> dict[str, Any]:
+    """Handle EXPERIMENT_PROPOSED tasks — pause the spec for human review."""
+    # Increment experiment usage count
+    if db:
+        db.increment_experiment_usage(
+            queue_id, count=len(experiment_proposed_tasks)
+        )
+    else:
+        increment_experiment_usage(
+            queue_dir, queue_id, count=len(experiment_proposed_tasks)
+        )
+
+    # Pause spec for human review
+    if db:
+        db.set_needs_review(
+            queue_id,
+            experiment_proposed_tasks,
+            done_count,
+            total_count,
+        )
+    else:
+        set_needs_review(
+            queue_dir,
+            queue_id,
+            experiment_proposed_tasks,
+            done_count,
+            total_count,
+        )
+    result["outcome"] = "needs_review"
+    result["experiment_tasks"] = experiment_proposed_tasks
+
+    write_event(
+        events_dir,
+        {
+            "type": "experiment_proposed",
+            "queue_id": queue_id,
+            "spec_path": spec_path,
+            "experiment_tasks": experiment_proposed_tasks,
+            "iteration": iteration,
+            "timestamp": timestamp,
+        },
+    )
+
+    # Run on-experiment hook if present
+    run_hook(hooks_dir, "on-experiment", queue_id, spec_path)
+
+    # Update telemetry
+    try:
+        update_telemetry(queue_dir, queue_id)
+    except Exception:
+        pass
+
+    return result
+
+
+def _apply_critic_or_complete(
+    entry: dict[str, Any],
+    db: "Optional[Database]",
+    queue_dir: str,
+    queue_id: str,
+    done_count: int,
+    total_count: int,
+    hooks_dir: str,
+    events_dir: str,
+    spec_path: str,
+    iteration: int,
+    tasks_added: int,
+    timestamp: str,
+    script_dir: str,
+) -> dict[str, Any]:
+    """Determine whether to run the critic or complete the spec.
+
+    Called when pending_count == 0 and iteration < max_iter.
+    Returns a partial result dict to merge into the caller's result.
+    """
+    state_dir = str(Path(queue_dir).parent)
+    critic_config = load_critic_config(state_dir)
+    boi_dir = script_dir  # script_dir points to ~/boi/
+
+    if should_run_critic(entry, critic_config):
+        critic_passes = entry.get("critic_passes", 0)
+        try:
+            critic_start = time.monotonic()
+            prompt = generate_critic_prompt(
+                spec_path=spec_path,
+                queue_id=queue_id,
+                iteration=critic_passes + 1,
+                config=critic_config,
+                boi_dir=boi_dir,
+                state_dir=state_dir,
+                queue_entry=entry,
+            )
+            prompt_path = os.path.join(queue_dir, f"{queue_id}.critic-prompt.md")
+            tmp_path = prompt_path + ".tmp"
+            Path(tmp_path).write_text(prompt, encoding="utf-8")
+            os.replace(tmp_path, prompt_path)
+
+            critic_elapsed = round(time.monotonic() - critic_start, 3)
+
+            write_event(
+                events_dir,
+                {
+                    "type": "critic_review_triggered",
+                    "queue_id": queue_id,
+                    "spec_path": spec_path,
+                    "critic_pass": critic_passes + 1,
+                    "critic_elapsed_seconds": critic_elapsed,
+                    "timestamp": timestamp,
+                },
+            )
+
+            # Requeue so daemon can pick it up for critic worker
+            if db:
+                db.requeue(queue_id, done_count, total_count)
+                db.update_spec_fields(queue_id, phase="critic")
+            else:
+                requeue(queue_dir, queue_id, done_count, total_count)
+
+            return {
+                "outcome": "critic_review",
+                "critic_prompt_path": prompt_path,
+                "critic_pass": critic_passes + 1,
+            }
+
+        except Exception as exc:
+            # If critic prompt generation fails, complete anyway
+            if db:
+                db.complete(queue_id, done_count, total_count)
+            else:
+                complete(queue_dir, queue_id, done_count, total_count)
+
+            write_event(
+                events_dir,
+                {
+                    "type": "spec_completed",
+                    "queue_id": queue_id,
+                    "spec_path": spec_path,
+                    "iterations": iteration,
+                    "tasks_done": done_count,
+                    "tasks_added": tasks_added,
+                    "critic_error": str(exc),
+                    "timestamp": timestamp,
+                },
+            )
+
+            run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
+
+            return {"outcome": "completed", "critic_error": str(exc)}
+
+    else:
+        # Critic disabled or max passes reached — complete normally
+        if db:
+            db.complete(queue_id, done_count, total_count)
+        else:
+            complete(queue_dir, queue_id, done_count, total_count)
+
+        write_event(
+            events_dir,
+            {
+                "type": "spec_completed",
+                "queue_id": queue_id,
+                "spec_path": spec_path,
+                "iterations": iteration,
+                "tasks_done": done_count,
+                "tasks_added": tasks_added,
+                "timestamp": timestamp,
+            },
+        )
+
+        run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
+
+        return {"outcome": "completed"}
 
 
 def pick_next_spec(
