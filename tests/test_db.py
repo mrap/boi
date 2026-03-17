@@ -2465,5 +2465,80 @@ class TestMigrateFromJson(CrudTestCase):
         self.assertEqual(ids, ["1", "2", "3"])
 
 
+# ─── Worker Load Balancing Tests ───────────────────────────────────────
+
+
+class TestWorkerLoadBalancing(CrudTestCase):
+    """Verify workers are selected with round-robin fairness."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.register_worker("w-1", "/tmp/wt-1")
+        self.db.register_worker("w-2", "/tmp/wt-2")
+        self.db.register_worker("w-3", "/tmp/wt-3")
+        # Create a spec so foreign key constraints are satisfied
+        spec = self._make_spec_file()
+        entry = self.db.enqueue(spec)
+        self.spec_id = entry["id"]
+        self.db.pick_next_spec()
+        self.db.set_running(self.spec_id, "w-1")
+
+    def test_free_worker_rotates_not_always_w1(self) -> None:
+        """get_free_worker should not always return the same worker."""
+        # Assign w-1, then free it. Next pick should NOT be w-1.
+        self.db.assign_worker("w-1", self.spec_id, pid=100)
+        self.db.free_worker("w-1")
+
+        worker = self.db.get_free_worker()
+        self.assertIsNotNone(worker)
+        self.assertNotEqual(
+            worker["id"], "w-1",
+            "get_free_worker always returns w-1. Should rotate.",
+        )
+
+    def test_round_robin_cycles_through_all_workers(self) -> None:
+        """Workers should be selected in round-robin order."""
+        picked = []
+        for i in range(3):
+            w = self.db.get_free_worker()
+            self.assertIsNotNone(w)
+            picked.append(w["id"])
+            self.db.assign_worker(w["id"], self.spec_id, pid=100 + i)
+            self.db.free_worker(w["id"])
+
+        # All three workers should have been picked
+        self.assertEqual(len(set(picked)), 3, f"Expected 3 unique workers, got {picked}")
+
+    def test_wraps_around_after_last_worker(self) -> None:
+        """After assigning the last worker, should wrap back to first."""
+        # Assign w-3, free it
+        self.db.assign_worker("w-3", self.spec_id, pid=100)
+        self.db.free_worker("w-3")
+
+        # Next should wrap around and NOT be w-3
+        worker = self.db.get_free_worker()
+        self.assertIsNotNone(worker)
+        self.assertEqual(worker["id"], "w-1", "Should wrap around to w-1 after w-3")
+
+    def test_all_workers_busy_returns_none(self) -> None:
+        """When all workers are busy, get_free_worker returns None."""
+        # Need more specs for each worker (foreign key constraint)
+        spec2 = self._make_spec_file_named("spec2.md")
+        entry2 = self.db.enqueue(spec2)
+        self.db.pick_next_spec()
+        self.db.set_running(entry2["id"], "w-2")
+
+        spec3 = self._make_spec_file_named("spec3.md")
+        entry3 = self.db.enqueue(spec3)
+        self.db.pick_next_spec()
+        self.db.set_running(entry3["id"], "w-3")
+
+        self.db.assign_worker("w-1", self.spec_id, pid=100)
+        self.db.assign_worker("w-2", entry2["id"], pid=101)
+        self.db.assign_worker("w-3", entry3["id"], pid=102)
+
+        self.assertIsNone(self.db.get_free_worker())
+
+
 if __name__ == "__main__":
     unittest.main()

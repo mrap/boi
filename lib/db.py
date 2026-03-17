@@ -1071,14 +1071,40 @@ class Database:
             self.conn.commit()
 
     def get_free_worker(self) -> Optional[dict[str, Any]]:
-        """Find the first worker not currently assigned to a spec.
+        """Find the next free worker using round-robin selection.
+
+        Picks the free worker whose id comes after the last assigned
+        worker, wrapping around. Prevents w-1 from handling 57%+ of
+        all tasks (the old ORDER BY id ASC behaviour).
 
         Returns the worker dict or None if all workers are busy.
         """
-        cursor = self.conn.execute(
-            "SELECT * FROM workers WHERE current_spec_id IS NULL ORDER BY id ASC"
-        )
-        row = cursor.fetchone()
+        # Find the last assigned worker from the event log.
+        # Events persist across assign/free cycles, unlike start_time.
+        last_event = self.conn.execute(
+            "SELECT data FROM events WHERE event_type = 'worker_assigned' "
+            "ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+
+        if last_event:
+            last_id = json.loads(last_event["data"]).get("worker_id", "")
+        else:
+            last_id = ""
+
+        # Try workers after last_id first (round-robin)
+        row = self.conn.execute(
+            "SELECT * FROM workers WHERE current_spec_id IS NULL AND id > ? "
+            "ORDER BY id ASC LIMIT 1",
+            (last_id,),
+        ).fetchone()
+
+        if row is None:
+            # Wrap around to beginning
+            row = self.conn.execute(
+                "SELECT * FROM workers WHERE current_spec_id IS NULL "
+                "ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+
         return self._row_to_dict(row) if row else None
 
     def assign_worker(
