@@ -84,6 +84,30 @@ TMUX_SOCKET = "boi"     # tmux socket name (-L flag)
 logger = logging.getLogger("boi.worker")
 
 
+# Model name aliases → (full model ID, effort level)
+_MODEL_MAP = {
+    "opus":   ("claude-opus-4-6", "high"),
+    "sonnet": ("claude-sonnet-4-6", "medium"),
+    "haiku":  ("claude-haiku-4-5-20251001", "low"),
+}
+
+
+def parse_task_model(task_block: str) -> Optional[tuple[str, str]]:
+    """Parse **Model:** field from a task block.
+
+    Returns (model_id, effort) or None if no Model field found.
+    Supports: opus, sonnet, haiku, or full model IDs.
+    """
+    match = re.search(r'\*\*Model:\*\*\s*(\S+)', task_block)
+    if not match:
+        return None
+    name = match.group(1).lower().strip()
+    if name in _MODEL_MAP:
+        return _MODEL_MAP[name]
+    # Allow full model IDs (e.g., claude-opus-4-6)
+    return (name, "medium")  # default effort for custom models
+
+
 class Worker:
     """Execute one iteration of a BOI spec.
 
@@ -163,6 +187,43 @@ class Worker:
 
         # Pre-iteration task counts (set during run)
         self.pre_counts: dict[str, int] = {}
+
+        # Model routing: phase → (model, effort)
+        # PLAN (decompose) uses Opus at high effort for deep reasoning.
+        # WORK (execute) uses Sonnet at medium effort for speed + quality balance.
+        # QUALITY (critic, evaluate) uses Sonnet at medium effort.
+        self._model_routing = {
+            "decompose": ("claude-opus-4-6", "high"),
+            "execute":   ("claude-sonnet-4-6", "medium"),  # default; per-task **Model:** overrides
+            "critic":    ("claude-sonnet-4-6", "medium"),
+            "evaluate":  ("claude-sonnet-4-6", "medium"),
+        }
+
+    def _claude_cmd(self, model_override: Optional[tuple[str, str]] = None) -> str:
+        """Build the claude -p command with model routing.
+
+        Priority: per-task **Model:** field > phase-based default.
+
+        The returned string is interpolated via {self._claude_cmd()} inside
+        the outer f-string, so bash variables must use ${{var}} to survive
+        the outer f-string's brace resolution ({{x}} → {x} → ${x} in bash).
+        """
+        if model_override:
+            model, effort = model_override
+        else:
+            model, effort = self._model_routing.get(
+                self.phase, ("claude-sonnet-4-6", "medium")
+            )
+        # NOTE: The outer f-string in generate_run_script() will resolve
+        # {{_PROMPT_FILE}} → {_PROMPT_FILE}. But since _claude_cmd()'s
+        # return is already evaluated by the time the outer f-string runs,
+        # we need the literal bash: ${_PROMPT_FILE}.
+        prompt_ref = '${_PROMPT_FILE}'
+        log_ref = '${_LOG_FILE}'
+        return (
+            f'env -u CLAUDECODE claude -p "$(cat "{prompt_ref}")" '
+            f'--model {model} --effort {effort} --dangerously-skip-permissions'
+        )
 
     def run(self) -> int:
         """Execute one iteration: check tasks, generate scripts, launch.
@@ -530,6 +591,27 @@ class Worker:
         pre_skipped = self.pre_counts.get("skipped", 0)
         pre_total = self.pre_counts.get("total", 0)
 
+        # Per-task model routing: parse **Model:** from first PENDING task
+        task_model = None
+        if self.phase == "execute" and os.path.isfile(self.spec_path):
+            spec_content = _read_file(self.spec_path)
+            # Find the first PENDING task block
+            pending_match = re.search(
+                r'(### t-\d+:.*?\nPENDING\b.*?)(?=\n### t-|\Z)',
+                spec_content,
+                re.DOTALL,
+            )
+            if pending_match:
+                task_model = parse_task_model(pending_match.group(1))
+
+        model_for_cost, _ = (
+            task_model
+            if task_model
+            else self._model_routing.get(
+                self.phase, ("claude-sonnet-4-6", "medium")
+            )
+        )
+
         script = f"""\
 #!/bin/bash
 # Auto-generated BOI worker run script for iteration {self.iteration}.
@@ -555,9 +637,9 @@ _PRE_TOTAL={pre_total}
 _START_TIME=$(date +%s)
 _START_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# ── Run Claude ───────────────────────────────────────────────────────────
+# ── Run Claude (model routing: phase → model + effort) ──────────────────
 cd "${{_WORKTREE_PATH}}"
-env -u CLAUDECODE claude -p "$(cat "${{_PROMPT_FILE}}")" --dangerously-skip-permissions > "${{_LOG_FILE}}" 2>&1
+{self._claude_cmd(model_override=task_model)} > "${{_LOG_FILE}}" 2>&1
 _CLAUDE_EXIT=$?
 
 # ── Record end time ──────────────────────────────────────────────────────
@@ -589,6 +671,13 @@ if [[ ${{_TASKS_COMPLETED}} -lt 0 ]]; then _TASKS_COMPLETED=0; fi
 if [[ ${{_TASKS_ADDED}} -lt 0 ]]; then _TASKS_ADDED=0; fi
 if [[ ${{_TASKS_SKIPPED_DELTA}} -lt 0 ]]; then _TASKS_SKIPPED_DELTA=0; fi
 
+# ── Estimate token usage and cost ────────────────────────────────────────
+_COST_MODEL="{model_for_cost}"
+_OUTPUT_CHARS=$(wc -c < "${{_LOG_FILE}}" 2>/dev/null || echo 0)
+_INPUT_CHARS=$(wc -c < "${{_PROMPT_FILE}}" 2>/dev/null || echo 0)
+_OUTPUT_TOKENS=$((_OUTPUT_CHARS / 4))
+_INPUT_TOKENS=$((_INPUT_CHARS / 4))
+
 # ── Write iteration metadata ─────────────────────────────────────────────
 BOI_SCRIPT_DIR="${{_BOI_SCRIPT_DIR}}" python3 - \\
     "${{_ITERATION_FILE}}" \\
@@ -599,10 +688,23 @@ BOI_SCRIPT_DIR="${{_BOI_SCRIPT_DIR}}" python3 - \\
     "${{_START_ISO}}" \\
     "${{_PRE_PENDING}}" "${{_PRE_DONE}}" "${{_PRE_SKIPPED}}" "${{_PRE_TOTAL}}" \\
     "${{_POST_PENDING}}" "${{_POST_DONE}}" "${{_POST_SKIPPED}}" "${{_POST_TOTAL}}" \\
-    "${{_TASKS_COMPLETED}}" "${{_TASKS_ADDED}}" "${{_TASKS_SKIPPED_DELTA}}" <<'PYEOF'
+    "${{_TASKS_COMPLETED}}" "${{_TASKS_ADDED}}" "${{_TASKS_SKIPPED_DELTA}}" \\
+    "${{_COST_MODEL}}" "${{_INPUT_TOKENS}}" "${{_OUTPUT_TOKENS}}" <<'PYEOF'
 import json, sys, os
 
+_MODEL_PRICING = {{
+    "claude-opus-4-6":   (15.0, 75.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5":  (1.0, 5.0),
+}}
+
 target = sys.argv[1]
+_cost_model = sys.argv[18]
+_input_tokens = int(sys.argv[19])
+_output_tokens = int(sys.argv[20])
+_price_in, _price_out = _MODEL_PRICING.get(_cost_model, (3.0, 15.0))
+_estimated_cost = (_input_tokens * _price_in + _output_tokens * _price_out) / 1_000_000
+
 data = {{
     "queue_id": sys.argv[2],
     "iteration": int(sys.argv[3]),
@@ -624,6 +726,10 @@ data = {{
     "tasks_completed": int(sys.argv[15]),
     "tasks_added": int(sys.argv[16]),
     "tasks_skipped": int(sys.argv[17]),
+    "model": _cost_model,
+    "estimated_input_tokens": _input_tokens,
+    "estimated_output_tokens": _output_tokens,
+    "estimated_cost_usd": round(_estimated_cost, 6),
 }}
 
 tmp = target + ".tmp"
