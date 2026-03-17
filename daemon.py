@@ -92,7 +92,6 @@ class Daemon:
 
         # PID / lock files
         self.pid_file = os.path.join(self.state_dir, "daemon.pid")
-        self.lock_file = os.path.join(self.state_dir, "daemon.lock")
 
         # Active worker subprocesses: worker_id -> subprocess.Popen
         self.worker_procs: dict[str, subprocess.Popen] = {}
@@ -115,7 +114,7 @@ class Daemon:
 
     # ── Signal handling ──────────────────────────────────────────────
 
-    def _signal_handler(self, signum: int, frame: Any) -> None:
+    def _signal_handler(self, signum: int, _frame: Any) -> None:
         """Handle SIGTERM and SIGINT by requesting shutdown."""
         sig_name = signal.Signals(signum).name
         logger.info("Received %s, initiating shutdown", sig_name)

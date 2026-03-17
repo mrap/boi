@@ -33,7 +33,6 @@ from lib.critic_config import load_critic_config
 from lib.evaluate import (
     build_completion_summary,
     check_convergence,
-    evaluate_criteria,
     get_criteria_history,
     is_generate_spec,
     write_completion_summary_to_spec,
@@ -1109,9 +1108,6 @@ def process_critic_completion(
         return {"outcome": "critic_approved"}
 
 
-DEFAULT_DECOMPOSITION_TIMEOUT_SECONDS = 900  # 15 minutes
-
-
 def process_decomposition_completion(
     queue_dir: str,
     queue_id: str,
@@ -1493,7 +1489,150 @@ def _auto_reject_experiments(spec_path: str) -> None:
     os.replace(tmp, spec_path)
 
 
-DEFAULT_EVALUATION_TIMEOUT_SECONDS = 900  # 15 minutes
+def _handle_evaluate_crash(
+    queue_dir: str,
+    queue_id: str,
+    events_dir: str,
+    entry: dict[str, Any],
+    db: Optional[Database],
+    timestamp: str,
+) -> dict[str, Any]:
+    """Handle a crashed evaluation worker. Returns a result dict describing the outcome."""
+    if db:
+        crash_result = db.record_failure(queue_id)
+    else:
+        crash_result = record_failure(queue_dir, queue_id)
+
+    if crash_result:
+        if db:
+            db.fail(queue_id, "Evaluation crashed: consecutive failures")
+        else:
+            fail(queue_dir, queue_id, "Evaluation crashed: consecutive failures")
+        write_event(
+            events_dir,
+            {
+                "type": "evaluate_failed",
+                "queue_id": queue_id,
+                "reason": "consecutive_failures",
+                "timestamp": timestamp,
+            },
+        )
+        return {"outcome": "evaluate_crashed", "reason": "consecutive_failures"}
+
+    tasks_done = entry.get("tasks_done") or 0
+    tasks_total = entry.get("tasks_total") or 0
+    if db:
+        db.requeue(queue_id, tasks_done, tasks_total)
+    else:
+        requeue(queue_dir, queue_id, tasks_done, tasks_total)
+    write_event(
+        events_dir,
+        {
+            "type": "evaluate_crash_requeued",
+            "queue_id": queue_id,
+            "timestamp": timestamp,
+        },
+    )
+    return {"outcome": "evaluate_crashed", "phase": "evaluate"}
+
+
+def _complete_evaluated_spec(
+    queue_dir: str,
+    queue_id: str,
+    events_dir: str,
+    hooks_dir: str,
+    spec_path: str,
+    counts: dict[str, int],
+    entry: dict[str, Any],
+    status: str,
+    convergence: Any,
+    db: Optional[Database],
+    timestamp: str,
+) -> dict[str, Any]:
+    """Write completion summary, mark spec done, emit event, run hooks."""
+    summary = build_completion_summary(
+        status=status,
+        queue_entry=entry,
+        spec_path=spec_path,
+        start_time=entry.get("submitted_at"),
+    )
+    write_completion_summary_to_spec(spec_path, summary)
+
+    if db:
+        db.complete(queue_id, counts["done"], counts["total"])
+    else:
+        entry["phase"] = "completed"
+        _write_entry(queue_dir, entry)
+        complete(queue_dir, queue_id, counts["done"], counts["total"])
+
+    write_event(
+        events_dir,
+        {
+            "type": "generate_completed",
+            "queue_id": queue_id,
+            "spec_path": spec_path,
+            "status": status,
+            "criteria_met": convergence.criteria_met,
+            "criteria_total": convergence.criteria_total,
+            "iterations_used": convergence.iterations_used,
+            "timestamp": timestamp,
+        },
+    )
+
+    run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
+
+    return {
+        "criteria_met": convergence.criteria_met,
+        "criteria_total": convergence.criteria_total,
+        "iterations_used": convergence.iterations_used,
+        "outcome": "evaluate_converged",
+        "status": status,
+        "phase": "completed",
+    }
+
+
+def _loop_back_to_execute(
+    queue_dir: str,
+    queue_id: str,
+    events_dir: str,
+    spec_path: str,
+    counts: dict[str, int],
+    entry: dict[str, Any],
+    convergence: Any,
+    pending_count: int,
+    db: Optional[Database],
+    timestamp: str,
+) -> dict[str, Any]:
+    """Requeue spec back to execute phase when evaluation finds unmet criteria."""
+    if db:
+        db.update_spec_fields(queue_id, phase="execute")
+        db.requeue(queue_id, counts["done"], counts["total"])
+    else:
+        entry["phase"] = "execute"
+        _write_entry(queue_dir, entry)
+        requeue(queue_dir, queue_id, counts["done"], counts["total"])
+
+    write_event(
+        events_dir,
+        {
+            "type": "evaluate_loop_back",
+            "queue_id": queue_id,
+            "spec_path": spec_path,
+            "pending_count": pending_count,
+            "criteria_met": convergence.criteria_met,
+            "criteria_total": convergence.criteria_total,
+            "timestamp": timestamp,
+        },
+    )
+
+    return {
+        "criteria_met": convergence.criteria_met,
+        "criteria_total": convergence.criteria_total,
+        "iterations_used": convergence.iterations_used,
+        "outcome": "evaluate_loop_back",
+        "phase": "execute",
+        "pending_count": pending_count,
+    }
 
 
 def process_evaluation_completion(
@@ -1540,171 +1679,38 @@ def process_evaluation_completion(
     if entry is None:
         return {"outcome": "error", "reason": f"Queue entry not found: {queue_id}"}
 
-    # Handle crash
     if exit_code is None or exit_code != "0":
-        # On crash, requeue still in evaluate phase for retry
-        if db:
-            crash_result = db.record_failure(queue_id)
-        else:
-            crash_result = record_failure(queue_dir, queue_id)
-        if crash_result:
-            if db:
-                db.fail(queue_id, "Evaluation crashed: consecutive failures")
-            else:
-                fail(queue_dir, queue_id, "Evaluation crashed: consecutive failures")
-            write_event(
-                events_dir,
-                {
-                    "type": "evaluate_failed",
-                    "queue_id": queue_id,
-                    "reason": "consecutive_failures",
-                    "timestamp": timestamp,
-                },
-            )
-            return {"outcome": "evaluate_crashed", "reason": "consecutive_failures"}
-
-        tasks_done = entry.get("tasks_done") or 0
-        tasks_total = entry.get("tasks_total") or 0
-        if db:
-            db.requeue(queue_id, tasks_done, tasks_total)
-        else:
-            requeue(queue_dir, queue_id, tasks_done, tasks_total)
-        write_event(
-            events_dir,
-            {
-                "type": "evaluate_crash_requeued",
-                "queue_id": queue_id,
-                "timestamp": timestamp,
-            },
+        return _handle_evaluate_crash(
+            queue_dir, queue_id, events_dir, entry, db, timestamp
         )
-        return {"outcome": "evaluate_crashed", "phase": "evaluate"}
 
-    # Check if the evaluation worker added new tasks (unmet criteria)
     counts = (
         count_boi_tasks(spec_path)
         if spec_path
-        else {
-            "pending": 0,
-            "done": 0,
-            "total": 0,
-        }
+        else {"pending": 0, "done": 0, "total": 0}
     )
     pending_count = counts["pending"]
 
-    # Run convergence algorithm
     criteria_history = get_criteria_history(queue_dir, queue_id)
     convergence = check_convergence(entry, spec_path, criteria_history)
 
-    result: dict[str, Any] = {
-        "criteria_met": convergence.criteria_met,
-        "criteria_total": convergence.criteria_total,
-        "iterations_used": convergence.iterations_used,
-    }
-
     if convergence.should_stop:
-        # Convergence reached — complete the spec
-        summary = build_completion_summary(
-            status=convergence.reason,
-            queue_entry=entry,
-            spec_path=spec_path,
-            start_time=entry.get("submitted_at"),
-        )
-        write_completion_summary_to_spec(spec_path, summary)
-
-        if db:
-            db.complete(queue_id, counts["done"], counts["total"])
-        else:
-            entry["phase"] = "completed"
-            _write_entry(queue_dir, entry)
-            complete(queue_dir, queue_id, counts["done"], counts["total"])
-
-        write_event(
-            events_dir,
-            {
-                "type": "generate_completed",
-                "queue_id": queue_id,
-                "spec_path": spec_path,
-                "status": convergence.reason,
-                "criteria_met": convergence.criteria_met,
-                "criteria_total": convergence.criteria_total,
-                "iterations_used": convergence.iterations_used,
-                "timestamp": timestamp,
-            },
+        return _complete_evaluated_spec(
+            queue_dir, queue_id, events_dir, hooks_dir, spec_path,
+            counts, entry, convergence.reason, convergence, db, timestamp,
         )
 
-        run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
-
-        result["outcome"] = "evaluate_converged"
-        result["status"] = convergence.reason
-        result["phase"] = "completed"
-        return result
-
-    elif pending_count > 0:
-        # Unmet criteria generated new tasks — loop back to execute
-        if db:
-            db.update_spec_fields(queue_id, phase="execute")
-            db.requeue(queue_id, counts["done"], counts["total"])
-        else:
-            entry["phase"] = "execute"
-            _write_entry(queue_dir, entry)
-            requeue(queue_dir, queue_id, counts["done"], counts["total"])
-
-        write_event(
-            events_dir,
-            {
-                "type": "evaluate_loop_back",
-                "queue_id": queue_id,
-                "spec_path": spec_path,
-                "pending_count": pending_count,
-                "criteria_met": convergence.criteria_met,
-                "criteria_total": convergence.criteria_total,
-                "timestamp": timestamp,
-            },
+    if pending_count > 0:
+        return _loop_back_to_execute(
+            queue_dir, queue_id, events_dir, spec_path,
+            counts, entry, convergence, pending_count, db, timestamp,
         )
 
-        result["outcome"] = "evaluate_loop_back"
-        result["phase"] = "execute"
-        result["pending_count"] = pending_count
-        return result
-
-    else:
-        # No new tasks and no convergence — all criteria met by the evaluator
-        # This is the ideal case: goal_achieved
-        summary = build_completion_summary(
-            status="goal_achieved",
-            queue_entry=entry,
-            spec_path=spec_path,
-            start_time=entry.get("submitted_at"),
-        )
-        write_completion_summary_to_spec(spec_path, summary)
-
-        if db:
-            db.complete(queue_id, counts["done"], counts["total"])
-        else:
-            entry["phase"] = "completed"
-            _write_entry(queue_dir, entry)
-            complete(queue_dir, queue_id, counts["done"], counts["total"])
-
-        write_event(
-            events_dir,
-            {
-                "type": "generate_completed",
-                "queue_id": queue_id,
-                "spec_path": spec_path,
-                "status": "goal_achieved",
-                "criteria_met": convergence.criteria_met,
-                "criteria_total": convergence.criteria_total,
-                "iterations_used": convergence.iterations_used,
-                "timestamp": timestamp,
-            },
-        )
-
-        run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
-
-        result["outcome"] = "evaluate_converged"
-        result["status"] = "goal_achieved"
-        result["phase"] = "completed"
-        return result
+    # No new tasks and no convergence — all criteria met by the evaluator (goal_achieved)
+    return _complete_evaluated_spec(
+        queue_dir, queue_id, events_dir, hooks_dir, spec_path,
+        counts, entry, "goal_achieved", convergence, db, timestamp,
+    )
 
 
 # ─── Self-Healing ──────────────────────────────────────────────────────────────
