@@ -598,6 +598,45 @@ class Daemon:
                 phase,
             )
 
+        # 2b. Emit lifecycle events based on updated spec status
+        try:
+            spec_after = self.db.get_spec(spec_id)
+            if spec_after is not None:
+                new_status = spec_after.get("status", "")
+                target_repo = self._extract_target_repo(
+                    spec_after.get("spec_path", "")
+                )
+                tasks_done = spec_after.get("tasks_done", 0)
+                tasks_total = spec_after.get("tasks_total", 0)
+                iteration_num = spec_after.get("iteration", 0)
+
+                if new_status == "completed":
+                    self.emit_hex_event("boi.spec.completed", {
+                        "spec_id": spec_id,
+                        "target_repo": target_repo,
+                        "tasks_done": tasks_done,
+                        "tasks_total": tasks_total,
+                    })
+                elif new_status == "failed":
+                    self.emit_hex_event("boi.spec.failed", {
+                        "spec_id": spec_id,
+                        "failure_reason": spec_after.get(
+                            "failure_reason", ""
+                        ),
+                        "iteration": iteration_num,
+                    })
+
+                self.emit_hex_event("boi.iteration.done", {
+                    "spec_id": spec_id,
+                    "iteration": iteration_num,
+                    "tasks_completed": tasks_done,
+                    "tasks_added": 0,
+                })
+        except Exception:
+            logger.exception(
+                "Failed to emit lifecycle events for %s", spec_id
+            )
+
         # 3. Free worker
         self.db.free_worker(worker_id)
 
@@ -882,6 +921,51 @@ class Daemon:
             )
         except Exception:
             logger.exception("Error in daemon_ops.self_heal")
+
+    # ── Hex-events integration ───────────────────────────────────────
+
+    def emit_hex_event(self, event_type: str, payload: dict) -> None:
+        """Emit an event to the hex-events bus via hex_emit.py.
+
+        If ~/.hex-events/hex_emit.py is not installed, logs a debug
+        message and returns silently (hex-events is optional).
+
+        Args:
+            event_type: Event type string, e.g. "boi.spec.completed".
+            payload: Dict of event data to pass as JSON.
+        """
+        hex_emit = os.path.expanduser("~/.hex-events/hex_emit.py")
+        if not os.path.isfile(hex_emit):
+            logger.debug(
+                "hex_emit.py not found at %s, skipping event %s",
+                hex_emit,
+                event_type,
+            )
+            return
+
+        try:
+            subprocess.run(
+                [sys.executable, hex_emit, event_type, json.dumps(payload)],
+                timeout=5,
+                capture_output=True,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Failed to emit hex event %s: %s", event_type, exc
+            )
+
+    @staticmethod
+    def _extract_target_repo(spec_path: str) -> str:
+        """Extract the target repo path from a spec file's 'Target:' field."""
+        try:
+            content = Path(spec_path).read_text(encoding="utf-8")
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("**Target:**"):
+                    return stripped.split("**Target:**", 1)[1].strip()
+        except Exception:
+            pass
+        return ""
 
     # ── Helpers ──────────────────────────────────────────────────────
 
