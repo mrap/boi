@@ -47,11 +47,11 @@ PID_FILE="${BOI_STATE_DIR}/daemon.pid"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
+RED='\033[38;2;210;15;57m'        # Catppuccin Latte red
+GREEN='\033[38;2;64;160;43m'      # Catppuccin Latte green
+YELLOW='\033[38;2;223;142;29m'    # Catppuccin Latte yellow/peach
 BOLD='\033[1m'
-DIM='\033[2m'
+DIM='\033[38;2;108;111;133m'      # Catppuccin Latte subtext0
 NC='\033[0m'
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -255,6 +255,7 @@ cmd_dispatch() {
     local dry_run=false
     local project=""
     local experiment_budget=""
+    local after=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -307,12 +308,17 @@ cmd_dispatch() {
                 experiment_budget="$2"
                 shift 2
                 ;;
+            --after)
+                [[ -z "${2:-}" ]] && die_usage "--after requires one or more queue IDs (e.g. q-001 or q-001,q-002)"
+                after="$2"
+                shift 2
+                ;;
             --dry-run)
                 dry_run=true
                 shift
                 ;;
             -h|--help)
-                echo "Usage: boi dispatch <spec.md> [--priority N] [--max-iter N] [--mode MODE] [--experiment-budget N] [--worktree <path>] [--timeout SECONDS] [--no-critic] [--project <name>] [--dry-run]"
+                echo "Usage: boi dispatch <spec.md> [--priority N] [--max-iter N] [--mode MODE] [--experiment-budget N] [--worktree <path>] [--timeout SECONDS] [--no-critic] [--project <name>] [--after q-NNN[,q-NNN...]] [--dry-run]"
                 echo "       boi dispatch --spec <spec.md> [options]   (explicit flag form)"
                 echo "       boi dispatch --tasks <tasks.md>"
                 echo ""
@@ -327,6 +333,7 @@ cmd_dispatch() {
                 echo "  --timeout SECS    Per-iteration timeout in seconds (default: from config or 1800)"
                 echo "  --no-critic       Skip critic validation when spec completes"
                 echo "  --project NAME    Associate with a BOI project"
+                echo "  --after q-NNN     Block until q-NNN (or comma-separated list) completes"
                 echo "  --dry-run         Validate and show what would be dispatched without enqueueing"
                 exit 0
                 ;;
@@ -460,6 +467,9 @@ PYEOF
         if [[ -n "${project}" ]]; then
             info "[dry-run] Project: ${project}"
         fi
+        if [[ -n "${after}" ]]; then
+            info "[dry-run] Blocked by: ${after}"
+        fi
         exit 0
     fi
 
@@ -471,7 +481,7 @@ PYEOF
     fi
 
     local result
-    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${mode}" "${project}" "${experiment_budget}" <<'PYEOF'
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${mode}" "${project}" "${experiment_budget}" "${after}" <<'PYEOF'
 import sys, os, json
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
 from lib.cli_ops import dispatch
@@ -486,6 +496,33 @@ timeout_str = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else None
 mode = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] else "execute"
 project_name = sys.argv[8] if len(sys.argv) > 8 and sys.argv[8] else None
 experiment_budget_str = sys.argv[9] if len(sys.argv) > 9 and sys.argv[9] else None
+after_str = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else ""
+
+# Parse --after CLI flag (comma-separated queue IDs)
+blocked_by_cli = [d.strip() for d in after_str.split(",") if d.strip()] if after_str else []
+
+# Parse **Blocked-By:** from spec file header (first 50 lines)
+blocked_by_header = []
+try:
+    with open(spec_path, encoding="utf-8") as _f:
+        for _i, _line in enumerate(_f):
+            if _i >= 50:
+                break
+            _line = _line.strip()
+            if _line.lower().startswith("**blocked-by:**"):
+                _deps_str = _line.split(":**", 1)[1].strip()
+                blocked_by_header = [d.strip() for d in _deps_str.split(",") if d.strip()]
+                break
+except Exception:
+    pass
+
+# Merge CLI + header (deduplicated, CLI listed first)
+_seen = set()
+blocked_by = []
+for _dep in blocked_by_cli + blocked_by_header:
+    if _dep not in _seen:
+        _seen.add(_dep)
+        blocked_by.append(_dep)
 
 try:
     result = dispatch(
@@ -498,11 +535,15 @@ try:
         mode=mode,
         project=project_name,
         experiment_budget=int(experiment_budget_str) if experiment_budget_str else None,
+        blocked_by=blocked_by if blocked_by else None,
     )
     print(json.dumps(result))
 except DuplicateSpecError as e:
     print(json.dumps({"error": "duplicate", "message": str(e)}))
     sys.exit(2)
+except ValueError as e:
+    print(json.dumps({"error": "validation", "message": str(e)}))
+    sys.exit(3)
 PYEOF
     )
 
@@ -516,6 +557,14 @@ PYEOF
         die "${dup_msg}"
     fi
 
+    if [[ ${enqueue_exit} -eq 3 ]]; then
+        # Dependency validation error
+        progress_fail
+        local val_msg
+        val_msg=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['message'])")
+        die "${val_msg}"
+    fi
+
     if [[ ${enqueue_exit} -ne 0 ]]; then
         progress_fail
         die "Failed to enqueue spec."
@@ -525,12 +574,18 @@ PYEOF
     local task_count
     local pending_count
     local enqueued_mode
+    local blocked_by_ids
     queue_id=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['id'])")
     task_count=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['tasks'])")
     pending_count=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pending'])")
     enqueued_mode=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mode','execute'))")
+    blocked_by_ids=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); bl=d.get('blocked_by',[]); print(', '.join(bl) if bl else '')")
 
     progress_done "${queue_id}, ${pending_count}/${task_count} tasks, priority ${priority}"
+
+    if [[ -n "${blocked_by_ids}" ]]; then
+        info "  blocked by: ${blocked_by_ids} (will not run until dependencies complete)"
+    fi
 
     # Start daemon if not already running
     if require_daemon; then
@@ -650,14 +705,20 @@ cmd_status() {
     require_config
 
     if [[ "${watch_mode}" == "true" ]]; then
-        # Loop with clear + same output as non-watch mode, refreshed every 2s
+        # Flicker-free refresh: render to buffer, then overwrite screen in one shot
+        # (watch -c doesn't support 24-bit true color, so we do it manually)
+        tput civis 2>/dev/null || true  # hide cursor
+        trap 'tput cnorm 2>/dev/null; printf "\033[?25h"; exit' INT TERM EXIT
+        clear
         while true; do
-            clear
+            local buf
             if [[ -n "${sort_mode}" || -n "${filter_status}" ]]; then
-                cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}"
+                buf=$(cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}" 2>&1)
             else
-                cmd_queue_inner "${json_mode}"
+                buf=$(cmd_queue_inner "${json_mode}" 2>&1)
             fi
+            # Move cursor home + clear to end (no blank-screen flash)
+            printf '\033[H\033[J%s\n' "$buf"
             sleep 2
         done
     fi
@@ -1642,9 +1703,9 @@ try:
 except Exception:
     active_sessions = set()
 
-GREEN = "\033[0;32m"
-YELLOW = "\033[1;33m"
-RED = "\033[0;31m"
+GREEN = "\033[38;2;64;160;43m"
+YELLOW = "\033[38;2;223;142;29m"
+RED = "\033[38;2;210;15;57m"
 NC = "\033[0m"
 
 if not json_mode:
@@ -2645,20 +2706,20 @@ if json_mode:
     print(json.dumps(result, indent=2))
 else:
     # Status symbols
-    symbols = {"DONE": "\033[0;32m✓\033[0m", "PENDING": "\033[1;33m○\033[0m", "SKIPPED": "\033[2m—\033[0m"}
+    symbols = {"DONE": "\033[38;2;64;160;43m✓\033[0m", "PENDING": "\033[38;2;223;142;29m○\033[0m", "SKIPPED": "\033[38;2;108;111;133m—\033[0m"}
     next_pending_found = False
     for t in tasks:
         sym = symbols.get(t.status, "?")
         marker = ""
         if t.status == "PENDING" and not next_pending_found:
-            marker = " \033[1;33m← next\033[0m"
+            marker = " \033[38;2;223;142;29m← next\033[0m"
             next_pending_found = True
         # Check for blocked-by
         blocked = ""
         for line in t.body.splitlines():
             if line.strip().startswith("**Blocked by:**"):
                 deps = line.strip().split("**Blocked by:**")[1].strip()
-                blocked = f" \033[2m[blocked by: {deps}]\033[0m"
+                blocked = f" \033[38;2;108;111;133m[blocked by: {deps}]\033[0m"
                 break
         print(f"  {sym} {t.id}: {t.title}{blocked}{marker}")
 PYEOF
@@ -3508,6 +3569,209 @@ usage() {
     echo "  boi --version                       # show version"
 }
 
+# ─── Subcommand: dep ────────────────────────────────────────────────────────
+
+cmd_dep() {
+    if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+        echo "Usage: boi dep <add|remove|list> <spec-id> --after <dep-id>[,<dep-id>...]"
+        echo ""
+        echo "Commands:"
+        echo "  add    <spec-id> --after <dep-id>   Add dependency (with cycle detection)"
+        echo "  remove <spec-id> --after <dep-id>   Remove dependency"
+        echo "  list   <spec-id>                    List dependencies for a spec"
+        exit 0
+    fi
+
+    local subcommand="$1"
+    shift
+
+    case "${subcommand}" in
+        add)    _dep_add "$@" ;;
+        remove) _dep_remove "$@" ;;
+        list)   _dep_list "$@" ;;
+        -h|--help) cmd_dep --help ;;
+        *)
+            die_usage "Unknown dep subcommand: ${subcommand}. Use 'boi dep --help'."
+            ;;
+    esac
+}
+
+_dep_add() {
+    local spec_id=""
+    local after=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --after)
+                [[ -z "${2:-}" ]] && die_usage "--after requires one or more queue IDs"
+                after="$2"
+                shift 2
+                ;;
+            -h|--help)
+                echo "Usage: boi dep add <spec-id> --after <dep-id>[,<dep-id>...]"
+                exit 0
+                ;;
+            *)
+                if [[ -z "${spec_id}" ]]; then
+                    spec_id="$1"
+                    shift
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    [[ -z "${spec_id}" ]] && die_usage "spec-id required. Usage: boi dep add <spec-id> --after <dep-id>"
+    [[ -z "${after}" ]] && die_usage "--after required. Usage: boi dep add <spec-id> --after <dep-id>"
+
+    local result
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${spec_id}" "${after}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import add_dependency
+
+queue_dir = sys.argv[1]
+spec_id = sys.argv[2]
+after_str = sys.argv[3]
+dep_ids = [d.strip() for d in after_str.split(",") if d.strip()]
+
+try:
+    result = add_dependency(queue_dir, spec_id, dep_ids)
+    print(json.dumps(result))
+except ValueError as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(1)
+PYEOF
+    )
+
+    local exit_code=$?
+    if [[ ${exit_code} -ne 0 ]]; then
+        local err_msg
+        err_msg=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error','unknown error'))" 2>/dev/null || echo "Failed to add dependency")
+        die "${err_msg}"
+    fi
+
+    local added_ids
+    added_ids=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(', '.join(d.get('added',[])))" 2>/dev/null)
+    info "${spec_id} now blocked by: ${added_ids}"
+}
+
+_dep_remove() {
+    local spec_id=""
+    local after=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --after)
+                [[ -z "${2:-}" ]] && die_usage "--after requires one or more queue IDs"
+                after="$2"
+                shift 2
+                ;;
+            -h|--help)
+                echo "Usage: boi dep remove <spec-id> --after <dep-id>[,<dep-id>...]"
+                exit 0
+                ;;
+            *)
+                if [[ -z "${spec_id}" ]]; then
+                    spec_id="$1"
+                    shift
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    [[ -z "${spec_id}" ]] && die_usage "spec-id required. Usage: boi dep remove <spec-id> --after <dep-id>"
+    [[ -z "${after}" ]] && die_usage "--after required. Usage: boi dep remove <spec-id> --after <dep-id>"
+
+    local result
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${spec_id}" "${after}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import remove_dependency
+
+queue_dir = sys.argv[1]
+spec_id = sys.argv[2]
+after_str = sys.argv[3]
+dep_ids = [d.strip() for d in after_str.split(",") if d.strip()]
+
+try:
+    result = remove_dependency(queue_dir, spec_id, dep_ids)
+    print(json.dumps(result))
+except ValueError as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(1)
+PYEOF
+    )
+
+    local exit_code=$?
+    if [[ ${exit_code} -ne 0 ]]; then
+        local err_msg
+        err_msg=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error','unknown error'))" 2>/dev/null || echo "Failed to remove dependency")
+        die "${err_msg}"
+    fi
+
+    local removed_ids
+    removed_ids=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(', '.join(d.get('removed',[])))" 2>/dev/null)
+    info "Removed dependencies from ${spec_id}: ${removed_ids}"
+}
+
+_dep_list() {
+    local spec_id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: boi dep list <spec-id>"
+                exit 0
+                ;;
+            *)
+                if [[ -z "${spec_id}" ]]; then
+                    spec_id="$1"
+                    shift
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    [[ -z "${spec_id}" ]] && die_usage "spec-id required. Usage: boi dep list <spec-id>"
+
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${spec_id}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.db import Database
+from pathlib import Path
+
+queue_dir = sys.argv[1]
+spec_id = sys.argv[2]
+state_dir = str(Path(queue_dir).parent)
+db_path = os.path.join(state_dir, "boi.db")
+db = Database(db_path, queue_dir)
+
+try:
+    deps = db.get_dependencies(spec_id)
+    dependents = db.get_dependents(spec_id)
+
+    if deps:
+        print(f"  {spec_id} is blocked by:")
+        for d in deps:
+            print(f"    {d['id']} [{d['status']}]")
+    else:
+        print(f"  {spec_id} has no dependencies")
+
+    if dependents:
+        print(f"  Specs waiting on {spec_id}:")
+        for d in dependents:
+            print(f"    {d['id']} [{d['status']}]")
+finally:
+    db.close()
+PYEOF
+}
+
 main() {
     if [[ $# -eq 0 ]]; then
         usage
@@ -3536,6 +3800,7 @@ main() {
         project)    cmd_project "$@" ;;
         do)         cmd_do "$@" ;;
         dashboard)  cmd_dashboard "$@" ;;
+        dep)        cmd_dep "$@" ;;
         migrate-db) cmd_migrate_db "$@" ;;
         export-db)  cmd_export_db "$@" ;;
         -h|--help) usage; exit 0 ;;

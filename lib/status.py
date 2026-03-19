@@ -18,17 +18,17 @@ from typing import Any
 from lib.telemetry import load_iteration_files
 
 
-# ANSI color codes
-GREEN = "\033[0;32m"
-YELLOW = "\033[1;33m"
-RED = "\033[0;31m"
-DIM = "\033[2m"
+# ANSI color codes — Catppuccin Latte-compatible (true color, works on light bg)
+GREEN = "\033[38;2;64;160;43m"      # Latte green (#40a02b)
+YELLOW = "\033[38;2;223;142;29m"    # Latte yellow/peach (#df8e1d)
+RED = "\033[38;2;210;15;57m"        # Latte red (#d20f39)
+DIM = "\033[38;2;108;111;133m"      # Latte subtext0 (#6c6f85)
 BOLD = "\033[1m"
 NC = "\033[0m"
 
 # ANSI codes for specific use
-CYAN = "\033[0;36m"
-MAGENTA = "\033[0;35m"
+CYAN = "\033[38;2;4;165;229m"       # Latte sapphire (#04a5e5)
+MAGENTA = "\033[38;2;136;57;239m"   # Latte mauve (#8839ef)
 
 # Status -> color mapping
 STATUS_COLORS: dict[str, str] = {
@@ -129,6 +129,54 @@ def _get_db_path(queue_dir: str) -> str | None:
     return None
 
 
+def _load_all_deps_from_db(db_path: str) -> dict[str, dict[str, Any]]:
+    """Load all dependency relationships for all specs from the database.
+
+    Returns a dict mapping queue_id -> {
+        'blocked_by': list of (id, status) tuples — specs this spec waits on,
+        'blocking':   list of (id, status) tuples — specs waiting on this spec,
+    }
+    """
+    try:
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            timeout=5,
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT sd.spec_id, s_dep.status AS dep_status, "
+                "       sd.blocks_on, s_on.status AS on_status "
+                "FROM spec_dependencies sd "
+                "JOIN specs s_dep ON s_dep.id = sd.spec_id "
+                "JOIN specs s_on  ON s_on.id  = sd.blocks_on"
+            ).fetchall()
+
+            result: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                spec_id = row["spec_id"]
+                dep_status = row["dep_status"]
+                blocks_on_id = row["blocks_on"]
+                on_status = row["on_status"]
+
+                if spec_id not in result:
+                    result[spec_id] = {"blocked_by": [], "blocking": []}
+                result[spec_id]["blocked_by"].append((blocks_on_id, on_status))
+
+                if blocks_on_id not in result:
+                    result[blocks_on_id] = {"blocked_by": [], "blocking": []}
+                result[blocks_on_id]["blocking"].append((spec_id, dep_status))
+
+            return result
+        except sqlite3.OperationalError:
+            return {}
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return {}
+
+
 def build_queue_status(
     queue_dir: str, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -175,6 +223,14 @@ def build_queue_status(
         telem = _load_telemetry_for_entry(queue_dir, qid)
         if telem:
             entry["_telemetry"] = telem
+
+    # Enrich entries with dependency info (blocked_by / blocking)
+    if db_path is not None:
+        all_deps = _load_all_deps_from_db(db_path)
+        for entry in entries:
+            qid = entry.get("id", "")
+            if qid in all_deps:
+                entry["_deps"] = all_deps[qid]
 
     return {
         "entries": entries,
@@ -293,6 +349,37 @@ def _get_quality_alerts(entries: list[dict[str, Any]], color: bool = True) -> li
                 line = _colorize(line, YELLOW)
             alert_lines.append(line)
     return alert_lines
+
+
+def _get_blocked_specs_display(
+    entries: list[dict[str, Any]], color: bool = True
+) -> list[str]:
+    """Get display lines for specs blocked by unmet dependencies.
+
+    Returns warning lines like:
+      ⏳ q-007: waiting on q-003 (queued), q-005 (running)
+    """
+    lines = []
+    header_added = False
+    for entry in entries:
+        deps_info = entry.get("_deps", {})
+        blocked_by = deps_info.get("blocked_by", [])
+        unmet = [(dep_id, dep_status) for dep_id, dep_status in blocked_by if dep_status != "completed"]
+        if not unmet:
+            continue
+        if not header_added:
+            header = "Blocked:"
+            if color:
+                header = _colorize(header, YELLOW)
+            lines.append(header)
+            header_added = True
+        qid = entry.get("id", "?")
+        dep_parts = [f"{dep_id} ({dep_status})" for dep_id, dep_status in unmet]
+        line = f"  \u23f3 {qid}: waiting on {', '.join(dep_parts)}"
+        if color:
+            line = _colorize(line, YELLOW)
+        lines.append(line)
+    return lines
 
 
 def _get_terminal_width() -> int:
@@ -536,9 +623,10 @@ def format_queue_table(
     COL_WORKER = 8  # "w-1     " (6 + 2 space)
     COL_ITER = 8  # "10/30   " (7 + 1 space)
     COL_TASKS = 13  # "6/6 done     " (12 + 1 space)
+    COL_DEPS = 14  # "⏳ q-001,q-002" dep info
     COL_STATUS = 12  # "running" right-padded
 
-    fixed_cols = COL_MODE + COL_WORKER + COL_ITER + COL_TASKS + COL_STATUS
+    fixed_cols = COL_MODE + COL_WORKER + COL_ITER + COL_TASKS + COL_DEPS + COL_STATUS
     # SPEC column gets remaining space, minimum 20
     col_spec = max(20, term_w - fixed_cols)
 
@@ -572,6 +660,7 @@ def format_queue_table(
         f"{'WORKER':<{COL_WORKER}}"
         f"{'ITER':<{COL_ITER}}"
         f"{'TASKS':<{COL_TASKS}}"
+        f"{'Deps':<{COL_DEPS}}"
         f"{'STATUS'}"
     )
     if color:
@@ -632,6 +721,24 @@ def format_queue_table(
         if quality_str != "\u2014" and quality_str != "-":
             quality_suffix = f" [{quality_str}]"
 
+        # Deps column
+        deps_info = entry.get("_deps", {})
+        blocked_by = deps_info.get("blocked_by", [])  # list of (id, status) tuples
+        blocking = deps_info.get("blocking", [])       # list of (id, status) tuples
+        unmet_deps = [dep_id for dep_id, dep_status in blocked_by if dep_status != "completed"]
+        if unmet_deps:
+            dep_ids_str = ",".join(unmet_deps)
+            deps_str = f"\u23f3 {dep_ids_str}"  # ⏳
+        elif blocking:
+            blocking_ids = ",".join(bid for bid, _ in blocking)
+            deps_str = f"\u2192 {blocking_ids}"  # →
+        else:
+            deps_str = "\u2014"  # em dash
+
+        # Truncate deps_str to column width
+        if len(deps_str) > COL_DEPS - 1:
+            deps_str = deps_str[:COL_DEPS - 2] + "\u2026"
+
         # Build the plain-text row
         row_text = (
             f"{label:<{col_spec}}"
@@ -639,6 +746,7 @@ def format_queue_table(
             f"{worker:<{COL_WORKER}}"
             f"{iter_str:<{COL_ITER}}"
             f"{tasks_str:<{COL_TASKS}}"
+            f"{deps_str:<{COL_DEPS}}"
             f"{status}{quality_suffix}"
         )
 
@@ -658,6 +766,7 @@ def format_queue_table(
                         f"{worker:<{COL_WORKER}}"
                         f"{iter_str:<{COL_ITER}}"
                         f"{tasks_str:<{COL_TASKS}}"
+                        f"{deps_str:<{COL_DEPS}}"
                     )
                     colored_status = _colorize(status + quality_suffix, status_color)
                     row_text = f"{row_prefix}{colored_status}"
@@ -690,6 +799,13 @@ def format_queue_table(
     if alert_lines:
         for al in alert_lines:
             lines.append(al)
+        lines.append("")
+
+    # Blocked specs section: list specs with unmet dependencies
+    blocked_lines = _get_blocked_specs_display(entries, color)
+    if blocked_lines:
+        for bl in blocked_lines:
+            lines.append(bl)
         lines.append("")
 
     # Summary line (single line)

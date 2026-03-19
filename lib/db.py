@@ -1376,6 +1376,103 @@ class Database:
             cursor = self.conn.execute("SELECT * FROM events ORDER BY seq ASC")
         return [self._row_to_dict(row) for row in cursor]
 
+    # ── Dependency queries ────────────────────────────────────────
+
+    def get_dependencies(self, queue_id: str) -> list[dict[str, Any]]:
+        """Get specs that queue_id must wait for (its blockers).
+
+        Returns list of dicts with 'id' and 'status' for each
+        spec listed in spec_dependencies.blocks_on for queue_id.
+        """
+        rows = self.conn.execute(
+            "SELECT s.id, s.status "
+            "FROM spec_dependencies sd "
+            "JOIN specs s ON s.id = sd.blocks_on "
+            "WHERE sd.spec_id = ?",
+            (queue_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_dependents(self, queue_id: str) -> list[dict[str, Any]]:
+        """Get specs that are waiting on queue_id to complete.
+
+        Returns list of dicts with 'id' and 'status' for each
+        spec that has queue_id in its spec_dependencies.blocks_on.
+        """
+        rows = self.conn.execute(
+            "SELECT s.id, s.status "
+            "FROM spec_dependencies sd "
+            "JOIN specs s ON s.id = sd.spec_id "
+            "WHERE sd.blocks_on = ?",
+            (queue_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_dependency(self, spec_id: str, dep_id: str) -> None:
+        """Add a dependency: spec_id must wait for dep_id to complete.
+
+        Validates that both specs exist and performs DFS cycle detection
+        before inserting. Silently ignores if the edge already exists.
+
+        Raises ValueError if either spec is not found or if the new edge
+        would create a circular dependency.
+        """
+        with self.lock:
+            for sid in (spec_id, dep_id):
+                if not self.conn.execute(
+                    "SELECT 1 FROM specs WHERE id = ?", (sid,)
+                ).fetchone():
+                    raise ValueError(f"Spec not found: {sid}")
+
+            # Cycle detection: would dep_id transitively depend on spec_id?
+            path = self._find_dependency_path(dep_id, spec_id)
+            if path is not None:
+                cycle = [spec_id] + path + [spec_id]
+                cycle_str = " \u2192 ".join(cycle)
+                raise ValueError(f"Circular dependency detected: {cycle_str}")
+
+            try:
+                self.conn.execute(
+                    "INSERT INTO spec_dependencies (spec_id, blocks_on) "
+                    "VALUES (?, ?)",
+                    (spec_id, dep_id),
+                )
+            except sqlite3.IntegrityError:
+                pass  # edge already exists
+
+            self._log_event(
+                "dependency_added",
+                f"Dependency added: {spec_id} blocked by {dep_id}",
+                spec_id=spec_id,
+                data={"dep_id": dep_id},
+            )
+            self.conn.commit()
+
+    def remove_dependency(self, spec_id: str, dep_id: str) -> None:
+        """Remove a dependency: spec_id is no longer blocked by dep_id.
+
+        Raises ValueError if spec_id does not exist.
+        Silently succeeds if the dependency edge does not exist.
+        """
+        with self.lock:
+            if not self.conn.execute(
+                "SELECT 1 FROM specs WHERE id = ?", (spec_id,)
+            ).fetchone():
+                raise ValueError(f"Spec not found: {spec_id}")
+
+            self.conn.execute(
+                "DELETE FROM spec_dependencies "
+                "WHERE spec_id = ? AND blocks_on = ?",
+                (spec_id, dep_id),
+            )
+            self._log_event(
+                "dependency_removed",
+                f"Dependency removed: {spec_id} unblocked from {dep_id}",
+                spec_id=spec_id,
+                data={"dep_id": dep_id},
+            )
+            self.conn.commit()
+
     # ── Iteration metadata ────────────────────────────────────────
 
     def insert_iteration(

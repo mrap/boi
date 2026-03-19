@@ -37,6 +37,7 @@ def dispatch(
     mode: str = "execute",
     project: Optional[str] = None,
     experiment_budget: Optional[int] = None,
+    blocked_by: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Enqueue a spec into the SQLite database.
 
@@ -60,6 +61,7 @@ def dispatch(
             max_iterations=max_iterations,
             checkout=checkout,
             project=project,
+            blocked_by=blocked_by or None,
         )
 
         spec_id = entry["id"]
@@ -152,6 +154,48 @@ def purge_specs(
                                 pass
 
         return results
+    finally:
+        db.close()
+
+
+def add_dependency(
+    queue_dir: str,
+    spec_id: str,
+    dep_ids: list[str],
+) -> dict[str, Any]:
+    """Add one or more post-dispatch dependencies to a spec.
+
+    Returns dict with spec_id and list of successfully added dep IDs.
+    Raises ValueError on missing specs or circular dependencies.
+    """
+    db = _get_db(queue_dir)
+    try:
+        added = []
+        for dep_id in dep_ids:
+            db.add_dependency(spec_id, dep_id)
+            added.append(dep_id)
+        return {"spec_id": spec_id, "added": added}
+    finally:
+        db.close()
+
+
+def remove_dependency(
+    queue_dir: str,
+    spec_id: str,
+    dep_ids: list[str],
+) -> dict[str, Any]:
+    """Remove one or more dependencies from a spec.
+
+    Returns dict with spec_id and list of dep IDs passed for removal.
+    Raises ValueError if spec_id does not exist.
+    """
+    db = _get_db(queue_dir)
+    try:
+        removed = []
+        for dep_id in dep_ids:
+            db.remove_dependency(spec_id, dep_id)
+            removed.append(dep_id)
+        return {"spec_id": spec_id, "removed": removed}
     finally:
         db.close()
 

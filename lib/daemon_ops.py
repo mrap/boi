@@ -1075,7 +1075,9 @@ def process_critic_completion(
 
     else:
         # No approval and no tasks added — critic didn't produce valid output.
-        # Treat as approval to avoid infinite loops.
+        # Check post_counts: if any tasks are still PENDING (e.g. critic added a
+        # plain PENDING task without the [CRITIC] tag), requeue instead of
+        # completing. Only complete when post_counts["pending"] == 0.
         from lib.spec_parser import count_boi_tasks
 
         counts = (
@@ -1087,6 +1089,32 @@ def process_critic_completion(
                 "total": 0,
             }
         )
+
+        if counts["pending"] > 0:
+            # Pending tasks exist — requeue for regular workers to handle.
+            if db:
+                db.requeue(queue_id, counts["done"], counts["total"])
+                db.update_spec_fields(queue_id, phase="execute")
+            else:
+                requeue(queue_dir, queue_id, counts["done"], counts["total"])
+
+            write_event(
+                events_dir,
+                {
+                    "type": "critic_tasks_added",
+                    "queue_id": queue_id,
+                    "spec_path": spec_path,
+                    "critic_pass": entry["critic_passes"],
+                    "tasks_added": counts["pending"],
+                    "timestamp": timestamp,
+                },
+            )
+
+            return {
+                "outcome": "critic_tasks_added",
+                "critic_tasks_added": counts["pending"],
+            }
+
         if db:
             db.complete(queue_id, counts["done"], counts["total"])
         else:

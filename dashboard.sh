@@ -98,8 +98,8 @@ get_selected_queue_id() {
 
 show_keybinds() {
     # Dim keybinding bar at the bottom, styled like Claude Code's status bar
-    local DIM=$'\033[2m'
-    local CYAN_BOLD=$'\033[1;36m'
+    local DIM=$'\033[38;2;108;111;133m'
+    local CYAN_BOLD=$'\033[38;2;4;165;229m'
     local NC=$'\033[0m'
 
     echo ""
@@ -132,8 +132,8 @@ show_keybinds() {
 }
 
 show_help_overlay() {
-    local DIM=$'\033[2m'
-    local CYAN_BOLD=$'\033[1;36m'
+    local DIM=$'\033[38;2;108;111;133m'
+    local CYAN_BOLD=$'\033[38;2;4;165;229m'
     local NC=$'\033[0m'
 
     echo ""
@@ -163,7 +163,7 @@ run_spec_action() {
     clear
     "${cmd}" "$@"
     echo ""
-    echo -e "\033[2mPress any key to return to dashboard...\033[0m"
+    echo -e "\033[38;2;108;111;133mPress any key to return to dashboard...\033[0m"
     read -rsn1 || true
 }
 
@@ -205,13 +205,13 @@ handle_key() {
             qid=$(get_selected_queue_id)
             if [[ -n "${qid}" ]]; then
                 echo ""
-                echo -e "\033[1;33mCancel ${qid}? (y/N)\033[0m"
+                echo -e "\033[38;2;223;142;29mCancel ${qid}? (y/N)\033[0m"
                 local confirm=""
                 read -rsn1 confirm || true
                 if [[ "${confirm}" == "y" || "${confirm}" == "Y" ]]; then
                     bash "${SCRIPT_DIR}/boi.sh" cancel "${qid}"
                     echo ""
-                    echo -e "\033[2mPress any key to return to dashboard...\033[0m"
+                    echo -e "\033[38;2;108;111;133mPress any key to return to dashboard...\033[0m"
                     read -rsn1 || true
                 fi
             fi
@@ -280,7 +280,7 @@ PYEOF
                     echo "Queue entry not found: ${queue_file}"
                 fi
                 echo ""
-                echo -e "\033[2mPress any key to return to dashboard...\033[0m"
+                echo -e "\033[38;2;108;111;133mPress any key to return to dashboard...\033[0m"
                 read -rsn1 || true
             fi
             ;;
