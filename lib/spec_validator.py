@@ -26,11 +26,15 @@
 #           print(f"  ERROR: {error}")
 
 import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 # Regex to match BOI task headings: ### t-N: Title
 _BOI_TASK_HEADING_RE = re.compile(r"^###\s+(t-\d+):\s+(.+)$")
+
+# Regex to match top-level bold field lines: **FieldName:** value
+_BOLD_FIELD_RE = re.compile(r"^\*\*([^*:]+):\*\*\s*(.+)$")
 
 # Valid status values
 _VALID_STATUSES = {
@@ -41,6 +45,73 @@ _VALID_STATUSES = {
     "EXPERIMENT_PROPOSED",
     "SUPERSEDED",
 }
+
+
+def _extract_spec_header_fields(content: str) -> dict[str, str]:
+    """Extract top-level bold field values from spec header (before first task).
+
+    Scans lines before the first ### t-N: heading and collects **Field:** value
+    pairs. Keys are lowercased and stripped. Example fields: workspace, target,
+    workspace-justification.
+    """
+    fields: dict[str, str] = {}
+    for line in content.splitlines():
+        if _BOI_TASK_HEADING_RE.match(line):
+            break  # Stop at first task heading
+        m = _BOLD_FIELD_RE.match(line.strip())
+        if m:
+            key = m.group(1).strip().lower()
+            value = m.group(2).strip()
+            fields[key] = value
+    return fields
+
+
+def _is_git_repo(path: str) -> bool:
+    """Return True if *path* is inside a git repository.
+
+    Expands ~ in the path. Returns False if the path does not exist or
+    git is not available.
+    """
+    expanded = Path(path).expanduser()
+    if not expanded.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(expanded), "rev-parse", "--git-dir"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def check_workspace_policy(content: str) -> list[str]:
+    """Check the spec's Workspace/Target fields against workspace policy.
+
+    Returns a list of warning strings (never errors — does not block dispatch).
+
+    Rules:
+    - If Workspace is missing, treat as 'worktree' (safe default, no warning).
+    - If Workspace is 'in-place' and Target points to an existing git repo,
+      emit a warning — unless Workspace-Justification is provided.
+    - worktree / docker always produce no warning.
+    """
+    fields = _extract_spec_header_fields(content)
+    workspace = fields.get("workspace", "worktree").strip().lower()
+    target = fields.get("target", "").strip()
+    justification = fields.get("workspace-justification", "").strip()
+
+    warnings: list[str] = []
+
+    if workspace == "in-place" and target and not justification:
+        if _is_git_repo(target):
+            warnings.append(
+                f"in-place workspace targeting git repo {target} "
+                "— consider worktree or docker"
+            )
+
+    return warnings
 
 
 @dataclass
@@ -193,6 +264,9 @@ def validate_spec(content: str) -> ValidationResult:
             result.done += 1
         elif task.status == "SKIPPED":
             result.skipped += 1
+
+    # Check workspace policy (produces warnings, never errors)
+    result.warnings.extend(check_workspace_policy(content))
 
     # Set valid flag
     if result.errors:

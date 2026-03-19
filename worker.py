@@ -35,6 +35,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.spec_parser import count_boi_tasks
+from lib.workspace_guard import WorkspaceBoundaryChecker
 
 
 class WorkerHooks:
@@ -267,6 +268,14 @@ class Worker:
         # Generate prompt and run script
         self.generate_run_script()
 
+        # Boundary checker: snapshot main repo state before worker runs
+        boundary = WorkspaceBoundaryChecker(
+            worktree_path=self.worktree,
+            spec_id=self.spec_id,
+            worker_id=self.worker_id,
+        )
+        boundary.snapshot_before()
+
         # Launch tmux session, wait, post-process
         rc = self.launch_tmux()
         if rc != 0:
@@ -283,6 +292,9 @@ class Worker:
             exit_code = 124
             _write_file(self.exit_file, "124")
             self._kill_tmux_session()
+
+        # Boundary check: detect leaks before reporting results
+        boundary.check_after()
 
         self.post_process()
         return exit_code
