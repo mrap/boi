@@ -37,6 +37,7 @@ from lib.db import Database
 DEFAULT_POLL_INTERVAL = 5
 DEFAULT_WORKER_TIMEOUT = 1800  # 30 minutes
 SELF_HEAL_INTERVAL = 10  # Run self-heal every N poll cycles
+DEFAULT_RECONCILE_INTERVAL = 30  # Seconds between periodic liveness checks
 
 logger = logging.getLogger("boi.daemon")
 
@@ -74,6 +75,7 @@ class Daemon:
         db_path: str,
         poll_interval: int = DEFAULT_POLL_INTERVAL,
         state_dir: Optional[str] = None,
+        reconcile_interval: int = DEFAULT_RECONCILE_INTERVAL,
     ) -> None:
         self.config_path = config_path
         self.db_path = db_path
@@ -98,6 +100,10 @@ class Daemon:
 
         # Default worker timeout (can be overridden per-spec)
         self.default_worker_timeout = DEFAULT_WORKER_TIMEOUT
+
+        # Periodic reconciliation interval (seconds)
+        self.reconcile_interval = reconcile_interval
+        self._last_reconcile: float = 0.0
 
         # Shutdown flag
         self._shutdown_requested = False
@@ -146,6 +152,19 @@ class Daemon:
                 ", ".join(recovered),
             )
 
+        # Reconcile orphaned running specs (not caught by recover_running_specs
+        # because the workers table no longer has current_spec_id set).
+        reconciled = self.reconcile_stale_specs()
+        if reconciled:
+            logger.warning(
+                "Reconciled %d orphaned spec(s): %s",
+                len(reconciled),
+                ", ".join(reconciled),
+            )
+
+        # Set last_reconcile so first periodic check fires after reconcile_interval
+        self._last_reconcile = time.time()
+
         # Poll loop
         poll_cycle = 0
         try:
@@ -158,6 +177,18 @@ class Daemon:
                 poll_cycle += 1
                 if poll_cycle % SELF_HEAL_INTERVAL == 0:
                     self.self_heal()
+
+                # Periodic liveness check for running specs
+                now = time.time()
+                if now - self._last_reconcile >= self.reconcile_interval:
+                    periodic_requeued = self.reconcile_stale_specs()
+                    if periodic_requeued:
+                        logger.warning(
+                            "Periodic reconciliation requeued %d spec(s): %s",
+                            len(periodic_requeued),
+                            ", ".join(periodic_requeued),
+                        )
+                    self._last_reconcile = now
 
                 # Sleep in small increments so we can respond to signals
                 for _ in range(self.poll_interval * 10):
@@ -253,6 +284,73 @@ class Daemon:
             self.db.register_worker(worker_id, worktree_path)
 
         logger.info("Loaded %d worker(s) from config", len(workers))
+
+    # ── Startup reconciliation ───────────────────────────────────────
+
+    def reconcile_stale_specs(self) -> list[str]:
+        """Requeue specs stuck in 'running' with no live worker.
+
+        Two cases are handled:
+        1. No worker row has current_spec_id pointing to the spec
+           (orphaned — e.g. workers table reset on restart while spec
+           was still marked running).
+        2. A worker row claims the spec but the PID is dead or is not
+           tracked in this daemon instance's worker_procs (stale from
+           a prior daemon run).
+
+        Returns list of spec IDs that were requeued.
+        """
+        requeued: list[str] = []
+
+        cursor = self.db.conn.execute(
+            "SELECT id, last_worker FROM specs WHERE status = 'running'"
+        )
+        running_specs = cursor.fetchall()
+
+        for spec_row in running_specs:
+            spec_id = spec_row["id"]
+            last_worker = spec_row["last_worker"]
+
+            worker_row = self.db.conn.execute(
+                "SELECT id, current_pid FROM workers WHERE current_spec_id = ?",
+                (spec_id,),
+            ).fetchone()
+
+            should_requeue = False
+
+            if worker_row is None:
+                # No worker claims this spec — orphaned
+                should_requeue = True
+            else:
+                pid = worker_row["current_pid"]
+                if pid is None:
+                    should_requeue = True
+                elif worker_row["id"] not in self.worker_procs:
+                    # PID is from a previous daemon instance; not tracked here
+                    should_requeue = True
+                else:
+                    try:
+                        os.kill(pid, 0)
+                    except (ProcessLookupError, PermissionError):
+                        should_requeue = True
+
+            if should_requeue:
+                self.db.conn.execute(
+                    "UPDATE specs SET status = 'requeued', last_worker = NULL "
+                    "WHERE id = ?",
+                    (spec_id,),
+                )
+                logger.warning(
+                    "Reconciliation: requeued %s (worker %s is dead)",
+                    spec_id,
+                    last_worker or "unknown",
+                )
+                requeued.append(spec_id)
+
+        if requeued:
+            self.db.conn.commit()
+
+        return requeued
 
     # ── Dispatch (Task 7) ───────────────────────────────────────────
 
