@@ -1131,9 +1131,9 @@ def format_dashboard(
 
     Output:
         ═══ BOI ═══════════════════════════════════════════════ 08:23 ══
-         ✓ q-001 ios-recording    disc  5/8  3i  B(0.78)
-         ▶ q-002 topic-chats      exec  2/9  1i  ---      w-1
-         · q-003 heartbeat        chal  0/5  0i  ---
+         ✓ q-001 add-dark-mode    disc  5/8  3i  B(0.78)
+         ▶ q-002 api-endpoints    exec  2/9  1i  ---      w-1
+         · q-003 polish-onboard   chal  0/5  0i  ---
         Workers: 1/3 busy | Queue: 3
     """
     entries = status_data.get("entries", [])

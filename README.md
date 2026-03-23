@@ -272,7 +272,7 @@ BOI
 
 QUEUE                         MODE       WORKER  ITER   TASKS       QUALITY    PROGRESS   STATUS
 q-001  ai-profile-v2          discover   w-1     7/30   5/8 done    B (0.78)   51%        running
-q-002  topic-chats-backend    execute    ---     ---    0/9 done    ---        0%         queued
+q-002  api-endpoints          execute    ---     ---    0/9 done    ---        0%         queued
 q-003  security-audit         challenge  w-2     2/30   1/12 done   A (0.91)   8%         running
 
 Workers: 2/3 busy  |  Queue: 2 running, 1 queued
@@ -294,7 +294,7 @@ Quality alerts appear as warnings:
 ### Telemetry output
 
 ```
-Spec: ios-recording (q-001)
+Spec: add-dark-mode (q-001)
 Mode: discover
 Iterations: 3 of 30
 Total time: 47m 23s
@@ -323,9 +323,9 @@ Iteration breakdown:
 
 ```
 === BOI =============== 08:23 ==
- + q-001 ios-recording     5/8  3i disc B
- > q-002 topic-chats       2/9  1i exec   w-1
- . q-003 heartbeat         0/5  0i exec
+ + q-001 add-dark-mode     5/8  3i disc B
+ > q-002 api-endpoints     2/9  1i exec   w-1
+ . q-003 polish-onboard    0/5  0i exec
 Workers: 1/3 busy | Queue: 3
 ```
 

@@ -23,7 +23,7 @@ from lib.db import Database
 SAMPLE_SPEC_COMPLETED = """\
 # Test Spec
 
-**Target:** ~/github.com/mrap/some-repo
+**Target:** ~/projects/example-repo
 
 ## Tasks
 
@@ -36,7 +36,7 @@ DONE
 SAMPLE_SPEC_PENDING = """\
 # Test Spec
 
-**Target:** ~/github.com/mrap/some-repo
+**Target:** ~/projects/example-repo
 
 ## Tasks
 
@@ -158,7 +158,7 @@ class TestExtractTargetRepo(HexEventTestCase):
     def test_extracts_target_from_spec(self):
         spec_path = self._write_spec(SAMPLE_SPEC_COMPLETED)
         result = Daemon._extract_target_repo(spec_path)
-        self.assertEqual(result, "~/github.com/mrap/some-repo")
+        self.assertEqual(result, "~/projects/example-repo")
 
     def test_returns_empty_string_for_missing_file(self):
         result = Daemon._extract_target_repo("/does/not/exist.md")

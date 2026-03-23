@@ -310,7 +310,7 @@ class TestTelemetryFormatting(unittest.TestCase):
         self.assertEqual(len(telemetry["iterations"]), 3)
 
     def test_telemetry_table_format(self):
-        entry = enqueue(self.queue_dir, self._make_spec("ios-recording.md"))
+        entry = enqueue(self.queue_dir, self._make_spec("add-dark-mode.md"))
         entry["iteration"] = 2
         entry["tasks_done"] = 3
         entry["tasks_total"] = 5
@@ -325,7 +325,7 @@ class TestTelemetryFormatting(unittest.TestCase):
         telemetry = build_telemetry(self.queue_dir, "q-001")
         output = format_telemetry_table(telemetry, color=False)
 
-        self.assertIn("ios-recording", output)
+        self.assertIn("add-dark-mode", output)
         self.assertIn("q-001", output)
         self.assertIn("Iterations: 2 of 30", output)
         self.assertIn("3/5 done", output)

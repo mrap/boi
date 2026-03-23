@@ -64,9 +64,9 @@ Output format:
 BOI
 
 QUEUE                         MODE       WORKER  ITER   TASKS       QUALITY    PROGRESS   STATUS
-q-001  ios-recording          discover   w-1     3/30   5/8 done    B (0.78)   51%        running
-q-002  topic-chats-backend    execute    ---     ---    0/9 done    ---        0%         queued
-q-003  heartbeat-polish       execute    ---     ---    5/5 done    A (0.91)   100%       completed
+q-001  add-dark-mode          discover   w-1     3/30   5/8 done    B (0.78)   51%        running
+q-002  api-endpoints          execute    ---     ---    0/9 done    ---        0%         queued
+q-003  polish-onboarding      execute    ---     ---    5/5 done    A (0.91)   100%       completed
 
 Workers: 1/3 busy  |  Queue: 1 running, 1 queued, 1 completed
 ```
@@ -106,7 +106,7 @@ boi telemetry <queue-id> [--json]
 
 Output:
 ```
-Spec: ios-recording (q-001)
+Spec: add-dark-mode (q-001)
 Iterations: 3 of 30
 Total time: 47m 23s
 Tasks: 5/8 done, 2 added (self-evolved), 1 skipped

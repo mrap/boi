@@ -2,7 +2,7 @@
 
 ## Summary
 
-Vibe-to-production playbook applied to BOI codebase across 8 BOI worker iterations (q-102).
+Vibe-to-production playbook applied to BOI codebase across 8 BOI worker iterations.
 Four commits landed, covering dead code removal, complexity reduction, and safety net test coverage.
 
 ---
