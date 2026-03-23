@@ -610,9 +610,13 @@ class Daemon:
                 tasks_total = spec_after.get("tasks_total", 0)
                 iteration_num = spec_after.get("iteration", 0)
 
+                spec_title = self._extract_spec_title(
+                    spec_after.get("spec_path", "")
+                )
                 if new_status == "completed":
                     self.emit_hex_event("boi.spec.completed", {
                         "spec_id": spec_id,
+                        "spec_title": spec_title,
                         "target_repo": target_repo,
                         "tasks_done": tasks_done,
                         "tasks_total": tasks_total,
@@ -620,6 +624,7 @@ class Daemon:
                 elif new_status == "failed":
                     self.emit_hex_event("boi.spec.failed", {
                         "spec_id": spec_id,
+                        "spec_title": spec_title,
                         "failure_reason": spec_after.get(
                             "failure_reason", ""
                         ),
@@ -963,6 +968,19 @@ class Daemon:
                 stripped = line.strip()
                 if stripped.startswith("**Target:**"):
                     return stripped.split("**Target:**", 1)[1].strip()
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _extract_spec_title(spec_path: str) -> str:
+        """Extract the title from a spec file's first '# ' heading."""
+        try:
+            content = Path(spec_path).read_text(encoding="utf-8")
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("# "):
+                    return stripped[2:].strip()
         except Exception:
             pass
         return ""

@@ -241,6 +241,9 @@ class TestLifecycleEventsOnCompletion(HexEventTestCase):
         self.assertIn("target_repo", completed_payload)
         self.assertIn("tasks_done", completed_payload)
         self.assertIn("tasks_total", completed_payload)
+        self.assertIn("spec_title", completed_payload)
+        self.assertIsInstance(completed_payload["spec_title"], str)
+        self.assertTrue(len(completed_payload["spec_title"]) > 0)
 
     def test_failed_status_emits_boi_spec_failed(self):
         spec_path = self._write_spec(SAMPLE_SPEC_PENDING)
@@ -278,6 +281,9 @@ class TestLifecycleEventsOnCompletion(HexEventTestCase):
         self.assertEqual(failed_payload["spec_id"], spec_id)
         self.assertIn("failure_reason", failed_payload)
         self.assertIn("iteration", failed_payload)
+        self.assertIn("spec_title", failed_payload)
+        self.assertIsInstance(failed_payload["spec_title"], str)
+        self.assertTrue(len(failed_payload["spec_title"]) > 0)
 
     def test_requeued_status_emits_only_iteration_done(self):
         spec_path = self._write_spec(SAMPLE_SPEC_PENDING)

@@ -587,6 +587,27 @@ PYEOF
         info "  blocked by: ${blocked_by_ids} (will not run until dependencies complete)"
     fi
 
+    # Emit boi.spec.dispatched event to hex-events (if installed)
+    local _hex_emit_py="${HOME}/.hex-events/hex_emit.py"
+    if [[ -f "${_hex_emit_py}" ]]; then
+        local _spec_title
+        _spec_title=$(python3 -c "
+import sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith('# '):
+                print(s[2:].strip())
+                break
+except Exception:
+    pass
+" "${input_file}" 2>/dev/null || true)
+        python3 "${_hex_emit_py}" boi.spec.dispatched \
+            "{\"queue_id\":\"${queue_id}\",\"spec_title\":\"${_spec_title}\",\"tasks_total\":${task_count},\"spec_path\":\"${input_file}\"}" \
+            2>/dev/null || true
+    fi
+
     # Start daemon if not already running
     if require_daemon; then
         progress_step "Starting daemon"
