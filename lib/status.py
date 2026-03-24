@@ -383,11 +383,48 @@ def _get_blocked_specs_display(
 
 
 def _get_terminal_width() -> int:
-    """Get terminal width with fallback to 80."""
+    """Get terminal width, trying multiple sources with fallback to 120.
+
+    Sources tried in order:
+    1. os.get_terminal_size() on stdout (fd 1)
+    2. os.get_terminal_size() on stderr (fd 2)
+    3. /dev/tty (works even when stdout/stderr are piped)
+    4. $COLUMNS environment variable
+    5. Fallback: 120
+
+    Enforces a minimum of 80 columns.
+    """
+    import sys
+
+    # Try stdout
     try:
-        return os.get_terminal_size().columns
+        cols = os.get_terminal_size(1).columns
+        return max(80, cols)
     except (ValueError, OSError):
-        return 80
+        pass
+
+    # Try stderr
+    try:
+        cols = os.get_terminal_size(2).columns
+        return max(80, cols)
+    except (ValueError, OSError):
+        pass
+
+    # Try /dev/tty directly (works when stdout/stderr are piped)
+    try:
+        with open("/dev/tty") as tty:
+            cols = os.get_terminal_size(tty.fileno()).columns
+            return max(80, cols)
+    except (ValueError, OSError):
+        pass
+
+    # Try $COLUMNS env var (set by bash/zsh)
+    cols_env = os.environ.get("COLUMNS", "")
+    if cols_env.isdigit():
+        return max(80, int(cols_env))
+
+    # Default fallback
+    return 120
 
 
 def _sort_entries_for_display(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -628,27 +665,36 @@ def _apply_view_filter(
 
         return sorted(entries, key=_ts, reverse=True)[:n]
 
-    # default: active specs + completed/failed within 24 h
+    # default: active specs + failed within 24h + completed within 6h
+    # Canceled is never shown in default view.
     now = datetime.now(timezone.utc)
     from datetime import timedelta
-    cutoff = now - timedelta(hours=24)
+    cutoff_failed = now - timedelta(hours=24)
+    cutoff_completed = now - timedelta(hours=6)
 
-    def _is_recent(e: dict[str, Any]) -> bool:
+    def _last_ts(e: dict[str, Any]) -> datetime | None:
         ts_str = e.get("last_iteration_at") or e.get("submitted_at") or ""
         if not ts_str:
-            return False
+            return None
         try:
-            return datetime.fromisoformat(ts_str.replace("Z", "+00:00")) >= cutoff
+            return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
         except Exception:
-            return False
+            return None
 
     result = []
     for e in entries:
         status = e.get("status", "")
         if status in ("running", "requeued", "queued", "needs_review", "assigning"):
             result.append(e)
-        elif status in ("completed", "failed") and _is_recent(e):
-            result.append(e)
+        elif status == "failed":
+            ts = _last_ts(e)
+            if ts is not None and ts >= cutoff_failed:
+                result.append(e)
+        elif status == "completed":
+            ts = _last_ts(e)
+            if ts is not None and ts >= cutoff_completed:
+                result.append(e)
+        # canceled: never shown in default view
     return result
 
 
@@ -682,8 +728,8 @@ def format_queue_table(
     total_entry_count = len(all_entries)
     shown_entry_count = len(entries)
 
-    # Terminal width
-    term_w = width if width is not None else _get_terminal_width()
+    # Terminal width (minimum 80)
+    term_w = max(80, width if width is not None else _get_terminal_width())
 
     # Fixed column widths (including trailing space as separator)
     COL_MODE = 10  # "execute   " (8 + 2 space)
@@ -913,10 +959,16 @@ def format_queue_table(
 
     # "Showing X of Y" summary when filtered
     if view_mode != "all" and shown_entry_count < total_entry_count:
-        showing_hint = (
-            f"Showing {shown_entry_count} of {total_entry_count} specs."
-            " Use --all to see all."
-        )
+        if view_mode == "default":
+            showing_hint = (
+                f"Showing {shown_entry_count} of {total_entry_count} specs"
+                " (running + last 6h). Use --all for full history."
+            )
+        else:
+            showing_hint = (
+                f"Showing {shown_entry_count} of {total_entry_count} specs."
+                " Use --all to see all."
+            )
         if color:
             showing_hint = f"{DIM}{showing_hint}{NC}"
         lines.append(showing_hint)
