@@ -1267,18 +1267,19 @@ def format_dashboard(
         Workers: 1/3 busy | Queue: 3
     """
     all_entries = status_data.get("entries", [])
+    total_all = len(all_entries)  # total before any filter — used for "Showing N of M"
     # Apply the same relevance filter as format_queue_table (the base data set)
     entries = _apply_view_filter(all_entries, view_mode)
     summary = status_data.get("summary", {})
     workers = status_data.get("workers", [])
 
     term_w = width if width is not None else _get_terminal_width()
-    # Dashboard targets narrower widths
-    dash_w = min(term_w, 80)
+    # Use full terminal width (same as format_queue_table)
+    dash_w = max(80, term_w)
 
     lines: list[str] = []
 
-    # Track total entries before filtering for "Showing X of Y" display
+    # Track filtered entry count (after view filter, before status filter)
     total_entries = len(entries)
 
     # Header bar with filter/sort indicators
@@ -1444,8 +1445,8 @@ def format_dashboard(
                     row = f"{BOLD}{row}{NC}"
             elif status in ("completed", "canceled"):
                 row = f"{DIM}{row}{NC}"
-            elif status_color:
-                row = f"{status_color}{row}{NC}"
+            # Non-selected active rows: no whole-row ANSI wrap so that
+            # the row starts with plain sel_marker + icon for grep patterns.
 
         lines.append(row)
 
@@ -1463,13 +1464,32 @@ def format_dashboard(
     parts: list[str] = []
     if total_workers:
         parts.append(f"Workers: {running}/{total_workers} busy")
-    # Show "Showing X of Y specs" when filtering hides entries
-    if shown_count < total_entries:
-        parts.append(f"Showing {shown_count} of {total_entries} specs")
-    else:
-        parts.append(f"Queue: {total_specs}")
-    summary_line = " | ".join(parts)
+    parts_count = ", ".join(filter(None, [
+        f"{summary.get('running', 0)} running" if summary.get("running") else "",
+        f"{summary.get('queued', 0) + summary.get('requeued', 0)} queued" if summary.get("queued", 0) + summary.get("requeued", 0) else "",
+        f"{summary.get('failed', 0)} failed" if summary.get("failed") else "",
+        f"{summary.get('completed', 0)} completed" if summary.get("completed") else "",
+    ]))
+    if parts_count:
+        parts.append(parts_count)
+    summary_line = " | ".join(parts) if parts else f"Queue: {total_specs}"
     lines.append(summary_line)
+
+    # "Showing N of M" hint when view filter hides entries (same as format_queue_table)
+    if view_mode != "all" and shown_count < total_all:
+        if view_mode == "default":
+            showing_hint = (
+                f"Showing {shown_count} of {total_all} specs"
+                " (running + last 6h). Use --all for full history."
+            )
+        else:
+            showing_hint = (
+                f"Showing {shown_count} of {total_all} specs."
+                " Use --all to see all."
+            )
+        if color:
+            showing_hint = f"{DIM}{showing_hint}{NC}"
+        lines.append(showing_hint)
 
     # Emit visible queue IDs as a machine-readable footer line for dashboard.sh
     # Format: __QUEUE_IDS__:q-001,q-002,q-003
