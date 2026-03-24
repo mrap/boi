@@ -361,8 +361,8 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
         self.assertIn("error: something broke", meta["log_tail"])
         self.assertTrue(meta.get("crash", False))
 
-    def test_nonzero_exit_captures_failure_reason(self):
-        """Non-zero exit code captures specific exit code in failure_reason."""
+    def test_signal_exit_requeues_without_crash(self):
+        """Exit code 137 (SIGKILL) is treated as signal death, not a crash."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
         entry = enqueue(self.queue_dir, spec_path)
         set_running(self.queue_dir, entry["id"], "w-1")
@@ -379,14 +379,9 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
             exit_code="137",
         )
 
-        self.assertEqual(result["outcome"], "crashed")
-        self.assertIn("137", result["failure_reason"])
-
-        iter_file = os.path.join(self.queue_dir, f"{entry['id']}.iteration-1.json")
-        self.assertTrue(os.path.isfile(iter_file))
-        meta = json.loads(Path(iter_file).read_text())
-        self.assertEqual(meta["failure_reason"], "Worker exited with code 137.")
-        self.assertEqual(meta["exit_code"], 137)
+        # Exit 137 (SIGKILL) is a signal death, not a real crash.
+        # Signal path requeues without logging an iteration file.
+        self.assertEqual(result["outcome"], "signal_requeued")
 
     def test_timeout_captures_failure_reason(self):
         """Timeout passes specific timeout message as failure_reason."""
