@@ -698,7 +698,8 @@ class TestDashboardFormat(unittest.TestCase):
         )
         config = {"workers": [{"id": "w-1"}, {"id": "w-2"}, {"id": "w-3"}]}
         status_data = build_queue_status(self.tmpdir, config)
-        output = format_dashboard(status_data, color=False)
+        # view_mode="all" to show completed/failed entries without timestamps
+        output = format_dashboard(status_data, color=False, view_mode="all")
 
         # Check status icons present
         self.assertIn("\u2713", output)  # ✓ completed
@@ -712,8 +713,8 @@ class TestDashboardFormat(unittest.TestCase):
         self.assertIn("q-003", output)
         self.assertIn("q-004", output)
 
-        # Summary
-        self.assertIn("Queue: 4", output)
+        # Summary shows counts
+        self.assertIn("1 running", output)
 
     def test_header_contains_time(self):
         from lib.status import build_queue_status, format_dashboard
@@ -776,7 +777,8 @@ class TestDashboardFormat(unittest.TestCase):
             ]
         )
         status_data = build_queue_status(self.tmpdir, None)
-        output = format_dashboard(status_data, color=False)
+        # Use narrow width to force truncation of long spec name
+        output = format_dashboard(status_data, color=False, width=80)
 
         # The full long name should NOT appear (it would be truncated)
         self.assertNotIn(
@@ -815,7 +817,8 @@ class TestDashboardFormat(unittest.TestCase):
             ]
         )
         status_data = build_queue_status(self.tmpdir, None)
-        output = format_dashboard(status_data, color=False)
+        # view_mode="all" to show completed entries without timestamps
+        output = format_dashboard(status_data, color=False, view_mode="all")
         lines = output.strip().split("\n")
 
         # Find the line with q-001 (completed) — should NOT show w-1
@@ -847,8 +850,8 @@ class TestDashboardFormat(unittest.TestCase):
         status_data = build_queue_status(self.tmpdir, None)
         output = format_dashboard(status_data, color=False)
 
-        # Should show Queue count but not Workers
-        self.assertIn("Queue: 1", output)
+        # Should show count info but not Workers (no workers in config)
+        self.assertIn("queued", output)
         self.assertNotIn("Workers:", output)
 
     def test_dashboard_sh_exists(self):

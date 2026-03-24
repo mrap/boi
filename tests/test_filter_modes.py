@@ -139,7 +139,8 @@ class TestFormatDashboardFilter(unittest.TestCase):
             _make_entry("q-003", status="completed"),
         ]
         data = _make_status_data(entries)
-        output = format_dashboard(data, color=False, width=80, filter_status="all")
+        # view_mode="all" to bypass time-based filter (entries have no timestamps)
+        output = format_dashboard(data, color=False, width=80, filter_status="all", view_mode="all")
         self.assertIn("q-001", output)
         self.assertIn("q-002", output)
         self.assertIn("q-003", output)
@@ -175,8 +176,9 @@ class TestFormatDashboardFilter(unittest.TestCase):
             _make_entry("q-003", status="completed"),
         ]
         data = _make_status_data(entries)
+        # view_mode="all" to bypass time-based filter (entries have no timestamps)
         output = format_dashboard(
-            data, color=False, width=80, filter_status="completed"
+            data, color=False, width=80, filter_status="completed", view_mode="all"
         )
         self.assertNotIn("q-001", output)
         self.assertNotIn("q-002", output)
@@ -212,7 +214,9 @@ class TestFormatDashboardFilter(unittest.TestCase):
         data = _make_status_data(entries)
         output = format_dashboard(data, color=False, width=80, filter_status="all")
         self.assertNotIn("Showing", output)
-        self.assertIn("Queue:", output)
+        # Summary line should contain count info (format: "Workers: N/M busy | X running, Y queued")
+        self.assertIn("running", output)
+        self.assertIn("queued", output)
 
     def test_filter_indicator_in_header(self):
         entries = [_make_entry("q-001", status="running")]

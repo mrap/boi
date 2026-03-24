@@ -354,7 +354,8 @@ class TestFormatDashboardSortIntegration(unittest.TestCase):
         ]
         data = self._make_status_data(entries)
         for mode in ["queue", "status", "progress", "dag", "name", "recent"]:
-            output = format_dashboard(data, color=False, width=80, sort_mode=mode)
+            # view_mode="all" to bypass time filter (entries have no timestamps)
+            output = format_dashboard(data, color=False, width=80, sort_mode=mode, view_mode="all")
             self.assertIn("q-001", output, f"mode={mode} missing q-001")
             self.assertIn("q-002", output, f"mode={mode} missing q-002")
             self.assertIn("q-003", output, f"mode={mode} missing q-003")

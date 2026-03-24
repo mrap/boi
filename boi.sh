@@ -832,7 +832,7 @@ else:
 PYEOF
 }
 
-# Non-interactive sorted/filtered output using format_dashboard
+# Non-interactive sorted/filtered output using the unified format_queue_table renderer
 cmd_queue_sorted() {
     local sort_mode="${1:-queue}"
     local filter_status="${2:-all}"
@@ -841,7 +841,7 @@ cmd_queue_sorted() {
     BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${BOI_CONFIG}" "${sort_mode}" "${filter_status}" "${view_mode}" <<'PYEOF'
 import sys, os, json
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
-from lib.status import build_queue_status, format_dashboard
+from lib.status import build_queue_status, format_queue_table
 
 queue_dir = sys.argv[1]
 config_path = sys.argv[2]
@@ -858,19 +858,11 @@ if os.path.isfile(config_path):
         pass
 
 status_data = build_queue_status(queue_dir, config)
-output = format_dashboard(
+print(format_queue_table(
     status_data,
-    sort_mode=sort_mode,
-    filter_status=filter_status,
-    show_completed=True,
-    selected_row=-1,
     view_mode=view_mode,
-)
-
-# Strip __QUEUE_IDS__ metadata line from output
-for line in output.splitlines():
-    if not line.startswith("__QUEUE_IDS__:"):
-        print(line)
+    sort=sort_mode,
+))
 PYEOF
 }
 

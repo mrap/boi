@@ -164,7 +164,8 @@ class TestFormatQueueTable(unittest.TestCase):
     def test_completed_entry_appears(self):
         entries = [_minimal_entry(id="q-010", status="completed", tasks_done=5, tasks_total=5)]
         status_data = _minimal_status_data(entries=entries)
-        result = format_queue_table(status_data, color=False, width=120)
+        # view_mode="all" to show completed entries regardless of age
+        result = format_queue_table(status_data, color=False, width=120, view_mode="all")
         self.assertIn("q-010", result)
         self.assertIn("completed", result)
 
@@ -186,7 +187,8 @@ class TestFormatQueueTable(unittest.TestCase):
             _minimal_entry(id="q-003", status="completed"),
         ]
         status_data = _minimal_status_data(entries=entries)
-        result = format_queue_table(status_data, color=False, width=120)
+        # view_mode="all" to show completed entries regardless of age
+        result = format_queue_table(status_data, color=False, width=120, view_mode="all")
         self.assertIn("q-001", result)
         self.assertIn("q-002", result)
         self.assertIn("q-003", result)
@@ -286,7 +288,8 @@ class TestFormatDashboard(unittest.TestCase):
             _minimal_entry(id="q-003", status="queued"),
         ]
         status_data = _minimal_status_data(entries=entries)
-        result = format_dashboard(status_data, color=False, width=80)
+        # view_mode="all" to show completed entries regardless of age
+        result = format_dashboard(status_data, color=False, width=80, view_mode="all")
         self.assertIn("q-001", result)
         self.assertIn("q-002", result)
         self.assertIn("q-003", result)

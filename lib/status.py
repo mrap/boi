@@ -56,6 +56,32 @@ def format_duration(seconds: int | float) -> str:
     return f"{hours}h {remaining_mins:02d}m"
 
 
+def format_relative_time(ts: str | None) -> str:
+    """Format a timestamp as a relative time string like '5m ago'.
+
+    Returns em dash for None or invalid input.
+    """
+    if ts is None:
+        return "\u2014"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        delta = now - dt
+        seconds = int(delta.total_seconds())
+        if seconds < 60:
+            return f"{seconds}s ago"
+        minutes = seconds // 60
+        if minutes < 60:
+            return f"{minutes}m ago"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}h ago"
+        days = hours // 24
+        return f"{days}d ago"
+    except Exception:
+        return "\u2014"
+
+
 def _colorize(text: str, color: str) -> str:
     """Wrap text in ANSI color codes."""
     if not color:
@@ -427,6 +453,11 @@ def _get_terminal_width() -> int:
     return 120
 
 
+def get_terminal_width() -> int:
+    """Public interface for terminal width detection. Delegates to _get_terminal_width."""
+    return _get_terminal_width()
+
+
 def _sort_entries_for_display(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sort entries: running first, then queued/requeued, then completed/canceled.
 
@@ -607,6 +638,17 @@ def filter_entries(
     return result
 
 
+def filter_specs(specs: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+    """Single public filter function called by every display mode.
+
+    Delegates to _apply_view_filter. No other code should call _apply_view_filter
+    directly — use this instead.
+
+    mode: "default" | "all" | "running" | "recent:N"
+    """
+    return _apply_view_filter(specs, mode)
+
+
 def sort_entries(
     entries: list[dict[str, Any]], sort_mode: str = "queue"
 ) -> list[dict[str, Any]] | list[tuple[dict[str, Any], int]]:
@@ -616,6 +658,9 @@ def sort_entries(
     """
     if sort_mode == "queue":
         return _sort_by_queue(entries)
+    elif sort_mode == "display":
+        # Running first, then queued/failed/needs_review, then completed — preserves priority order within groups
+        return _sort_entries_for_display(entries)
     elif sort_mode == "status":
         return _sort_by_status(entries)
     elif sort_mode == "progress":
@@ -698,50 +743,147 @@ def _apply_view_filter(
     return result
 
 
-def format_queue_table(
-    status_data: dict[str, Any],
+# ─── Unified column widths ───────────────────────────────────────────────────
+# These constants are shared by format_spec_row and render_status so that all
+# display modes use identical column geometry.
+
+_COL_MODE = 10    # "execute   " (8 + 2 space)
+_COL_WORKER = 8   # "w-1     "  (6 + 2 space)
+_COL_ITER = 8     # "10/30   "  (7 + 1 space)
+_COL_TASKS = 13   # "6/6 done " (12 + 1 space)
+_COL_DEPS = 14    # dep info column
+_COL_STATUS = 12  # "running" right-padded
+_COL_FIXED = _COL_MODE + _COL_WORKER + _COL_ITER + _COL_TASKS + _COL_DEPS + _COL_STATUS
+
+
+def format_spec_row(
+    spec: dict[str, Any],
+    columns: int,
+    style: str = "default",
     color: bool = True,
-    width: int | None = None,
+) -> str:
+    """Format a single spec entry as a display row at the given width.
+
+    style "default": tabular layout (same as standard status output)
+    style "dag":     same layout with depth-based indentation (reads spec["_dag_depth"])
+
+    This is the single row formatter called by render_status for all display modes.
+    """
+    col_spec = max(20, columns - _COL_FIXED)
+
+    qid = spec.get("id", "?")
+    spec_path = spec.get("original_spec_path", spec.get("spec_path", ""))
+    spec_name = os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
+
+    mode = spec.get("mode", "execute")
+    status = spec.get("status", "queued")
+
+    # DAG indentation: 2 spaces per depth level, with status icon prefix
+    # Icons are only added for active statuses (running/queued/failed/needs_review).
+    # Completed/canceled rows are dimmed as a whole row and have no icon prefix,
+    # keeping the grep pattern "[▸▶✓✗] q-" consistent with the default "^q-" count.
+    depth = spec.get("_dag_depth", 0) if style == "dag" else 0
+    indent = "  " * depth
+    if style == "dag" and status not in ("completed", "canceled"):
+        icon = STATUS_ICONS.get(status, "")
+        dag_prefix = f"{icon} " if icon else ""
+    else:
+        dag_prefix = ""
+    label = f"{dag_prefix}{indent}{qid}  {spec_name}"
+    max_label = col_spec - 2
+    if len(label) > max_label:
+        label = label[: max_label - 1] + "\u2026"
+
+    worker = spec.get("last_worker") or "-"
+    if status not in ("running", "requeued"):
+        worker = "-"
+
+    iteration = spec.get("iteration", 0)
+    max_iter = spec.get("max_iterations", 30)
+    iter_str = f"{iteration}/{max_iter}" if status != "queued" else "-"
+
+    tasks_done = spec.get("tasks_done", 0)
+    tasks_total = spec.get("tasks_total", 0)
+    tasks_str = f"{tasks_done}/{tasks_total} done" if tasks_total > 0 else "-"
+
+    quality_str, _ = _get_quality_display(spec, color=False)
+    quality_suffix = (
+        f" [{quality_str}]"
+        if quality_str not in ("\u2014", "-")
+        else ""
+    )
+
+    deps_info = spec.get("_deps", {})
+    blocked_by = deps_info.get("blocked_by", [])
+    blocking = deps_info.get("blocking", [])
+    unmet_deps = [dep_id for dep_id, dep_status in blocked_by if dep_status != "completed"]
+    if unmet_deps:
+        deps_str = f"\u23f3 {','.join(unmet_deps)}"  # ⏳
+    elif blocking:
+        deps_str = f"\u2192 {','.join(bid for bid, _ in blocking)}"  # →
+    else:
+        deps_str = "\u2014"
+    if len(deps_str) > _COL_DEPS - 1:
+        deps_str = deps_str[: _COL_DEPS - 2] + "\u2026"
+
+    row_text = (
+        f"{label:<{col_spec}}"
+        f"{mode:<{_COL_MODE}}"
+        f"{worker:<{_COL_WORKER}}"
+        f"{iter_str:<{_COL_ITER}}"
+        f"{tasks_str:<{_COL_TASKS}}"
+        f"{deps_str:<{_COL_DEPS}}"
+        f"{status}{quality_suffix}"
+    )
+
+    if color:
+        if status in ("completed", "canceled"):
+            row_text = f"{DIM}{row_text}{NC}"
+        else:
+            status_color = STATUS_COLORS.get(status, "")
+            if status_color:
+                row_prefix = (
+                    f"{label:<{col_spec}}"
+                    f"{mode:<{_COL_MODE}}"
+                    f"{worker:<{_COL_WORKER}}"
+                    f"{iter_str:<{_COL_ITER}}"
+                    f"{tasks_str:<{_COL_TASKS}}"
+                    f"{deps_str:<{_COL_DEPS}}"
+                )
+                row_text = f"{row_prefix}{_colorize(status + quality_suffix, status_color)}"
+
+    return row_text
+
+
+def render_status(
+    specs: list[dict[str, Any]],
+    sort: str = "queue",
+    watch: bool = False,
+    columns: int | None = None,
+    color: bool = True,
+    summary: dict[str, Any] | None = None,
+    workers: list[Any] | None = None,
+    total_count: int | None = None,
     view_mode: str = "default",
 ) -> str:
-    """Format queue status as a human-readable, full-width table.
+    """Unified status renderer — single entry point for all display modes.
 
-    Adapts to terminal width. Fixed columns for structured data,
-    flexible SPEC column gets remaining space.
+    Takes pre-filtered specs (use filter_specs() first), sorts them, and
+    renders header + rows + summary footer.
 
-    Output:
-        BOI
-
-        SPEC                           MODE      WORKER  ITER    TASKS        STATUS
-        ─────────────────────────────────────────────────────────────────────────────
-        q-005  ux-polish               execute   w-1     10/30   6/6 done     running
-        ...
-
-        Workers: 3/3 busy  |  3 running, 2 queued, 7 completed
+    For watch mode, callers should call this in a loop and overwrite the
+    screen with cursor-home (no clear) between frames.
     """
-    all_entries = status_data.get("entries", [])
-    summary = status_data.get("summary", {})
-    workers = status_data.get("workers", [])
+    if columns is None:
+        columns = get_terminal_width()
+    term_w = max(80, columns)
 
-    # Apply view filter
-    entries = _apply_view_filter(all_entries, view_mode)
-    total_entry_count = len(all_entries)
-    shown_entry_count = len(entries)
-
-    # Terminal width (minimum 80)
-    term_w = max(80, width if width is not None else _get_terminal_width())
-
-    # Fixed column widths (including trailing space as separator)
-    COL_MODE = 10  # "execute   " (8 + 2 space)
-    COL_WORKER = 8  # "w-1     " (6 + 2 space)
-    COL_ITER = 8  # "10/30   " (7 + 1 space)
-    COL_TASKS = 13  # "6/6 done     " (12 + 1 space)
-    COL_DEPS = 14  # "⏳ q-001,q-002" dep info
-    COL_STATUS = 12  # "running" right-padded
-
-    fixed_cols = COL_MODE + COL_WORKER + COL_ITER + COL_TASKS + COL_DEPS + COL_STATUS
-    # SPEC column gets remaining space, minimum 20
-    col_spec = max(20, term_w - fixed_cols)
+    if summary is None:
+        summary = {}
+    if workers is None:
+        workers = []
+    if total_count is None:
+        total_count = len(specs)
 
     lines: list[str] = []
 
@@ -751,7 +893,7 @@ def format_queue_table(
     lines.append(header)
     lines.append("")
 
-    if not entries:
+    if not specs:
         lines.append("No specs in queue. Ready to dispatch.")
         total_workers = len(workers)
         if total_workers:
@@ -766,127 +908,49 @@ def format_queue_table(
         lines.append("  boi --help                       See all commands")
         return "\n".join(lines)
 
-    # Column header
+    col_spec = max(20, term_w - _COL_FIXED)
     col_header = (
         f"{'SPEC':<{col_spec}}"
-        f"{'MODE':<{COL_MODE}}"
-        f"{'WORKER':<{COL_WORKER}}"
-        f"{'ITER':<{COL_ITER}}"
-        f"{'TASKS':<{COL_TASKS}}"
-        f"{'Deps':<{COL_DEPS}}"
+        f"{'MODE':<{_COL_MODE}}"
+        f"{'WORKER':<{_COL_WORKER}}"
+        f"{'ITER':<{_COL_ITER}}"
+        f"{'TASKS':<{_COL_TASKS}}"
+        f"{'Deps':<{_COL_DEPS}}"
         f"{'STATUS'}"
     )
     if color:
         col_header = f"{BOLD}{col_header}{NC}"
     lines.append(col_header)
 
-    # Separator line spanning full width
     sep = "\u2500" * term_w
     if color:
         sep = f"{DIM}{sep}{NC}"
     lines.append(sep)
 
-    # Sort: running first, queued, then completed
-    sorted_entries = _sort_entries_for_display(entries)
+    # Sort — dag mode embeds _dag_depth into each entry dict
+    style = "dag" if sort == "dag" else "default"
+    sorted_result = sort_entries(specs, sort)
 
-    generate_details: list[tuple[int, list[str]]] = []
+    if sort == "dag":
+        # sort_entries returns list[(entry, depth)] for dag
+        display_entries = []
+        for entry, depth in sorted_result:  # type: ignore[misc]
+            entry["_dag_depth"] = depth
+            display_entries.append(entry)
+    else:
+        display_entries = sorted_result  # type: ignore[assignment]
+
     first_running_id = ""
+    generate_details: list[tuple[int, list[str]]] = []
 
-    for entry in sorted_entries:
-        qid = entry.get("id", "?")
-        spec_path = entry.get("original_spec_path", entry.get("spec_path", ""))
-        spec_name = (
-            os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
-        )
-        label = f"{qid}  {spec_name}"
-        # Truncate with ellipsis if too long
-        max_label = col_spec - 2  # leave padding
-        if len(label) > max_label:
-            label = label[: max_label - 1] + "\u2026"
-
-        mode = entry.get("mode", "execute")
-        mode_str = mode
-
-        worker = entry.get("last_worker") or "-"
-        if entry.get("status") not in ("running", "requeued"):
-            worker = "-"
-        iteration = entry.get("iteration", 0)
-        max_iter = entry.get("max_iterations", 30)
-        iter_str = f"{iteration}/{max_iter}" if entry.get("status") != "queued" else "-"
-
-        # Task progress
-        tasks_done = entry.get("tasks_done", 0)
-        tasks_total = entry.get("tasks_total", 0)
-        if tasks_total > 0:
-            tasks_str = f"{tasks_done}/{tasks_total} done"
-        else:
-            tasks_str = "-"
-
+    for entry in display_entries:
         status = entry.get("status", "queued")
-
-        # Track first running spec for hint
         if not first_running_id and status == "running":
-            first_running_id = qid
+            first_running_id = entry.get("id", "")
 
-        # Quality annotation (compact, appended to status)
-        quality_str, _progress_str = _get_quality_display(entry, color=False)
-        quality_suffix = ""
-        if quality_str != "\u2014" and quality_str != "-":
-            quality_suffix = f" [{quality_str}]"
+        row = format_spec_row(entry, term_w, style=style, color=color)
+        lines.append(row)
 
-        # Deps column
-        deps_info = entry.get("_deps", {})
-        blocked_by = deps_info.get("blocked_by", [])  # list of (id, status) tuples
-        blocking = deps_info.get("blocking", [])       # list of (id, status) tuples
-        unmet_deps = [dep_id for dep_id, dep_status in blocked_by if dep_status != "completed"]
-        if unmet_deps:
-            dep_ids_str = ",".join(unmet_deps)
-            deps_str = f"\u23f3 {dep_ids_str}"  # ⏳
-        elif blocking:
-            blocking_ids = ",".join(bid for bid, _ in blocking)
-            deps_str = f"\u2192 {blocking_ids}"  # →
-        else:
-            deps_str = "\u2014"  # em dash
-
-        # Truncate deps_str to column width
-        if len(deps_str) > COL_DEPS - 1:
-            deps_str = deps_str[:COL_DEPS - 2] + "\u2026"
-
-        # Build the plain-text row
-        row_text = (
-            f"{label:<{col_spec}}"
-            f"{mode_str:<{COL_MODE}}"
-            f"{worker:<{COL_WORKER}}"
-            f"{iter_str:<{COL_ITER}}"
-            f"{tasks_str:<{COL_TASKS}}"
-            f"{deps_str:<{COL_DEPS}}"
-            f"{status}{quality_suffix}"
-        )
-
-        if color:
-            is_completed = status in ("completed", "canceled")
-            if is_completed:
-                # Dim the entire row for completed specs
-                row_text = f"{DIM}{row_text}{NC}"
-            else:
-                # Colorize just the status portion
-                status_color = STATUS_COLORS.get(status, "")
-                if status_color:
-                    # Rebuild with colored status
-                    row_prefix = (
-                        f"{label:<{col_spec}}"
-                        f"{mode_str:<{COL_MODE}}"
-                        f"{worker:<{COL_WORKER}}"
-                        f"{iter_str:<{COL_ITER}}"
-                        f"{tasks_str:<{COL_TASKS}}"
-                        f"{deps_str:<{COL_DEPS}}"
-                    )
-                    colored_status = _colorize(status + quality_suffix, status_color)
-                    row_text = f"{row_prefix}{colored_status}"
-
-        lines.append(row_text)
-
-        # Show failure reason on a second line for failed specs
         if status == "failed":
             fail_reason = entry.get("failure_reason", "")
             if fail_reason:
@@ -895,33 +959,29 @@ def format_queue_table(
                     reason_line = _colorize(reason_line, RED)
                 lines.append(reason_line)
 
-        # Collect Generate mode detail blocks
         gen_detail = _get_generate_detail(entry)
         if gen_detail:
             generate_details.append((len(lines), gen_detail))
 
-    # Insert Generate mode detail blocks (after their parent row)
     for insert_idx, detail_lines in reversed(generate_details):
         for i, dl in enumerate(detail_lines):
             lines.insert(insert_idx + i, dl)
 
     lines.append("")
 
-    # Quality alerts
-    alert_lines = _get_quality_alerts(entries, color)
+    alert_lines = _get_quality_alerts(specs, color)
     if alert_lines:
         for al in alert_lines:
             lines.append(al)
         lines.append("")
 
-    # Blocked specs section: list specs with unmet dependencies
-    blocked_lines = _get_blocked_specs_display(entries, color)
+    blocked_lines = _get_blocked_specs_display(specs, color)
     if blocked_lines:
         for bl in blocked_lines:
             lines.append(bl)
         lines.append("")
 
-    # Summary line (single line)
+    # Summary line
     total_workers = len(workers)
     running = summary.get("running", 0)
     queued = summary.get("queued", 0) + summary.get("requeued", 0)
@@ -950,23 +1010,22 @@ def format_queue_table(
 
     lines.append("  |  ".join(parts) if parts else f"Total: {summary.get('total', 0)}")
 
-    # Footer hint
     if first_running_id:
         hint = f"Run 'boi log {first_running_id}' to see worker output"
         if color:
             hint = f"{DIM}{hint}{NC}"
         lines.append(hint)
 
-    # "Showing X of Y" summary when filtered
-    if view_mode != "all" and shown_entry_count < total_entry_count:
+    shown_count = len(specs)
+    if view_mode != "all" and shown_count < total_count:
         if view_mode == "default":
             showing_hint = (
-                f"Showing {shown_entry_count} of {total_entry_count} specs"
+                f"Showing {shown_count} of {total_count} specs"
                 " (running + last 6h). Use --all for full history."
             )
         else:
             showing_hint = (
-                f"Showing {shown_entry_count} of {total_entry_count} specs."
+                f"Showing {shown_count} of {total_count} specs."
                 " Use --all to see all."
             )
         if color:
@@ -974,6 +1033,49 @@ def format_queue_table(
         lines.append(showing_hint)
 
     return "\n".join(lines)
+
+
+def format_queue_table(
+    status_data: dict[str, Any],
+    color: bool = True,
+    width: int | None = None,
+    view_mode: str = "default",
+    sort: str = "display",
+) -> str:
+    """Format queue status as a human-readable, full-width table.
+
+    Adapts to terminal width. Fixed columns for structured data,
+    flexible SPEC column gets remaining space.
+
+    Output:
+        BOI
+
+        SPEC                           MODE      WORKER  ITER    TASKS        STATUS
+        ─────────────────────────────────────────────────────────────────────────────
+        q-005  ux-polish               execute   w-1     10/30   6/6 done     running
+        ...
+
+        Workers: 3/3 busy  |  3 running, 2 queued, 7 completed
+    """
+    all_entries = status_data.get("entries", [])
+    summary = status_data.get("summary", {})
+    workers = status_data.get("workers", [])
+    total_count = len(all_entries)
+
+    entries = filter_specs(all_entries, view_mode)
+    columns = max(80, width if width is not None else get_terminal_width())
+
+    return render_status(
+        entries,
+        sort=sort,
+        watch=False,
+        columns=columns,
+        color=color,
+        summary=summary,
+        workers=workers,
+        total_count=total_count,
+        view_mode=view_mode,
+    )
 
 
 def format_queue_json(status_data: dict[str, Any]) -> str:
@@ -1159,6 +1261,12 @@ def format_telemetry_table(telemetry: dict[str, Any], color: bool = True) -> str
     if failures:
         lines.append(f"Consecutive failures: {failures}")
 
+    cost = telemetry.get("cost")
+    if cost:
+        total_cost = cost.get("total_cost_usd")
+        if total_cost is not None:
+            lines.append(f"Cost: ${total_cost}")
+
     # Deutschian progress metrics
     evo_ratio = telemetry.get("evolution_ratio")
     pfr = telemetry.get("productive_failure_rate")
@@ -1268,13 +1376,12 @@ def format_dashboard(
     """
     all_entries = status_data.get("entries", [])
     total_all = len(all_entries)  # total before any filter — used for "Showing N of M"
-    # Apply the same relevance filter as format_queue_table (the base data set)
-    entries = _apply_view_filter(all_entries, view_mode)
+    # Single filter function for all display modes
+    entries = filter_specs(all_entries, view_mode)
     summary = status_data.get("summary", {})
     workers = status_data.get("workers", [])
 
-    term_w = width if width is not None else _get_terminal_width()
-    # Use full terminal width (same as format_queue_table)
+    term_w = width if width is not None else get_terminal_width()
     dash_w = max(80, term_w)
 
     lines: list[str] = []
@@ -1345,25 +1452,19 @@ def format_dashboard(
     else:
         display_items = [(e, 0) for e in sorted_result]  # type: ignore[misc]
 
-    # Apply filtering after sorting (preserves sort order)
-    filtered_items: list[tuple[dict[str, Any], int]] = []
-    for entry, depth in display_items:
-        status = entry.get("status", "queued")
-        # show_completed toggle
-        if not show_completed and status in ("completed", "canceled"):
-            continue
-        # status filter
-        if filter_status == "running" and status not in ("running", "requeued"):
-            continue
-        if filter_status == "queued" and status not in (
-            "queued",
-            "needs_review",
-            "failed",
-        ):
-            continue
-        if filter_status == "completed" and status not in ("completed", "canceled"):
-            continue
-        filtered_items.append((entry, depth))
+    # Apply secondary status filter via unified filter_entries (removes duplicate inline logic)
+    if filter_status != "all" or not show_completed:
+        filtered_entries = filter_entries(
+            [e for e, _ in display_items],
+            filter_status=filter_status,
+            show_completed=show_completed,
+        )
+        filtered_entry_ids = {e.get("id") for e in filtered_entries}
+        filtered_items: list[tuple[dict[str, Any], int]] = [
+            (e, d) for e, d in display_items if e.get("id") in filtered_entry_ids
+        ]
+    else:
+        filtered_items = display_items
 
     shown_count = len(filtered_items)
 
