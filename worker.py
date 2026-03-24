@@ -35,7 +35,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.spec_parser import count_boi_tasks
-from lib.workspace_guard import WorkspaceBoundaryChecker
+from lib.workspace_guard import WorkspaceBoundaryChecker, diff_status, snapshot_git_status
 
 
 class WorkerHooks:
@@ -276,6 +276,17 @@ class Worker:
         )
         boundary.snapshot_before()
 
+        # Parse **Target:** from spec to snapshot the TARGET REPO (not BOI worktree)
+        _spec_content_for_target = _read_file(self.spec_path)
+        _target_match = re.search(
+            r'^\*\*Target:\*\*\s*(.+)$', _spec_content_for_target, re.MULTILINE
+        )
+        _target_repo = (
+            os.path.expanduser(_target_match.group(1).strip()) if _target_match else None
+        )
+        _track_target = bool(_target_repo and os.path.isdir(_target_repo))
+        pre_target_status = snapshot_git_status(_target_repo) if _track_target else set()
+
         # Launch tmux session, wait, post-process
         rc = self.launch_tmux()
         if rc != 0:
@@ -295,6 +306,32 @@ class Worker:
 
         # Boundary check: detect leaks before reporting results
         boundary.check_after()
+
+        # Write changed-files manifest for scoped auto-commit
+        try:
+            if _track_target:
+                post_target_status = snapshot_git_status(_target_repo)
+                new_files = diff_status(pre_target_status, post_target_status)
+                if new_files:
+                    manifest_path = os.path.join(
+                        self.queue_dir, f"{self.spec_id}.changed-files"
+                    )
+                    existing: set = set()
+                    if os.path.isfile(manifest_path):
+                        with open(manifest_path) as f:
+                            existing = {l.strip() for l in f if l.strip()}
+                    all_files = existing | set(new_files)
+                    with open(manifest_path, "w") as f:
+                        f.write("\n".join(sorted(all_files)) + "\n")
+                    logger.info(
+                        "changed-files manifest updated: %s (%d files)",
+                        manifest_path,
+                        len(all_files),
+                    )
+        except Exception:
+            logger.exception(
+                "Failed to write changed-files manifest for %s", self.spec_id
+            )
 
         self.post_process()
         return exit_code

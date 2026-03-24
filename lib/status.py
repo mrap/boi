@@ -593,8 +593,70 @@ def sort_entries(
         return _sort_by_queue(entries)
 
 
+def _apply_view_filter(
+    entries: list[dict[str, Any]], view_mode: str
+) -> list[dict[str, Any]]:
+    """Filter entries based on view_mode.
+
+    view_mode:
+        "all"       — no filtering (show everything)
+        "default"   — running/queued/needs_review + completed/failed in last 24h
+        "running"   — only running/requeued/assigning
+        "recent:N"  — last N entries by most recent activity timestamp
+    """
+    if view_mode == "all":
+        return entries
+
+    if view_mode == "running":
+        return [
+            e for e in entries
+            if e.get("status") in ("running", "requeued", "assigning")
+        ]
+
+    if view_mode.startswith("recent:"):
+        try:
+            n = int(view_mode.split(":", 1)[1])
+        except (ValueError, IndexError):
+            n = 10
+
+        def _ts(e: dict[str, Any]) -> datetime:
+            ts_str = e.get("last_iteration_at") or e.get("submitted_at") or ""
+            try:
+                return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except Exception:
+                return datetime.min.replace(tzinfo=timezone.utc)
+
+        return sorted(entries, key=_ts, reverse=True)[:n]
+
+    # default: active specs + completed/failed within 24 h
+    now = datetime.now(timezone.utc)
+    from datetime import timedelta
+    cutoff = now - timedelta(hours=24)
+
+    def _is_recent(e: dict[str, Any]) -> bool:
+        ts_str = e.get("last_iteration_at") or e.get("submitted_at") or ""
+        if not ts_str:
+            return False
+        try:
+            return datetime.fromisoformat(ts_str.replace("Z", "+00:00")) >= cutoff
+        except Exception:
+            return False
+
+    result = []
+    for e in entries:
+        status = e.get("status", "")
+        if status in ("running", "requeued", "queued", "needs_review", "assigning"):
+            result.append(e)
+        elif status in ("completed", "failed") and _is_recent(e):
+            result.append(e)
+    return result
+
+
 def format_queue_table(
-    status_data: dict[str, Any], color: bool = True, width: int | None = None
+    status_data: dict[str, Any],
+    color: bool = True,
+    width: int | None = None,
+    view_mode: str = "default",
 ) -> str:
     """Format queue status as a human-readable, full-width table.
 
@@ -611,9 +673,14 @@ def format_queue_table(
 
         Workers: 3/3 busy  |  3 running, 2 queued, 7 completed
     """
-    entries = status_data.get("entries", [])
+    all_entries = status_data.get("entries", [])
     summary = status_data.get("summary", {})
     workers = status_data.get("workers", [])
+
+    # Apply view filter
+    entries = _apply_view_filter(all_entries, view_mode)
+    total_entry_count = len(all_entries)
+    shown_entry_count = len(entries)
 
     # Terminal width
     term_w = width if width is not None else _get_terminal_width()
@@ -843,6 +910,16 @@ def format_queue_table(
         if color:
             hint = f"{DIM}{hint}{NC}"
         lines.append(hint)
+
+    # "Showing X of Y" summary when filtered
+    if view_mode != "all" and shown_entry_count < total_entry_count:
+        showing_hint = (
+            f"Showing {shown_entry_count} of {total_entry_count} specs."
+            " Use --all to see all."
+        )
+        if color:
+            showing_hint = f"{DIM}{showing_hint}{NC}"
+        lines.append(showing_hint)
 
     return "\n".join(lines)
 

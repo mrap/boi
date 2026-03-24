@@ -671,11 +671,20 @@ cmd_status() {
     local json_mode=false
     local sort_mode=""
     local filter_status=""
+    local view_mode="default"   # default | all | running | recent:N
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --watch) watch_mode=true; shift ;;
             --json) json_mode=true; shift ;;
+            --all) view_mode="all"; shift ;;
+            --running) view_mode="running"; shift ;;
+            --recent)
+                if [[ $# -lt 2 ]]; then
+                    die_usage "--recent requires a number"
+                fi
+                view_mode="recent:$2"; shift 2 ;;
+            --recent=*) view_mode="recent:${1#--recent=}"; shift ;;
             --sort)
                 if [[ $# -lt 2 ]]; then
                     die_usage "--sort requires a value (queue, status, progress, dag, name, recent)"
@@ -689,17 +698,23 @@ cmd_status() {
                 filter_status="$2"; shift 2 ;;
             --filter=*) filter_status="${1#--filter=}"; shift ;;
             -h|--help)
-                echo "Usage: boi status [--watch] [--json] [--sort MODE] [--filter STATUS]"
+                echo "Usage: boi status [--watch] [--all] [--running] [--recent N] [--json] [--sort MODE] [--filter STATUS]"
                 echo ""
                 echo "Options:"
                 echo "  --watch           Auto-refresh interactive dashboard"
+                echo "  --all             Show all specs (default hides old completed/canceled)"
+                echo "  --running         Show only running specs"
+                echo "  --recent N        Show last N specs by activity"
                 echo "  --json            Output machine-readable JSON"
                 echo "  --sort MODE       Sort by: queue, status, progress, dag, name, recent"
                 echo "  --filter STATUS   Filter by: all, running, queued, completed"
                 echo ""
                 echo "Examples:"
-                echo "  boi status --sort progress          # One-shot sorted output"
-                echo "  boi status --filter running         # One-shot filtered output"
+                echo "  boi status                          # Running + recent (last 24h)"
+                echo "  boi status --all                    # All specs"
+                echo "  boi status --running                # Only running specs"
+                echo "  boi status --recent 10              # Last 10 specs"
+                echo "  boi status --sort progress          # Sorted output"
                 echo "  boi status --watch --sort dag       # Interactive with initial sort"
                 exit 0
                 ;;
@@ -736,7 +751,7 @@ cmd_status() {
             if [[ -n "${sort_mode}" || -n "${filter_status}" ]]; then
                 buf=$(cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}" 2>&1)
             else
-                buf=$(cmd_queue_inner "${json_mode}" 2>&1)
+                buf=$(cmd_queue_inner "${json_mode}" "${view_mode}" 2>&1)
             fi
             # Move cursor home + clear to end (no blank-screen flash)
             printf '\033[H\033[J%s\n' "$buf"
@@ -748,7 +763,7 @@ cmd_status() {
     if [[ -n "${sort_mode}" || -n "${filter_status}" ]]; then
         cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}"
     else
-        cmd_queue_inner "${json_mode}"
+        cmd_queue_inner "${json_mode}" "${view_mode}"
     fi
 
     # Check daemon heartbeat staleness
@@ -787,8 +802,9 @@ except Exception:
 # Inner queue display used by both cmd_queue and cmd_status
 cmd_queue_inner() {
     local json_mode="${1:-false}"
+    local view_mode="${2:-default}"
 
-    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${BOI_CONFIG}" "${json_mode}" <<'PYEOF'
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${BOI_CONFIG}" "${json_mode}" "${view_mode}" <<'PYEOF'
 import sys, os, json
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
 from lib.status import build_queue_status, format_queue_table, format_queue_json
@@ -796,6 +812,7 @@ from lib.status import build_queue_status, format_queue_table, format_queue_json
 queue_dir = sys.argv[1]
 config_path = sys.argv[2]
 json_mode = sys.argv[3] == "True" or sys.argv[3] == "true"
+view_mode = sys.argv[4] if len(sys.argv) > 4 else "default"
 
 config = None
 if os.path.isfile(config_path):
@@ -810,7 +827,7 @@ status_data = build_queue_status(queue_dir, config)
 if json_mode:
     print(format_queue_json(status_data))
 else:
-    print(format_queue_table(status_data))
+    print(format_queue_table(status_data, view_mode=view_mode))
 PYEOF
 }
 
