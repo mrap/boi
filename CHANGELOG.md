@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - Unreleased
 
 ### Added
+- `boi resume <queue-id>` / `boi resume --all`: Resume failed or canceled specs with progress preserved
+- `boi dep` commands for inter-spec dependency DAG management:
+  - `boi dep add <spec> --on <dep>`: Add dependency between specs
+  - `boi dep remove <spec> --on <dep>`: Remove dependency
+  - `boi dep set <spec> --on <dep1,dep2>`: Replace all deps
+  - `boi dep clear <spec>`: Make spec independent
+  - `boi dep show [spec]`: Show deps for one or all specs
+  - `boi dep viz`: ASCII fleet DAG visualization
+  - `boi dep check`: Validate DAG (cycles, missing refs)
+  - `boi dispatch --spec file.md --after q-A,q-B`: Dispatch with dependencies
+- `boi cleanup`: Find and kill orphaned `claude -p` worker processes not tracked by any active spec
+- `boi spec <qid> deps` for intra-spec task-level dependency management:
+  - `boi spec <qid> deps show/add/rm/set/clear/viz/migrate`
+- `## Dependencies` section in specs as first-class DAG format:
+  ```
+  ## Dependencies
+  t-1: (none)
+  t-2: (none)
+  t-3: t-1, t-2
+  ```
+  Backward compatible with `**Blocked by:**` inline format
+- `lib/dag.py`: DAG management module for intra-spec task dependencies
+- Signal-aware failure handling: SIGTERM (exit 143) and SIGKILL (exit 137) no longer count as consecutive failures; workers killed externally are requeued, not failed
+- Daemon lock via `fcntl.flock` preventing multiple daemon instances
 - Dependency-aware task decomposition: `**Blocked by:** t-X, t-Y` syntax for declaring task dependencies in specs
 - `validate_dependencies()` in `lib/spec_validator.py`: Kahn's algorithm cycle detection, unmet dependency detection, orphan task warnings
 - `check_task_sizing()` in `lib/spec_validator.py`: heuristic warnings for oversized tasks (>2000 chars, 3+ data sources, 3+ mutations) and undersized tasks (<50 chars)
@@ -19,9 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Append-only self-evolution rule: new tasks always appended at end of spec file
 
 ### Changed
-- Worker prompt (`templates/worker-prompt.md`) updated with dependency-aware task selection logic
+- Worker prompt (`templates/worker-prompt.md`) updated with dependency-aware task selection logic and topological task ordering
 - Discover mode template updated with dependency inference instructions for self-evolved tasks
 - Spec validator now runs dependency validation after format checks during `boi dispatch`
+
+### Fixed
+- Orphaned worker processes no longer linger after spec completion (`boi cleanup`)
+- Multiple daemon instances no longer spawn (daemon lock via `fcntl.flock`)
+- Exit codes 143 (SIGTERM) and 137 (SIGKILL) no longer count as consecutive failures, preventing false failure states from external kills
+
+### Removed
+- Messaging protocol between daemon and workers (reverted; kill + sidecar files is simpler and more reliable)
 
 ## [0.2.0] - 2026-03-09
 

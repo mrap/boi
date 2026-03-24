@@ -219,6 +219,9 @@ cp ~/.boi/src/plugin/commands/boi.md ~/.claude/commands/
 | `boi log <queue-id>` | Tail latest iteration log |
 | `boi log <queue-id> --full` | Full log output |
 | `boi cancel <queue-id>` | Cancel a queued or running spec |
+| `boi resume <queue-id>` | Resume a failed/canceled spec with progress preserved |
+| `boi resume --all` | Resume all failed/canceled specs |
+| `boi cleanup` | Find and kill orphaned worker processes not tracked by any active spec |
 | `boi stop` | Stop daemon and all workers |
 | `boi workers` | Show worktree/worker availability |
 | `boi telemetry <queue-id>` | Per-iteration task, quality, and timing breakdown |
@@ -242,12 +245,26 @@ cp ~/.boi/src/plugin/commands/boi.md ~/.claude/commands/
 | `boi spec <queue-id> skip <task-id>` | Skip a pending task |
 | `boi spec <queue-id> next <task-id>` | Reorder task to run next |
 | `boi spec <queue-id> block <t-id> --on <dep>` | Mark task as blocked by another |
+| `boi spec <queue-id> deps` | Show the task dependency graph |
+| `boi spec <queue-id> deps add <t-id> --on <dep>` | Add a dependency edge |
+| `boi spec <queue-id> deps rm <t-id> --on <dep>` | Remove a dependency edge |
+| `boi spec <queue-id> deps set <t-id> --on <d1,d2>` | Replace all deps for a task |
+| `boi spec <queue-id> deps clear <t-id>` | Make a task independent |
+| `boi spec <queue-id> deps viz` | ASCII visualization of the task DAG |
+| `boi spec <queue-id> deps migrate` | Migrate from `**Blocked by:**` to `## Dependencies` format |
 | `boi spec <queue-id> edit [<task-id>]` | Open spec/task in `$EDITOR` |
 | `boi project create <name>` | Create a new project |
 | `boi project list` | List all projects |
 | `boi project status <name>` | Show project metadata + specs |
 | `boi project context <name>` | Print project context.md |
 | `boi project delete <name>` | Delete a project |
+| `boi dep add <spec> --on <dep>` | Add inter-spec dependency |
+| `boi dep remove <spec> --on <dep>` | Remove inter-spec dependency |
+| `boi dep set <spec> --on <dep1,dep2>` | Replace all inter-spec deps |
+| `boi dep clear <spec>` | Make spec independent |
+| `boi dep show [spec]` | Show deps for one or all specs |
+| `boi dep viz` | ASCII fleet DAG visualization |
+| `boi dep check` | Validate fleet DAG (cycles, missing refs) |
 | `boi do "request"` | Translate natural language to BOI commands |
 | `boi do --dry-run "request"` | Show generated commands without executing |
 | `boi doctor` | Check prerequisites and environment health |
@@ -260,6 +277,7 @@ Options on `dispatch`:
 - `--no-critic` — Skip critic validation when this spec completes
 - `--project NAME` — Associate this spec with a BOI project
 - `--mode MODE` / `-m MODE` — Set execution mode: `execute` (default), `challenge`, `discover`, `generate` (aliases: `e`, `c`, `d`, `g`)
+- `--after q-A,q-B` — Spec won't start until the listed specs complete (inter-spec dependencies)
 - `--experiment-budget N` — Override default experiment budget for the chosen mode
 
 Options on `queue`, `status`, `telemetry`:
@@ -658,6 +676,31 @@ structures can't be reliably matched. Future workers should use the
 yaml module from stdlib instead.
 ```
 
+## Signal-Aware Failure Handling
+
+Workers killed externally (SIGTERM exit code 143, SIGKILL exit code 137) are requeued, not counted as consecutive failures. This prevents specs from failing permanently when workers are killed by the OS, resource limits, or manual intervention. Only genuine worker crashes (non-zero exit codes from the worker itself) increment the consecutive failure counter.
+
+## Daemon Lock
+
+BOI uses `fcntl.flock` to prevent multiple daemon instances from running simultaneously. If a daemon is already running, `boi dispatch` and other commands that would start a new daemon will detect the lock and exit cleanly. This prevents the "19 daemons spawning" problem that could occur from rapid successive dispatches.
+
+## Resuming Specs
+
+Failed or canceled specs can be resumed with progress preserved. The iteration count, completed tasks, and spec modifications from previous runs are all retained. Only the consecutive failure counter is reset.
+
+```bash
+boi resume q-001          # Resume a specific failed/canceled spec
+boi resume --all          # Resume all failed/canceled specs
+```
+
+## Orphan Cleanup
+
+If worker processes become detached from the daemon (e.g., daemon crash), use `boi cleanup` to find and kill orphaned `claude -p` processes that are no longer tracked by any active spec.
+
+```bash
+boi cleanup
+```
+
 ## Critic
 
 The critic is BOI's built-in quality gate. When a spec finishes all its PENDING tasks, the critic reviews the completed work before marking the spec as done. It evaluates spec integrity, verification rigor, code quality, completeness, and fleet-readiness. It also computes a quality score (see Progress Measurement above). If it finds issues, it adds new `[CRITIC]` PENDING tasks to the spec and requeues it. If everything passes, it writes a `## Critic Approved` section and the spec is marked completed.
@@ -831,6 +874,107 @@ Workers will skip t-5 until t-3 is DONE. Multiple dependencies can be added by c
 ```bash
 boi spec q-001 edit          # Open full spec in $EDITOR
 boi spec q-001 edit t-2      # Edit just task t-2
+```
+
+## Task Dependencies
+
+Declare dependencies between tasks within a spec using the `## Dependencies` section. Tasks with unresolved dependencies are skipped until their dependencies are DONE or SKIPPED.
+
+### Dependencies section format
+
+Add a `## Dependencies` section before `## Tasks` in your spec:
+
+```markdown
+# My Spec
+
+**Mode:** discover
+
+## Dependencies
+t-1: (none)
+t-2: (none)
+t-3: t-1, t-2
+t-4: t-3
+t-5: t-4
+
+## Tasks
+
+### t-1: First task
+PENDING
+...
+```
+
+Each line maps a task ID to its prerequisites. `(none)` means the task has no dependencies (root node). Tasks not listed are treated as independent.
+
+### Backward compatibility
+
+The `## Dependencies` section is the preferred format but BOI also supports the legacy `**Blocked by:** t-1, t-2` inline format within task bodies. When both exist, the `## Dependencies` section takes precedence.
+
+Use `boi spec <qid> deps migrate` to convert a spec from inline `**Blocked by:**` lines to the `## Dependencies` section format.
+
+### Managing task dependencies
+
+```bash
+boi spec q-001 deps                        # Show the dependency graph
+boi spec q-001 deps add t-5 --on t-3       # Add an edge: t-5 now depends on t-3
+boi spec q-001 deps rm t-5 --on t-3        # Remove an edge
+boi spec q-001 deps set t-5 --on t-3,t-4   # Replace all deps for t-5
+boi spec q-001 deps clear t-5              # Make t-5 independent
+boi spec q-001 deps viz                    # ASCII DAG visualization
+```
+
+### Visualization
+
+```
+$ boi spec q-001 deps viz
+t-1 ──> t-3 ──> t-4 ──> t-5
+t-2 ──> t-3
+t-4 (independent)
+
+Critical path: t-1 -> t-3 -> t-4 -> t-5 (4 tasks)
+```
+
+### Validation
+
+BOI validates the dependency graph on dispatch and during execution:
+- Self-references (`t-1: t-1`) are rejected
+- Missing references (`t-3: t-99` where t-99 doesn't exist) are rejected
+- Cycles are detected via Kahn's algorithm
+
+## Fleet Dependencies
+
+Chain specs so one waits for another to complete before starting. Useful for multi-phase work where later specs depend on earlier specs' output.
+
+### Dispatching with dependencies
+
+```bash
+boi dispatch --spec phase2.md --after q-001,q-002
+```
+
+The spec stays queued until all listed dependencies complete.
+
+### Managing fleet dependencies
+
+```bash
+boi dep add q-003 --on q-001          # q-003 waits for q-001
+boi dep remove q-003 --on q-001       # Remove the dependency
+boi dep set q-003 --on q-001,q-002    # Replace all deps for q-003
+boi dep clear q-003                   # Make q-003 independent
+boi dep show                          # Show all inter-spec dependencies
+boi dep show q-003                    # Show deps for a specific spec
+boi dep viz                           # ASCII fleet DAG
+boi dep check                         # Validate DAG (cycles, missing refs)
+```
+
+### Fleet DAG visualization
+
+```
+$ boi dep viz
+q-001 (root)
+q-002 (root)
+q-001 ──> q-003
+q-002 ──> q-003
+
+Critical path: q-001 -> q-003 (2 specs)
 ```
 
 ## Projects

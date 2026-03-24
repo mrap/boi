@@ -1,6 +1,6 @@
 ---
 name: boi
-description: "Dispatch self-evolving specs to parallel Claude Code workers. Use when the user says 'boi', '/boi', 'dispatch this', 'dispatch spec', 'fire it', 'boi status', 'boi queue', 'boi log', 'boi stop', 'boi cancel', 'boi telemetry', 'boi dashboard', 'run this overnight', 'self-evolving loop', or wants to break a task into a spec and dispatch it to autonomous workers. Also use when the user has a complex task and wants it executed iteratively by fresh Claude sessions."
+description: "Dispatch self-evolving specs to parallel Claude Code workers. Use when the user says 'boi', '/boi', 'dispatch this', 'dispatch spec', 'fire it', 'boi status', 'boi queue', 'boi log', 'boi stop', 'boi cancel', 'boi telemetry', 'boi dashboard', 'boi resume', 'boi dep', 'boi cleanup', 'fleet dag', 'spec dependencies', 'run this overnight', 'self-evolving loop', or wants to break a task into a spec and dispatch it to autonomous workers. Also use when the user has a complex task and wants it executed iteratively by fresh Claude sessions."
 ---
 
 # BOI — Beginning of Infinity
@@ -43,6 +43,7 @@ Options:
 - `--max-iter N` — Maximum iterations before marking failed (default: 30)
 - `--worktree PATH` — Pin to a specific worktree
 - `--worktree-isolate` — Create a dedicated worktree and branch for this spec (enables parallel execution without blocking)
+- `--after q-A,q-B` — Dispatch with fleet-level dependencies (this spec waits until q-A and q-B complete)
 - `--no-critic` — Skip critic validation when this spec completes
 - `--mode MODE` / `-m MODE` — Execution mode: `execute` (default), `challenge`, `discover`, `generate` (aliases: `e`, `c`, `d`, `g`)
 - `--experiment-budget N` — Override default experiment budget for the chosen mode
@@ -154,6 +155,42 @@ boi install [--workers N]
 
 Creates `~/.boi/` state directory, sets up worker worktrees, writes config. Must be run outside Claude Code.
 
+### `/boi resume` — Resume failed or canceled specs
+
+```bash
+boi resume <queue-id>    # Resume a specific failed/canceled spec
+boi resume --all         # Resume all failed/canceled specs
+```
+
+Preserves progress. The spec picks up from where it left off with all DONE tasks intact.
+
+### `/boi cleanup` — Kill orphaned workers
+
+```bash
+boi cleanup
+```
+
+Finds and kills orphaned `claude -p` worker processes not tracked by any active spec.
+
+### Fleet Dependencies (`boi dep`)
+
+Manage inter-spec dependencies so specs execute in the right order across the fleet.
+
+```bash
+boi dep add <spec> --on <dep>       # Add dependency (spec waits for dep)
+boi dep remove <spec> --on <dep>    # Remove dependency
+boi dep set <spec> --on <dep1,dep2> # Replace all deps
+boi dep clear <spec>                # Make independent
+boi dep show [spec]                 # Show deps for one or all specs
+boi dep viz                         # ASCII fleet DAG visualization
+boi dep check                       # Validate DAG (cycles, missing refs)
+```
+
+Dispatch with dependencies:
+```bash
+boi dispatch --spec spec.md --after q-A,q-B   # Waits for q-A and q-B to complete
+```
+
 ## Spec Format
 
 A BOI spec.md file is a Markdown document with task headings. Each task has a status line, a spec section, and a verify section.
@@ -190,7 +227,15 @@ PENDING
 - `**Spec:**` section is required. Tell the worker exactly what to do.
 - `**Verify:**` section is required. Give concrete verification commands.
 - `**Self-evolution:**` section is optional but recommended for complex tasks
-- `**Blocked by:** t-X, t-Y` declares dependencies. A task won't execute until all deps are DONE.
+- `**Blocked by:** t-X, t-Y` declares inline dependencies. A task won't execute until all deps are DONE.
+- `## Dependencies` section declares task dependencies as a DAG (preferred over inline `**Blocked by:**`):
+  ```markdown
+  ## Dependencies
+  t-1: (none)
+  t-2: (none)
+  t-3: t-1, t-2
+  ```
+  Both formats are supported. The `## Dependencies` section is parsed first if present.
 - Tasks are executed by picking the unblocked PENDING task that enables the most downstream work (not just lowest ID)
 - Workers execute one task per iteration, then exit
 
@@ -265,6 +310,17 @@ boi spec q-001 skip t-4 --reason "No longer needed after API change"
 boi spec q-001 next t-6                 # Move t-6 to run next
 boi spec q-001 block t-5 --on t-3       # t-5 can't run until t-3 is DONE
 boi spec q-001 edit t-2                 # Edit just t-2 in your editor
+```
+
+**Task-level dependency management (`deps`):**
+```bash
+boi spec q-001 deps show              # Show task dependency DAG
+boi spec q-001 deps add t-3 --on t-1  # t-3 depends on t-1
+boi spec q-001 deps rm t-3 --on t-1   # Remove dependency
+boi spec q-001 deps set t-3 --on t-1,t-2  # Replace all deps for t-3
+boi spec q-001 deps clear t-3         # Make t-3 independent
+boi spec q-001 deps viz               # ASCII task DAG visualization
+boi spec q-001 deps migrate           # Convert inline **Blocked by:** to ## Dependencies section
 ```
 
 ### `/boi project` — Organize specs into projects
@@ -465,5 +521,7 @@ Then confirms: `boi critic checks` shows `performance-review (custom)`.
 - Daemon polls every 5 seconds. Status may lag slightly.
 - Default 3 workers, max 5. Set during install.
 - Workers get fresh context each iteration. No memory of previous iterations.
+- Signal-aware failure handling: SIGTERM (exit 143) and SIGKILL (exit 137) do not count as consecutive failures. Workers killed externally are requeued, not failed.
+- Daemon lock prevents multiple daemon instances via `fcntl.flock`.
 - State lives in `~/.boi/` (queue, logs, events, hooks, config).
 - Python: stdlib only. Shell: `set -uo pipefail`.
