@@ -740,16 +740,17 @@ cmd_status() {
 
     require_config
 
-    if [[ "${watch_mode}" == "true" ]]; then
+    if [[ "${watch_mode}" == "true" ]] && [ -t 1 ]; then
         # Flicker-free refresh: render to buffer, then overwrite screen in one shot
         # (watch -c doesn't support 24-bit true color, so we do it manually)
+        # Only runs in an interactive TTY; non-TTY (pipes, tests) falls through to single render.
         tput civis 2>/dev/null || true  # hide cursor
         trap 'tput cnorm 2>/dev/null; printf "\033[?25h"; exit' INT TERM EXIT
         clear
         while true; do
             local buf
             if [[ -n "${sort_mode}" || -n "${filter_status}" ]]; then
-                buf=$(cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}" 2>&1)
+                buf=$(cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}" "${view_mode}" 2>&1)
             else
                 buf=$(cmd_queue_inner "${json_mode}" "${view_mode}" 2>&1)
             fi
@@ -761,7 +762,7 @@ cmd_status() {
 
     # Non-interactive: if sort or filter specified, use dashboard format for richer output
     if [[ -n "${sort_mode}" || -n "${filter_status}" ]]; then
-        cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}"
+        cmd_queue_sorted "${sort_mode:-queue}" "${filter_status:-all}" "${view_mode}"
     else
         cmd_queue_inner "${json_mode}" "${view_mode}"
     fi
@@ -835,8 +836,9 @@ PYEOF
 cmd_queue_sorted() {
     local sort_mode="${1:-queue}"
     local filter_status="${2:-all}"
+    local view_mode="${3:-default}"
 
-    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${BOI_CONFIG}" "${sort_mode}" "${filter_status}" <<'PYEOF'
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${BOI_CONFIG}" "${sort_mode}" "${filter_status}" "${view_mode}" <<'PYEOF'
 import sys, os, json
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
 from lib.status import build_queue_status, format_dashboard
@@ -845,6 +847,7 @@ queue_dir = sys.argv[1]
 config_path = sys.argv[2]
 sort_mode = sys.argv[3]
 filter_status = sys.argv[4]
+view_mode = sys.argv[5] if len(sys.argv) > 5 else "default"
 
 config = None
 if os.path.isfile(config_path):
@@ -861,6 +864,7 @@ output = format_dashboard(
     filter_status=filter_status,
     show_completed=True,
     selected_row=-1,
+    view_mode=view_mode,
 )
 
 # Strip __QUEUE_IDS__ metadata line from output

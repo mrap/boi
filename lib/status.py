@@ -1253,6 +1253,7 @@ def format_dashboard(
     filter_status: str = "all",
     show_completed: bool = True,
     selected_row: int = 0,
+    view_mode: str = "default",
 ) -> str:
     """Format queue status as a compact dashboard for tmux panes.
 
@@ -1265,7 +1266,9 @@ def format_dashboard(
          · q-003 polish-onboard   chal  0/5  0i  ---
         Workers: 1/3 busy | Queue: 3
     """
-    entries = status_data.get("entries", [])
+    all_entries = status_data.get("entries", [])
+    # Apply the same relevance filter as format_queue_table (the base data set)
+    entries = _apply_view_filter(all_entries, view_mode)
     summary = status_data.get("summary", {})
     workers = status_data.get("workers", [])
 
