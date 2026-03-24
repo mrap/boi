@@ -1076,6 +1076,75 @@ PYEOF
     info "Spec '${queue_id}' canceled."
 }
 
+# ─── Subcommand: resume ──────────────────────────────────────────────────────
+
+cmd_resume() {
+    local queue_id=""
+    local all_mode=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: boi resume [queue-id | --all]"
+                echo ""
+                echo "Resume a failed or canceled spec."
+                echo "Resets status to queued, clears failures, preserves progress."
+                echo ""
+                echo "Options:"
+                echo "  --all    Resume ALL failed specs at once"
+                echo ""
+                echo "Use 'boi queue' to see available queue IDs."
+                exit 0
+                ;;
+            --all)
+                all_mode=true
+                shift
+                ;;
+            -*)
+                die_usage "Unknown option: $1"
+                ;;
+            *)
+                if [[ -z "${queue_id}" ]]; then
+                    queue_id="$1"
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    require_config
+
+    if [[ "${all_mode}" == true ]]; then
+        queue_id="--all"
+    elif [[ -z "${queue_id}" ]]; then
+        die_usage "Usage: boi resume <queue-id> or boi resume --all"
+    fi
+
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import resume_spec
+
+queue_dir = sys.argv[1]
+queue_id = sys.argv[2]
+
+try:
+    resumed = resume_spec(queue_dir, queue_id)
+    if queue_id == "--all":
+        if resumed:
+            print(f"Resumed {len(resumed)} spec(s): {', '.join(resumed)}")
+        else:
+            print("No failed specs to resume.")
+    else:
+        print(f"Spec '{queue_id}' resumed. Daemon will pick it up on next poll.")
+except ValueError as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
 # ─── Subcommand: review ─────────────────────────────────────────────────────
 
 cmd_review() {
@@ -1441,8 +1510,99 @@ PYEOF
 
 # ─── Subcommand: stop ────────────────────────────────────────────────────────
 
+# ─── Subcommand: daemon ───────────────────────────────────────────────────────
+
+cmd_daemon() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: boi daemon <subcommand>"
+        echo ""
+        echo "Subcommands:"
+        echo "  status [--json]   Show daemon status (running/stopped, PID, uptime)"
+        return 0
+    fi
+
+    local subcmd="$1"
+    shift
+
+    case "${subcmd}" in
+        status)
+            local json_flag=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --json) json_flag=true; shift ;;
+                    *) shift ;;
+                esac
+            done
+
+            BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${BOI_STATE_DIR}" "${json_flag}" <<'PYEOF'
+import json
+import os
+import sys
+sys.path.insert(0, os.environ.get("BOI_SCRIPT_DIR", os.path.dirname(__file__)))
+from lib.daemon_lock import daemon_status
+
+state_dir = sys.argv[1]
+as_json = sys.argv[2] == "true"
+
+status = daemon_status(state_dir)
+
+if as_json:
+    print(json.dumps(status, indent=2))
+else:
+    if status.get("running"):
+        pid = status.get("pid", "?")
+        uptime = status.get("uptime")
+        uptime_str = ""
+        if uptime is not None:
+            hours = int(uptime // 3600)
+            minutes = int((uptime % 3600) // 60)
+            if hours > 0:
+                uptime_str = f" (uptime: {hours}h {minutes}m)"
+            else:
+                uptime_str = f" (uptime: {minutes}m)"
+        print(f"Daemon: running (PID {pid}){uptime_str}")
+    else:
+        print("Daemon: stopped")
+PYEOF
+            ;;
+        *)
+            echo "Unknown daemon subcommand: ${subcmd}"
+            echo "Usage: boi daemon status [--json]"
+            return 1
+            ;;
+    esac
+}
+
+# ─── Subcommand: stop ────────────────────────────────────────────────────────
+
 cmd_stop() {
     require_config
+
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --force) force=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    # Kill tracked worker PIDs from the DB
+    local force_flag=""
+    if ${force}; then
+        force_flag="force=True"
+    else
+        force_flag="force=False"
+    fi
+    local db_killed
+    db_killed=$(python3 -c "
+import sys; sys.path.insert(0, '${BOI_SRC_DIR}')
+from lib.cli_ops import stop_all_workers
+killed = stop_all_workers('${QUEUE_DIR}', ${force_flag})
+print(len(killed))
+" 2>/dev/null || echo "0")
+    if [[ "${db_killed}" -gt 0 ]]; then
+        info "Killed ${db_killed} tracked worker PID(s) from DB."
+    fi
 
     # Kill all worker tmux sessions
     local killed=0
@@ -1487,6 +1647,35 @@ cmd_stop() {
         rm -f "${PID_FILE}"
     else
         info "Daemon not running."
+    fi
+}
+
+# ─── Subcommand: cleanup ─────────────────────────────────────────────────────
+
+cmd_cleanup() {
+    require_config
+
+    info "Scanning for orphaned BOI worker processes..."
+    local orphan_count
+    orphan_count=$(python3 -c "
+import sys; sys.path.insert(0, '${BOI_SRC_DIR}')
+from lib.cli_ops import cleanup_orphans
+orphans = cleanup_orphans('${QUEUE_DIR}')
+for pid in orphans:
+    print(f'  Killed orphaned process: PID {pid}')
+print(len(orphans))
+" 2>&1)
+
+    # Last line is the count
+    local count
+    count=$(echo "${orphan_count}" | tail -1)
+    # Print the kill lines (all but last)
+    echo "${orphan_count}" | head -n -1
+
+    if [[ "${count}" -gt 0 ]]; then
+        info "Cleaned up ${count} orphaned process(es)."
+    else
+        info "No orphaned processes found."
     fi
 }
 
@@ -3542,6 +3731,7 @@ usage() {
     echo "  status      Show workers + queue progress"
     echo "  log         View logs for a spec"
     echo "  cancel      Cancel a queued/running spec"
+    echo "  resume      Resume a failed/canceled spec (preserves progress)"
     echo "  stop        Stop daemon and all workers"
     echo "  workers     Show worker/worktree status"
     echo "  telemetry   Show per-iteration breakdown"
@@ -3809,8 +3999,11 @@ main() {
         status)     cmd_status "$@" ;;
         log)        cmd_log "$@" ;;
         cancel)     cmd_cancel "$@" ;;
+        resume)     cmd_resume "$@" ;;
         review)     cmd_review "$@" ;;
+        daemon)     cmd_daemon "$@" ;;
         stop)       cmd_stop "$@" ;;
+        cleanup)    cmd_cleanup "$@" ;;
         purge)      cmd_purge "$@" ;;
         workers)    cmd_workers "$@" ;;
         telemetry)  cmd_telemetry "$@" ;;

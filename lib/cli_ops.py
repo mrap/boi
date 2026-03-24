@@ -9,6 +9,8 @@
 
 import json
 import os
+import signal
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -126,8 +128,12 @@ def purge_specs(
     """
     if all_mode:
         statuses = [
-            "queued", "running", "requeued",
-            "completed", "failed", "canceled",
+            "queued",
+            "running",
+            "requeued",
+            "completed",
+            "failed",
+            "canceled",
         ]
     else:
         statuses = ["completed", "failed", "canceled"]
@@ -142,10 +148,7 @@ def purge_specs(
             for result in results:
                 sid = result["id"]
                 for f in sorted(log_path.iterdir()):
-                    if (
-                        f.name.startswith(f"{sid}-iter-")
-                        and f.name.endswith(".log")
-                    ):
+                    if f.name.startswith(f"{sid}-iter-") and f.name.endswith(".log"):
                         result["files_removed"].append(str(f))
                         if not dry_run:
                             try:
@@ -196,6 +199,122 @@ def remove_dependency(
             db.remove_dependency(spec_id, dep_id)
             removed.append(dep_id)
         return {"spec_id": spec_id, "removed": removed}
+    finally:
+        db.close()
+
+
+def resume_spec(queue_dir: str, queue_id: str) -> list[str]:
+    """Resume failed/canceled specs back to queued.
+
+    Resets status to 'queued', clears consecutive_failures and
+    failure_reason, but preserves iteration count and tasks_done.
+
+    If queue_id is '--all', resumes ALL failed specs.
+    Returns list of resumed spec IDs.
+    Raises ValueError if spec not found or not in a resumable state.
+    """
+    RESUMABLE = {"failed", "canceled"}
+    db = _get_db(queue_dir)
+    try:
+        if queue_id == "--all":
+            specs = db.get_queue()
+            failed = [s for s in specs if s["status"] in RESUMABLE]
+            resumed = []
+            for spec in failed:
+                db.update_spec_fields(
+                    spec["id"],
+                    status="queued",
+                    consecutive_failures=0,
+                    failure_reason=None,
+                )
+                resumed.append(spec["id"])
+            return resumed
+
+        spec = db.get_spec(queue_id)
+        if spec is None:
+            raise ValueError(f"Spec not found: {queue_id}")
+        if spec["status"] not in RESUMABLE:
+            raise ValueError(
+                f"Cannot resume spec '{queue_id}' with status "
+                f"'{spec['status']}'. Only failed or canceled specs "
+                "can be resumed."
+            )
+        db.update_spec_fields(
+            queue_id,
+            status="queued",
+            consecutive_failures=0,
+            failure_reason=None,
+        )
+        return [queue_id]
+    finally:
+        db.close()
+
+
+def stop_all_workers(queue_dir: str, force: bool = False) -> list[int]:
+    """Kill all worker processes tracked in the DB.
+
+    Sends SIGTERM (or SIGKILL if force=True) to every worker
+    with a current_pid. Returns list of PIDs that were signaled.
+    """
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    db = _get_db(queue_dir)
+    try:
+        workers = db.get_all_workers()
+        killed: list[int] = []
+        for w in workers:
+            pid = w.get("current_pid")
+            if pid is not None:
+                try:
+                    os.kill(pid, sig)
+                    killed.append(pid)
+                except ProcessLookupError:
+                    pass
+        return killed
+    finally:
+        db.close()
+
+
+def cleanup_orphans(queue_dir: str) -> list[int]:
+    """Find and kill orphaned BOI worker processes not tracked in the DB.
+
+    Scans running processes for the BOI Worker pattern, cross-references
+    against tracked PIDs in the workers table, and kills any that are
+    untracked.
+
+    Returns list of orphaned PIDs that were killed.
+    """
+    db = _get_db(queue_dir)
+    try:
+        workers = db.get_all_workers()
+        tracked_pids = {
+            w["current_pid"] for w in workers if w.get("current_pid") is not None
+        }
+
+        try:
+            ps_output = subprocess.check_output(
+                ["ps", "ax", "-o", "pid,args"],
+                text=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return []
+
+        orphans: list[int] = []
+        for line in ps_output.strip().split("\n"):
+            line = line.strip()
+            if "claude" in line and "BOI Worker" in line:
+                parts = line.split(None, 1)
+                if parts:
+                    try:
+                        pid = int(parts[0])
+                    except ValueError:
+                        continue
+                    if pid not in tracked_pids:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            orphans.append(pid)
+                        except ProcessLookupError:
+                            pass
+        return orphans
     finally:
         db.close()
 

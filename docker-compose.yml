@@ -4,6 +4,7 @@
 #   docker compose run boi dispatch --spec /project/spec.md
 #   docker compose run boi status
 #   docker compose run boi log
+#   docker compose run --rm test pytest tests/integration/ -v
 #
 # The ./project directory (or your project path) is mounted at /project
 # inside the container. Reference spec files as /project/spec.md.
@@ -21,3 +22,13 @@ services:
     # No privileged mode — runs as non-root user
     stdin_open: true
     tty: true
+
+  test:
+    build: .
+    entrypoint: ["python3", "-m"]
+    command: ["pytest", "tests/", "-v", "--tb=short"]
+    working_dir: /home/boi/boi
+    environment:
+      - HOME=/home/boi
+      - TERM=xterm-256color
+      - PYTHONDONTWRITEBYTECODE=1

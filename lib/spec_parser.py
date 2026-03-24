@@ -213,6 +213,10 @@ def parse_file(filepath: str) -> list[Task]:
 # ─── BOI Spec Parsing (self-evolving spec.md format) ─────────────────────────
 
 
+# Regex to match **Blocked by:** lines
+_BLOCKED_BY_RE = re.compile(r"^\*\*Blocked\s+by:\*\*\s*(.+)$")
+
+
 @dataclass
 class BoiTask:
     """A single task from a BOI self-evolving spec.md file."""
@@ -224,6 +228,7 @@ class BoiTask:
     superseded_by: str = ""  # For SUPERSEDED status: the t-N that replaces this task
     experiment: str = ""  # Content of #### Experiment: subsection
     discovery: str = ""  # Content of #### Discovery: subsection
+    blocked_by: list[str] = field(default_factory=list)  # Task IDs this task depends on
 
 
 def parse_boi_spec(content: str) -> list[BoiTask]:
@@ -248,6 +253,7 @@ def parse_boi_spec(content: str) -> list[BoiTask]:
     current_title: str = ""
     current_status: str | None = None
     current_superseded_by: str = ""
+    current_blocked_by: list[str] = []
     current_body_lines: list[str] = []
     current_subsection: str | None = None  # "experiment" or "discovery"
     current_experiment_lines: list[str] = []
@@ -255,7 +261,7 @@ def parse_boi_spec(content: str) -> list[BoiTask]:
 
     def _flush() -> None:
         nonlocal current_id, current_title, current_status, current_superseded_by
-        nonlocal current_body_lines, current_subsection
+        nonlocal current_blocked_by, current_body_lines, current_subsection
         nonlocal current_experiment_lines, current_discovery_lines
         if current_id is not None and current_status is not None:
             tasks.append(
@@ -267,12 +273,14 @@ def parse_boi_spec(content: str) -> list[BoiTask]:
                     superseded_by=current_superseded_by,
                     experiment="\n".join(current_experiment_lines).strip(),
                     discovery="\n".join(current_discovery_lines).strip(),
+                    blocked_by=list(current_blocked_by),
                 )
             )
         current_id = None
         current_title = ""
         current_status = None
         current_superseded_by = ""
+        current_blocked_by = []
         current_body_lines = []
         current_subsection = None
         current_experiment_lines = []
@@ -306,6 +314,16 @@ def parse_boi_spec(content: str) -> list[BoiTask]:
             continue
 
         if current_id is not None and current_status is not None:
+            # Check for **Blocked by:** line
+            blocked_match = _BLOCKED_BY_RE.match(line.strip())
+            if blocked_match:
+                deps_str = blocked_match.group(1).strip()
+                current_blocked_by = [
+                    d.strip() for d in deps_str.split(",") if d.strip()
+                ]
+                current_body_lines.append(line)
+                continue
+
             # Check for #### subsection headings
             subsection_match = _SUBSECTION_HEADING_RE.match(line)
             if subsection_match:

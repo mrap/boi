@@ -5,6 +5,24 @@ All notable changes to BOI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - Unreleased
+
+### Added
+- Dependency-aware task decomposition: `**Blocked by:** t-X, t-Y` syntax for declaring task dependencies in specs
+- `validate_dependencies()` in `lib/spec_validator.py`: Kahn's algorithm cycle detection, unmet dependency detection, orphan task warnings
+- `check_task_sizing()` in `lib/spec_validator.py`: heuristic warnings for oversized tasks (>2000 chars, 3+ data sources, 3+ mutations) and undersized tasks (<50 chars)
+- `blocked_by` field in `BotTask` dataclass (`lib/spec_parser.py`): parsed from `**Blocked by:**` lines
+- `lib/context_injector.py`: shared context injection into worker prompts with priority ordering
+- `lib/preflight_context.py`: pre-launch environment verification (checks tools, paths, permissions)
+- Topological task selection in worker prompt: workers prioritize tasks that unblock the most downstream work
+- Self-evolution dependency inference: workers adding new tasks in Discover mode must declare `**Blocked by:**` lines
+- Append-only self-evolution rule: new tasks always appended at end of spec file
+
+### Changed
+- Worker prompt (`templates/worker-prompt.md`) updated with dependency-aware task selection logic
+- Discover mode template updated with dependency inference instructions for self-evolved tasks
+- Spec validator now runs dependency validation after format checks during `boi dispatch`
+
 ## [0.2.0] - 2026-03-09
 
 ### Changed

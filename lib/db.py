@@ -17,6 +17,7 @@ import shutil
 import signal
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -854,6 +855,32 @@ class Database:
             )
             self.conn.commit()
 
+    def signal_requeue(self, spec_id: str) -> None:
+        """Requeue a spec after a signal death (SIGTERM, SIGKILL, etc.).
+
+        Unlike crash_requeue(), does NOT increment consecutive_failures
+        or set cooldown. Signal deaths are external kills, not worker bugs.
+        """
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT id FROM specs WHERE id = ?", (spec_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Spec not found: {spec_id}")
+
+            self.conn.execute(
+                "UPDATE specs SET status = 'requeued', "
+                "cooldown_until = NULL "
+                "WHERE id = ?",
+                (spec_id,),
+            )
+            self._log_event(
+                "signal_requeued",
+                "Spec requeued after signal death (no failure counted)",
+                spec_id=spec_id,
+            )
+            self.conn.commit()
+
     def set_needs_review(
         self,
         spec_id: str,
@@ -993,6 +1020,7 @@ class Database:
     _UPDATABLE_COLUMNS = frozenset(
         {
             "phase",
+            "consecutive_failures",
             "critic_passes",
             "decomposition_retries",
             "tasks_done",
@@ -1113,10 +1141,12 @@ class Database:
         spec_id: str,
         pid: int,
         phase: str = "execute",
+        task_id: str | None = None,
     ) -> None:
         """Mark a worker as busy with the given spec and PID.
 
         Records current_phase for crash recovery dispatch.
+        Optionally records current_task_id for parallel DAG execution.
         """
         with self.lock:
             now = self._now_iso()
@@ -1125,18 +1155,20 @@ class Database:
                 "current_spec_id = ?, "
                 "current_pid = ?, "
                 "start_time = ?, "
-                "current_phase = ? "
+                "current_phase = ?, "
+                "current_task_id = ? "
                 "WHERE id = ?",
-                (spec_id, pid, now, phase, worker_id),
+                (spec_id, pid, now, phase, task_id, worker_id),
             )
             self._log_event(
                 "worker_assigned",
-                f"Worker {worker_id} assigned to {spec_id} (pid={pid}, phase={phase})",
+                f"Worker {worker_id} assigned to {spec_id} (pid={pid}, phase={phase}, task={task_id})",
                 spec_id=spec_id,
                 data={
                     "worker_id": worker_id,
                     "pid": pid,
                     "phase": phase,
+                    "task_id": task_id,
                 },
             )
             self.conn.commit()
@@ -1149,7 +1181,8 @@ class Database:
                 "current_spec_id = NULL, "
                 "current_pid = NULL, "
                 "start_time = NULL, "
-                "current_phase = NULL "
+                "current_phase = NULL, "
+                "current_task_id = NULL "
                 "WHERE id = ?",
                 (worker_id,),
             )
@@ -1176,6 +1209,66 @@ class Database:
         if worker is None or worker["current_spec_id"] is None:
             return None
         return self.get_spec(worker["current_spec_id"])
+
+    def get_workers_on_spec(self, spec_id: str) -> list[dict[str, Any]]:
+        """Return all workers currently assigned to a spec.
+
+        Used for parallel DAG execution to determine which tasks
+        are already in_progress (assigned to a worker).
+        """
+        cursor = self.conn.execute(
+            "SELECT * FROM workers WHERE current_spec_id = ?",
+            (spec_id,),
+        )
+        return [self._row_to_dict(row) for row in cursor]
+
+    def get_in_progress_task_ids(self, spec_id: str) -> set[str]:
+        """Return the set of task IDs currently being executed for a spec.
+
+        Reads current_task_id from all workers assigned to this spec.
+        Used by the daemon to avoid assigning the same task twice.
+        """
+        workers = self.get_workers_on_spec(spec_id)
+        return {w["current_task_id"] for w in workers if w.get("current_task_id")}
+
+    def get_all_workers(self) -> list[dict[str, Any]]:
+        """Return all registered workers."""
+        cursor = self.conn.execute("SELECT * FROM workers")
+        return [self._row_to_dict(row) for row in cursor]
+
+    def get_free_workers(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Return up to N free workers using round-robin selection.
+
+        Unlike get_free_worker() which returns one, this returns
+        multiple for parallel task assignment.
+        """
+        workers: list[dict[str, Any]] = []
+        for _ in range(limit):
+            w = self.get_free_worker()
+            if w is None:
+                break
+            workers.append(w)
+            # Temporarily mark as busy to avoid returning the same worker
+            # The caller is responsible for actually assigning or freeing.
+            # We use a sentinel spec_id that will be overwritten.
+            with self.lock:
+                self.conn.execute(
+                    "UPDATE workers SET current_spec_id = '__reserving' WHERE id = ?",
+                    (w["id"],),
+                )
+                self.conn.commit()
+
+        # Unreserve any workers we grabbed (caller will assign them)
+        for w in workers:
+            with self.lock:
+                self.conn.execute(
+                    "UPDATE workers SET current_spec_id = NULL "
+                    "WHERE id = ? AND current_spec_id = '__reserving'",
+                    (w["id"],),
+                )
+                self.conn.commit()
+
+        return workers
 
     # ── Process tracking ───────────────────────────────────────────
 
@@ -1433,8 +1526,7 @@ class Database:
 
             try:
                 self.conn.execute(
-                    "INSERT INTO spec_dependencies (spec_id, blocks_on) "
-                    "VALUES (?, ?)",
+                    "INSERT INTO spec_dependencies (spec_id, blocks_on) VALUES (?, ?)",
                     (spec_id, dep_id),
                 )
             except sqlite3.IntegrityError:
@@ -1461,8 +1553,7 @@ class Database:
                 raise ValueError(f"Spec not found: {spec_id}")
 
             self.conn.execute(
-                "DELETE FROM spec_dependencies "
-                "WHERE spec_id = ? AND blocks_on = ?",
+                "DELETE FROM spec_dependencies WHERE spec_id = ? AND blocks_on = ?",
                 (spec_id, dep_id),
             )
             self._log_event(
@@ -1554,6 +1645,115 @@ class Database:
             (spec_id,),
         )
         return [self._row_to_dict(row) for row in cursor]
+
+    # ── Messaging ─────────────────────────────────────────────────
+
+    def record_message(self, msg: dict) -> None:
+        """Record a message in the messages table for audit.
+
+        Args:
+            msg: Message dict from lib.messaging.create_message().
+        """
+        now = time.time()
+        direction = msg.get("_direction", "to_worker")
+        if msg.get("sender") == "worker":
+            direction = "to_daemon"
+
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO messages "
+                "(id, spec_id, task_id, msg_type, sender, direction, "
+                "payload, created_at, delivered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    msg["id"],
+                    msg["spec_id"],
+                    msg.get("task_id"),
+                    msg["type"],
+                    msg["sender"],
+                    direction,
+                    json.dumps(msg.get("payload", {})),
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+
+    def ack_message_db(self, msg_id: str) -> None:
+        """Mark a message as acknowledged in the database.
+
+        Args:
+            msg_id: The message ID to acknowledge.
+        """
+        now = time.time()
+        with self.lock:
+            self.conn.execute(
+                "UPDATE messages SET acked_at = ? WHERE id = ?",
+                (now, msg_id),
+            )
+            self.conn.commit()
+
+    def get_unacked_messages(
+        self,
+        spec_id: Optional[str] = None,
+        direction: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Get unacknowledged messages, optionally filtered.
+
+        Args:
+            spec_id: Filter by spec ID.
+            direction: Filter by direction ("to_worker" or "to_daemon").
+
+        Returns:
+            List of message rows as dicts.
+        """
+        query = "SELECT * FROM messages WHERE acked_at IS NULL"
+        params: list = []
+
+        if spec_id:
+            query += " AND spec_id = ?"
+            params.append(spec_id)
+        if direction:
+            query += " AND direction = ?"
+            params.append(direction)
+
+        query += " ORDER BY created_at ASC"
+
+        cursor = self.conn.execute(query, params)
+        return [self._row_to_dict(row) for row in cursor]
+
+    def get_latest_progress(
+        self,
+        spec_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Get the most recent PROGRESS message for a spec.
+
+        Returns:
+            Message row as dict, or None.
+        """
+        cursor = self.conn.execute(
+            "SELECT * FROM messages "
+            "WHERE spec_id = ? AND msg_type = 'PROGRESS' AND direction = 'to_daemon' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (spec_id,),
+        )
+        row = cursor.fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def cleanup_old_messages(self, max_age_days: int = 7) -> int:
+        """Delete acknowledged messages older than max_age_days.
+
+        Returns:
+            Number of rows deleted.
+        """
+        cutoff = time.time() - (max_age_days * 86400)
+        with self.lock:
+            cursor = self.conn.execute(
+                "DELETE FROM messages WHERE acked_at IS NOT NULL AND acked_at < ?",
+                (cutoff,),
+            )
+            self.conn.commit()
+            return cursor.rowcount
 
     # ── JSON migration ────────────────────────────────────────────
 

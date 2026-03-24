@@ -30,6 +30,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from lib.spec_parser import parse_boi_spec
+
 # Regex to match BOI task headings: ### t-N: Title
 _BOI_TASK_HEADING_RE = re.compile(r"^###\s+(t-\d+):\s+(.+)$")
 
@@ -114,6 +116,104 @@ def check_workspace_policy(content: str) -> list[str]:
     return warnings
 
 
+def validate_dependencies(content: str) -> list[str]:
+    """Validate the dependency DAG in a BOI spec.
+
+    Checks:
+    1. Unmet dependencies: **Blocked by:** t-X where t-X doesn't exist
+    2. Cycle detection via Kahn's algorithm
+
+    Returns list of error strings. Empty = valid.
+    """
+    tasks = parse_boi_spec(content)
+    task_ids = {t.id for t in tasks}
+    errors: list[str] = []
+
+    # Build adjacency list from blocked_by fields
+    edges: list[tuple[str, str]] = []  # (dependency, dependent)
+    for task in tasks:
+        for dep in task.blocked_by:
+            if dep not in task_ids:
+                errors.append(
+                    f"{task.id}: blocked by {dep} which doesn't exist"
+                )
+            else:
+                edges.append((dep, task.id))
+
+    # Cycle detection (Kahn's algorithm)
+    in_degree: dict[str, int] = {t.id: 0 for t in tasks}
+    adj: dict[str, list[str]] = {t.id: [] for t in tasks}
+    for src, dst in edges:
+        if src in adj:  # skip edges with unmet deps
+            adj[src].append(dst)
+            in_degree[dst] += 1
+
+    queue = [tid for tid in in_degree if in_degree[tid] == 0]
+    visited = 0
+    while queue:
+        node = queue.pop(0)
+        visited += 1
+        for neighbor in adj[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    if visited != len(tasks):
+        errors.append("Dependency cycle detected in task graph")
+
+    return errors
+
+
+def check_task_sizing(task_id: str, body: str) -> list[str]:
+    """Check a single task's body for sizing heuristics.
+
+    Returns a list of warning strings (never errors).
+
+    Heuristics:
+    - Spec text > 2000 chars: "Consider splitting"
+    - Spec text < 50 chars: "May be too vague"
+    - >= 3 file write references: "Consider splitting mutations"
+    - Combining keywords ("and also", "additionally", "plus"): "May be combining multiple objectives"
+    """
+    warnings: list[str] = []
+    body_len = len(body)
+
+    if body_len > 2000:
+        warnings.append(
+            f"{task_id}: Task spec is very long ({body_len} chars). "
+            "Consider splitting into smaller tasks."
+        )
+    elif body_len < 50:
+        warnings.append(
+            f"{task_id}: Task spec is very short ({body_len} chars). "
+            "May be too vague."
+        )
+
+    # Count file write patterns (write to X.md, output to X, create X.py, etc.)
+    write_patterns = re.findall(
+        r"(?:write|output|create|save|generate)\s+(?:to\s+|)\S+\.(?:md|py|json|txt|yaml|yml|sh|sql|csv|html)",
+        body,
+        re.IGNORECASE,
+    )
+    if len(write_patterns) >= 3:
+        warnings.append(
+            f"{task_id}: Task references {len(write_patterns)} write operations. "
+            "Consider splitting into one mutation per task."
+        )
+
+    # Check for combining keywords
+    combining_keywords = ["and also", "additionally", "plus "]
+    body_lower = body.lower()
+    found_keywords = [kw for kw in combining_keywords if kw in body_lower]
+    if found_keywords:
+        warnings.append(
+            f"{task_id}: Task may be combining multiple objectives "
+            f"(found: {', '.join(repr(k) for k in found_keywords)})."
+        )
+
+    return warnings
+
+
 @dataclass
 class ValidationResult:
     """Result of validating a BOI spec.md file."""
@@ -153,6 +253,29 @@ class _ParsedTask:
     has_verify: bool = False
     has_self_evolution: bool = False
     line_number: int = 0
+
+
+def _extract_task_body(content: str, task_id: str) -> str:
+    """Extract the body text of a specific task from spec content.
+
+    Returns everything between this task's heading and the next task heading.
+    """
+    lines = content.splitlines()
+    in_task = False
+    body_lines: list[str] = []
+
+    for line in lines:
+        heading_match = _BOI_TASK_HEADING_RE.match(line)
+        if heading_match:
+            if in_task:
+                break  # Hit next task heading
+            if heading_match.group(1) == task_id:
+                in_task = True
+            continue
+        if in_task:
+            body_lines.append(line)
+
+    return "\n".join(body_lines)
 
 
 def validate_spec(content: str) -> ValidationResult:
@@ -264,6 +387,17 @@ def validate_spec(content: str) -> ValidationResult:
             result.done += 1
         elif task.status == "SKIPPED":
             result.skipped += 1
+
+    # Validate dependency graph (produces errors for cycles and unmet deps)
+    dep_errors = validate_dependencies(content)
+    result.errors.extend(dep_errors)
+
+    # Check task sizing heuristics (produces warnings, never errors)
+    for task in tasks:
+        if task.status and task.status not in ("__MISSING__",):
+            # Build body from lines between this task heading and next
+            task_body = _extract_task_body(content, task.task_id)
+            result.warnings.extend(check_task_sizing(task.task_id, task_body))
 
     # Check workspace policy (produces warnings, never errors)
     result.warnings.extend(check_workspace_policy(content))

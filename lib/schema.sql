@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS workers (
     current_pid INTEGER,
     start_time TEXT,
     current_phase TEXT,                    -- Phase being executed (for crash recovery)
+    current_task_id TEXT,                  -- Task ID within spec being executed (for parallel DAG)
     FOREIGN KEY (current_spec_id) REFERENCES specs(id) ON DELETE SET NULL
 );
 
@@ -104,7 +105,24 @@ CREATE TABLE IF NOT EXISTS events (
     level TEXT DEFAULT 'info'
 );
 
+-- Messages table: audit trail for inter-process messaging.
+-- Primary transport is file-based mailboxes; this table provides history and queryability.
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,                    -- msg-{timestamp_ms}-{random}
+    spec_id TEXT NOT NULL,
+    task_id TEXT,
+    msg_type TEXT NOT NULL,                 -- CANCEL, SKIP, PREEMPT, etc.
+    sender TEXT NOT NULL,                   -- daemon, worker, cli, hex-events
+    direction TEXT NOT NULL,                -- to_worker or to_daemon
+    payload TEXT NOT NULL DEFAULT '{}',     -- JSON payload
+    created_at REAL NOT NULL,              -- Unix timestamp
+    delivered_at REAL,                     -- When file was written to mailbox
+    acked_at REAL                          -- When message was processed
+);
+
 -- Performance indexes.
 CREATE INDEX IF NOT EXISTS idx_specs_last_worker ON specs(last_worker);
 CREATE INDEX IF NOT EXISTS idx_events_spec_id ON events(spec_id);
 CREATE INDEX IF NOT EXISTS idx_iterations_spec_id ON iterations(spec_id);
+CREATE INDEX IF NOT EXISTS idx_messages_spec ON messages(spec_id);
+CREATE INDEX IF NOT EXISTS idx_messages_unacked ON messages(acked_at) WHERE acked_at IS NULL;

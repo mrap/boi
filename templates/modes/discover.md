@@ -17,6 +17,10 @@ You are in DISCOVER mode. Execute the current task AND handle what you find.
 - If you discover a missing capability, add a new PENDING task.
 - If a task is genuinely irrelevant, mark it SKIPPED with a note.
 - New tasks MUST have PENDING status on its own line after the heading, a **Spec:** section, and a **Verify:** section.
+- New tasks MUST be appended at the END of the spec, never inserted between existing tasks.
+- Include a `**Blocked by:**` line if the new task depends on any existing task's output.
+- If your new task is a synthesis/recommendation task, it MUST be blocked by all tasks whose output it will consume.
+- Check if any existing PENDING task references output that your new task will produce. If so, note this in your Discovery section so the dependency can be added.
 
 **Error Log:**
 - Before attempting any task, READ the `## Error Log` section in the spec (if it exists).

@@ -190,11 +190,41 @@ PENDING
 - `**Spec:**` section is required. Tell the worker exactly what to do.
 - `**Verify:**` section is required. Give concrete verification commands.
 - `**Self-evolution:**` section is optional but recommended for complex tasks
-- Tasks are executed in ID order (lowest first)
+- `**Blocked by:** t-X, t-Y` declares dependencies. A task won't execute until all deps are DONE.
+- Tasks are executed by picking the unblocked PENDING task that enables the most downstream work (not just lowest ID)
 - Workers execute one task per iteration, then exit
 
-**Writing good specs:**
+**Dependency graph:**
+
+After writing all tasks, analyze dependencies and add a `## Dependency Graph` section:
+
+```markdown
+## Dependency Graph
+t-1 --> t-3 (t-3 reads output from t-1)
+t-2 --> t-3
+t-3 --> t-5 (synthesis)
+t-4 (independent)
+```
+
+For each task, check:
+1. Does it reference output from another task (file paths, "read from t-N", "using results from t-N")?
+2. Does it read a file that another task writes?
+3. If yes, add a `**Blocked by:** t-X, t-Y` line after the status line.
+
+Synthesis tasks (combine, recommend, summarize) MUST be blocked by all tasks whose output they consume.
+
+**Environment gate convention:**
+
+If your spec depends on specific tools, services, or infrastructure (devserver capabilities, specific CLI tools, API access), add a `t-0` environment gate task that verifies these prerequisites. If t-0 fails, the spec should abort early rather than wasting iterations.
+
+**Task-sizing guidelines:**
 - Each task should be completable in a single Claude session (10-30 min)
+- Limit each task to 1-2 data sources. If you need 3+ sources, split into one task per source plus a synthesis task.
+- Limit each task to 1-2 file mutations. If you need 3+, split into one mutation per task.
+- If your spec text exceeds 2000 characters, the task is likely too large. Split it.
+- If your spec text is under 50 characters, the task is likely too vague. Add detail.
+
+**Writing good specs:**
 - Include file paths, function names, and concrete references
 - Reference earlier tasks if later tasks depend on their output
 - Add verification commands that prove the work is done (test runs, lint checks, file existence)

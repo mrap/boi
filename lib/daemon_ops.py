@@ -21,7 +21,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 from lib.critic import (
     generate_critic_prompt,
@@ -62,6 +62,16 @@ from lib.telemetry import update_telemetry
 
 if TYPE_CHECKING:
     from lib.db import Database
+
+
+def _signal_name(signal_num: int) -> str:
+    """Return a human-readable signal name (e.g., 'SIGTERM') for a signal number."""
+    import signal as _signal
+
+    try:
+        return _signal.Signals(signal_num).name
+    except (ValueError, AttributeError):
+        return f"SIG{signal_num}"
 
 
 def _parse_json_field(value: Any, default: Any = None) -> Any:
@@ -202,6 +212,104 @@ def process_worker_completion(
         "max_iterations": max_iter,
         "spec_path": spec_path,
     }
+
+    # Message-driven exits: handled separately from crashes
+    _MESSAGE_EXIT_CODES = {"130", "131", "132", "133"}
+    if exit_code in _MESSAGE_EXIT_CODES:
+        from lib.messaging import cleanup_mailbox, exit_reason
+
+        reason = exit_reason(int(exit_code))
+        result["outcome"] = reason
+        result["exit_code"] = int(exit_code)
+
+        # Clean up the spec's mailbox
+        state_dir = str(Path(queue_dir).parent)
+        cleanup_mailbox(queue_id, state_dir)
+
+        write_event(
+            events_dir,
+            {
+                "type": f"spec_{reason}",
+                "queue_id": queue_id,
+                "spec_path": spec_path,
+                "iteration": iteration,
+                "exit_code": int(exit_code),
+                "timestamp": timestamp,
+            },
+        )
+
+        # 130 (canceled) / 132 (preempted): mark canceled or requeue
+        if exit_code == "130":
+            if db:
+                db.cancel(queue_id)
+            else:
+                from lib.queue import cancel
+
+                cancel(queue_dir, queue_id)
+        elif exit_code == "131":
+            # task_skipped: requeue for next task
+            if db:
+                db.requeue(queue_id)
+            else:
+                requeue(queue_dir, queue_id)
+        elif exit_code == "132":
+            # preempted: requeue for higher-priority work
+            if db:
+                db.requeue(queue_id)
+            else:
+                requeue(queue_dir, queue_id)
+        elif exit_code == "133":
+            # deprioritized: requeue at lower priority
+            if db:
+                db.requeue(queue_id)
+            else:
+                requeue(queue_dir, queue_id)
+
+        return result
+
+    # Signal death: exit code 128+ means the worker was killed by a signal
+    # (e.g., SIGTERM=143, SIGKILL=137). These are external kills, NOT worker
+    # bugs — do NOT count toward consecutive_failures.
+    if exit_code is not None and exit_code.isdigit() and int(exit_code) >= 128:
+        exit_code_int = int(exit_code)
+        signal_num = exit_code_int - 128
+        signal_name = _signal_name(signal_num)
+
+        log_event(
+            queue_id,
+            "signal_death",
+            f"Worker killed by {signal_name} (exit {exit_code_int}), requeuing",
+            {"iteration": iteration, "signal": signal_num, "exit_code": exit_code_int},
+            "warn",
+        )
+
+        # Requeue without incrementing consecutive_failures
+        if db:
+            db.signal_requeue(queue_id)
+        else:
+            entry_now = _read_entry(queue_dir, queue_id)
+            if entry_now:
+                entry_now["status"] = "requeued"
+                _write_entry(queue_dir, entry_now)
+
+        write_event(
+            events_dir,
+            {
+                "type": "spec_signal_requeued",
+                "queue_id": queue_id,
+                "spec_path": spec_path,
+                "iteration": iteration,
+                "exit_code": exit_code_int,
+                "signal": signal_num,
+                "signal_name": signal_name,
+                "timestamp": timestamp,
+            },
+        )
+
+        result["outcome"] = "signal_requeued"
+        result["exit_code"] = exit_code_int
+        result["signal_name"] = signal_name
+        return result
 
     # Crash: no exit file, or non-zero exit code
     if exit_code is None or exit_code != "0":
@@ -583,8 +691,7 @@ def _get_failure_reason(
             timeout_minutes = timeout_seconds // 60
             return f"Worker timed out after {timeout_minutes} minutes."
         return (
-            "Worker crashed: no exit file. "
-            "Process may have been killed or timed out."
+            "Worker crashed: no exit file. Process may have been killed or timed out."
         )
     return f"Worker exited with code {exit_code}."
 
@@ -687,7 +794,7 @@ def _get_experiment_proposed_tasks(spec_path: str) -> list[str]:
 def _handle_experiment_proposed_return(
     result: dict[str, Any],
     experiment_proposed_tasks: list[str],
-    db: "Optional[Database]",
+    db: Optional[Database],
     queue_dir: str,
     queue_id: str,
     done_count: int,
@@ -701,9 +808,7 @@ def _handle_experiment_proposed_return(
     """Handle EXPERIMENT_PROPOSED tasks — pause the spec for human review."""
     # Increment experiment usage count
     if db:
-        db.increment_experiment_usage(
-            queue_id, count=len(experiment_proposed_tasks)
-        )
+        db.increment_experiment_usage(queue_id, count=len(experiment_proposed_tasks))
     else:
         increment_experiment_usage(
             queue_dir, queue_id, count=len(experiment_proposed_tasks)
@@ -754,7 +859,7 @@ def _handle_experiment_proposed_return(
 
 def _apply_critic_or_complete(
     entry: dict[str, Any],
-    db: "Optional[Database]",
+    db: Optional[Database],
     queue_dir: str,
     queue_id: str,
     done_count: int,
@@ -899,6 +1004,45 @@ def pick_next_spec(
     }
 
 
+def find_parallel_assignments(
+    db: Database,
+    spec_id: str,
+    spec_path: str,
+) -> list[str]:
+    """Find all task IDs that can be assigned to workers in parallel.
+
+    Parses the spec file, determines which tasks are already in_progress
+    (assigned to a worker), and returns the list of newly assignable
+    task IDs sorted by downstream impact (most-unblocking first).
+
+    Args:
+        db: Database instance.
+        spec_id: The spec queue ID.
+        spec_path: Path to the spec file on disk.
+
+    Returns:
+        List of task IDs ready for assignment, ordered by priority
+        (tasks that unblock the most work come first).
+    """
+    from lib.dag import downstream_count, find_assignable_tasks
+
+    spec_content = Path(spec_path).read_text(encoding="utf-8")
+    tasks = parse_boi_spec(spec_content)
+    if not tasks:
+        return []
+
+    in_progress = db.get_in_progress_task_ids(spec_id)
+    assignable = find_assignable_tasks(tasks, in_progress=in_progress)
+
+    # Sort by downstream impact: tasks unblocking the most work first
+    assignable.sort(
+        key=lambda tid: downstream_count(tasks, tid),
+        reverse=True,
+    )
+
+    return assignable
+
+
 def get_active_count(
     queue_dir: str,
     db: Optional[Database] = None,
@@ -913,6 +1057,7 @@ def get_active_count(
         entries = db.get_queue()
     else:
         from lib.queue import get_queue
+
         entries = get_queue(queue_dir)
     return sum(
         1
@@ -1399,6 +1544,7 @@ def check_needs_review_timeouts(
         entries = db.get_queue()
     else:
         from lib.queue import get_queue
+
         entries = get_queue(queue_dir)
 
     timeout_hours = _load_experiment_timeout(state_dir)
@@ -1724,20 +1870,46 @@ def process_evaluation_completion(
 
     if convergence.should_stop:
         return _complete_evaluated_spec(
-            queue_dir, queue_id, events_dir, hooks_dir, spec_path,
-            counts, entry, convergence.reason, convergence, db, timestamp,
+            queue_dir,
+            queue_id,
+            events_dir,
+            hooks_dir,
+            spec_path,
+            counts,
+            entry,
+            convergence.reason,
+            convergence,
+            db,
+            timestamp,
         )
 
     if pending_count > 0:
         return _loop_back_to_execute(
-            queue_dir, queue_id, events_dir, spec_path,
-            counts, entry, convergence, pending_count, db, timestamp,
+            queue_dir,
+            queue_id,
+            events_dir,
+            spec_path,
+            counts,
+            entry,
+            convergence,
+            pending_count,
+            db,
+            timestamp,
         )
 
     # No new tasks and no convergence — all criteria met by the evaluator (goal_achieved)
     return _complete_evaluated_spec(
-        queue_dir, queue_id, events_dir, hooks_dir, spec_path,
-        counts, entry, "goal_achieved", convergence, db, timestamp,
+        queue_dir,
+        queue_id,
+        events_dir,
+        hooks_dir,
+        spec_path,
+        counts,
+        entry,
+        "goal_achieved",
+        convergence,
+        db,
+        timestamp,
     )
 
 
@@ -1863,6 +2035,7 @@ def _heal_max_running_duration(
         entries = db.get_queue()
     else:
         from lib.queue import get_queue
+
         entries = get_queue(queue_dir)
 
     actions: list[dict[str, Any]] = []
@@ -1888,8 +2061,7 @@ def _heal_max_running_duration(
 
         # Compute max running duration
         worker_timeout = (
-            entry.get("worker_timeout_seconds")
-            or DEFAULT_WORKER_TIMEOUT_SECONDS
+            entry.get("worker_timeout_seconds") or DEFAULT_WORKER_TIMEOUT_SECONDS
         )
         max_iterations = entry.get("max_iterations") or 30
         max_duration = entry.get(
@@ -1993,6 +2165,7 @@ def _heal_circular_dependencies(
         entries = db.get_queue()
     else:
         from lib.queue import get_queue
+
         entries = get_queue(queue_dir)
 
     actions: list[dict[str, Any]] = []
@@ -2128,9 +2301,7 @@ def _heal_blocked_by_cleanup_db(db: Database) -> list[dict[str, Any]]:
         if dep_status is None:
             to_remove.append((spec_id, blocks_on, f"{blocks_on} (missing)"))
         elif dep_status in terminal_statuses:
-            to_remove.append(
-                (spec_id, blocks_on, f"{blocks_on} ({dep_status})")
-            )
+            to_remove.append((spec_id, blocks_on, f"{blocks_on} ({dep_status})"))
 
     # Group removals by spec_id for reporting
     removals_by_spec: dict[str, list[str]] = {}
@@ -2138,8 +2309,7 @@ def _heal_blocked_by_cleanup_db(db: Database) -> list[dict[str, Any]]:
         removals_by_spec.setdefault(spec_id, []).append(label)
         with db.lock:
             db.conn.execute(
-                "DELETE FROM spec_dependencies "
-                "WHERE spec_id = ? AND blocks_on = ?",
+                "DELETE FROM spec_dependencies WHERE spec_id = ? AND blocks_on = ?",
                 (spec_id, blocks_on),
             )
             db.conn.commit()

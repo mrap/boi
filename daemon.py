@@ -31,6 +31,7 @@ from typing import Any, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from lib.daemon_lock import DaemonLock
 from lib.db import Database
 
 # Default daemon constants
@@ -94,6 +95,7 @@ class Daemon:
 
         # PID / lock files
         self.pid_file = os.path.join(self.state_dir, "daemon.pid")
+        self._daemon_lock = DaemonLock(self.state_dir)
 
         # Active worker subprocesses: worker_id -> subprocess.Popen
         self.worker_procs: dict[str, subprocess.Popen] = {}
@@ -135,8 +137,8 @@ class Daemon:
         for d in [self.queue_dir, self.log_dir, self.hooks_dir]:
             os.makedirs(d, exist_ok=True)
 
-        # Write PID file
-        self._write_pid_file()
+        # Acquire exclusive daemon lock (exits if another daemon is running)
+        self._daemon_lock.acquire()
 
         logger.info("Daemon started (PID %d)", os.getpid())
 
@@ -252,11 +254,8 @@ class Daemon:
 
         self.worker_procs.clear()
 
-        # Remove PID file
-        try:
-            os.remove(self.pid_file)
-        except FileNotFoundError:
-            pass
+        # Release daemon lock (also removes PID file)
+        self._daemon_lock.release()
 
         # Close database
         self.db.close()
@@ -1094,12 +1093,6 @@ class Daemon:
             f.write(now + "\n")
         os.replace(tmp, heartbeat_path)
 
-    def _write_pid_file(self) -> None:
-        """Atomically write current PID to the PID file."""
-        tmp = self.pid_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
-        os.replace(tmp, self.pid_file)
 
 
 # ── CLI entrypoint ───────────────────────────────────────────────────

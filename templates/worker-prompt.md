@@ -24,7 +24,10 @@ You are a BOI (Beginning of Infinity) worker executing one iteration of a self-e
 ## Your Job
 
 1. Read the spec above carefully
-2. Find the next PENDING task (by task ID order, lowest first)
+2. Find the next PENDING task to execute:
+   a. Skip any task with a `**Blocked by:** t-X` line where t-X is not DONE
+   b. Among remaining PENDING tasks, prefer the task that unblocks the most other blocked tasks (check which tasks list this one in their Blocked by line)
+   c. If tied, pick the lowest task ID
 3. Execute it completely
 4. Mark it DONE in the spec file (`{{SPEC_PATH}}`)
 5. If you discover additional work needed, ADD new PENDING tasks to the spec
@@ -75,6 +78,7 @@ This is a clean Claude session. You have NO memory of previous iterations. The s
 - **Update the spec file** to mark your task as DONE before exiting.
 - **Stay in scope.** Only do what the current task asks. Don't jump ahead.
 - **Blocked tasks:** If a task has a `**Blocked by:** t-X` line, check if t-X is DONE in the spec. If t-X is NOT DONE, skip this task and pick the next non-blocked PENDING task.
+- **Append-only self-evolution:** New tasks MUST be appended at the END of the spec file, never inserted between existing tasks. Use sequential task IDs (one higher than the current max). Include `**Blocked by:**` lines if the new task depends on any existing task's output. If the new task produces output that an existing PENDING task needs, note this in your Discovery section.
 - **Error Log:** If the spec contains an `## Error Log` section, read it before starting your task. Do NOT retry approaches documented as failed.
 - **Shell scripts:** Use `set -uo pipefail` (NO `-e`).
 - **Python:** stdlib only, no pip dependencies.
