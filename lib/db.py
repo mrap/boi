@@ -1564,6 +1564,148 @@ class Database:
             )
             self.conn.commit()
 
+    def replace_dependencies(self, spec_id: str, dep_ids: list[str]) -> None:
+        """Replace all dependencies for spec_id with the given dep_ids.
+
+        Performs cycle detection for each new dependency. If any would
+        create a cycle, raises ValueError and makes no changes.
+        """
+        with self.lock:
+            if not self.conn.execute(
+                "SELECT 1 FROM specs WHERE id = ?", (spec_id,)
+            ).fetchone():
+                raise ValueError(f"Spec not found: {spec_id}")
+
+            # Validate all new deps exist and check cycles
+            for dep_id in dep_ids:
+                if not self.conn.execute(
+                    "SELECT 1 FROM specs WHERE id = ?", (dep_id,)
+                ).fetchone():
+                    raise ValueError(f"Spec not found: {dep_id}")
+                path = self._find_dependency_path(dep_id, spec_id)
+                if path is not None:
+                    cycle = [spec_id] + path + [spec_id]
+                    raise ValueError(
+                        f"Circular dependency detected: {' -> '.join(cycle)}"
+                    )
+
+            # Atomic replace
+            self.conn.execute(
+                "DELETE FROM spec_dependencies WHERE spec_id = ?",
+                (spec_id,),
+            )
+            for dep_id in dep_ids:
+                self.conn.execute(
+                    "INSERT INTO spec_dependencies (spec_id, blocks_on) VALUES (?, ?)",
+                    (spec_id, dep_id),
+                )
+            self._log_event(
+                "dependencies_replaced",
+                f"Dependencies replaced for {spec_id}: "
+                f"{', '.join(dep_ids) if dep_ids else '(none)'}",
+                spec_id=spec_id,
+                data={"dep_ids": dep_ids},
+            )
+            self.conn.commit()
+
+    def clear_dependencies(self, spec_id: str) -> int:
+        """Remove all dependencies from spec_id. Returns count removed."""
+        with self.lock:
+            if not self.conn.execute(
+                "SELECT 1 FROM specs WHERE id = ?", (spec_id,)
+            ).fetchone():
+                raise ValueError(f"Spec not found: {spec_id}")
+
+            cursor = self.conn.execute(
+                "DELETE FROM spec_dependencies WHERE spec_id = ?",
+                (spec_id,),
+            )
+            count = cursor.rowcount
+            self._log_event(
+                "dependencies_cleared",
+                f"All dependencies cleared for {spec_id} ({count} removed)",
+                spec_id=spec_id,
+                data={"count": count},
+            )
+            self.conn.commit()
+            return count
+
+    def get_fleet_dag(self) -> dict[str, Any]:
+        """Return the full fleet dependency DAG.
+
+        Returns dict with:
+          - specs: list of {id, status, deps: [dep_ids], dependents: [dep_ids]}
+          - edges: list of {from: spec_id, to: blocks_on}
+        """
+        specs = self.conn.execute("SELECT id, status FROM specs").fetchall()
+
+        edges = self.conn.execute(
+            "SELECT spec_id, blocks_on FROM spec_dependencies"
+        ).fetchall()
+
+        edge_list = [{"from": e["spec_id"], "to": e["blocks_on"]} for e in edges]
+
+        # Build adjacency info per spec
+        spec_deps: dict[str, list[str]] = {}
+        spec_dependents: dict[str, list[str]] = {}
+        for e in edges:
+            spec_deps.setdefault(e["spec_id"], []).append(e["blocks_on"])
+            spec_dependents.setdefault(e["blocks_on"], []).append(e["spec_id"])
+
+        spec_list = []
+        for s in specs:
+            spec_list.append(
+                {
+                    "id": s["id"],
+                    "status": s["status"],
+                    "deps": spec_deps.get(s["id"], []),
+                    "dependents": spec_dependents.get(s["id"], []),
+                }
+            )
+
+        return {"specs": spec_list, "edges": edge_list}
+
+    def check_fleet_dag(self) -> list[dict[str, str]]:
+        """Validate the fleet DAG. Returns list of issues found.
+
+        Checks for:
+        - Self-loops
+        - Deps on failed/canceled specs that block queued specs
+        """
+        issues: list[dict[str, str]] = []
+
+        edges = self.conn.execute(
+            "SELECT spec_id, blocks_on FROM spec_dependencies"
+        ).fetchall()
+
+        for e in edges:
+            sid, dep = e["spec_id"], e["blocks_on"]
+
+            # Self-loop
+            if sid == dep:
+                issues.append({"type": "self_loop", "spec": sid})
+                continue
+
+            # Check if dep is in a terminal non-completed state
+            dep_row = self.conn.execute(
+                "SELECT status FROM specs WHERE id = ?", (dep,)
+            ).fetchone()
+            if dep_row and dep_row["status"] in ("failed", "canceled"):
+                spec_row = self.conn.execute(
+                    "SELECT status FROM specs WHERE id = ?", (sid,)
+                ).fetchone()
+                if spec_row and spec_row["status"] in ("queued", "requeued"):
+                    issues.append(
+                        {
+                            "type": "blocked_by_terminal",
+                            "spec": sid,
+                            "blocked_on": dep,
+                            "blocked_on_status": dep_row["status"],
+                        }
+                    )
+
+        return issues
+
     # ── Iteration metadata ────────────────────────────────────────
 
     def insert_iteration(

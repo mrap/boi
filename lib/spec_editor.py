@@ -7,8 +7,9 @@ import os
 import re
 from pathlib import Path
 
+from lib.dag import validate_dag
 from lib.locking import queue_lock
-from lib.spec_parser import parse_boi_spec
+from lib.spec_parser import parse_boi_spec, parse_deps_section
 
 # Regex to extract t-N IDs
 _TASK_ID_RE = re.compile(r"^###\s+(t-(\d+)):\s+", re.MULTILINE)
@@ -325,3 +326,251 @@ def block_task(spec_path: str, task_id: str, blocked_by: str) -> None:
             lines.insert(insert_idx, f"**Blocked by:** {blocked_by}")
 
         _atomic_write(spec_path, "\n".join(lines) + "\n")
+
+
+# ─── Dependencies Section Editing ────────────────────────────────────────────
+
+# Regex for dependency lines in the ## Dependencies section
+_DEP_LINE_RE = re.compile(r"^(t-\d+):\s*(.*)$")
+_DEP_SECTION_HEADING_RE = re.compile(r"^##\s+Dependencies\s*$")
+
+
+def _rewrite_dep_line(line: str, task_id: str, new_deps: list[str]) -> str:
+    """Rewrite a single dependency line with new deps."""
+    if new_deps:
+        return f"{task_id}: {', '.join(new_deps)}"
+    return f"{task_id}: (none)"
+
+
+def _edit_deps_section(content: str, edits: dict[str, list[str]]) -> str:
+    """Apply edits to the ## Dependencies section.
+
+    edits maps task_id -> new dependency list.
+    Only lines matching edited task_ids are changed.
+    """
+    lines = content.splitlines()
+    in_section = False
+    result: list[str] = []
+
+    for line in lines:
+        if _DEP_SECTION_HEADING_RE.match(line.strip()):
+            in_section = True
+            result.append(line)
+            continue
+
+        if in_section and line.startswith("## "):
+            in_section = False
+            result.append(line)
+            continue
+
+        if in_section:
+            m = _DEP_LINE_RE.match(line.strip())
+            if m and m.group(1) in edits:
+                task_id = m.group(1)
+                result.append(_rewrite_dep_line(line, task_id, edits[task_id]))
+                continue
+
+        result.append(line)
+
+    return "\n".join(result)
+
+
+def add_dep(spec_path: str, task_id: str, dep_id: str) -> None:
+    """Add a dependency edge: task_id depends on dep_id.
+
+    Raises ValueError if adding would create a cycle.
+    """
+    with queue_lock(_queue_dir_for(spec_path)):
+        content = Path(spec_path).read_text(encoding="utf-8")
+        deps = parse_deps_section(content)
+        if deps is None:
+            raise ValueError("No ## Dependencies section found in spec")
+
+        # Get current deps for task
+        current = list(deps.get(task_id, []))
+        if dep_id in current:
+            return  # Already present, no-op
+
+        # Check cycle: temporarily add the edge and validate
+        new_deps = dict(deps)
+        new_deps[task_id] = current + [dep_id]
+        task_ids = set(new_deps.keys())
+        errors = validate_dag(new_deps, task_ids)
+        cycle_errors = [e for e in errors if "cycle" in e.lower()]
+        if cycle_errors:
+            raise ValueError("Cannot add dependency: would create a cycle")
+
+        content = _edit_deps_section(content, {task_id: current + [dep_id]})
+        _atomic_write(spec_path, content)
+
+
+def remove_dep(spec_path: str, task_id: str, dep_id: str) -> None:
+    """Remove a dependency edge: task_id no longer depends on dep_id."""
+    with queue_lock(_queue_dir_for(spec_path)):
+        content = Path(spec_path).read_text(encoding="utf-8")
+        deps = parse_deps_section(content)
+        if deps is None:
+            raise ValueError("No ## Dependencies section found in spec")
+
+        current = list(deps.get(task_id, []))
+        if dep_id not in current:
+            return  # Not present, no-op
+
+        current.remove(dep_id)
+        content = _edit_deps_section(content, {task_id: current})
+        _atomic_write(spec_path, content)
+
+
+def set_deps(spec_path: str, task_id: str, dep_ids: list[str]) -> None:
+    """Replace all dependencies for task_id."""
+    with queue_lock(_queue_dir_for(spec_path)):
+        content = Path(spec_path).read_text(encoding="utf-8")
+        deps = parse_deps_section(content)
+        if deps is None:
+            raise ValueError("No ## Dependencies section found in spec")
+
+        content = _edit_deps_section(content, {task_id: dep_ids})
+        _atomic_write(spec_path, content)
+
+
+def clear_deps(spec_path: str, task_id: str) -> None:
+    """Remove all dependencies for task_id, making it independent."""
+    set_deps(spec_path, task_id, [])
+
+
+def swap_deps(spec_path: str, task_a: str, task_b: str) -> None:
+    """Swap the dependency positions of two tasks.
+
+    All references to task_a become task_b and vice versa.
+    """
+    with queue_lock(_queue_dir_for(spec_path)):
+        content = Path(spec_path).read_text(encoding="utf-8")
+        deps = parse_deps_section(content)
+        if deps is None:
+            raise ValueError("No ## Dependencies section found in spec")
+
+        # Build new deps with swapped references
+        new_deps: dict[str, list[str]] = {}
+        for tid, task_deps in deps.items():
+            # Swap the task ID itself
+            new_tid = task_b if tid == task_a else (task_a if tid == task_b else tid)
+            # Swap references in dependency lists
+            new_task_deps = []
+            for d in task_deps:
+                if d == task_a:
+                    new_task_deps.append(task_b)
+                elif d == task_b:
+                    new_task_deps.append(task_a)
+                else:
+                    new_task_deps.append(d)
+            new_deps[new_tid] = new_task_deps
+
+        # Validate no cycles
+        task_ids = set(new_deps.keys())
+        errors = validate_dag(new_deps, task_ids)
+        cycle_errors = [e for e in errors if "cycle" in e.lower()]
+        if cycle_errors:
+            raise ValueError("Cannot swap: would create a cycle")
+
+        # Rewrite the entire deps section
+        lines = content.splitlines()
+        result: list[str] = []
+        in_section = False
+        section_written = False
+
+        for line in lines:
+            if _DEP_SECTION_HEADING_RE.match(line.strip()):
+                in_section = True
+                result.append(line)
+                continue
+
+            if in_section and line.startswith("## "):
+                # Write all new deps before leaving section
+                if not section_written:
+                    sorted_ids = sorted(
+                        new_deps.keys(), key=lambda x: int(x.split("-")[1])
+                    )
+                    for tid in sorted_ids:
+                        d = new_deps[tid]
+                        if d:
+                            result.append(f"{tid}: {', '.join(d)}")
+                        else:
+                            result.append(f"{tid}: (none)")
+                    section_written = True
+                in_section = False
+                result.append(line)
+                continue
+
+            if in_section:
+                # Skip old dep lines, we'll rewrite them
+                m = _DEP_LINE_RE.match(line.strip())
+                if m:
+                    continue
+                if not line.strip():
+                    continue  # Skip blank lines in section
+                result.append(line)
+                continue
+
+            result.append(line)
+
+        # If section was at end of file
+        if in_section and not section_written:
+            sorted_ids = sorted(new_deps.keys(), key=lambda x: int(x.split("-")[1]))
+            for tid in sorted_ids:
+                d = new_deps[tid]
+                if d:
+                    result.append(f"{tid}: {', '.join(d)}")
+                else:
+                    result.append(f"{tid}: (none)")
+
+        _atomic_write(spec_path, "\n".join(result) + "\n")
+
+
+def migrate_deps(spec_path: str) -> None:
+    """Migrate from **Blocked by:** inline format to ## Dependencies section.
+
+    If a ## Dependencies section already exists, this is a no-op.
+    """
+    with queue_lock(_queue_dir_for(spec_path)):
+        content = Path(spec_path).read_text(encoding="utf-8")
+
+        # Check if section already exists
+        if parse_deps_section(content) is not None:
+            return  # Already has section, no-op
+
+        tasks = parse_boi_spec(content)
+
+        # Build dependency map
+        deps_map: dict[str, list[str]] = {}
+        for task in tasks:
+            deps_map[task.id] = list(task.blocked_by) if task.blocked_by else []
+
+        # Generate section
+        dep_lines = ["## Dependencies"]
+        sorted_ids = sorted(deps_map.keys(), key=lambda x: int(x.split("-")[1]))
+        for task_id in sorted_ids:
+            task_deps = deps_map[task_id]
+            if task_deps:
+                dep_lines.append(f"{task_id}: {', '.join(task_deps)}")
+            else:
+                dep_lines.append(f"{task_id}: (none)")
+
+        dep_section = "\n".join(dep_lines) + "\n"
+
+        # Insert before ## Tasks heading
+        tasks_heading_re = re.compile(r"^## Tasks\s*$", re.MULTILINE)
+        m = tasks_heading_re.search(content)
+        if m:
+            content = content[: m.start()] + dep_section + "\n" + content[m.start() :]
+        else:
+            # No ## Tasks heading; insert before first ### t-N:
+            first_task_re = re.compile(r"^### t-\d+:", re.MULTILINE)
+            m = first_task_re.search(content)
+            if m:
+                content = (
+                    content[: m.start()] + dep_section + "\n" + content[m.start() :]
+                )
+            else:
+                content += "\n" + dep_section
+
+        _atomic_write(spec_path, content)

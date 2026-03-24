@@ -203,6 +203,65 @@ def remove_dependency(
         db.close()
 
 
+def replace_dependencies(
+    queue_dir: str,
+    spec_id: str,
+    dep_ids: list[str],
+) -> dict[str, Any]:
+    """Atomically replace all dependencies for a spec.
+
+    Returns dict with spec_id and the new dep list.
+    Raises ValueError on missing specs or circular dependencies.
+    """
+    db = _get_db(queue_dir)
+    try:
+        db.replace_dependencies(spec_id, dep_ids)
+        return {"spec_id": spec_id, "deps": dep_ids}
+    finally:
+        db.close()
+
+
+def clear_dependencies(
+    queue_dir: str,
+    spec_id: str,
+) -> dict[str, Any]:
+    """Remove all dependencies from a spec.
+
+    Returns dict with spec_id and count of cleared deps.
+    Raises ValueError if spec not found.
+    """
+    db = _get_db(queue_dir)
+    try:
+        count = db.clear_dependencies(spec_id)
+        return {"spec_id": spec_id, "cleared": count}
+    finally:
+        db.close()
+
+
+def get_fleet_dag(queue_dir: str) -> dict[str, Any]:
+    """Return the full fleet dependency DAG.
+
+    Returns dict with specs and edges.
+    """
+    db = _get_db(queue_dir)
+    try:
+        return db.get_fleet_dag()
+    finally:
+        db.close()
+
+
+def check_fleet_dag(queue_dir: str) -> list[dict[str, str]]:
+    """Validate the fleet DAG for issues.
+
+    Returns list of issue dicts.
+    """
+    db = _get_db(queue_dir)
+    try:
+        return db.check_fleet_dag()
+    finally:
+        db.close()
+
+
 def resume_spec(queue_dir: str, queue_id: str) -> list[str]:
     """Resume failed/canceled specs back to queued.
 

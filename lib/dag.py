@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
+import re
 from collections import deque
 
-from lib.spec_parser import BoiTask
+from lib.spec_parser import BoiTask, parse_boi_spec, parse_deps_section
 
 # Statuses that count as "resolved" for dependency purposes.
 # A task blocked by a DONE or SKIPPED task is considered unblocked.
@@ -156,3 +157,174 @@ def critical_path(tasks: list[BoiTask]) -> list[str]:
 
     path.reverse()
     return path
+
+
+def validate_dag(deps: dict[str, list[str]], task_ids: set[str]) -> list[str]:
+    """Validate a dependency graph without needing full BoiTask objects.
+
+    Checks:
+    1. Self-references (t-1: t-1)
+    2. Missing references (dependency on a task that doesn't exist)
+    3. Cycles (via Kahn's algorithm)
+
+    Returns list of error strings. Empty = valid.
+    """
+    errors: list[str] = []
+
+    # Check self-references and missing refs
+    for task_id, task_deps in deps.items():
+        for dep in task_deps:
+            if dep == task_id:
+                errors.append(f"{task_id}: self-dependency is not allowed")
+            elif dep not in task_ids and dep not in deps:
+                errors.append(f"{task_id}: depends on {dep} which doesn't exist")
+
+    # Cycle detection (Kahn's algorithm)
+    all_ids = set(deps.keys()) | task_ids
+    in_degree: dict[str, int] = {tid: 0 for tid in all_ids}
+    adj: dict[str, list[str]] = {tid: [] for tid in all_ids}
+
+    for task_id, task_deps in deps.items():
+        for dep in task_deps:
+            if dep in adj and dep != task_id:
+                adj[dep].append(task_id)
+                in_degree[task_id] += 1
+
+    queue: deque[str] = deque(tid for tid, deg in in_degree.items() if deg == 0)
+    visited = 0
+    while queue:
+        node = queue.popleft()
+        visited += 1
+        for neighbor in adj[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    if visited != len(all_ids):
+        errors.append("Cycle detected in task dependency graph")
+
+    return errors
+
+
+def validate_deps_section(content: str) -> list[str]:
+    """Validate the ## Dependencies section for structural issues.
+
+    Checks for duplicate task IDs in the section.
+    """
+    _DEP_SECTION_HEADING = re.compile(r"^##\s+Dependencies\s*$")
+    _DEP_LINE = re.compile(r"^(t-\d+):\s*(.*)$")
+
+    errors: list[str] = []
+    in_section = False
+    seen: set[str] = set()
+
+    for line in content.splitlines():
+        if _DEP_SECTION_HEADING.match(line.strip()):
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if not in_section:
+            continue
+
+        m = _DEP_LINE.match(line.strip())
+        if m:
+            task_id = m.group(1)
+            if task_id in seen:
+                errors.append(f"Duplicate entry for {task_id} in Dependencies section")
+            seen.add(task_id)
+
+    return errors
+
+
+def check_dep_conflicts(content: str) -> list[str]:
+    """Warn if Dependencies section and Blocked by lines disagree."""
+    section_deps = parse_deps_section(content)
+    if section_deps is None:
+        return []
+
+    # Parse tasks using the raw inline parser (bypass section override)
+    # by manually extracting blocked_by from task bodies
+    _BLOCKED_BY_RE = re.compile(r"^\*\*Blocked\s+by:\*\*\s*(.+)$")
+    _TASK_HEADING_RE = re.compile(r"^###\s+(t-\d+):\s+(.+)$")
+
+    inline_deps: dict[str, list[str]] = {}
+    current_id: str | None = None
+
+    for line in content.splitlines():
+        heading_match = _TASK_HEADING_RE.match(line)
+        if heading_match:
+            current_id = heading_match.group(1)
+            continue
+        if current_id is not None:
+            blocked_match = _BLOCKED_BY_RE.match(line.strip())
+            if blocked_match:
+                deps_str = blocked_match.group(1).strip()
+                inline_deps[current_id] = [
+                    d.strip() for d in deps_str.split(",") if d.strip()
+                ]
+
+    warnings: list[str] = []
+    for task_id, inline in inline_deps.items():
+        section = section_deps.get(task_id, [])
+        if set(inline) != set(section):
+            warnings.append(
+                f"{task_id}: Dependencies section says {section}, "
+                f"but **Blocked by:** says {inline}. "
+                "Dependencies section takes precedence."
+            )
+    return warnings
+
+
+def deps_viz(deps: dict[str, list[str]]) -> str:
+    """Generate an ASCII visualization of the dependency graph.
+
+    Shows each edge as: dep ──> task
+    Independent tasks are shown as: task (independent)
+    Includes critical path summary.
+    """
+    lines: list[str] = []
+
+    # Build reverse map: for each task, which tasks depend on it
+    has_dependents: set[str] = set()
+    for task_id, task_deps in deps.items():
+        for dep in task_deps:
+            has_dependents.add(dep)
+
+    # Sort by task number
+    sorted_ids = sorted(deps.keys(), key=lambda x: int(x.split("-")[1]))
+
+    for task_id in sorted_ids:
+        task_deps = deps[task_id]
+        if not task_deps:
+            if task_id not in has_dependents:
+                lines.append(f"{task_id} (independent)")
+            else:
+                lines.append(f"{task_id} (root)")
+        else:
+            for dep in task_deps:
+                lines.append(f"{dep} ──> {task_id}")
+
+    # Critical path
+    # Build BoiTask-like objects for critical_path computation
+    fake_tasks = []
+    for task_id in sorted_ids:
+        fake_tasks.append(
+            BoiTask(
+                id=task_id,
+                title="",
+                status="PENDING",
+                blocked_by=deps.get(task_id, []),
+            )
+        )
+    if fake_tasks:
+        try:
+            cp = critical_path(fake_tasks)
+            if len(cp) > 1:
+                lines.append("")
+                lines.append(f"Critical path: {' -> '.join(cp)} ({len(cp)} tasks)")
+        except ValueError:
+            lines.append("")
+            lines.append("Critical path: <cycle detected>")
+
+    return "\n".join(lines)

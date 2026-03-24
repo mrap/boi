@@ -3797,12 +3797,19 @@ usage() {
 
 cmd_dep() {
     if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
-        echo "Usage: boi dep <add|remove|list> <spec-id> --after <dep-id>[,<dep-id>...]"
+        echo "Usage: boi dep <subcommand> [args]"
         echo ""
-        echo "Commands:"
+        echo "Per-spec commands:"
         echo "  add    <spec-id> --after <dep-id>   Add dependency (with cycle detection)"
         echo "  remove <spec-id> --after <dep-id>   Remove dependency"
+        echo "  set    <spec-id> --after <dep-id>   Replace ALL deps atomically"
+        echo "  clear  <spec-id>                    Remove ALL deps, unblock immediately"
         echo "  list   <spec-id>                    List dependencies for a spec"
+        echo ""
+        echo "Fleet-wide commands:"
+        echo "  show                                Show full fleet DAG (table format)"
+        echo "  viz                                 ASCII visualization of fleet DAG"
+        echo "  check                               Validate DAG integrity"
         exit 0
     fi
 
@@ -3812,7 +3819,12 @@ cmd_dep() {
     case "${subcommand}" in
         add)    _dep_add "$@" ;;
         remove) _dep_remove "$@" ;;
+        set)    _dep_set "$@" ;;
+        clear)  _dep_clear "$@" ;;
         list)   _dep_list "$@" ;;
+        show)   _dep_show "$@" ;;
+        viz)    _dep_viz "$@" ;;
+        check)  _dep_check "$@" ;;
         -h|--help) cmd_dep --help ;;
         *)
             die_usage "Unknown dep subcommand: ${subcommand}. Use 'boi dep --help'."
@@ -3993,6 +4005,250 @@ try:
             print(f"    {d['id']} [{d['status']}]")
 finally:
     db.close()
+PYEOF
+}
+
+_dep_set() {
+    local spec_id=""
+    local after=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --after)
+                [[ -z "${2:-}" ]] && die_usage "--after requires one or more queue IDs"
+                after="$2"
+                shift 2
+                ;;
+            -h|--help)
+                echo "Usage: boi dep set <spec-id> --after <dep-id>[,<dep-id>...]"
+                exit 0
+                ;;
+            *)
+                if [[ -z "${spec_id}" ]]; then
+                    spec_id="$1"
+                    shift
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    [[ -z "${spec_id}" ]] && die_usage "spec-id required. Usage: boi dep set <spec-id> --after <dep-id>"
+    [[ -z "${after}" ]] && die_usage "--after required. Usage: boi dep set <spec-id> --after <dep-id>"
+
+    local result
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${spec_id}" "${after}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import replace_dependencies
+
+queue_dir = sys.argv[1]
+spec_id = sys.argv[2]
+after_str = sys.argv[3]
+dep_ids = [d.strip() for d in after_str.split(",") if d.strip()]
+
+try:
+    result = replace_dependencies(queue_dir, spec_id, dep_ids)
+    print(json.dumps(result))
+except ValueError as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(1)
+PYEOF
+    )
+
+    local exit_code=$?
+    if [[ ${exit_code} -ne 0 ]]; then
+        local err_msg
+        err_msg=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error','unknown error'))" 2>/dev/null || echo "Failed to set dependencies")
+        die "${err_msg}"
+    fi
+
+    local dep_ids_str
+    dep_ids_str=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(', '.join(d.get('deps',[])))" 2>/dev/null)
+    info "${spec_id} dependencies replaced: ${dep_ids_str}"
+}
+
+_dep_clear() {
+    local spec_id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: boi dep clear <spec-id>"
+                exit 0
+                ;;
+            *)
+                if [[ -z "${spec_id}" ]]; then
+                    spec_id="$1"
+                    shift
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                ;;
+        esac
+    done
+
+    [[ -z "${spec_id}" ]] && die_usage "spec-id required. Usage: boi dep clear <spec-id>"
+
+    local result
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${spec_id}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import clear_dependencies
+
+queue_dir = sys.argv[1]
+spec_id = sys.argv[2]
+
+try:
+    result = clear_dependencies(queue_dir, spec_id)
+    print(json.dumps(result))
+except ValueError as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(1)
+PYEOF
+    )
+
+    local exit_code=$?
+    if [[ ${exit_code} -ne 0 ]]; then
+        local err_msg
+        err_msg=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('error','unknown error'))" 2>/dev/null || echo "Failed to clear dependencies")
+        die "${err_msg}"
+    fi
+
+    local cleared
+    cleared=$(echo "${result}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('cleared',0))" 2>/dev/null)
+    info "Cleared ${cleared} dependencies from ${spec_id}"
+}
+
+_dep_show() {
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import get_fleet_dag
+
+queue_dir = sys.argv[1]
+dag = get_fleet_dag(queue_dir)
+
+print("Fleet Dependency Graph")
+print("======================")
+print()
+
+independent = []
+for spec in sorted(dag["specs"], key=lambda s: s["id"]):
+    if not spec["deps"] and not spec["dependents"]:
+        independent.append(spec)
+        continue
+
+    deps_str = ""
+    if spec["deps"]:
+        dep_details = []
+        for did in spec["deps"]:
+            dep_spec = next((s for s in dag["specs"] if s["id"] == did), None)
+            status = dep_spec["status"] if dep_spec else "unknown"
+            dep_details.append(f"{did} ({status})")
+        deps_str = f"  blocked by: {', '.join(dep_details)}"
+
+    print(f"{spec['id']} [{spec['status']}]{deps_str}")
+    if spec["dependents"]:
+        print(f"  -> {', '.join(spec['dependents'])}")
+    print()
+
+if independent:
+    ids = ", ".join(s["id"] for s in independent)
+    print(f"Independent specs: {ids}")
+PYEOF
+}
+
+_dep_viz() {
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import get_fleet_dag
+
+queue_dir = sys.argv[1]
+dag = get_fleet_dag(queue_dir)
+
+if not dag["specs"]:
+    print("No specs in queue.")
+    sys.exit(0)
+
+# Build adjacency: who depends on whom
+dependents_of = {}  # spec_id -> list of specs that depend on it
+for edge in dag["edges"]:
+    dependents_of.setdefault(edge["to"], []).append(edge["from"])
+
+spec_map = {s["id"]: s for s in dag["specs"]}
+
+# Find roots (specs with no deps)
+roots = [s for s in dag["specs"] if not s["deps"]]
+independent = [s for s in roots if not s["dependents"]]
+dag_roots = [s for s in roots if s["dependents"]]
+
+# Print DAG chains starting from roots
+visited = set()
+def print_chain(sid, indent=0):
+    if sid in visited:
+        return
+    visited.add(sid)
+    s = spec_map.get(sid)
+    if not s:
+        return
+    prefix = "  " * indent
+    suffix = ""
+    if indent > 0:
+        prefix = "  " * (indent - 1) + "-> "
+    print(f"{prefix}{s['id']} [{s['status']}]")
+    for dep_id in sorted(dependents_of.get(sid, [])):
+        print_chain(dep_id, indent + 1)
+
+for root in sorted(dag_roots, key=lambda s: s["id"]):
+    print_chain(root["id"])
+    print()
+
+if independent:
+    for s in sorted(independent, key=lambda x: x["id"]):
+        print(f"{s['id']} [{s['status']}]  (independent)")
+PYEOF
+}
+
+_dep_check() {
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import check_fleet_dag
+
+queue_dir = sys.argv[1]
+issues = check_fleet_dag(queue_dir)
+
+print("Fleet DAG Health Check")
+print("======================")
+
+errors = [i for i in issues if i["type"] in ("missing_spec",)]
+warnings = [i for i in issues if i["type"] not in ("missing_spec",)]
+
+if not issues:
+    print("OK  No cycles detected")
+    print("OK  No missing spec references")
+    print("OK  No blocked-by-terminal issues")
+    print()
+    print("0 errors, 0 warnings")
+    sys.exit(0)
+
+for issue in issues:
+    if issue["type"] == "self_loop":
+        print(f"WARN  {issue['spec']} has a self-loop dependency")
+    elif issue["type"] == "blocked_by_terminal":
+        print(f"WARN  {issue['spec']} is blocked by {issue['blocked_on']} which is {issue['blocked_on_status']}")
+        print(f"      Fix: boi dep remove {issue['spec']} --after {issue['blocked_on']}")
+        print(f"           OR boi resume {issue['blocked_on']}")
+    elif issue["type"] == "missing_spec":
+        print(f"ERR   {issue['edge']}: {issue['role']} {issue['spec']} not found")
+
+print()
+print(f"{len(errors)} errors, {len(warnings)} warnings")
+if errors:
+    sys.exit(1)
 PYEOF
 }
 

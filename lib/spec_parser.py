@@ -210,6 +210,70 @@ def parse_file(filepath: str) -> list[Task]:
         )
 
 
+# ─── Dependencies Section Parsing ─────────────────────────────────────────────
+
+# Regex to match ## Dependencies heading
+_DEP_SECTION_HEADING_RE = re.compile(r"^##\s+Dependencies\s*$")
+
+# Regex to match dependency lines: t-N: dep1, dep2 or t-N: (none)
+_DEP_LINE_RE = re.compile(r"^(t-\d+):\s*(.*)$")
+
+
+def parse_deps_section(content: str) -> dict[str, list[str]] | None:
+    """Parse the ## Dependencies section from spec content.
+
+    Returns a dict mapping task_id -> list of dependency task_ids,
+    or None if no ## Dependencies section exists.
+    """
+    lines = content.splitlines()
+    in_section = False
+    deps: dict[str, list[str]] = {}
+
+    for line in lines:
+        if _DEP_SECTION_HEADING_RE.match(line.strip()):
+            in_section = True
+            continue
+
+        if in_section and line.startswith("## "):
+            break  # Hit next section heading
+
+        if not in_section:
+            continue
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        m = _DEP_LINE_RE.match(stripped)
+        if not m:
+            continue
+
+        task_id = m.group(1)
+        deps_str = m.group(2).strip()
+        if deps_str == "(none)" or not deps_str:
+            deps[task_id] = []
+        else:
+            deps[task_id] = [d.strip() for d in deps_str.split(",") if d.strip()]
+
+    return deps if in_section else None
+
+
+def get_dependencies(content: str) -> dict[str, list[str]]:
+    """Get task dependencies from spec content.
+
+    Priority:
+    1. ## Dependencies section (if present)
+    2. **Blocked by:** lines in task bodies (legacy fallback)
+    """
+    deps_from_section = parse_deps_section(content)
+    if deps_from_section is not None:
+        return deps_from_section
+
+    # Legacy: parse from task bodies
+    tasks = parse_boi_spec(content)
+    return {t.id: t.blocked_by for t in tasks}
+
+
 # ─── BOI Spec Parsing (self-evolving spec.md format) ─────────────────────────
 
 
@@ -348,6 +412,14 @@ def parse_boi_spec(content: str) -> list[BoiTask]:
             current_body_lines.append(line)
 
     _flush()
+
+    # If a ## Dependencies section exists, use it as the authoritative source
+    # for blocked_by, overriding any inline **Blocked by:** lines.
+    deps_from_section = parse_deps_section(content)
+    if deps_from_section is not None:
+        for task in tasks:
+            task.blocked_by = deps_from_section.get(task.id, [])
+
     return tasks
 
 
