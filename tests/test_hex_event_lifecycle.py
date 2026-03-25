@@ -158,7 +158,8 @@ class TestExtractTargetRepo(HexEventTestCase):
     def test_extracts_target_from_spec(self):
         spec_path = self._write_spec(SAMPLE_SPEC_COMPLETED)
         result = Daemon._extract_target_repo(spec_path)
-        self.assertEqual(result, "~/projects/example-repo")
+        import os
+        self.assertEqual(result, os.path.expanduser("~/projects/example-repo"))
 
     def test_returns_empty_string_for_missing_file(self):
         result = Daemon._extract_target_repo("/does/not/exist.md")

@@ -603,12 +603,15 @@ def _sort_by_dag(entries: list[dict[str, Any]]) -> list[tuple[dict[str, Any], in
     return result
 
 
-def filter_entries(
+def _apply_status_filter(
     entries: list[dict[str, Any]],
     filter_status: str = "all",
     show_completed: bool = True,
 ) -> list[dict[str, Any]]:
-    """Filter entries by status.
+    """Filter entries by interactive status filter (internal use only).
+
+    Used by format_dashboard for tmux dashboard filter_status / show_completed.
+    For CLI view filtering, use filter_specs() instead.
 
     Args:
         entries: List of queue entry dicts.
@@ -755,20 +758,112 @@ _COL_DEPS = 14    # dep info column
 _COL_STATUS = 12  # "running" right-padded
 _COL_FIXED = _COL_MODE + _COL_WORKER + _COL_ITER + _COL_TASKS + _COL_DEPS + _COL_STATUS
 
+# Mode abbreviations for compact dashboard style
+_MODE_ABBREV: dict[str, str] = {
+    "execute": "exec",
+    "challenge": "chal",
+    "discover": "disc",
+    "generate": "gen",
+}
+# Right-side fixed columns for compact layout: mode(5) + tasks(6) + iter(4) + quality(9) + worker(5) + spacing
+_COL_COMPACT_RIGHT = 30
+
+
+def _format_spec_row_compact(
+    spec: dict[str, Any],
+    columns: int,
+    color: bool = True,
+    selected: bool = False,
+) -> str:
+    """Compact dashboard row: icon + label + mode_abbrev + tasks + quality.
+
+    Used by format_spec_row(style='compact') which is called by render_status
+    in compact mode (i.e., from format_dashboard).
+    """
+    status = spec.get("status", "queued")
+    icon = STATUS_ICONS.get(status, "?")
+
+    qid = spec.get("id", "?")
+    spec_path = spec.get("original_spec_path", spec.get("spec_path", ""))
+    spec_name = os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
+
+    depth = spec.get("_dag_depth", 0)
+    indent = "  " * depth
+
+    # 4 = sel_marker(1) + icon(1) + space(1) + space(1)
+    max_label_len = max(20, columns - _COL_COMPACT_RIGHT - 4)
+    label = f"{indent}{qid} {spec_name}"
+    if len(label) > max_label_len:
+        label = label[: max_label_len - 1] + "\u2026"
+
+    mode = spec.get("mode", "execute")
+    mode_str = _MODE_ABBREV.get(mode, mode[:4])
+
+    tasks_done = spec.get("tasks_done", 0)
+    tasks_total = spec.get("tasks_total", 0)
+    tasks_str = f"{tasks_done}/{tasks_total}" if tasks_total > 0 else "\u2014"
+
+    iteration = spec.get("iteration", 0)
+    iter_str = f"{iteration}i"
+
+    telem = spec.get("_telemetry")
+    quality_compact = "\u2014"
+    if telem:
+        scores = telem.get("quality_score_per_iteration", [])
+        valid = [s for s in scores if s is not None]
+        if valid:
+            from lib.quality import grade as _grade
+
+            latest = valid[-1]
+            quality_compact = f"{_grade(latest)}({latest:.2f})"
+
+    worker = spec.get("last_worker") or ""
+    worker_str = f"  {worker}" if worker and status == "running" else ""
+
+    sel_marker = "\u25b8" if selected else " "  # ▸ or space
+
+    row = (
+        f"{sel_marker}{icon} {label:<{max_label_len}}"
+        f" {mode_str:<5}"
+        f" {tasks_str:>5}"
+        f" {iter_str:>3}"
+        f"  {quality_compact:<9}"
+        f"{worker_str}"
+    )
+
+    if color:
+        status_color = STATUS_COLORS.get(status, "")
+        if selected:
+            if status in ("completed", "canceled"):
+                row = f"{BOLD}{DIM}{row}{NC}"
+            elif status_color:
+                row = f"{BOLD}{status_color}{row}{NC}"
+            else:
+                row = f"{BOLD}{row}{NC}"
+        elif status in ("completed", "canceled"):
+            row = f"{DIM}{row}{NC}"
+        # Non-selected active rows: no whole-row ANSI wrap so grep patterns work
+
+    return row
+
 
 def format_spec_row(
     spec: dict[str, Any],
     columns: int,
     style: str = "default",
     color: bool = True,
+    selected: bool = False,
 ) -> str:
     """Format a single spec entry as a display row at the given width.
 
     style "default": tabular layout (same as standard status output)
     style "dag":     same layout with depth-based indentation (reads spec["_dag_depth"])
+    style "compact": compact dashboard layout with quality column and selection marker
 
     This is the single row formatter called by render_status for all display modes.
     """
+    if style == "compact":
+        return _format_spec_row_compact(spec, columns, color=color, selected=selected)
     col_spec = max(20, columns - _COL_FIXED)
 
     qid = spec.get("id", "?")
@@ -865,11 +960,18 @@ def render_status(
     workers: list[Any] | None = None,
     total_count: int | None = None,
     view_mode: str = "default",
+    style: str = "default",
+    selected_row: int = -1,
+    emit_queue_ids: bool = False,
 ) -> str:
     """Unified status renderer — single entry point for all display modes.
 
     Takes pre-filtered specs (use filter_specs() first), sorts them, and
     renders header + rows + summary footer.
+
+    style "default" or "dag": full tabular layout with column headers.
+    style "compact": compact dashboard layout (no column headers, quality
+        column, selection marker). Called by format_dashboard.
 
     For watch mode, callers should call this in a loop and overwrite the
     screen with cursor-home (no clear) between frames.
@@ -886,6 +988,95 @@ def render_status(
         total_count = len(specs)
 
     lines: list[str] = []
+
+    # ── Compact mode (dashboard) ──────────────────────────────────────────────
+    if style == "compact":
+        # Truly empty queue — no specs at all, not just filtered
+        if not specs and total_count == 0:
+            lines.append(" No specs in queue. Ready to dispatch.")
+            _tw = len(workers)
+            if _tw:
+                lines.append(f" Workers: 0/{_tw} idle")
+            lines.append("")
+            lines.append(" Quick start:")
+            lines.append("   boi dispatch my-spec.md          Dispatch a spec file")
+            lines.append(
+                '   boi do "build a REST API"        Describe what you want (uses AI)'
+            )
+            lines.append("   boi status                       Check progress")
+            lines.append("   boi --help                       See all commands")
+            return "\n".join(lines)
+
+        # Sort — DAG mode embeds _dag_depth into each entry dict
+        _sorted = sort_entries(specs, sort)
+        if sort == "dag":
+            _display: list[dict[str, Any]] = []
+            for _e, _d in _sorted:  # type: ignore[misc]
+                _e["_dag_depth"] = _d
+                _display.append(_e)
+        else:
+            _display = _sorted  # type: ignore[assignment]
+
+        _visible_ids: list[str] = []
+        for _idx, _entry in enumerate(_display):
+            lines.append(
+                format_spec_row(
+                    _entry,
+                    term_w,
+                    style="compact",
+                    color=color,
+                    selected=(_idx == selected_row),
+                )
+            )
+            _visible_ids.append(_entry.get("id", ""))
+
+        # Quality alerts
+        for _al in _get_quality_alerts(specs, color):
+            lines.append(_al)
+
+        # Summary line (compact: "Workers: N/M busy | X running, Y queued")
+        _tw = len(workers)
+        _run = summary.get("running", 0)
+        _q = summary.get("queued", 0) + summary.get("requeued", 0)
+        _fail = summary.get("failed", 0)
+        _done = summary.get("completed", 0)
+        _parts: list[str] = []
+        if _tw:
+            _parts.append(f"Workers: {_run}/{_tw} busy")
+        _cnts = ", ".join(
+            p
+            for p in [
+                f"{_run} running" if _run else "",
+                f"{_q} queued" if _q else "",
+                f"{_fail} failed" if _fail else "",
+                f"{_done} completed" if _done else "",
+            ]
+            if p
+        )
+        if _cnts:
+            _parts.append(_cnts)
+        lines.append(" | ".join(_parts) if _parts else f"Queue: {summary.get('total', 0)}")
+
+        # Showing N of M hint
+        _shown = len(specs)
+        if view_mode != "all" and _shown < total_count:
+            if view_mode == "default":
+                _hint = (
+                    f"Showing {_shown} of {total_count} specs"
+                    " (running + last 6h). Use --all for full history."
+                )
+            else:
+                _hint = f"Showing {_shown} of {total_count} specs. Use --all to see all."
+            if color:
+                _hint = f"{DIM}{_hint}{NC}"
+            lines.append(_hint)
+
+        # Machine-readable footer for dashboard.sh
+        if emit_queue_ids and _visible_ids:
+            lines.append(f"__QUEUE_IDS__:{','.join(_visible_ids)}")
+
+        return "\n".join(lines)
+    # ── End compact mode ──────────────────────────────────────────────────────
 
     header = "BOI"
     if color:
@@ -1376,7 +1567,6 @@ def format_dashboard(
     """
     all_entries = status_data.get("entries", [])
     total_all = len(all_entries)  # total before any filter — used for "Showing N of M"
-    # Single filter function for all display modes
     entries = filter_specs(all_entries, view_mode)
     summary = status_data.get("summary", {})
     workers = status_data.get("workers", [])
@@ -1384,16 +1574,10 @@ def format_dashboard(
     term_w = width if width is not None else get_terminal_width()
     dash_w = max(80, term_w)
 
-    lines: list[str] = []
-
-    # Track filtered entry count (after view filter, before status filter)
-    total_entries = len(entries)
-
-    # Header bar with filter/sort indicators
+    # ── Dashboard-specific header bar (═══ BOI ═══ timestamp ══) ────────────
     now = datetime.now()
     time_str = now.strftime("%H:%M")
     header_text = "\u2550\u2550\u2550 BOI "
-    # Add filter/sort indicators to header
     indicators: list[str] = []
     if filter_status != "all":
         indicators.append(f"filter: {filter_status}")
@@ -1402,22 +1586,19 @@ def format_dashboard(
     if not show_completed:
         indicators.append("completed: hidden")
     if indicators:
-        indicator_str = " [" + "] [".join(indicators) + "] "
-        header_text += indicator_str
+        header_text += " [" + "] [".join(indicators) + "] "
     right = f" {time_str} \u2550\u2550"
-    fill_len = dash_w - len(header_text) - len(right)
-    if fill_len < 1:
-        fill_len = 1
+    fill_len = max(1, dash_w - len(header_text) - len(right))
     header_line = header_text + ("\u2550" * fill_len) + right
     if color:
         header_line = f"{BOLD}{header_line}{NC}"
-    lines.append(header_line)
 
+    # Handle empty queue (after view filter, before secondary filter)
     if not entries:
+        lines: list[str] = [header_line]
         lines.append(" No specs in queue. Ready to dispatch.")
-        total_workers = len(workers)
-        if total_workers:
-            lines.append(f" Workers: 0/{total_workers} idle")
+        if workers:
+            lines.append(f" Workers: 0/{len(workers)} idle")
         lines.append("")
         lines.append(" Quick start:")
         lines.append("   boi dispatch my-spec.md          Dispatch a spec file")
@@ -1428,176 +1609,38 @@ def format_dashboard(
         lines.append("   boi --help                       See all commands")
         return "\n".join(lines)
 
-    # Mode abbreviations for compact display
-    mode_abbrev: dict[str, str] = {
-        "execute": "exec",
-        "challenge": "chal",
-        "discover": "disc",
-        "generate": "gen",
-    }
-
-    # Fixed right-side columns: mode(5) + tasks(6) + iter(4) + quality(9) + worker(5) + spacing
-    # We calculate the label (qid + spec_name) width as flexible
-    RIGHT_FIXED = 30  # approximate space for mode, tasks, iter, quality, worker
-    max_label_len = max(20, dash_w - RIGHT_FIXED - 4)  # 4 = icon + spaces
-
-    # Sort entries for display using the requested sort mode
-    sorted_result = sort_entries(entries, sort_mode)
-
-    # Build display rows: for DAG mode, entries come with depth for indentation
-    display_items: list[tuple[dict[str, Any], int]] = []
-    if sort_mode == "dag":
-        # sort_entries returns list[(entry, depth)] for dag mode
-        display_items = sorted_result  # type: ignore[assignment]
-    else:
-        display_items = [(e, 0) for e in sorted_result]  # type: ignore[misc]
-
-    # Apply secondary status filter via unified filter_entries (removes duplicate inline logic)
+    # Apply secondary interactive filter (tmux dashboard filter_status / show_completed)
     if filter_status != "all" or not show_completed:
-        filtered_entries = filter_entries(
-            [e for e, _ in display_items],
+        entries = _apply_status_filter(
+            entries,
             filter_status=filter_status,
             show_completed=show_completed,
         )
-        filtered_entry_ids = {e.get("id") for e in filtered_entries}
-        filtered_items: list[tuple[dict[str, Any], int]] = [
-            (e, d) for e, d in display_items if e.get("id") in filtered_entry_ids
-        ]
-    else:
-        filtered_items = display_items
-
-    shown_count = len(filtered_items)
 
     # Clamp selected_row to valid range
+    shown_count = len(entries)
     if shown_count > 0:
         selected_row = max(0, min(selected_row, shown_count - 1))
     else:
         selected_row = 0
 
-    # Track queue IDs in display order for row-to-id mapping
-    visible_queue_ids: list[str] = []
+    # Delegate core table output to unified renderer
+    body = render_status(
+        entries,
+        sort=sort_mode,
+        watch=False,
+        columns=dash_w,
+        color=color,
+        summary=summary,
+        workers=workers,
+        total_count=total_all,
+        view_mode=view_mode,
+        style="compact",
+        selected_row=selected_row,
+        emit_queue_ids=True,
+    )
 
-    for row_idx, (entry, depth) in enumerate(filtered_items):
-        status = entry.get("status", "queued")
-        icon = STATUS_ICONS.get(status, "?")
-
-        qid = entry.get("id", "?")
-        visible_queue_ids.append(qid)
-        spec_path = entry.get("original_spec_path", entry.get("spec_path", ""))
-        spec_name = (
-            os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
-        )
-        # DAG indentation: 2 spaces per depth level
-        indent = "  " * depth if sort_mode == "dag" else ""
-        # Truncate spec name if needed (with ellipsis)
-        label = f"{indent}{qid} {spec_name}"
-        effective_max = max_label_len
-        if len(label) > effective_max:
-            label = label[: effective_max - 1] + "\u2026"
-
-        mode = entry.get("mode", "execute")
-        mode_str = mode_abbrev.get(mode, mode[:4])
-
-        tasks_done = entry.get("tasks_done", 0)
-        tasks_total = entry.get("tasks_total", 0)
-        tasks_str = f"{tasks_done}/{tasks_total}" if tasks_total > 0 else "\u2014"
-
-        iteration = entry.get("iteration", 0)
-        iter_str = f"{iteration}i"
-
-        # Quality compact display
-        telem = entry.get("_telemetry")
-        quality_compact = "\u2014"
-        if telem:
-            scores = telem.get("quality_score_per_iteration", [])
-            valid = [s for s in scores if s is not None]
-            if valid:
-                from lib.quality import grade as _grade
-
-                latest = valid[-1]
-                quality_compact = f"{_grade(latest)}({latest:.2f})"
-
-        worker = entry.get("last_worker") or ""
-        worker_str = f"  {worker}" if worker and status == "running" else ""
-
-        # Row selection indicator
-        is_selected = row_idx == selected_row
-        sel_marker = "\u25b8" if is_selected else " "  # ▸ or space
-
-        # Build row with fixed-width columns
-        row = (
-            f"{sel_marker}{icon} {label:<{effective_max}}"
-            f" {mode_str:<5}"
-            f" {tasks_str:>5}"
-            f" {iter_str:>3}"
-            f"  {quality_compact:<9}"
-            f"{worker_str}"
-        )
-
-        if color:
-            status_color = STATUS_COLORS.get(status, "")
-            if is_selected:
-                # Selected row: bold with status color
-                if status in ("completed", "canceled"):
-                    row = f"{BOLD}{DIM}{row}{NC}"
-                elif status_color:
-                    row = f"{BOLD}{status_color}{row}{NC}"
-                else:
-                    row = f"{BOLD}{row}{NC}"
-            elif status in ("completed", "canceled"):
-                row = f"{DIM}{row}{NC}"
-            # Non-selected active rows: no whole-row ANSI wrap so that
-            # the row starts with plain sel_marker + icon for grep patterns.
-
-        lines.append(row)
-
-    # Quality alerts (compact)
-    alert_lines = _get_quality_alerts(entries, color)
-    if alert_lines:
-        for al in alert_lines:
-            lines.append(al)
-
-    # Summary line
-    total_workers = len(workers)
-    running = summary.get("running", 0)
-    total_specs = summary.get("total", 0)
-
-    parts: list[str] = []
-    if total_workers:
-        parts.append(f"Workers: {running}/{total_workers} busy")
-    parts_count = ", ".join(filter(None, [
-        f"{summary.get('running', 0)} running" if summary.get("running") else "",
-        f"{summary.get('queued', 0) + summary.get('requeued', 0)} queued" if summary.get("queued", 0) + summary.get("requeued", 0) else "",
-        f"{summary.get('failed', 0)} failed" if summary.get("failed") else "",
-        f"{summary.get('completed', 0)} completed" if summary.get("completed") else "",
-    ]))
-    if parts_count:
-        parts.append(parts_count)
-    summary_line = " | ".join(parts) if parts else f"Queue: {total_specs}"
-    lines.append(summary_line)
-
-    # "Showing N of M" hint when view filter hides entries (same as format_queue_table)
-    if view_mode != "all" and shown_count < total_all:
-        if view_mode == "default":
-            showing_hint = (
-                f"Showing {shown_count} of {total_all} specs"
-                " (running + last 6h). Use --all for full history."
-            )
-        else:
-            showing_hint = (
-                f"Showing {shown_count} of {total_all} specs."
-                " Use --all to see all."
-            )
-        if color:
-            showing_hint = f"{DIM}{showing_hint}{NC}"
-        lines.append(showing_hint)
-
-    # Emit visible queue IDs as a machine-readable footer line for dashboard.sh
-    # Format: __QUEUE_IDS__:q-001,q-002,q-003
-    if visible_queue_ids:
-        lines.append(f"__QUEUE_IDS__:{','.join(visible_queue_ids)}")
-
-    return "\n".join(lines)
+    return header_line + "\n" + body
 
 
 def get_visible_queue_ids(

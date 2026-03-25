@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lib.status import filter_entries, format_dashboard
+from lib.status import _apply_status_filter, format_dashboard
 
 
 def _make_entry(
@@ -56,7 +56,7 @@ def _make_status_data(entries: list[dict]) -> dict:
 
 
 class TestFilterEntries(unittest.TestCase):
-    """Test the filter_entries() function directly."""
+    """Test the _apply_status_filter() function directly."""
 
     def _entries(self):
         return [
@@ -71,33 +71,33 @@ class TestFilterEntries(unittest.TestCase):
 
     def test_filter_all_returns_everything(self):
         entries = self._entries()
-        result = filter_entries(entries, filter_status="all")
+        result = _apply_status_filter(entries, filter_status="all")
         self.assertEqual(len(result), 7)
 
     def test_filter_running(self):
         entries = self._entries()
-        result = filter_entries(entries, filter_status="running")
+        result = _apply_status_filter(entries, filter_status="running")
         statuses = {e["status"] for e in result}
         self.assertTrue(statuses <= {"running", "requeued"})
         self.assertEqual(len(result), 2)  # q-001 (running) + q-006 (requeued)
 
     def test_filter_queued(self):
         entries = self._entries()
-        result = filter_entries(entries, filter_status="queued")
+        result = _apply_status_filter(entries, filter_status="queued")
         statuses = {e["status"] for e in result}
         self.assertTrue(statuses <= {"queued", "needs_review", "failed"})
         self.assertEqual(len(result), 3)  # q-002, q-005, q-007
 
     def test_filter_completed(self):
         entries = self._entries()
-        result = filter_entries(entries, filter_status="completed")
+        result = _apply_status_filter(entries, filter_status="completed")
         statuses = {e["status"] for e in result}
         self.assertTrue(statuses <= {"completed", "canceled"})
         self.assertEqual(len(result), 2)  # q-003, q-004
 
     def test_show_completed_false_hides_completed_and_canceled(self):
         entries = self._entries()
-        result = filter_entries(entries, filter_status="all", show_completed=False)
+        result = _apply_status_filter(entries, filter_status="all", show_completed=False)
         statuses = {e["status"] for e in result}
         self.assertNotIn("completed", statuses)
         self.assertNotIn("canceled", statuses)
@@ -105,27 +105,27 @@ class TestFilterEntries(unittest.TestCase):
 
     def test_show_completed_false_with_filter_running(self):
         entries = self._entries()
-        result = filter_entries(entries, filter_status="running", show_completed=False)
+        result = _apply_status_filter(entries, filter_status="running", show_completed=False)
         # show_completed=False has no effect when filtering to running
         self.assertEqual(len(result), 2)
 
     def test_show_completed_false_with_filter_completed_returns_nothing(self):
         entries = self._entries()
         # show_completed=False removes completed/canceled, then filter asks for completed only
-        result = filter_entries(
+        result = _apply_status_filter(
             entries, filter_status="completed", show_completed=False
         )
         self.assertEqual(len(result), 0)
 
     def test_empty_entries(self):
-        result = filter_entries([], filter_status="running")
+        result = _apply_status_filter([], filter_status="running")
         self.assertEqual(result, [])
 
     def test_all_same_status(self):
         entries = [_make_entry(f"q-{i:03d}", status="running") for i in range(5)]
-        result = filter_entries(entries, filter_status="running")
+        result = _apply_status_filter(entries, filter_status="running")
         self.assertEqual(len(result), 5)
-        result = filter_entries(entries, filter_status="queued")
+        result = _apply_status_filter(entries, filter_status="queued")
         self.assertEqual(len(result), 0)
 
 

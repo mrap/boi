@@ -158,7 +158,10 @@ class Worker:
         else:
             self.state_dir = state_dir
 
-        self.worker_id = worker_id or os.environ.get("WORKER_ID", "")
+        if worker_id is None:
+            self.worker_id = os.environ.get("WORKER_ID", "")
+        else:
+            self.worker_id = worker_id
 
         # Derived paths
         self.queue_dir = os.path.join(self.state_dir, "queue")

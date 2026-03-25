@@ -1058,13 +1058,18 @@ class Daemon:
 
     @staticmethod
     def _extract_target_repo(spec_path: str) -> str:
-        """Extract the target repo path from a spec file's 'Target:' field."""
+        """Extract the target repo path from a spec file's 'Target repo:' or 'Target:' field."""
+        _PREFIXES = ("**Target repo:**", "**Target:**")
         try:
             content = Path(spec_path).read_text(encoding="utf-8")
             for line in content.splitlines():
                 stripped = line.strip()
-                if stripped.startswith("**Target:**"):
-                    return stripped.split("**Target:**", 1)[1].strip()
+                for prefix in _PREFIXES:
+                    if stripped.startswith(prefix):
+                        value = stripped[len(prefix):].strip().strip("`").strip()
+                        if value.startswith("~"):
+                            value = str(Path(value).expanduser())
+                        return value
         except Exception:
             pass
         return ""
