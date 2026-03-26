@@ -256,6 +256,7 @@ cmd_dispatch() {
     local project=""
     local experiment_budget=""
     local after=""
+    local source="mike"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -311,6 +312,11 @@ cmd_dispatch() {
             --after)
                 [[ -z "${2:-}" ]] && die_usage "--after requires one or more queue IDs (e.g. q-001 or q-001,q-002)"
                 after="$2"
+                shift 2
+                ;;
+            --source)
+                [[ -z "${2:-}" ]] && die_usage "--source requires a value (e.g. mike, hex:auto-dispatch)"
+                source="$2"
                 shift 2
                 ;;
             --dry-run)
@@ -481,7 +487,7 @@ PYEOF
     fi
 
     local result
-    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${mode}" "${project}" "${experiment_budget}" "${after}" <<'PYEOF'
+    result=$(BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${input_file}" "${QUEUE_DIR}" "${priority}" "${max_iter}" "${worktree_arg}" "${timeout}" "${mode}" "${project}" "${experiment_budget}" "${after}" "${source}" <<'PYEOF'
 import sys, os, json
 sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
 from lib.cli_ops import dispatch
@@ -497,6 +503,7 @@ mode = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] else "execute"
 project_name = sys.argv[8] if len(sys.argv) > 8 and sys.argv[8] else None
 experiment_budget_str = sys.argv[9] if len(sys.argv) > 9 and sys.argv[9] else None
 after_str = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else ""
+source_val = sys.argv[11] if len(sys.argv) > 11 and sys.argv[11] else "mike"
 
 # Parse --after CLI flag (comma-separated queue IDs)
 blocked_by_cli = [d.strip() for d in after_str.split(",") if d.strip()] if after_str else []
@@ -536,6 +543,7 @@ try:
         project=project_name,
         experiment_budget=int(experiment_budget_str) if experiment_budget_str else None,
         blocked_by=blocked_by if blocked_by else None,
+        source=source_val,
     )
     print(json.dumps(result))
 except DuplicateSpecError as e:

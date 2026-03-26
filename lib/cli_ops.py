@@ -29,6 +29,29 @@ def _get_db(queue_dir: str) -> Database:
     return Database(db_path, queue_dir)
 
 
+def _emit_dispatched_event(spec_id: str, source: str) -> None:
+    """Fire-and-forget: emit boi.spec.dispatched to hex-events.
+
+    Silently ignores all errors — BOI must never fail because hex-events
+    is down or missing.
+    """
+    try:
+        import json as _json
+
+        hex_emit = os.path.expanduser("~/.hex-events/hex_emit.py")
+        if not os.path.exists(hex_emit):
+            return
+
+        payload = {"spec_id": spec_id, "source": source}
+        subprocess.Popen(
+            ["python3", hex_emit, "boi.spec.dispatched", _json.dumps(payload), source],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
 def dispatch(
     queue_dir: str,
     spec_path: str,
@@ -40,6 +63,7 @@ def dispatch(
     project: Optional[str] = None,
     experiment_budget: Optional[int] = None,
     blocked_by: Optional[list[str]] = None,
+    source: str = "mike",
 ) -> dict[str, Any]:
     """Enqueue a spec into the SQLite database.
 
@@ -89,6 +113,8 @@ def dispatch(
         updates["experiment_invocations_used"] = 0
 
         db.update_spec_fields(spec_id, **updates)
+
+        _emit_dispatched_event(spec_id, source)
 
         return {
             "id": spec_id,
