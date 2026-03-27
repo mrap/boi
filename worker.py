@@ -670,6 +670,9 @@ class Worker:
 # Runs inside a tmux session. Do not edit manually.
 set -uo pipefail
 
+# Ensure PATH includes common tool locations (needed when launched via launchd)
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 # ── Config (baked in at generation time) ──────────────────────────────────
 _BOI_SCRIPT_DIR="{SCRIPT_DIR}"
 _SPEC_PATH="{self.spec_path}"

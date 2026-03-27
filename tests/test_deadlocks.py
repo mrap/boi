@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lib.daemon_ops import (
+    CompletionContext,
     process_critic_completion,
     process_worker_completion,
     self_heal,
@@ -55,6 +56,14 @@ class DeadlockTestCase(unittest.TestCase):
         # Create SQLite database
         db_path = os.path.join(self.boi_state, "boi.db")
         self.db = Database(db_path, self.queue_dir)
+        self.ctx = CompletionContext(
+            queue_dir=self.queue_dir,
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            log_dir=self.log_dir,
+            script_dir=self.script_dir,
+            db=self.db,
+        )
 
     def tearDown(self):
         self.db.close()
@@ -400,14 +409,9 @@ class TestZeroPendingCompletion(DeadlockTestCase):
         self._db_set_running(qid, "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=qid,
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "completed")
@@ -442,14 +446,9 @@ class TestCriticReviewHandled(DeadlockTestCase):
         )
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=qid,
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "critic_review")
@@ -571,14 +570,9 @@ class TestDeletedSpecFile(DeadlockTestCase):
 
         # process_worker_completion with exit_code=0 should handle missing spec
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=qid,
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
-            db=self.db,
         )
 
         # Should complete (0 pending since spec can't be read) or handle gracefully

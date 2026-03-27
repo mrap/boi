@@ -5,9 +5,9 @@
 # during refactoring — not to test ideal behavior.
 #
 # Coverage targets (all file-based / non-DB path):
-#   - process_decomposition_completion  (CC=14, 0 file-based tests before t-2)
-#   - process_evaluation_completion     (CC=17, 0 file-based tests before t-2)
-#   - check_needs_review_timeouts       (CC=14, 0 file-based tests before t-2)
+#   - process_decomposition_completion  (CC=14, 0 file-based tests before t-2, db=self.db)
+#   - process_evaluation_completion     (CC=17, 0 file-based tests before t-2, db=self.db)
+#   - check_needs_review_timeouts       (CC=14, 0 file-based tests before t-2, db=self.db)
 #
 # Uses stdlib unittest only. No live API calls, no real worktrees.
 
@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.db import Database
 
 from lib.daemon_ops import (
     check_needs_review_timeouts,
@@ -124,8 +126,13 @@ class DecompositionTestCase(unittest.TestCase):
         self.events_dir = os.path.join(self.boi_state, "events")
         os.makedirs(self.queue_dir)
         os.makedirs(self.events_dir)
+        # Create SQLite database
+        db_path = os.path.join(self.boi_state, "boi.db")
+        self.db = Database(db_path, self.queue_dir)
+
 
     def tearDown(self):
+        self.db.close()
         self._tmpdir.cleanup()
 
     def _make_spec(self, content: str) -> str:
@@ -134,17 +141,15 @@ class DecompositionTestCase(unittest.TestCase):
         return path
 
     def _enqueue(self, spec_path: str) -> dict:
-        entry = enqueue(self.queue_dir, spec_path)
-        # Put into decompose phase (file-based path uses _write_entry directly)
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["phase"] = "decompose"
-        _write_entry(self.queue_dir, e)
-        set_running(self.queue_dir, entry["id"], "w-1")
-        return e
+        entry = self.db.enqueue(spec_path)
+        # Put into decompose phase via DB
+        self.db.update_spec_fields(entry["id"], phase="decompose")
+        self.db.set_running(entry["id"], "w-1", phase="decompose")
+        return self.db.get_spec(entry["id"])
 
 
 class TestProcessDecompositionCompletion(DecompositionTestCase):
-    """Characterization tests for process_decomposition_completion() file-based path."""
+    """Characterization tests for process_decomposition_completion(db=self.db) file-based path."""
 
     def test_crash_first_attempt_retries(self):
         """First crash → decomposition_retry (retry_count becomes 1)."""
@@ -156,14 +161,15 @@ class TestProcessDecompositionCompletion(DecompositionTestCase):
             queue_id=entry["id"],
             events_dir=self.events_dir,
             spec_path=spec_path,
-            exit_code=None,  # crash
+            exit_code=None,  # crash,
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "decomposition_retry")
         self.assertEqual(result["phase"], "decompose")
         self.assertEqual(result["retry_count"], 1)
         # Queue entry should be requeued
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "requeued")
         self.assertEqual(updated["decomposition_retries"], 1)
 
@@ -172,9 +178,7 @@ class TestProcessDecompositionCompletion(DecompositionTestCase):
         spec_path = self._make_spec(VALID_DECOMPOSED_SPEC)
         entry = self._enqueue(spec_path)
         # Simulate already having retried once
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["decomposition_retries"] = 1
-        _write_entry(self.queue_dir, e)
+        self.db.update_spec_fields(entry["id"], decomposition_retries=1)
 
         result = process_decomposition_completion(
             queue_dir=self.queue_dir,
@@ -182,10 +186,12 @@ class TestProcessDecompositionCompletion(DecompositionTestCase):
             events_dir=self.events_dir,
             spec_path=spec_path,
             exit_code=None,
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "decomposition_failed")
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "failed")
 
     def test_nonzero_exit_code_retries(self):
@@ -199,6 +205,8 @@ class TestProcessDecompositionCompletion(DecompositionTestCase):
             events_dir=self.events_dir,
             spec_path=spec_path,
             exit_code="1",
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "decomposition_retry")
@@ -214,13 +222,15 @@ class TestProcessDecompositionCompletion(DecompositionTestCase):
             events_dir=self.events_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "decomposition_complete")
         self.assertEqual(result["phase"], "execute")
         self.assertEqual(result["task_count"], 3)
         # Queue entry should be requeued for execute phase
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "requeued")
         self.assertEqual(updated["phase"], "execute")
 
@@ -250,6 +260,8 @@ class TestProcessDecompositionCompletion(DecompositionTestCase):
             events_dir=self.events_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "decomposition_retry")
@@ -292,6 +304,8 @@ class TestProcessDecompositionCompletion(DecompositionTestCase):
             events_dir=self.events_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "decomposition_retry")
@@ -307,6 +321,8 @@ class TestProcessDecompositionCompletion(DecompositionTestCase):
             events_dir=self.events_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "error")
@@ -322,6 +338,8 @@ class TestProcessDecompositionCompletion(DecompositionTestCase):
             events_dir=self.events_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         events = list(Path(self.events_dir).glob("event-*.json"))
@@ -345,8 +363,13 @@ class EvaluationTestCase(unittest.TestCase):
         os.makedirs(self.queue_dir)
         os.makedirs(self.events_dir)
         os.makedirs(self.hooks_dir)
+        # Create SQLite database
+        db_path = os.path.join(self.boi_state, "boi.db")
+        self.db = Database(db_path, self.queue_dir)
+
 
     def tearDown(self):
+        self.db.close()
         self._tmpdir.cleanup()
 
     def _make_spec(self, content: str, name: str = "spec.md") -> str:
@@ -355,21 +378,19 @@ class EvaluationTestCase(unittest.TestCase):
         return path
 
     def _enqueue_generate(self, spec_path: str, iteration: int = 1, max_iterations: int = 10) -> dict:
-        entry = enqueue(self.queue_dir, spec_path)
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["phase"] = "evaluate"
-        e["mode"] = "generate"
-        e["iteration"] = iteration
-        e["max_iterations"] = max_iterations
-        e["tasks_done"] = 1
-        e["tasks_total"] = 2
-        _write_entry(self.queue_dir, e)
-        set_running(self.queue_dir, entry["id"], "w-1")
-        return e
+        entry = self.db.enqueue(spec_path)
+        # Update fields via DB
+        self.db.conn.execute(
+            "UPDATE specs SET phase='evaluate', iteration=?, max_iterations=?, tasks_done=1, tasks_total=2 WHERE id=?",
+            (iteration, max_iterations, entry["id"]),
+        )
+        self.db.conn.commit()
+        self.db.set_running(entry["id"], "w-1", phase="evaluate")
+        return self.db.get_spec(entry["id"])
 
 
 class TestProcessEvaluationCompletion(EvaluationTestCase):
-    """Characterization tests for process_evaluation_completion() file-based path."""
+    """Characterization tests for process_evaluation_completion(db=self.db) file-based path."""
 
     def test_crash_requeues_for_retry(self):
         """Crash on first attempt → evaluate_crashed, requeued."""
@@ -383,10 +404,12 @@ class TestProcessEvaluationCompletion(EvaluationTestCase):
             hooks_dir=self.hooks_dir,
             spec_path=spec_path,
             exit_code=None,
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "evaluate_crashed")
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         # After first crash, should be requeued for retry
         self.assertIn(updated["status"], ("requeued", "failed"))
 
@@ -395,10 +418,8 @@ class TestProcessEvaluationCompletion(EvaluationTestCase):
         spec_path = self._make_spec(GENERATE_SPEC_ALL_MET)
         entry = self._enqueue_generate(spec_path)
         # Simulate max consecutive failures
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["consecutive_failures"] = 4
-        _write_entry(self.queue_dir, e)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        self.db.update_spec_fields(entry["id"], consecutive_failures=4)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_evaluation_completion(
             queue_dir=self.queue_dir,
@@ -407,11 +428,13 @@ class TestProcessEvaluationCompletion(EvaluationTestCase):
             hooks_dir=self.hooks_dir,
             spec_path=spec_path,
             exit_code=None,
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "evaluate_crashed")
         self.assertEqual(result.get("reason"), "consecutive_failures")
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "failed")
 
     def test_all_criteria_met_converges(self):
@@ -426,10 +449,12 @@ class TestProcessEvaluationCompletion(EvaluationTestCase):
             hooks_dir=self.hooks_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         self.assertIn(result["outcome"], ("evaluate_converged",))
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "completed")
 
     def test_unmet_criteria_with_pending_tasks_loops_back(self):
@@ -444,11 +469,13 @@ class TestProcessEvaluationCompletion(EvaluationTestCase):
             hooks_dir=self.hooks_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "evaluate_loop_back")
         self.assertEqual(result["phase"], "execute")
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "requeued")
         self.assertEqual(updated["phase"], "execute")
 
@@ -465,11 +492,13 @@ class TestProcessEvaluationCompletion(EvaluationTestCase):
             hooks_dir=self.hooks_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "evaluate_converged")
         self.assertEqual(result.get("status"), "max_iterations")
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "completed")
 
     def test_missing_entry_returns_error(self):
@@ -483,6 +512,8 @@ class TestProcessEvaluationCompletion(EvaluationTestCase):
             hooks_dir=self.hooks_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "error")
@@ -499,6 +530,8 @@ class TestProcessEvaluationCompletion(EvaluationTestCase):
             hooks_dir=self.hooks_dir,
             spec_path=spec_path,
             exit_code="0",
+        
+            db=self.db,
         )
 
         events = list(Path(self.events_dir).glob("event-*.json"))
@@ -519,8 +552,13 @@ class NeedsReviewTimeoutTestCase(unittest.TestCase):
         self.events_dir = os.path.join(self.boi_state, "events")
         os.makedirs(self.queue_dir)
         os.makedirs(self.events_dir)
+        # Create SQLite database
+        db_path = os.path.join(self.boi_state, "boi.db")
+        self.db = Database(db_path, self.queue_dir)
+
 
     def tearDown(self):
+        self.db.close()
         self._tmpdir.cleanup()
 
     def _make_spec(self, content: str) -> str:
@@ -536,26 +574,22 @@ class NeedsReviewTimeoutTestCase(unittest.TestCase):
         """Create a queue entry in needs_review status with needs_review_since set."""
         spec_path = self._make_spec("# Spec\n\n## Tasks\n\n### t-1: Task\nPENDING\n\n**Spec:** x\n\n**Verify:** true\n")
         past_time = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
-        entry = {
-            "id": queue_id,
-            "spec_path": spec_path,
-            "status": "needs_review",
-            "needs_review_since": past_time.isoformat(),
-            "priority": 100,
-            "iteration": 1,
-            "max_iterations": 30,
-            "blocked_by": [],
-            "consecutive_failures": 0,
-            "tasks_done": 1,
-            "tasks_total": 2,
-            "submitted_at": past_time.isoformat(),
-        }
-        _write_entry(self.queue_dir, entry)
-        return entry
+        # Enqueue via DB and update to needs_review status
+        entry = self.db.enqueue(spec_path)
+        # Override the ID to match what tests expect (q-001, q-006, etc)
+        self.db.conn.execute("UPDATE specs SET id=? WHERE id=?", (queue_id, entry["id"]))
+        self.db.conn.commit()
+        # Set to needs_review status with backdated needs_review_since
+        self.db.conn.execute(
+            "UPDATE specs SET status='needs_review', needs_review_since=?, submitted_at=? WHERE id=?",
+            (past_time.isoformat(), past_time.isoformat(), queue_id),
+        )
+        self.db.conn.commit()
+        return self.db.get_spec(queue_id)
 
 
 class TestCheckNeedsReviewTimeouts(NeedsReviewTimeoutTestCase):
-    """Characterization tests for check_needs_review_timeouts() file-based path."""
+    """Characterization tests for check_needs_review_timeouts(db=self.db) file-based path."""
 
     def test_no_needs_review_specs_returns_empty(self):
         """With no needs_review specs, returns empty list."""
@@ -563,6 +597,8 @@ class TestCheckNeedsReviewTimeouts(NeedsReviewTimeoutTestCase):
             queue_dir=self.queue_dir,
             events_dir=self.events_dir,
             state_dir=self.boi_state,
+        
+            db=self.db,
         )
 
         self.assertEqual(result, [])
@@ -570,13 +606,15 @@ class TestCheckNeedsReviewTimeouts(NeedsReviewTimeoutTestCase):
     def test_non_needs_review_specs_are_ignored(self):
         """Specs with other statuses are not auto-rejected."""
         spec_path = self._make_spec("# Spec\n\n## Tasks\n")
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         # Entry is in 'queued' status, not needs_review
 
         result = check_needs_review_timeouts(
             queue_dir=self.queue_dir,
             events_dir=self.events_dir,
             state_dir=self.boi_state,
+        
+            db=self.db,
         )
 
         self.assertEqual(result, [])
@@ -590,13 +628,15 @@ class TestCheckNeedsReviewTimeouts(NeedsReviewTimeoutTestCase):
             queue_dir=self.queue_dir,
             events_dir=self.events_dir,
             state_dir=self.boi_state,
+        
+            db=self.db,
         )
 
         self.assertIn("q-001", result)
-        updated = _read_entry(self.queue_dir, "q-001")
+        updated = self.db.get_spec("q-001")
         self.assertEqual(updated["status"], "requeued")
-        # needs_review_since should be cleared
-        self.assertNotIn("needs_review_since", updated)
+        # needs_review_since should be cleared (None in DB)
+        self.assertIsNone(updated.get("needs_review_since"))
 
     def test_not_timed_out_spec_is_untouched(self):
         """needs_review spec within timeout → not auto-rejected."""
@@ -607,10 +647,12 @@ class TestCheckNeedsReviewTimeouts(NeedsReviewTimeoutTestCase):
             queue_dir=self.queue_dir,
             events_dir=self.events_dir,
             state_dir=self.boi_state,
+        
+            db=self.db,
         )
 
         self.assertNotIn("q-002", result)
-        updated = _read_entry(self.queue_dir, "q-002")
+        updated = self.db.get_spec("q-002")
         self.assertEqual(updated["status"], "needs_review")
 
     def test_timed_out_spec_writes_event(self):
@@ -621,6 +663,8 @@ class TestCheckNeedsReviewTimeouts(NeedsReviewTimeoutTestCase):
             queue_dir=self.queue_dir,
             events_dir=self.events_dir,
             state_dir=self.boi_state,
+        
+            db=self.db,
         )
 
         events = list(Path(self.events_dir).glob("event-*.json"))
@@ -641,6 +685,8 @@ class TestCheckNeedsReviewTimeouts(NeedsReviewTimeoutTestCase):
             queue_dir=self.queue_dir,
             events_dir=self.events_dir,
             state_dir=self.boi_state,
+        
+            db=self.db,
         )
 
         self.assertIn("q-004", result)
@@ -668,6 +714,8 @@ class TestCheckNeedsReviewTimeouts(NeedsReviewTimeoutTestCase):
             queue_dir=self.queue_dir,
             events_dir=self.events_dir,
             state_dir=self.boi_state,
+        
+            db=self.db,
         )
 
         self.assertNotIn("q-005", result)
@@ -675,31 +723,14 @@ class TestCheckNeedsReviewTimeouts(NeedsReviewTimeoutTestCase):
     def test_multiple_timed_out_specs_all_rejected(self):
         """Multiple timed-out specs are all auto-rejected in one call."""
         self._make_needs_review_entry(queue_id="q-006", hours_ago=30.0)
-
-        # Second entry
-        past = datetime.now(timezone.utc) - timedelta(hours=26)
-        spec2 = os.path.join(self._tmpdir.name, "spec2.md")
-        Path(spec2).write_text("# Spec\n\n## Tasks\n", encoding="utf-8")
-        entry2 = {
-            "id": "q-007",
-            "spec_path": spec2,
-            "status": "needs_review",
-            "needs_review_since": past.isoformat(),
-            "priority": 100,
-            "iteration": 1,
-            "max_iterations": 30,
-            "blocked_by": [],
-            "consecutive_failures": 0,
-            "tasks_done": 0,
-            "tasks_total": 1,
-            "submitted_at": past.isoformat(),
-        }
-        _write_entry(self.queue_dir, entry2)
+        self._make_needs_review_entry(queue_id="q-007", hours_ago=26.0)
 
         result = check_needs_review_timeouts(
             queue_dir=self.queue_dir,
             events_dir=self.events_dir,
             state_dir=self.boi_state,
+        
+            db=self.db,
         )
 
         self.assertIn("q-006", result)
@@ -758,6 +789,10 @@ class CriticCompletionTestCase(unittest.TestCase):
         os.makedirs(self.queue_dir)
         os.makedirs(self.events_dir)
         os.makedirs(self.hooks_dir)
+        # Create SQLite database
+        db_path = os.path.join(self.boi_state, "boi.db")
+        self.db = Database(db_path, self.queue_dir)
+
 
         # Disable critic config so queue helpers don't fail
         critic_dir = os.path.join(self.boi_state, "critic")
@@ -768,6 +803,7 @@ class CriticCompletionTestCase(unittest.TestCase):
         )
 
     def tearDown(self):
+        self.db.close()
         self._tmpdir.cleanup()
 
     def _make_spec(self, content: str) -> str:
@@ -776,13 +812,13 @@ class CriticCompletionTestCase(unittest.TestCase):
         return path
 
     def _enqueue_entry(self, spec_path: str) -> dict:
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
-        return _read_entry(self.queue_dir, entry["id"])
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
+        return self.db.get_spec(entry["id"])
 
 
 class TestProcessCriticCompletion(CriticCompletionTestCase):
-    """Characterization tests for process_critic_completion() (CC=16)."""
+    """Characterization tests for process_critic_completion(db=self.db) (CC=16)."""
 
     def test_critic_approved_returns_approved_outcome(self):
         """Spec with ## Critic Approved → outcome is 'critic_approved'."""
@@ -797,6 +833,8 @@ class TestProcessCriticCompletion(CriticCompletionTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=entry["spec_path"],
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "critic_approved")
@@ -814,9 +852,11 @@ class TestProcessCriticCompletion(CriticCompletionTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=entry["spec_path"],
+        
+            db=self.db,
         )
 
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "completed")
 
     def test_critic_tasks_added_requeues(self):
@@ -832,10 +872,12 @@ class TestProcessCriticCompletion(CriticCompletionTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=entry["spec_path"],
+        
+            db=self.db,
         )
 
         self.assertIn(result["outcome"], ("critic_tasks_added", "requeued"))
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "requeued")
 
     def test_critic_passes_incremented(self):
@@ -852,10 +894,12 @@ class TestProcessCriticCompletion(CriticCompletionTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=entry["spec_path"],
+        
+            db=self.db,
         )
 
         # critic_passes should have incremented by 1
-        updated = _read_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual((updated.get("critic_passes") or 0), initial + 1)
 
     def test_missing_entry_returns_error(self):
@@ -870,6 +914,8 @@ class TestProcessCriticCompletion(CriticCompletionTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=spec_path,
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "error")
@@ -888,6 +934,8 @@ class TestProcessCriticCompletion(CriticCompletionTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path="/nonexistent/spec.md",
+        
+            db=self.db,
         )
 
         # Should not raise; should return a valid outcome
@@ -906,8 +954,13 @@ class SelfHealTestCase(unittest.TestCase):
         self.boi_state = self._tmpdir.name
         self.queue_dir = os.path.join(self.boi_state, "queue")
         os.makedirs(self.queue_dir)
+        # Create SQLite database
+        db_path = os.path.join(self.boi_state, "boi.db")
+        self.db = Database(db_path, self.queue_dir)
+
 
     def tearDown(self):
+        self.db.close()
         self._tmpdir.cleanup()
 
     def _make_spec(self) -> str:
@@ -920,16 +973,16 @@ class SelfHealTestCase(unittest.TestCase):
 
 
 class TestSelfHeal(SelfHealTestCase):
-    """Characterization tests for self_heal() (wraps 5 sub-healers)."""
+    """Characterization tests for self_heal(db=self.db) (wraps 5 sub-healers)."""
 
     def test_empty_queue_returns_no_actions(self):
         """Empty queue → empty actions list."""
-        result = self_heal(queue_dir=self.queue_dir, worker_specs={})
+        result = self_heal(queue_dir=self.queue_dir, worker_specs={}, db=self.db)
         self.assertEqual(result, [])
 
     def test_returns_list_of_dicts(self):
         """self_heal always returns a list; each item is a dict with 'action' key."""
-        result = self_heal(queue_dir=self.queue_dir, worker_specs={})
+        result = self_heal(queue_dir=self.queue_dir, worker_specs={}, db=self.db)
         self.assertIsInstance(result, list)
         for action in result:
             self.assertIsInstance(action, dict)
@@ -938,41 +991,44 @@ class TestSelfHeal(SelfHealTestCase):
     def test_queued_spec_not_healed(self):
         """A spec in normal 'queued' state does not trigger any heal action."""
         spec_path = self._make_spec()
-        enqueue(self.queue_dir, spec_path)
+        self.db.enqueue(spec_path)
 
-        result = self_heal(queue_dir=self.queue_dir, worker_specs={"w-1": ""})
+        result = self_heal(queue_dir=self.queue_dir, worker_specs={"w-1": ""}, db=self.db)
         self.assertEqual(result, [])
 
     def test_stale_running_no_pid_file_is_recovered(self):
         """A spec stuck in 'running' with dead PID is reset to requeued."""
         spec_path = self._make_spec()
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
-        # Rewrite the entry with an impossible PID (-1) so it's treated as dead
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["worker_pid"] = -1
-        _write_entry(self.queue_dir, e)
+        # Register worker with a dead PID so recover_running_specs detects it as stale
+        # Use 999999999 as a PID that won't exist
+        self.db.register_worker("w-1", self.queue_dir)
+        self.db.conn.execute(
+            "UPDATE workers SET current_spec_id=?, current_pid=999999999 WHERE id=?",
+            (entry["id"], "w-1"),
+        )
+        self.db.conn.commit()
 
-        actions = self_heal(queue_dir=self.queue_dir, worker_specs={})
+        actions = self_heal(queue_dir=self.queue_dir, worker_specs={}, db=self.db)
 
         action_types = [a.get("action", "") for a in actions]
         self.assertTrue(
             any("stale" in t or "running" in t or "recovered" in t for t in action_types),
             f"Expected a stale-running heal action; got: {action_types}",
         )
-        recovered = _read_entry(self.queue_dir, entry["id"])
+        recovered = self.db.get_spec(entry["id"])
         self.assertIn(recovered["status"], ("requeued", "queued"))
 
     def test_completed_spec_not_healed(self):
         """A completed spec is not touched by self_heal."""
-        from lib.queue import complete
-
         spec_path = self._make_spec()
-        entry = enqueue(self.queue_dir, spec_path)
-        complete(self.queue_dir, entry["id"])
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
+        self.db.complete(entry["id"], 0, 0)
 
-        result = self_heal(queue_dir=self.queue_dir, worker_specs={})
+        result = self_heal(queue_dir=self.queue_dir, worker_specs={}, db=self.db)
         self.assertEqual(result, [])
 
 

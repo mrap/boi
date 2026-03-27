@@ -791,15 +791,18 @@ class Daemon:
             return
 
         if phase == "execute":
-            daemon_ops.process_worker_completion(
+            ctx = daemon_ops.CompletionContext(
                 queue_dir=self.queue_dir,
-                queue_id=spec_id,
                 events_dir=events_dir,
-                log_dir=self.log_dir,
                 hooks_dir=self.hooks_dir,
+                log_dir=self.log_dir,
                 script_dir=self.script_dir,
-                exit_code=str(exit_code),
                 db=self.db,
+            )
+            daemon_ops.process_worker_completion(
+                ctx=ctx,
+                queue_id=spec_id,
+                exit_code=str(exit_code),
             )
         elif phase == "critic":
             daemon_ops.process_critic_completion(

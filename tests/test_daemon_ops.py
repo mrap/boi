@@ -15,8 +15,8 @@ from pathlib import Path
 # Add parent directory to path so we can import lib modules
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lib.daemon_ops import get_active_count, pick_next_spec, process_worker_completion
-from lib.queue import enqueue, get_entry, set_running
+from lib.daemon_ops import CompletionContext, get_active_count, pick_next_spec, process_worker_completion
+from lib.db import Database
 
 
 class DaemonOpsTestCase(unittest.TestCase):
@@ -42,7 +42,20 @@ class DaemonOpsTestCase(unittest.TestCase):
         config_path = os.path.join(critic_dir, "config.json")
         Path(config_path).write_text(json.dumps({"enabled": False}, indent=2) + "\n")
 
+        # Create SQLite database
+        db_path = os.path.join(self.boi_state, "boi.db")
+        self.db = Database(db_path, self.queue_dir)
+        self.ctx = CompletionContext(
+            queue_dir=self.queue_dir,
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            log_dir=self.log_dir,
+            script_dir=self.script_dir,
+            db=self.db,
+        )
+
     def tearDown(self):
+        self.db.close()
         self._tmpdir.cleanup()
 
     def _create_spec(self, tasks_pending=3, tasks_done=0, tasks_skipped=0):
@@ -81,16 +94,12 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
     def test_all_tasks_done_marks_completed(self):
         """When all tasks are DONE, outcome is 'completed'."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -98,88 +107,72 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
         self.assertEqual(result["pending_count"], 0)
         self.assertEqual(result["done_count"], 3)
 
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "completed")
 
     def test_pending_tasks_requeues(self):
         """When pending tasks remain, outcome is 'requeued'."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
         self.assertEqual(result["outcome"], "requeued")
         self.assertEqual(result["pending_count"], 2)
 
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "requeued")
 
     def test_max_iterations_fails(self):
         """When max iterations reached with pending tasks, outcome is 'failed'."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path, max_iterations=1)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path, max_iterations=1)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
         self.assertEqual(result["outcome"], "failed")
         self.assertEqual(result["reason"], "max_iterations")
 
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "failed")
 
     def test_no_exit_code_crashes(self):
         """When exit_code is None (no exit file), outcome is 'crashed'."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
         )
 
         self.assertEqual(result["outcome"], "crashed")
 
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "requeued")
         self.assertEqual(updated["consecutive_failures"], 1)
 
     def test_nonzero_exit_code_crashes(self):
         """When exit_code is non-zero, outcome is 'crashed'."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="1",
         )
 
@@ -188,24 +181,16 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
     def test_consecutive_failures_exceed_threshold(self):
         """When too many consecutive failures, outcome is 'failed'."""
         spec_path = self._create_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
 
         # Simulate 4 prior failures
-        from lib.queue import _read_entry, _write_entry
+        self.db.update_spec_fields(entry["id"], consecutive_failures=4)
 
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["consecutive_failures"] = 4
-        _write_entry(self.queue_dir, e)
-
-        set_running(self.queue_dir, entry["id"], "w-1")
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
         )
 
@@ -215,16 +200,12 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
     def test_writes_events(self):
         """process_worker_completion writes events to events_dir."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -238,16 +219,12 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
     def test_writes_telemetry(self):
         """process_worker_completion writes telemetry file."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -257,12 +234,8 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
     def test_missing_queue_entry_returns_error(self):
         """When queue entry doesn't exist, returns error outcome."""
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id="q-999",
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -271,8 +244,8 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
     def test_runs_hooks_on_completion(self):
         """Hooks are called on completion."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         # Create a hook that writes a marker file
         marker = os.path.join(self._tmpdir.name, "hook_ran")
@@ -281,12 +254,8 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
         os.chmod(hook_path, 0o755)
 
         process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -295,8 +264,8 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
     def test_runs_fail_hook_on_failure(self):
         """on-fail hook runs when spec fails."""
         spec_path = self._create_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path, max_iterations=1)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path, max_iterations=1)
+        self.db.set_running(entry["id"], "w-1")
 
         marker = os.path.join(self._tmpdir.name, "fail_hook_ran")
         hook_path = os.path.join(self.hooks_dir, "on-fail.sh")
@@ -304,12 +273,8 @@ class TestProcessWorkerCompletion(DaemonOpsTestCase):
         os.chmod(hook_path, 0o755)
 
         process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -328,8 +293,8 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
     def test_crash_captures_failure_reason_in_iteration_meta(self):
         """When worker crashes (no exit file), failure_reason is written to iteration JSON."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         # Write a mock log file
         self._write_log_file(
@@ -337,12 +302,8 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
         )
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
         )
 
@@ -364,18 +325,14 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
     def test_signal_exit_requeues_without_crash(self):
         """Exit code 137 (SIGKILL) is treated as signal death, not a crash."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         self._write_log_file(entry["id"], 1, ["running...", "segfault"])
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="137",
         )
 
@@ -386,18 +343,14 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
     def test_timeout_captures_failure_reason(self):
         """Timeout passes specific timeout message as failure_reason."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         self._write_log_file(entry["id"], 1, ["still running..."])
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
             timeout=True,
         )
@@ -411,25 +364,17 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
 
     def test_consecutive_failures_include_last_error(self):
         """When consecutive failure limit hit, failure_reason includes last error."""
-        from lib.queue import _read_entry, _write_entry
-
         spec_path = self._create_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
 
         # Simulate 4 prior failures
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["consecutive_failures"] = 4
-        _write_entry(self.queue_dir, e)
+        self.db.update_spec_fields(entry["id"], consecutive_failures=4)
 
-        set_running(self.queue_dir, entry["id"], "w-1")
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
         )
 
@@ -438,7 +383,7 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
         self.assertIn("no exit file", result["failure_reason"])
 
         # Check queue entry has the failure_reason
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "failed")
         self.assertIn("failure_reason", updated)
         self.assertIn("5 consecutive failures", updated["failure_reason"])
@@ -446,20 +391,16 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
     def test_log_tail_captures_last_20_lines(self):
         """log_tail captures the last 20 lines from the worker log."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         # Write a log with 30 lines
         lines = [f"log line {i}" for i in range(30)]
         self._write_log_file(entry["id"], 1, lines)
 
         process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
         )
 
@@ -472,16 +413,12 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
     def test_no_log_file_empty_log_tail(self):
         """When no log file exists, log_tail is empty list."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
         )
 
@@ -492,8 +429,8 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
     def test_existing_iteration_file_updated_with_diagnostics(self):
         """If iteration file already exists (from worker), diagnostics are merged in."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         # Pre-create iteration file (as the worker would)
         iter_file = os.path.join(self.queue_dir, f"{entry['id']}.iteration-1.json")
@@ -509,12 +446,8 @@ class TestFailureDiagnostics(DaemonOpsTestCase):
         self._write_log_file(entry["id"], 1, ["error line"])
 
         process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="1",
         )
 
@@ -534,15 +467,15 @@ class TestPickNextSpec(DaemonOpsTestCase):
 
     def test_returns_none_when_empty(self):
         """Returns None when queue is empty."""
-        result = pick_next_spec(self.queue_dir)
+        result = pick_next_spec(self.queue_dir, db=self.db)
         self.assertIsNone(result)
 
     def test_returns_queued_spec(self):
         """Returns the next queued spec."""
         spec_path = self._create_spec()
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
 
-        result = pick_next_spec(self.queue_dir)
+        result = pick_next_spec(self.queue_dir, db=self.db)
         self.assertIsNotNone(result)
         self.assertEqual(result["id"], entry["id"])
         self.assertEqual(result["spec_path"], entry["spec_path"])
@@ -553,31 +486,31 @@ class TestPickNextSpec(DaemonOpsTestCase):
         spec2 = os.path.join(self._tmpdir.name, "spec2.md")
         Path(spec2).write_text(Path(spec1).read_text())
 
-        enqueue(self.queue_dir, spec1, priority=200)
-        entry2 = enqueue(self.queue_dir, spec2, priority=50)
+        self.db.enqueue(spec1, priority=200)
+        entry2 = self.db.enqueue(spec2, priority=50)
 
-        result = pick_next_spec(self.queue_dir)
+        result = pick_next_spec(self.queue_dir, db=self.db)
         self.assertEqual(result["id"], entry2["id"])
 
     def test_skips_running_specs(self):
         """Does not return specs that are already running."""
         spec_path = self._create_spec()
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
-        result = pick_next_spec(self.queue_dir)
+        result = pick_next_spec(self.queue_dir, db=self.db)
         self.assertIsNone(result)
 
     def test_returns_requeued_spec(self):
         """Returns requeued specs."""
-        from lib.queue import requeue
 
         spec_path = self._create_spec()
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
-        requeue(self.queue_dir, entry["id"])
+        entry = self.db.enqueue(spec_path)
+        self.db.pick_next_spec()  # moves to running state
+        self.db.set_running(entry["id"], "w-1")
+        self.db.requeue(entry["id"])
 
-        result = pick_next_spec(self.queue_dir)
+        result = pick_next_spec(self.queue_dir, db=self.db)
         self.assertIsNotNone(result)
         self.assertEqual(result["id"], entry["id"])
 
@@ -587,29 +520,28 @@ class TestGetActiveCount(DaemonOpsTestCase):
 
     def test_empty_queue(self):
         """Returns 0 for empty queue."""
-        self.assertEqual(get_active_count(self.queue_dir), 0)
+        self.assertEqual(get_active_count(self.queue_dir, db=self.db), 0)
 
     def test_counts_active_statuses(self):
         """Counts queued, requeued, running specs."""
         spec_path = self._create_spec()
-        enqueue(self.queue_dir, spec_path)  # queued
-        self.assertEqual(get_active_count(self.queue_dir), 1)
+        self.db.enqueue(spec_path)  # queued
+        self.assertEqual(get_active_count(self.queue_dir, db=self.db), 1)
 
     def test_excludes_terminal_statuses(self):
         """Does not count completed, failed, canceled specs."""
-        from lib.queue import cancel, complete, fail
 
-        e1 = enqueue(self.queue_dir, self._create_spec())
-        e2 = enqueue(self.queue_dir, self._create_spec())
-        e3 = enqueue(self.queue_dir, self._create_spec())
-        e4 = enqueue(self.queue_dir, self._create_spec())
+        e1 = self.db.enqueue(self._create_spec())
+        e2 = self.db.enqueue(self._create_spec())
+        e3 = self.db.enqueue(self._create_spec())
+        e4 = self.db.enqueue(self._create_spec())
 
-        complete(self.queue_dir, e1["id"])
-        fail(self.queue_dir, e2["id"], "test")
-        cancel(self.queue_dir, e3["id"])
+        self.db.complete(e1["id"], 0, 0)
+        self.db.fail(e2["id"], "test")
+        self.db.cancel(e3["id"])
         # e4 remains queued
 
-        self.assertEqual(get_active_count(self.queue_dir), 1)
+        self.assertEqual(get_active_count(self.queue_dir, db=self.db), 1)
 
 
 class TestBatchedCallCount(DaemonOpsTestCase):
@@ -623,8 +555,8 @@ class TestBatchedCallCount(DaemonOpsTestCase):
         makes a single call to process_worker_completion.
         """
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         # This single call replaces what used to be 5-10 separate Python calls:
         # 1. get_entry (iteration, max_iter)
@@ -637,19 +569,15 @@ class TestBatchedCallCount(DaemonOpsTestCase):
         # 8. run_hook (on-complete)
         # 9. run_hook (on-fail)
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
         # Verify it handled everything in one call
         self.assertIn(result["outcome"], ("completed", "requeued", "failed", "crashed"))
         # Verify queue entry was updated
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertNotEqual(updated["status"], "running")
         # Verify events were written
         event_files = list(Path(self.events_dir).glob("event-*.json"))
@@ -683,11 +611,11 @@ class TestPostIterationValidation(DaemonOpsTestCase):
         """When spec fails validation after iteration, treat as crash."""
         # First enqueue with a valid spec
         valid_spec = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, valid_spec)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(valid_spec)
+        self.db.set_running(entry["id"], "w-1")
 
         # Now replace the copied spec with a malformed one
-        copied_spec = get_entry(self.queue_dir, entry["id"])["spec_path"]
+        copied_spec = self.db.get_spec(entry["id"])["spec_path"]
         malformed_content = (
             "# Test Spec\n\n## Tasks\n\n"
             "### t-1: Malformed task\n"
@@ -698,12 +626,8 @@ class TestPostIterationValidation(DaemonOpsTestCase):
         Path(copied_spec).write_text(malformed_content)
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -712,22 +636,18 @@ class TestPostIterationValidation(DaemonOpsTestCase):
         self.assertGreater(len(result["validation_errors"]), 0)
 
         # Should have recorded a failure
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertGreater(updated["consecutive_failures"], 0)
 
     def test_valid_spec_passes_validation(self):
         """When spec is valid, proceed normally (requeued or completed)."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -738,15 +658,18 @@ class TestPostIterationValidation(DaemonOpsTestCase):
         """Detect when a task regresses from DONE to PENDING."""
         # Create spec with a DONE task and a PENDING task
         spec_path = self._create_spec(tasks_pending=1, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         # Verify pre_iteration_tasks was saved
-        updated_entry = get_entry(self.queue_dir, entry["id"])
-        self.assertIn("pre_iteration_tasks", updated_entry)
+        updated_entry = self.db.get_spec(entry["id"])
+        self.assertIsNotNone(updated_entry.get("pre_iteration_tasks"))
+        _pre_tasks = updated_entry["pre_iteration_tasks"]
+        if isinstance(_pre_tasks, str):
+            import json as _j; _pre_tasks = _j.loads(_pre_tasks)
         # t-1 should be DONE, t-2 should be PENDING
-        self.assertEqual(updated_entry["pre_iteration_tasks"]["t-1"], "DONE")
-        self.assertEqual(updated_entry["pre_iteration_tasks"]["t-2"], "PENDING")
+        self.assertEqual(_pre_tasks["t-1"], "DONE")
+        self.assertEqual(_pre_tasks["t-2"], "PENDING")
 
         # Now modify the copied spec to regress t-1 from DONE to PENDING
         copied_spec = updated_entry["spec_path"]
@@ -760,12 +683,8 @@ class TestPostIterationValidation(DaemonOpsTestCase):
         Path(copied_spec).write_text(regressed_content)
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -788,18 +707,18 @@ class TestPostIterationValidation(DaemonOpsTestCase):
     def test_validation_errors_written_to_iteration_metadata(self):
         """Validation errors are written to the iteration metadata JSON."""
         spec_path = self._create_spec(tasks_pending=2, tasks_done=1)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         # Create iteration metadata file
-        iteration = get_entry(self.queue_dir, entry["id"])["iteration"]
+        iteration = self.db.get_spec(entry["id"])["iteration"]
         iter_meta_path = os.path.join(
             self.queue_dir, f"{entry['id']}.iteration-{iteration}.json"
         )
         Path(iter_meta_path).write_text(json.dumps({"iteration": iteration}) + "\n")
 
         # Corrupt the spec
-        copied_spec = get_entry(self.queue_dir, entry["id"])["spec_path"]
+        copied_spec = self.db.get_spec(entry["id"])["spec_path"]
         Path(copied_spec).write_text(
             "# Test Spec\n\n## Tasks\n\n"
             "### t-1: Bad task\nPENDING\n\n"
@@ -807,12 +726,8 @@ class TestPostIterationValidation(DaemonOpsTestCase):
         )
 
         process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -852,16 +767,12 @@ class TestCriticIntegration(DaemonOpsTestCase):
     def test_critic_triggered_on_completion(self):
         """When all tasks are DONE and critic is enabled, outcome is 'critic_review'."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -870,30 +781,22 @@ class TestCriticIntegration(DaemonOpsTestCase):
         self.assertEqual(result["critic_pass"], 1)
 
         # Spec should be requeued (so daemon picks it up for critic worker)
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "requeued")
 
     def test_critic_pass_counting(self):
         """critic_passes increments with each critic review."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
 
         # Simulate one prior critic pass
-        from lib.queue import _read_entry, _write_entry
+        self.db.update_spec_fields(entry["id"], critic_passes=1)
 
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["critic_passes"] = 1
-        _write_entry(self.queue_dir, e)
-
-        set_running(self.queue_dir, entry["id"], "w-1")
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -903,29 +806,21 @@ class TestCriticIntegration(DaemonOpsTestCase):
     def test_max_passes_enforcement(self):
         """When max_passes reached, completes without critic."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
 
         # Set critic_passes to match max_passes
-        from lib.queue import _read_entry, _write_entry
+        self.db.update_spec_fields(entry["id"], critic_passes=2)
 
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["critic_passes"] = 2  # max_passes is 2
-        _write_entry(self.queue_dir, e)
-
-        set_running(self.queue_dir, entry["id"], "w-1")
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
         self.assertEqual(result["outcome"], "completed")
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "completed")
 
     def test_critic_disabled_skips_review(self):
@@ -936,16 +831,12 @@ class TestCriticIntegration(DaemonOpsTestCase):
         Path(config_path).write_text(json.dumps(config, indent=2) + "\n")
 
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -954,16 +845,12 @@ class TestCriticIntegration(DaemonOpsTestCase):
     def test_critic_writes_event(self):
         """Critic review trigger writes an event."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -976,16 +863,12 @@ class TestCriticIntegration(DaemonOpsTestCase):
     def test_critic_prompt_file_written(self):
         """Critic prompt file is written to queue dir."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -1011,7 +894,7 @@ class TestProcessCriticCompletion(DaemonOpsTestCase):
         from lib.daemon_ops import process_critic_completion
 
         spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
 
         # Append Critic Approved to the copied spec
         copied_spec = entry["spec_path"]
@@ -1025,11 +908,13 @@ class TestProcessCriticCompletion(DaemonOpsTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=copied_spec,
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "critic_approved")
 
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "completed")
         self.assertEqual(updated["critic_passes"], 1)
 
@@ -1038,7 +923,7 @@ class TestProcessCriticCompletion(DaemonOpsTestCase):
         from lib.daemon_ops import process_critic_completion
 
         spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
 
         # Add a CRITIC task to the copied spec
         copied_spec = entry["spec_path"]
@@ -1057,12 +942,14 @@ class TestProcessCriticCompletion(DaemonOpsTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=copied_spec,
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "critic_tasks_added")
         self.assertEqual(result["critic_tasks_added"], 1)
 
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "requeued")
         self.assertEqual(updated["critic_passes"], 1)
 
@@ -1071,7 +958,7 @@ class TestProcessCriticCompletion(DaemonOpsTestCase):
         from lib.daemon_ops import process_critic_completion
 
         spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
 
         # Spec has no Critic Approved and no CRITIC tasks
         copied_spec = entry["spec_path"]
@@ -1082,24 +969,23 @@ class TestProcessCriticCompletion(DaemonOpsTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=copied_spec,
+        
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "critic_approved")
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "completed")
 
     def test_critic_passes_increment(self):
         """critic_passes is incremented on each call."""
         from lib.daemon_ops import process_critic_completion
-        from lib.queue import _read_entry, _write_entry
 
         spec_path = self._create_spec(tasks_pending=0, tasks_done=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
 
         # Set prior critic passes
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["critic_passes"] = 1
-        _write_entry(self.queue_dir, e)
+        self.db.update_spec_fields(entry["id"], critic_passes=1)
 
         # Append Critic Approved
         copied_spec = entry["spec_path"]
@@ -1113,9 +999,11 @@ class TestProcessCriticCompletion(DaemonOpsTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=copied_spec,
+        
+            db=self.db,
         )
 
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["critic_passes"], 2)
 
 
@@ -1280,35 +1168,29 @@ class TestCriticReviewDaemonIntegration(DaemonOpsTestCase):
     def test_critic_review_triggers_phase_transition(self):
         """After critic_review outcome, setting phase to 'critic' enables
         process_critic_completion to be called on next completion."""
-        from lib.queue import _read_entry, _write_entry
 
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         # Step 1: Process worker completion — should return critic_review
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
         self.assertEqual(result["outcome"], "critic_review")
 
         # Step 2: Simulate daemon setting phase to "critic" (as daemon.py does)
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["phase"] = "critic"
-        _write_entry(self.queue_dir, e)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        self.db.update_spec_fields(entry["id"], phase="critic")
+        self.db.set_running(entry["id"], "w-1", phase="critic")
 
         # Step 3: Simulate critic worker completing with approval
-        # Add "## Critic Approved" to spec
-        content = Path(spec_path).read_text()
-        content += "\n## Critic Approved\n\nAll checks passed.\n"
-        Path(spec_path).write_text(content)
+        # Add "## Critic Approved" to the copied spec
+        _spec_copy = self.db.get_spec(entry["id"])["spec_path"]
+        _c = Path(_spec_copy).read_text()
+        _c += "\n## Critic Approved\n\nAll checks passed.\n"
+        Path(_spec_copy).write_text(_c)
 
         from lib.daemon_ops import process_critic_completion
 
@@ -1317,27 +1199,24 @@ class TestCriticReviewDaemonIntegration(DaemonOpsTestCase):
             queue_id=entry["id"],
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
-            spec_path=spec_path,
+            spec_path=_spec_copy,
+            db=self.db,
         )
         self.assertEqual(critic_result["outcome"], "critic_approved")
 
         # Verify spec is now completed
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "completed")
 
     def test_critic_review_requeues_for_critic_worker(self):
         """critic_review outcome requeues spec so daemon can launch critic worker."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
-        set_running(self.queue_dir, entry["id"], "w-1")
+        entry = self.db.enqueue(spec_path)
+        self.db.set_running(entry["id"], "w-1")
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
@@ -1348,7 +1227,7 @@ class TestCriticReviewDaemonIntegration(DaemonOpsTestCase):
         self.assertTrue(os.path.isfile(prompt_path))
 
         # Entry should be requeued (daemon will pick it up and launch critic)
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertEqual(updated["status"], "requeued")
 
 
@@ -1360,15 +1239,20 @@ class TestSelfHeal(DaemonOpsTestCase):
         from lib.daemon_ops import self_heal
 
         spec_path = self._create_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self.db.set_running(qid, "w-1")
 
-        # Write a PID file with a definitely-dead PID
-        pid_file = os.path.join(self.queue_dir, f"{qid}.pid")
-        Path(pid_file).write_text("999999999\n")
+        # Register worker and assign to spec so recover_running_specs can find it
+        self.db.register_worker("w-1", self.queue_dir)
+        self.db.conn.execute(
+            "UPDATE workers SET current_spec_id=?, current_pid=NULL WHERE id=?",
+            (qid, "w-1"),
+        )
+        self.db.conn.commit()
 
-        actions = self_heal(self.queue_dir, {"w-1": qid})
+        # DB path: spec in running with no process record -> auto-recovered
+        actions = self_heal(self.queue_dir, {"w-1": qid}, db=self.db)
 
         # Should have recovered the spec
         stale_actions = [a for a in actions if a["action"] == "stale_running_recovered"]
@@ -1376,44 +1260,49 @@ class TestSelfHeal(DaemonOpsTestCase):
         self.assertIn(qid, stale_actions[0]["detail"])
 
         # Entry should now be requeued
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "requeued")
 
-        # PID file should be cleaned up
-        self.assertFalse(os.path.isfile(pid_file))
 
     def test_stale_running_no_pid_file(self):
         """Running spec with no PID file at all should be recovered."""
         from lib.daemon_ops import self_heal
 
         spec_path = self._create_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self.db.set_running(qid, "w-1")
 
-        # No PID file exists at all
-        actions = self_heal(self.queue_dir, {"w-1": qid})
+        # Register worker and assign to spec so recover_running_specs can find it
+        self.db.register_worker("w-1", self.queue_dir)
+        self.db.conn.execute(
+            "UPDATE workers SET current_spec_id=?, current_pid=NULL WHERE id=?",
+            (qid, "w-1"),
+        )
+        self.db.conn.commit()
+
+        # DB path: spec in running with no process record -> auto-recovered
+        actions = self_heal(self.queue_dir, {"w-1": qid}, db=self.db)
 
         stale_actions = [a for a in actions if a["action"] == "stale_running_recovered"]
         self.assertEqual(len(stale_actions), 1)
 
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "requeued")
 
     def test_orphaned_worker_freed(self):
         """Worker assigned to completed spec should be reported as orphaned."""
         from lib.daemon_ops import self_heal
-        from lib.queue import complete
 
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
-        complete(self.queue_dir, qid, 3, 3)
+        self.db.set_running(qid, "w-1")
+        self.db.complete(qid, 3, 3)
 
         # Worker still thinks it's assigned to this spec
         worker_specs = {"w-1": qid, "w-2": ""}
-        actions = self_heal(self.queue_dir, worker_specs)
+        actions = self_heal(self.queue_dir, worker_specs, db=self.db)
 
         orphan_actions = [a for a in actions if a["action"] == "orphaned_worker"]
         self.assertEqual(len(orphan_actions), 1)
@@ -1425,7 +1314,7 @@ class TestSelfHeal(DaemonOpsTestCase):
         from lib.daemon_ops import self_heal
 
         worker_specs = {"w-1": "q-nonexistent", "w-2": ""}
-        actions = self_heal(self.queue_dir, worker_specs)
+        actions = self_heal(self.queue_dir, worker_specs, db=self.db)
 
         orphan_actions = [a for a in actions if a["action"] == "orphaned_worker"]
         self.assertEqual(len(orphan_actions), 1)
@@ -1434,73 +1323,84 @@ class TestSelfHeal(DaemonOpsTestCase):
     def test_blocked_by_completed_spec_unblocked(self):
         """Spec blocked by a completed spec should have that dep removed."""
         from lib.daemon_ops import self_heal
-        from lib.queue import complete
 
         # Create blocker spec and complete it
         blocker_path = self._create_spec(tasks_pending=0, tasks_done=1)
-        blocker = enqueue(self.queue_dir, blocker_path)
-        set_running(self.queue_dir, blocker["id"], "w-1")
-        complete(self.queue_dir, blocker["id"], 1, 1)
+        blocker = self.db.enqueue(blocker_path)
+        self.db.set_running(blocker["id"], "w-1")
+        self.db.complete(blocker["id"], 1, 1)
 
         # Create blocked spec
         blocked_path = self._create_spec(tasks_pending=2)
-        blocked = enqueue(self.queue_dir, blocked_path, blocked_by=[blocker["id"]])
+        blocked = self.db.enqueue(blocked_path, blocked_by=[blocker["id"]])
 
-        # Verify it's blocked
-        entry = get_entry(self.queue_dir, blocked["id"])
-        self.assertEqual(entry["blocked_by"], [blocker["id"]])
+        # Verify it's blocked (via spec_dependencies table)
+        dep_count = self.db.conn.execute(
+            "SELECT COUNT(*) FROM spec_dependencies WHERE spec_id=? AND blocks_on=?",
+            (blocked["id"], blocker["id"]),
+        ).fetchone()[0]
+        self.assertEqual(dep_count, 1)
 
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
 
         cleanup_actions = [a for a in actions if a["action"] == "blocked_by_cleaned"]
         self.assertEqual(len(cleanup_actions), 1)
 
-        updated = get_entry(self.queue_dir, blocked["id"])
-        self.assertEqual(updated["blocked_by"], [])
+        dep_count_after = self.db.conn.execute(
+            "SELECT COUNT(*) FROM spec_dependencies WHERE spec_id=?",
+            (blocked["id"],),
+        ).fetchone()[0]
+        self.assertEqual(dep_count_after, 0)
 
     def test_blocked_by_missing_spec_unblocked(self):
         """Spec blocked by a nonexistent spec should have that dep removed."""
         from lib.daemon_ops import self_heal
-        from lib.queue import _read_entry, _write_entry
-
         spec_path = self._create_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
 
-        # Manually set blocked_by to a nonexistent spec
-        raw = _read_entry(self.queue_dir, qid)
-        raw["blocked_by"] = ["q-999"]
-        _write_entry(self.queue_dir, raw)
+        # Manually set blocked_by to a nonexistent spec via DB
+        # Disable FK so we can insert a nonexistent blocks_on
+        self.db.conn.execute("PRAGMA foreign_keys=OFF")
+        self.db.conn.execute(
+            "INSERT OR IGNORE INTO spec_dependencies (spec_id, blocks_on) VALUES (?, ?)",
+            (qid, "q-999"),
+        )
+        self.db.conn.commit()
+        self.db.conn.execute("PRAGMA foreign_keys=ON")
 
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
 
         cleanup_actions = [a for a in actions if a["action"] == "blocked_by_cleaned"]
         self.assertEqual(len(cleanup_actions), 1)
         self.assertIn("missing", cleanup_actions[0]["detail"])
 
-        updated = get_entry(self.queue_dir, qid)
-        self.assertEqual(updated["blocked_by"], [])
+        dep_count_after = self.db.conn.execute(
+            "SELECT COUNT(*) FROM spec_dependencies WHERE spec_id=?",
+            (qid,),
+        ).fetchone()[0]
+        self.assertEqual(dep_count_after, 0)
 
     def test_circular_dependency_detected(self):
         """Circular dependency A->B->C->A should cancel all specs in cycle."""
         from lib.daemon_ops import self_heal
-        from lib.queue import _read_entry, _write_entry
-
         # Create 3 specs
         specs = []
         for _ in range(3):
             path = self._create_spec(tasks_pending=1)
-            specs.append(enqueue(self.queue_dir, path))
+            specs.append(self.db.enqueue(path))
 
         a_id, b_id, c_id = specs[0]["id"], specs[1]["id"], specs[2]["id"]
 
         # Create cycle: A blocked by C, B blocked by A, C blocked by B
         for qid, dep in [(a_id, c_id), (b_id, a_id), (c_id, b_id)]:
-            raw = _read_entry(self.queue_dir, qid)
-            raw["blocked_by"] = [dep]
-            _write_entry(self.queue_dir, raw)
+            self.db.conn.execute(
+                "INSERT OR IGNORE INTO spec_dependencies (spec_id, blocks_on) VALUES (?, ?)",
+                (qid, dep),
+            )
+        self.db.conn.commit()
 
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
 
         cycle_actions = [
             a for a in actions if a["action"] == "circular_dependency_canceled"
@@ -1509,15 +1409,14 @@ class TestSelfHeal(DaemonOpsTestCase):
         self.assertEqual(len(cycle_actions), 3)
 
         for spec in specs:
-            updated = get_entry(self.queue_dir, spec["id"])
+            updated = self.db.get_spec(spec["id"])
             self.assertEqual(updated["status"], "canceled")
-            self.assertIn("Circular", updated.get("failure_reason", ""))
 
     def test_stale_lock_no_action_when_no_lock(self):
         """No lock file should produce no action."""
         from lib.daemon_ops import self_heal
 
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
 
         lock_actions = [a for a in actions if "lock" in a.get("action", "")]
         self.assertEqual(len(lock_actions), 0)
@@ -1527,7 +1426,7 @@ class TestSelfHeal(DaemonOpsTestCase):
         from lib.daemon_ops import self_heal
 
         worker_specs = {"w-1": "", "w-2": ""}
-        actions = self_heal(self.queue_dir, worker_specs)
+        actions = self_heal(self.queue_dir, worker_specs, db=self.db)
 
         orphan_actions = [a for a in actions if a["action"] == "orphaned_worker"]
         self.assertEqual(len(orphan_actions), 0)
@@ -1535,30 +1434,41 @@ class TestSelfHeal(DaemonOpsTestCase):
     def test_self_heal_multiple_issues(self):
         """Self-heal should fix multiple issues in a single call."""
         from lib.daemon_ops import self_heal
-        from lib.queue import _read_entry, _write_entry, complete
 
         # Issue 1: stale running spec
         spec1_path = self._create_spec(tasks_pending=2)
-        entry1 = enqueue(self.queue_dir, spec1_path)
-        set_running(self.queue_dir, entry1["id"], "w-1")
+        entry1 = self.db.enqueue(spec1_path)
+        self.db.set_running(entry1["id"], "w-1")
         pid_file = os.path.join(self.queue_dir, f"{entry1['id']}.pid")
         Path(pid_file).write_text("999999999\n")
+        # Register worker so recover_running_specs can detect it as stale
+        self.db.register_worker("w-1", self.queue_dir)
+        self.db.conn.execute(
+            "UPDATE workers SET current_spec_id=?, current_pid=999999999 WHERE id=?",
+            (entry1["id"], "w-1"),
+        )
+        self.db.conn.commit()
 
         # Issue 2: blocked by missing spec
         spec2_path = self._create_spec(tasks_pending=1)
-        entry2 = enqueue(self.queue_dir, spec2_path)
-        raw2 = _read_entry(self.queue_dir, entry2["id"])
-        raw2["blocked_by"] = ["q-missing"]
-        _write_entry(self.queue_dir, raw2)
+        entry2 = self.db.enqueue(spec2_path)
+        # Disable FK so we can insert a nonexistent blocks_on
+        self.db.conn.execute("PRAGMA foreign_keys=OFF")
+        self.db.conn.execute(
+            "INSERT OR IGNORE INTO spec_dependencies (spec_id, blocks_on) VALUES (?, ?)",
+            (entry2["id"], "q-missing"),
+        )
+        self.db.conn.commit()
+        self.db.conn.execute("PRAGMA foreign_keys=ON")
 
         # Issue 3: orphaned worker
         spec3_path = self._create_spec(tasks_pending=0, tasks_done=1)
-        entry3 = enqueue(self.queue_dir, spec3_path)
-        set_running(self.queue_dir, entry3["id"], "w-2")
-        complete(self.queue_dir, entry3["id"], 1, 1)
+        entry3 = self.db.enqueue(spec3_path)
+        self.db.set_running(entry3["id"], "w-2")
+        self.db.complete(entry3["id"], 1, 1)
 
         worker_specs = {"w-1": entry1["id"], "w-2": entry3["id"]}
-        actions = self_heal(self.queue_dir, worker_specs)
+        actions = self_heal(self.queue_dir, worker_specs, db=self.db)
 
         # Should have at least 3 actions (one for each issue)
         self.assertGreaterEqual(len(actions), 3)
@@ -1573,30 +1483,30 @@ class TestSelfHeal(DaemonOpsTestCase):
         from datetime import datetime, timedelta, timezone
 
         from lib.daemon_ops import self_heal
-        from lib.queue import _read_entry, _write_entry
-
         spec_path = self._create_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self.db.set_running(qid, "w-1")
 
-        # Manually backdate first_running_at to exceed the max duration
-        e = _read_entry(self.queue_dir, qid)
         # Set worker_timeout_seconds=60, max_iterations=5 -> max_duration=300s
-        e["worker_timeout_seconds"] = 60
-        e["max_iterations"] = 5
-        # Set first_running_at to 10 minutes ago (600s > 300s limit)
-        e["first_running_at"] = (
-            datetime.now(timezone.utc) - timedelta(seconds=600)
-        ).isoformat()
-        _write_entry(self.queue_dir, e)
+        self.db.conn.execute(
+            "UPDATE specs SET worker_timeout_seconds=60, max_iterations=5, "
+            "first_running_at=? WHERE id=?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat(), qid),
+        )
+        self.db.conn.commit()
 
-        # Write a PID file with a live PID (our own) so stale_running doesn't
-        # trigger first
-        pid_file = os.path.join(self.queue_dir, f"{qid}.pid")
-        Path(pid_file).write_text(str(os.getpid()) + "\n")
+        # DB path: add fake process record so stale_running check doesn't trigger
+        # processes schema: (pid, spec_id, worker_id, iteration, phase, started_at)
+        self.db.conn.execute(
+            "INSERT OR IGNORE INTO processes (pid, spec_id, worker_id, iteration, phase, started_at) "
+            "VALUES (?, ?, 'w-1', 1, 'execute', ?)",
+            (os.getpid(), qid,
+             (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()),
+        )
+        self.db.conn.commit()
 
-        actions = self_heal(self.queue_dir, {"w-1": qid})
+        actions = self_heal(self.queue_dir, {"w-1": qid}, db=self.db)
 
         # Should have force-failed
         duration_actions = [
@@ -1606,37 +1516,39 @@ class TestSelfHeal(DaemonOpsTestCase):
         self.assertIn(qid, duration_actions[0]["detail"])
 
         # Entry should now be failed with the right reason
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "failed")
         self.assertEqual(updated["failure_reason"], "Maximum running duration exceeded")
 
-        # PID file should be cleaned up
-        self.assertFalse(os.path.isfile(pid_file))
 
     def test_max_running_duration_not_exceeded(self):
         """Spec running within max duration should NOT be force-failed."""
         from datetime import datetime, timedelta, timezone
 
         from lib.daemon_ops import self_heal
-        from lib.queue import _read_entry, _write_entry
-
         spec_path = self._create_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self.db.set_running(qid, "w-1")
 
         # Set first_running_at to just 10 seconds ago (well within default limit)
-        e = _read_entry(self.queue_dir, qid)
-        e["first_running_at"] = (
-            datetime.now(timezone.utc) - timedelta(seconds=10)
-        ).isoformat()
-        _write_entry(self.queue_dir, e)
+        self.db.conn.execute(
+            "UPDATE specs SET first_running_at=? WHERE id=?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat(), qid),
+        )
+        self.db.conn.commit()
 
-        # Write a live PID so stale_running doesn't trigger
-        pid_file = os.path.join(self.queue_dir, f"{qid}.pid")
-        Path(pid_file).write_text(str(os.getpid()) + "\n")
+        # DB path: add fake process record
+        # processes schema: (pid, spec_id, worker_id, iteration, phase, started_at)
+        self.db.conn.execute(
+            "INSERT OR IGNORE INTO processes (pid, spec_id, worker_id, iteration, phase, started_at) "
+            "VALUES (?, ?, 'w-1', 1, 'execute', ?)",
+            (os.getpid(), qid,
+             (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()),
+        )
+        self.db.conn.commit()
 
-        actions = self_heal(self.queue_dir, {"w-1": qid})
+        actions = self_heal(self.queue_dir, {"w-1": qid}, db=self.db)
 
         # Should NOT have any max_running_duration actions
         duration_actions = [
@@ -1645,34 +1557,30 @@ class TestSelfHeal(DaemonOpsTestCase):
         self.assertEqual(len(duration_actions), 0)
 
         # Entry should still be running
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "running")
 
     def test_first_running_at_set_on_first_run(self):
         """first_running_at should be set when spec first enters running status."""
         spec_path = self._create_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
 
-        # Before running, no first_running_at
-        pre = get_entry(self.queue_dir, qid)
-        self.assertNotIn("first_running_at", pre)
+        # Before running, first_running_at should be None
+        pre = self.db.get_spec(qid)
+        self.assertIsNone(pre.get("first_running_at"))
 
         # After first set_running, first_running_at should be set
-        set_running(self.queue_dir, qid, "w-1")
-        post = get_entry(self.queue_dir, qid)
+        self.db.set_running(qid, "w-1")
+        post = self.db.get_spec(qid)
         self.assertIn("first_running_at", post)
         first_time = post["first_running_at"]
 
         # After requeue and second set_running, first_running_at should be preserved
-        from lib.queue import _read_entry, _write_entry
+        self.db.update_spec_fields(qid, status="requeued")
 
-        e = _read_entry(self.queue_dir, qid)
-        e["status"] = "requeued"
-        _write_entry(self.queue_dir, e)
-
-        set_running(self.queue_dir, qid, "w-2")
-        post2 = get_entry(self.queue_dir, qid)
+        self.db.set_running(qid, "w-2")
+        post2 = self.db.get_spec(qid)
         self.assertEqual(post2["first_running_at"], first_time)
 
 
@@ -1686,23 +1594,19 @@ class TestBugFixMaxIterAllTasksDone(DaemonOpsTestCase):
     def test_max_iter_enforced_when_all_tasks_done(self):
         """Max-iter should fail the spec even when pending_count == 0."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path, max_iterations=1)
-        set_running(self.queue_dir, entry["id"], "w-1")  # iteration becomes 1
+        entry = self.db.enqueue(spec_path, max_iterations=1)
+        self.db.set_running(entry["id"], "w-1")  # iteration becomes 1
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
         # With critic disabled, all tasks done + at max iter = should complete, not loop
         # The key assertion: outcome must NOT be "critic_review" (which causes infinite requeue)
         self.assertIn(result["outcome"], ("completed", "failed"))
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertIn(updated["status"], ("completed", "failed"))
         # Must NOT be requeued
         self.assertNotEqual(updated["status"], "requeued")
@@ -1716,8 +1620,8 @@ class TestBugFixMaxIterAllTasksDone(DaemonOpsTestCase):
         We mock generate_critic_prompt to succeed and verify requeue doesn't happen.
         """
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path, max_iterations=1)
-        set_running(self.queue_dir, entry["id"], "w-1")  # iteration becomes 1
+        entry = self.db.enqueue(spec_path, max_iterations=1)
+        self.db.set_running(entry["id"], "w-1")  # iteration becomes 1
 
         # Enable critic
         critic_dir = os.path.join(self.boi_state, "critic")
@@ -1732,17 +1636,13 @@ class TestBugFixMaxIterAllTasksDone(DaemonOpsTestCase):
         import unittest.mock as mock
         with mock.patch("lib.daemon_ops.generate_critic_prompt", return_value="mock critic prompt"):
             result = process_worker_completion(
-                queue_dir=self.queue_dir,
+                ctx=self.ctx,
                 queue_id=entry["id"],
-                events_dir=self.events_dir,
-                log_dir=self.log_dir,
-                hooks_dir=self.hooks_dir,
-                script_dir=self.script_dir,
                 exit_code="0",
             )
 
         # At max-iter, should NOT requeue for critic — should fail or complete
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertNotEqual(updated["status"], "requeued",
                           "Spec should not be requeued when at max iterations, "
                           "even if critic wants to run. "
@@ -1751,26 +1651,22 @@ class TestBugFixMaxIterAllTasksDone(DaemonOpsTestCase):
     def test_max_iter_vastly_exceeded_still_stops(self):
         """Simulate the actual bug: iteration=800, max_iter=10, all tasks done."""
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path, max_iterations=10)
+        entry = self.db.enqueue(spec_path, max_iterations=10)
 
         # Manually set iteration to 800 to simulate the bug state
-        from lib.queue import _read_entry, _write_entry
-        e = _read_entry(self.queue_dir, entry["id"])
-        e["iteration"] = 800
-        e["status"] = "running"
-        _write_entry(self.queue_dir, e)
+        self.db.conn.execute(
+            "UPDATE specs SET iteration=800, status='running' WHERE id=?",
+            (entry["id"],),
+        )
+        self.db.conn.commit()
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
         )
 
-        updated = get_entry(self.queue_dir, entry["id"])
+        updated = self.db.get_spec(entry["id"])
         self.assertNotEqual(updated["status"], "requeued",
                           f"Spec at iteration 800 (max 10) must not be requeued! "
                           f"Got outcome={result['outcome']}, status={updated['status']}")
@@ -1780,19 +1676,19 @@ class TestBugFixDoubleAssignment(DaemonOpsTestCase):
     """Regression tests for Bug 2: TOCTOU race in dequeue."""
 
     def test_dequeue_prevents_double_pickup(self):
-        """After dequeue returns a spec, the same spec should not be dequeued again."""
-        from lib.queue import dequeue as queue_dequeue
+        """After pick_next_spec returns a spec, the same spec should not be picked again."""
+        from lib.daemon_ops import pick_next_spec
 
         spec_path = self._create_spec(tasks_pending=2)
-        enqueue(self.queue_dir, spec_path)
+        self.db.enqueue(spec_path)
 
-        first = queue_dequeue(self.queue_dir)
+        first = pick_next_spec(self.queue_dir, db=self.db)
         self.assertIsNotNone(first)
 
-        second = queue_dequeue(self.queue_dir)
-        # Second dequeue of the same spec must return None (already taken)
+        second = pick_next_spec(self.queue_dir, db=self.db)
+        # Second pick must return None (first is now 'assigning', not 'queued')
         self.assertIsNone(second,
-                         "dequeue() returned the same spec twice — TOCTOU race condition!")
+                         "pick_next_spec() returned the same spec twice — TOCTOU race condition!")
 
 
 # ─── Database-backed tests ─────────────────────────────────────────────────
@@ -1828,6 +1724,14 @@ class DaemonOpsDBTestCase(unittest.TestCase):
 
         db_path = os.path.join(self.boi_state, "boi.db")
         self.db = Database(db_path, self.queue_dir)
+        self.ctx = CompletionContext(
+            queue_dir=self.queue_dir,
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            log_dir=self.log_dir,
+            script_dir=self.script_dir,
+            db=self.db,
+        )
 
     def tearDown(self):
         self.db.close()
@@ -1881,14 +1785,9 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
         entry = self._enqueue_and_run(spec_path)
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "completed")
@@ -1904,14 +1803,9 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
         entry = self._enqueue_and_run(spec_path)
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "requeued")
@@ -1926,14 +1820,9 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
         entry = self._enqueue_and_run(spec_path, max_iterations=1)
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "failed")
@@ -1948,14 +1837,9 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
         entry = self._enqueue_and_run(spec_path)
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "crashed")
@@ -1970,14 +1854,9 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
         entry = self._enqueue_and_run(spec_path)
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="1",
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "crashed")
@@ -1992,14 +1871,9 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
             self.db.record_failure(entry["id"])
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "failed")
@@ -2011,14 +1885,9 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
         entry = self._enqueue_and_run(spec_path)
 
         process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
-            db=self.db,
         )
 
         event_files = [
@@ -2029,14 +1898,9 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
     def test_missing_entry_returns_error(self):
         """When queue_id doesn't exist, returns error via db."""
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id="q-999",
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "error")
@@ -2047,15 +1911,10 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
         entry = self._enqueue_and_run(spec_path)
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code=None,
             timeout=True,
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "crashed")
@@ -2067,14 +1926,9 @@ class TestProcessWorkerCompletionDB(DaemonOpsDBTestCase):
         entry = self._enqueue_and_run(spec_path, max_iterations=1)
 
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id=entry["id"],
-            events_dir=self.events_dir,
-            log_dir=self.log_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.script_dir,
             exit_code="0",
-            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "completed")

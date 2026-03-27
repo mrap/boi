@@ -23,6 +23,8 @@ from lib.critic import (
     run_critic,
     should_run_critic,
 )
+from lib.daemon_ops import CompletionContext
+from lib.db import Database
 from lib.critic_config import (
     DEFAULT_CONFIG,
     ensure_critic_dirs,
@@ -75,6 +77,10 @@ def _make_temp_env(tmpdir):
         json.dumps(DEFAULT_CONFIG, indent=2) + "\n"
     )
 
+    # Create SQLite database
+    db_path = os.path.join(state_dir, "boi.db")
+    db = Database(db_path, queue_dir)
+
     return {
         "state_dir": state_dir,
         "queue_dir": queue_dir,
@@ -85,6 +91,7 @@ def _make_temp_env(tmpdir):
         "checks_dir": checks_dir,
         "critic_dir": critic_dir,
         "custom_dir": custom_dir,
+        "db": db,
     }
 
 
@@ -105,6 +112,35 @@ def _write_queue_entry(queue_dir, queue_id, **overrides):
     path = os.path.join(queue_dir, f"{queue_id}.json")
     Path(path).write_text(json.dumps(entry, indent=2) + "\n")
     return entry
+
+
+def _make_db_entry(db, queue_id, spec_path, **overrides):
+    """Create a spec entry in the Database (DB-backed tests)."""
+    # Use enqueue to create the spec
+    entry = db.enqueue(spec_path)
+    # Override the ID
+    new_id = queue_id
+    db.conn.execute("UPDATE specs SET id=? WHERE id=?", (new_id, entry["id"]))
+    db.conn.commit()
+
+    # Apply overrides via direct SQL
+    fields_to_update = {
+        "status": overrides.get("status", "running"),
+        "iteration": overrides.get("iteration", 1),
+        "max_iterations": overrides.get("max_iterations", 30),
+        "critic_passes": overrides.get("critic_passes", 0),
+        "tasks_done": overrides.get("tasks_done", 0),
+        "tasks_total": overrides.get("tasks_total", 0),
+        "consecutive_failures": overrides.get("consecutive_failures", 0),
+        "phase": overrides.get("phase", "critic"),
+    }
+    set_clauses = ", ".join(f"{k}=?" for k in fields_to_update)
+    db.conn.execute(
+        f"UPDATE specs SET {set_clauses} WHERE id=?",
+        list(fields_to_update.values()) + [new_id],
+    )
+    db.conn.commit()
+    return db.get_spec(new_id)
 
 
 def _write_spec(path, content):
@@ -424,10 +460,10 @@ class TestCriticTaskInjection(unittest.TestCase):
                 "### t-2: [CRITIC] Fix bug\nPENDING\n\n"
                 "**Spec:** Fix.\n\n**Verify:** Test.\n",
             )
-            _write_queue_entry(
-                env["queue_dir"],
+            _make_db_entry(
+                env["db"],
                 "q-001",
-                spec_path=spec_path,
+                spec_path,
                 critic_passes=0,
                 status="running",
             )
@@ -441,14 +477,14 @@ class TestCriticTaskInjection(unittest.TestCase):
                     env["events_dir"],
                     env["hooks_dir"],
                     spec_path,
+                    db=env["db"],
                 )
 
             self.assertEqual(result["outcome"], "critic_tasks_added")
             self.assertEqual(result["critic_tasks_added"], 1)
 
             # Verify critic_passes incremented
-            entry_path = os.path.join(env["queue_dir"], "q-001.json")
-            entry = json.loads(Path(entry_path).read_text())
+            entry = env["db"].get_spec("q-001")
             self.assertEqual(entry["critic_passes"], 1)
 
             # Verify requeued
@@ -503,10 +539,10 @@ class TestCriticApproval(unittest.TestCase):
                 spec_path,
                 "# Spec\n\n### t-1: Task\nDONE\n\n## Critic Approved\n\n2026-03-06\n",
             )
-            _write_queue_entry(
-                env["queue_dir"],
+            _make_db_entry(
+                env["db"],
                 "q-001",
-                spec_path=spec_path,
+                spec_path,
                 critic_passes=0,
                 status="running",
             )
@@ -520,13 +556,13 @@ class TestCriticApproval(unittest.TestCase):
                     env["events_dir"],
                     env["hooks_dir"],
                     spec_path,
+                    db=env["db"],
                 )
 
             self.assertEqual(result["outcome"], "critic_approved")
 
             # Verify status is completed
-            entry_path = os.path.join(env["queue_dir"], "q-001.json")
-            entry = json.loads(Path(entry_path).read_text())
+            entry = env["db"].get_spec("q-001")
             self.assertEqual(entry["status"], "completed")
 
     def test_process_critic_completion_no_output(self):
@@ -538,10 +574,10 @@ class TestCriticApproval(unittest.TestCase):
                 spec_path,
                 "# Spec\n\n### t-1: Task\nDONE\n",
             )
-            _write_queue_entry(
-                env["queue_dir"],
+            _make_db_entry(
+                env["db"],
                 "q-001",
-                spec_path=spec_path,
+                spec_path,
                 critic_passes=0,
                 status="running",
             )
@@ -555,6 +591,7 @@ class TestCriticApproval(unittest.TestCase):
                     env["events_dir"],
                     env["hooks_dir"],
                     spec_path,
+                    db=env["db"],
                 )
 
             # Treated as approved to prevent infinite loops
@@ -573,6 +610,7 @@ class TestCriticApproval(unittest.TestCase):
                 env["events_dir"],
                 env["hooks_dir"],
                 "/fake/spec.md",
+                db=env["db"],
             )
             self.assertEqual(result["outcome"], "error")
 
@@ -683,8 +721,18 @@ class TestCriticIntegration(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.env = _make_temp_env(self.tmpdir)
+        self.db = self.env["db"]
+        self.ctx = CompletionContext(
+            queue_dir=self.env["queue_dir"],
+            events_dir=self.env["events_dir"],
+            hooks_dir=self.env["hooks_dir"],
+            log_dir=self.env["log_dir"],
+            script_dir=self.env["boi_dir"],
+            db=self.db,
+        )
 
     def tearDown(self):
+        self.db.close()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_full_flow_critic_triggers_on_completion(self):
@@ -696,14 +744,15 @@ class TestCriticIntegration(unittest.TestCase):
             "### t-1: Do thing\nDONE\n\n"
             "**Spec:** Did it.\n**Verify:** true\n",
         )
-        _write_queue_entry(
-            self.env["queue_dir"],
+        _make_db_entry(
+            self.db,
             "q-001",
-            spec_path=spec_path,
+            spec_path,
             iteration=1,
             critic_passes=0,
             tasks_done=1,
             tasks_total=1,
+            phase="execute",
         )
 
         from lib.daemon_ops import process_worker_completion
@@ -714,12 +763,8 @@ class TestCriticIntegration(unittest.TestCase):
             patch("lib.daemon_ops.get_tasks_added_from_telemetry", return_value=0),
         ):
             result = process_worker_completion(
-                queue_dir=self.env["queue_dir"],
+                ctx=self.ctx,
                 queue_id="q-001",
-                events_dir=self.env["events_dir"],
-                log_dir=self.env["log_dir"],
-                hooks_dir=self.env["hooks_dir"],
-                script_dir=self.env["boi_dir"],
                 exit_code="0",
             )
 
@@ -736,12 +781,13 @@ class TestCriticIntegration(unittest.TestCase):
             "### t-1: Do thing\nDONE\n\n"
             "**Spec:** Did it.\n**Verify:** true\n",
         )
-        _write_queue_entry(
-            self.env["queue_dir"],
+        _make_db_entry(
+            self.db,
             "q-001",
-            spec_path=spec_path,
+            spec_path,
             iteration=1,
             critic_passes=0,
+            phase="execute",
         )
 
         # Disable critic
@@ -757,12 +803,8 @@ class TestCriticIntegration(unittest.TestCase):
             patch("lib.daemon_ops.get_tasks_added_from_telemetry", return_value=0),
         ):
             result = process_worker_completion(
-                queue_dir=self.env["queue_dir"],
+                ctx=self.ctx,
                 queue_id="q-001",
-                events_dir=self.env["events_dir"],
-                log_dir=self.env["log_dir"],
-                hooks_dir=self.env["hooks_dir"],
-                script_dir=self.env["boi_dir"],
                 exit_code="0",
             )
 
@@ -777,12 +819,13 @@ class TestCriticIntegration(unittest.TestCase):
             "### t-1: Do thing\nDONE\n\n"
             "**Spec:** Did it.\n**Verify:** true\n",
         )
-        _write_queue_entry(
-            self.env["queue_dir"],
+        _make_db_entry(
+            self.db,
             "q-001",
-            spec_path=spec_path,
+            spec_path,
             iteration=3,
             critic_passes=2,  # At max (DEFAULT_CONFIG max_passes=2)
+            phase="execute",
         )
 
         from lib.daemon_ops import process_worker_completion
@@ -793,12 +836,8 @@ class TestCriticIntegration(unittest.TestCase):
             patch("lib.daemon_ops.get_tasks_added_from_telemetry", return_value=0),
         ):
             result = process_worker_completion(
-                queue_dir=self.env["queue_dir"],
+                ctx=self.ctx,
                 queue_id="q-001",
-                events_dir=self.env["events_dir"],
-                log_dir=self.env["log_dir"],
-                hooks_dir=self.env["hooks_dir"],
-                script_dir=self.env["boi_dir"],
                 exit_code="0",
             )
 
@@ -814,10 +853,10 @@ class TestCriticIntegration(unittest.TestCase):
             "### t-1: Do thing\nDONE\n\n"
             "## Critic Approved\n\n2026-03-06\n",
         )
-        _write_queue_entry(
-            self.env["queue_dir"],
+        _make_db_entry(
+            self.db,
             "q-001",
-            spec_path=spec_path,
+            spec_path,
             critic_passes=0,
             status="running",
         )
@@ -831,13 +870,12 @@ class TestCriticIntegration(unittest.TestCase):
                 self.env["events_dir"],
                 self.env["hooks_dir"],
                 spec_path,
+                db=self.db,
             )
 
         self.assertEqual(result["outcome"], "critic_approved")
 
-        entry = json.loads(
-            Path(os.path.join(self.env["queue_dir"], "q-001.json")).read_text()
-        )
+        entry = self.db.get_spec("q-001")
         self.assertEqual(entry["status"], "completed")
         self.assertEqual(entry["critic_passes"], 1)
 
@@ -855,10 +893,10 @@ class TestCriticIntegration(unittest.TestCase):
             "### t-2: [CRITIC] Fix error handling\nPENDING\n\n"
             "**Spec:** Fix it.\n\n**Verify:** Test.\n",
         )
-        _write_queue_entry(
-            self.env["queue_dir"],
+        _make_db_entry(
+            self.db,
             "q-001",
-            spec_path=spec_path,
+            spec_path,
             critic_passes=0,
             status="running",
         )
@@ -872,32 +910,32 @@ class TestCriticIntegration(unittest.TestCase):
                 self.env["events_dir"],
                 self.env["hooks_dir"],
                 spec_path,
+                db=self.db,
             )
 
         self.assertEqual(result["outcome"], "critic_tasks_added")
-        entry = json.loads(
-            Path(os.path.join(self.env["queue_dir"], "q-001.json")).read_text()
-        )
+        entry = self.db.get_spec("q-001")
         self.assertEqual(entry["status"], "requeued")
         self.assertEqual(entry["critic_passes"], 1)
 
         # Step 2: Worker fixes the task (simulate by marking DONE)
-        _write_spec(
-            spec_path,
+        # Update the spec at the DB-stored path (queue copy)
+        db_entry = self.db.get_spec("q-001")
+        done_spec_content = (
             "# Test Spec\n\n**Workspace:** in-place\n\n"
             "## Tasks\n\n"
             "### t-1: Original\nDONE\n\n"
             "**Spec:** Did it.\n\n**Verify:** true\n\n"
             "### t-2: [CRITIC] Fix error handling\nDONE\n\n"
-            "**Spec:** Fix it.\n\n**Verify:** Test.\n",
+            "**Spec:** Fix it.\n\n**Verify:** Test.\n"
         )
+        _write_spec(db_entry["spec_path"], done_spec_content)
 
-        # Update entry for next worker completion
-        entry["iteration"] = 2
-        entry["status"] = "running"
-        Path(os.path.join(self.env["queue_dir"], "q-001.json")).write_text(
-            json.dumps(entry, indent=2) + "\n"
+        # Update entry for next worker completion via DB
+        self.db.conn.execute(
+            "UPDATE specs SET iteration=2, status='running', phase='execute' WHERE id='q-001'"
         )
+        self.db.conn.commit()
 
         # Step 3: Worker completes, critic triggers again (pass 2)
         from lib.daemon_ops import process_worker_completion
@@ -908,12 +946,8 @@ class TestCriticIntegration(unittest.TestCase):
             patch("lib.daemon_ops.get_tasks_added_from_telemetry", return_value=0),
         ):
             result2 = process_worker_completion(
-                queue_dir=self.env["queue_dir"],
+                ctx=self.ctx,
                 queue_id="q-001",
-                events_dir=self.env["events_dir"],
-                log_dir=self.env["log_dir"],
-                hooks_dir=self.env["hooks_dir"],
-                script_dir=self.env["boi_dir"],
                 exit_code="0",
             )
 
@@ -928,10 +962,10 @@ class TestCriticIntegration(unittest.TestCase):
             spec_path,
             "# Test\n\n### t-1: Task\nDONE\n\n## Critic Approved\n\n",
         )
-        _write_queue_entry(
-            self.env["queue_dir"],
+        _make_db_entry(
+            self.db,
             "q-001",
-            spec_path=spec_path,
+            spec_path,
             critic_passes=0,
             status="running",
         )
@@ -945,6 +979,8 @@ class TestCriticIntegration(unittest.TestCase):
                 self.env["events_dir"],
                 self.env["hooks_dir"],
                 spec_path,
+            
+                db=self.db,
             )
 
         # Check that at least one event file was written

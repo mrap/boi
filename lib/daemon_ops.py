@@ -21,6 +21,7 @@ import logging
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
@@ -43,10 +44,6 @@ from lib.evaluate import (
 )
 from lib.event_log import log_event, write_event
 from lib.hooks import get_tasks_added_from_telemetry, run_completion_hooks, run_hook
-from lib.queue import (
-    _read_entry,
-    _write_entry,
-)
 from lib.spec_parser import (
     BoiTask,
     check_status_regression,
@@ -58,6 +55,18 @@ from lib.telemetry import update_telemetry
 
 if TYPE_CHECKING:
     from lib.db import Database
+
+
+@dataclass
+class CompletionContext:
+    """Bundles path and DB parameters for worker completion handlers."""
+
+    queue_dir: str
+    events_dir: str
+    hooks_dir: str
+    log_dir: str
+    script_dir: str
+    db: "Database"
 
 
 def _signal_name(signal_num: int) -> str:
@@ -221,13 +230,8 @@ def _write_failure_to_iteration_meta(
 
 
 def process_worker_completion(
-    queue_dir: str,
+    ctx: CompletionContext,
     queue_id: str,
-    events_dir: str,
-    log_dir: str,
-    hooks_dir: str,
-    script_dir: str,
-    db: Database,
     exit_code: Optional[str] = None,
     timeout: bool = False,
 ) -> dict[str, Any]:
@@ -242,16 +246,11 @@ def process_worker_completion(
     6. Captures failure diagnostics (failure_reason, log_tail)
 
     Args:
-        queue_dir: Path to ~/.boi/queue/
+        ctx: CompletionContext bundling queue_dir, events_dir, hooks_dir,
+             log_dir, script_dir, and db.
         queue_id: The spec queue ID (e.g., "q-001")
-        events_dir: Path to ~/.boi/events/
-        log_dir: Path to ~/.boi/logs/
-        hooks_dir: Path to ~/.boi/hooks/
-        script_dir: Path to the BOI script directory
         exit_code: Worker exit code as string, or None if no exit file found
         timeout: True if the worker was killed due to timeout
-        db: Optional Database instance. When provided, state operations
-            use SQLite instead of the file-based JSON queue.
 
     Returns:
         A dict with:
@@ -268,7 +267,7 @@ def process_worker_completion(
     timestamp = datetime.now(timezone.utc).isoformat()
 
     # Step 1: Read queue entry
-    entry = db.get_spec(queue_id)
+    entry = ctx.db.get_spec(queue_id)
     if entry is None:
         return {"outcome": "error", "reason": f"Queue entry not found: {queue_id}"}
 
@@ -292,11 +291,11 @@ def process_worker_completion(
         result["exit_code"] = int(exit_code)
 
         # Clean up the spec's mailbox
-        state_dir = str(Path(queue_dir).parent)
+        state_dir = str(Path(ctx.queue_dir).parent)
         cleanup_mailbox(queue_id, state_dir)
 
         write_event(
-            events_dir,
+            ctx.events_dir,
             {
                 "type": f"spec_{reason}",
                 "queue_id": queue_id,
@@ -309,16 +308,16 @@ def process_worker_completion(
 
         # 130 (canceled) / 132 (preempted): mark canceled or requeue
         if exit_code == "130":
-            db.cancel(queue_id)
+            ctx.db.cancel(queue_id)
         elif exit_code == "131":
             # task_skipped: requeue for next task
-            db.requeue(queue_id)
+            ctx.db.requeue(queue_id)
         elif exit_code == "132":
             # preempted: requeue for higher-priority work
-            db.requeue(queue_id)
+            ctx.db.requeue(queue_id)
         elif exit_code == "133":
             # deprioritized: requeue at lower priority
-            db.requeue(queue_id)
+            ctx.db.requeue(queue_id)
 
         return result
 
@@ -339,10 +338,10 @@ def process_worker_completion(
         )
 
         # Requeue without incrementing consecutive_failures
-        db.signal_requeue(queue_id)
+        ctx.db.signal_requeue(queue_id)
 
         write_event(
-            events_dir,
+            ctx.events_dir,
             {
                 "type": "spec_signal_requeued",
                 "queue_id": queue_id,
@@ -364,44 +363,36 @@ def process_worker_completion(
     if exit_code is None or exit_code != "0":
         failure_reason = _get_failure_reason(exit_code, timeout, entry)
         crash_result = _handle_crash(
-            queue_dir,
+            ctx,
             queue_id,
             entry,
             iteration,
             max_iter,
-            events_dir,
-            hooks_dir,
-            log_dir,
             spec_path,
             timestamp,
             failure_reason=failure_reason,
             exit_code_str=exit_code,
-            db=db,
         )
         result.update(crash_result)
         return result
 
     # Step 2: Normal exit — validate spec first
     validation_error = _validate_spec_or_get_error(
-        queue_dir, queue_id, spec_path, iteration
+        ctx.queue_dir, queue_id, spec_path, iteration
     )
     if validation_error is not None:
         result["validation_errors"] = validation_error["validation_errors"]
         failure_reason = validation_error["failure_reason"]
         crash_result = _handle_crash(
-            queue_dir,
+            ctx,
             queue_id,
             entry,
             iteration,
             max_iter,
-            events_dir,
-            hooks_dir,
-            log_dir,
             spec_path,
             timestamp,
             failure_reason=failure_reason,
             exit_code_str=exit_code,
-            db=db,
         )
         result.update(crash_result)
         result["outcome"] = "validation_failed"
@@ -409,7 +400,7 @@ def process_worker_completion(
 
     # Check for status regression (DONE -> PENDING)
     regressions = _check_regression_and_record(
-        entry, spec_path, queue_id, iteration, timestamp, events_dir
+        entry, spec_path, queue_id, iteration, timestamp, ctx.events_dir
     )
     if regressions:
         result["status_regressions"] = regressions
@@ -436,18 +427,18 @@ def process_worker_completion(
     # Empty-diff detection: warn if tasks were marked DONE but the worktree
     # has no new changes (possible false completion / no real work performed).
     newly_done = done_count - entry.get("tasks_done", 0)
-    if newly_done > 0 and db is not None:
+    if newly_done > 0:
         last_worker = entry.get("last_worker")
         if last_worker:
             try:
-                worker_row = db.get_worker(last_worker)
+                worker_row = ctx.db.get_worker(last_worker)
                 worktree_path = (worker_row or {}).get("worktree_path", "")
                 warn_if_empty_diff(queue_id, worktree_path, newly_done)
             except Exception:
                 pass  # Never let this block the completion path
 
     # Get tasks_added from telemetry
-    tasks_added = get_tasks_added_from_telemetry(queue_dir, queue_id)
+    tasks_added = get_tasks_added_from_telemetry(ctx.queue_dir, queue_id)
 
     # Check for EXPERIMENT_PROPOSED tasks — pause for human review
     experiment_proposed_tasks = _get_experiment_proposed_tasks(spec_path)
@@ -455,13 +446,13 @@ def process_worker_completion(
         return _handle_experiment_proposed_return(
             result,
             experiment_proposed_tasks,
-            db,
-            queue_dir,
+            ctx.db,
+            ctx.queue_dir,
             queue_id,
             done_count,
             total_count,
-            hooks_dir,
-            events_dir,
+            ctx.hooks_dir,
+            ctx.events_dir,
             spec_path,
             iteration,
             timestamp,
@@ -474,12 +465,12 @@ def process_worker_completion(
     # because it was in an elif after the pending_count==0 branch.
     if iteration >= max_iter and pending_count > 0:
         # Max iterations reached with pending tasks — fail
-        db.fail(queue_id, "Max iterations reached")
+        ctx.db.fail(queue_id, "Max iterations reached")
         result["outcome"] = "failed"
         result["reason"] = "max_iterations"
 
         write_event(
-            events_dir,
+            ctx.events_dir,
             {
                 "type": "spec_failed",
                 "queue_id": queue_id,
@@ -491,18 +482,18 @@ def process_worker_completion(
             },
         )
 
-        run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=True)
+        run_completion_hooks(ctx.hooks_dir, queue_id, spec_path, is_failure=True)
         return result
 
     if pending_count == 0:
         # All tasks done — check if critic should run (only if under max-iter)
         if iteration >= max_iter:
             # Past max-iter: complete without critic, don't requeue
-            db.complete(queue_id, done_count, total_count)
+            ctx.db.complete(queue_id, done_count, total_count)
             result["outcome"] = "completed"
 
             write_event(
-                events_dir,
+                ctx.events_dir,
                 {
                     "type": "spec_completed",
                     "queue_id": queue_id,
@@ -515,34 +506,30 @@ def process_worker_completion(
                 },
             )
 
-            run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
+            run_completion_hooks(ctx.hooks_dir, queue_id, spec_path, is_failure=False)
             return result
 
         result.update(
             _apply_critic_or_complete(
                 entry,
-                db,
-                queue_dir,
+                ctx,
                 queue_id,
                 done_count,
                 total_count,
-                hooks_dir,
-                events_dir,
                 spec_path,
                 iteration,
                 tasks_added,
                 timestamp,
-                script_dir,
             )
         )
 
     else:
         # Still has pending tasks (and under max-iter, checked above), requeue
-        db.requeue(queue_id, done_count, total_count)
+        ctx.db.requeue(queue_id, done_count, total_count)
         result["outcome"] = "requeued"
 
         write_event(
-            events_dir,
+            ctx.events_dir,
             {
                 "type": "spec_requeued",
                 "queue_id": queue_id,
@@ -554,7 +541,7 @@ def process_worker_completion(
 
     # Step 6: Update telemetry
     try:
-        update_telemetry(queue_dir, queue_id)
+        update_telemetry(ctx.queue_dir, queue_id)
     except Exception:
         pass  # Telemetry failure should never block the daemon
 
@@ -562,17 +549,13 @@ def process_worker_completion(
 
 
 def _handle_crash(
-    queue_dir: str,
+    ctx: CompletionContext,
     queue_id: str,
     entry: dict[str, Any],
     iteration: int,
     max_iter: int,
-    events_dir: str,
-    hooks_dir: str,
-    log_dir: str,
     spec_path: str,
     timestamp: str,
-    db: Database,
     failure_reason: str = "",
     exit_code_str: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -581,9 +564,6 @@ def _handle_crash(
     Records failure, applies cooldown or fails permanently.
     Captures failure_reason and log_tail in iteration metadata.
     Returns a partial result dict to merge into the caller's result.
-
-    Args:
-        db: Optional Database instance for SQLite-backed state.
     """
     result: dict[str, Any] = {
         "pending_count": 0,
@@ -592,10 +572,10 @@ def _handle_crash(
     }
 
     # Capture log tail for diagnostics
-    log_tail = _read_log_tail(log_dir, queue_id, iteration)
+    log_tail = _read_log_tail(ctx.log_dir, queue_id, iteration)
 
     # Record the failure and check threshold
-    max_exceeded = db.record_failure(queue_id)
+    max_exceeded = ctx.db.record_failure(queue_id)
 
     if max_exceeded:
         final_reason = (
@@ -603,13 +583,13 @@ def _handle_crash(
             if failure_reason
             else "Consecutive failures exceeded threshold"
         )
-        db.fail(queue_id, final_reason)
+        ctx.db.fail(queue_id, final_reason)
         result["outcome"] = "failed"
         result["reason"] = "consecutive_failures"
         result["failure_reason"] = final_reason
 
         write_event(
-            events_dir,
+            ctx.events_dir,
             {
                 "type": "spec_failed",
                 "queue_id": queue_id,
@@ -629,10 +609,10 @@ def _handle_crash(
             "error",
         )
 
-        run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=True)
+        run_completion_hooks(ctx.hooks_dir, queue_id, spec_path, is_failure=True)
 
     elif iteration >= max_iter:
-        db.fail(queue_id, "Max iterations reached (with crashes)")
+        ctx.db.fail(queue_id, "Max iterations reached (with crashes)")
         result["outcome"] = "failed"
         result["reason"] = "max_iterations_with_crashes"
         result["failure_reason"] = (
@@ -640,7 +620,7 @@ def _handle_crash(
         )
 
         write_event(
-            events_dir,
+            ctx.events_dir,
             {
                 "type": "spec_failed",
                 "queue_id": queue_id,
@@ -660,17 +640,17 @@ def _handle_crash(
             "error",
         )
 
-        run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=True)
+        run_completion_hooks(ctx.hooks_dir, queue_id, spec_path, is_failure=True)
 
     else:
         # Requeue with cooldown (keep consecutive_failures intact)
-        db.crash_requeue(queue_id)
+        ctx.db.crash_requeue(queue_id)
 
         result["outcome"] = "crashed"
         result["failure_reason"] = failure_reason
 
         write_event(
-            events_dir,
+            ctx.events_dir,
             {
                 "type": "spec_crash_requeued",
                 "queue_id": queue_id,
@@ -692,7 +672,7 @@ def _handle_crash(
     if failure_reason:
         try:
             _write_failure_to_iteration_meta(
-                queue_dir,
+                ctx.queue_dir,
                 queue_id,
                 iteration,
                 failure_reason,
@@ -704,7 +684,7 @@ def _handle_crash(
 
     # Update telemetry
     try:
-        update_telemetry(queue_dir, queue_id)
+        update_telemetry(ctx.queue_dir, queue_id)
     except Exception:
         pass
 
@@ -883,27 +863,23 @@ def _handle_experiment_proposed_return(
 
 def _apply_critic_or_complete(
     entry: dict[str, Any],
-    db: Database,
-    queue_dir: str,
+    ctx: CompletionContext,
     queue_id: str,
     done_count: int,
     total_count: int,
-    hooks_dir: str,
-    events_dir: str,
     spec_path: str,
     iteration: int,
     tasks_added: int,
     timestamp: str,
-    script_dir: str,
 ) -> dict[str, Any]:
     """Determine whether to run the critic or complete the spec.
 
     Called when pending_count == 0 and iteration < max_iter.
     Returns a partial result dict to merge into the caller's result.
     """
-    state_dir = str(Path(queue_dir).parent)
+    state_dir = str(Path(ctx.queue_dir).parent)
     critic_config = load_critic_config(state_dir)
-    boi_dir = script_dir  # script_dir points to ~/boi/
+    boi_dir = ctx.script_dir  # script_dir points to ~/boi/
 
     if should_run_critic(entry, critic_config):
         critic_passes = entry.get("critic_passes", 0)
@@ -918,7 +894,7 @@ def _apply_critic_or_complete(
                 state_dir=state_dir,
                 queue_entry=entry,
             )
-            prompt_path = os.path.join(queue_dir, f"{queue_id}.critic-prompt.md")
+            prompt_path = os.path.join(ctx.queue_dir, f"{queue_id}.critic-prompt.md")
             tmp_path = prompt_path + ".tmp"
             Path(tmp_path).write_text(prompt, encoding="utf-8")
             os.replace(tmp_path, prompt_path)
@@ -926,7 +902,7 @@ def _apply_critic_or_complete(
             critic_elapsed = round(time.monotonic() - critic_start, 3)
 
             write_event(
-                events_dir,
+                ctx.events_dir,
                 {
                     "type": "critic_review_triggered",
                     "queue_id": queue_id,
@@ -938,8 +914,8 @@ def _apply_critic_or_complete(
             )
 
             # Requeue so daemon can pick it up for critic worker
-            db.requeue(queue_id, done_count, total_count)
-            db.update_spec_fields(queue_id, phase="critic")
+            ctx.db.requeue(queue_id, done_count, total_count)
+            ctx.db.update_spec_fields(queue_id, phase="critic")
 
             return {
                 "outcome": "critic_review",
@@ -949,10 +925,10 @@ def _apply_critic_or_complete(
 
         except Exception as exc:
             # If critic prompt generation fails, complete anyway
-            db.complete(queue_id, done_count, total_count)
+            ctx.db.complete(queue_id, done_count, total_count)
 
             write_event(
-                events_dir,
+                ctx.events_dir,
                 {
                     "type": "spec_completed",
                     "queue_id": queue_id,
@@ -965,16 +941,16 @@ def _apply_critic_or_complete(
                 },
             )
 
-            run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
+            run_completion_hooks(ctx.hooks_dir, queue_id, spec_path, is_failure=False)
 
             return {"outcome": "completed", "critic_error": str(exc)}
 
     else:
         # Critic disabled or max passes reached — complete normally
-        db.complete(queue_id, done_count, total_count)
+        ctx.db.complete(queue_id, done_count, total_count)
 
         write_event(
-            events_dir,
+            ctx.events_dir,
             {
                 "type": "spec_completed",
                 "queue_id": queue_id,
@@ -986,7 +962,7 @@ def _apply_critic_or_complete(
             },
         )
 
-        run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=False)
+        run_completion_hooks(ctx.hooks_dir, queue_id, spec_path, is_failure=False)
 
         return {"outcome": "completed"}
 

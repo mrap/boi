@@ -32,6 +32,15 @@ class SignalHandlingTestCase(unittest.TestCase):
         for d in (self.queue_dir, self.logs_dir, self.events_dir, self.hooks_dir):
             os.makedirs(d, exist_ok=True)
         self.db = Database(self.db_path, self.queue_dir)
+        from lib.daemon_ops import CompletionContext
+        self.ctx = CompletionContext(
+            queue_dir=self.queue_dir,
+            events_dir=self.events_dir,
+            hooks_dir=self.hooks_dir,
+            log_dir=self.logs_dir,
+            script_dir=self.state_dir,
+            db=self.db,
+        )
 
     def tearDown(self) -> None:
         self.db.close()
@@ -69,14 +78,9 @@ class TestSignalExitCodes(SignalHandlingTestCase):
 
         self._create_running_spec(consecutive_failures=0)
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id="q-001",
-            events_dir=self.events_dir,
-            log_dir=self.logs_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.state_dir,
             exit_code="143",
-            db=self.db,
         )
         row = self.db.conn.execute(
             "SELECT consecutive_failures, status FROM specs WHERE id = 'q-001'"
@@ -96,14 +100,9 @@ class TestSignalExitCodes(SignalHandlingTestCase):
 
         self._create_running_spec(consecutive_failures=0)
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id="q-001",
-            events_dir=self.events_dir,
-            log_dir=self.logs_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.state_dir,
             exit_code="137",
-            db=self.db,
         )
         row = self.db.conn.execute(
             "SELECT consecutive_failures, status FROM specs WHERE id = 'q-001'"
@@ -123,14 +122,9 @@ class TestSignalExitCodes(SignalHandlingTestCase):
 
         self._create_running_spec(consecutive_failures=0)
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id="q-001",
-            events_dir=self.events_dir,
-            log_dir=self.logs_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.state_dir,
             exit_code="1",
-            db=self.db,
         )
         row = self.db.conn.execute(
             "SELECT consecutive_failures FROM specs WHERE id = 'q-001'"
@@ -147,14 +141,9 @@ class TestSignalExitCodes(SignalHandlingTestCase):
 
         self._create_running_spec(consecutive_failures=3)
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id="q-001",
-            events_dir=self.events_dir,
-            log_dir=self.logs_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.state_dir,
             exit_code="0",
-            db=self.db,
         )
         row = self.db.conn.execute(
             "SELECT consecutive_failures FROM specs WHERE id = 'q-001'"
@@ -169,14 +158,9 @@ class TestSignalExitCodes(SignalHandlingTestCase):
 
         self._create_running_spec(consecutive_failures=4)
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id="q-001",
-            events_dir=self.events_dir,
-            log_dir=self.logs_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.state_dir,
             exit_code="143",
-            db=self.db,
         )
         row = self.db.conn.execute(
             "SELECT status FROM specs WHERE id = 'q-001'"
@@ -192,14 +176,9 @@ class TestSignalExitCodes(SignalHandlingTestCase):
         # Simulate 5 consecutive SIGTERM kills
         self._create_running_spec(consecutive_failures=4)
         result = process_worker_completion(
-            queue_dir=self.queue_dir,
+            ctx=self.ctx,
             queue_id="q-001",
-            events_dir=self.events_dir,
-            log_dir=self.logs_dir,
-            hooks_dir=self.hooks_dir,
-            script_dir=self.state_dir,
             exit_code="143",
-            db=self.db,
         )
         row = self.db.conn.execute(
             "SELECT status, consecutive_failures FROM specs WHERE id = 'q-001'"
