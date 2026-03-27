@@ -5,8 +5,8 @@
 # Each file contains one JSON object. Writes are atomic (write .tmp, then mv).
 # Events are read back in sequence-number order.
 #
-# Also provides log_event() — a wrapper around ~/hive/tools/logging/log_event.sh
-# for sending BOI events to the unified Hive event log (SQLite-backed).
+# Also provides log_event() — a wrapper around ~/hex/tools/logging/log_event.sh
+# for sending BOI events to the unified hex event log (SQLite-backed).
 
 import json
 import os
@@ -17,10 +17,10 @@ from typing import Any, Optional
 
 
 # ---------------------------------------------------------------------------
-# Hive unified event log wrapper
+# hex unified event log wrapper
 # ---------------------------------------------------------------------------
 
-_LOG_EVENT_SCRIPT = os.path.expanduser("~/hive/tools/logging/log_event.sh")
+_LOG_EVENT_SCRIPT = os.path.expanduser("~/hex/tools/logging/log_event.sh")
 
 
 def log_event(
@@ -30,9 +30,9 @@ def log_event(
     metadata: dict[str, Any] | None = None,
     severity: str = "info",
 ) -> None:
-    """Log an event to the Hive unified event log. Non-blocking.
+    """Log an event to the hex unified event log. Non-blocking.
 
-    Calls ~/hive/tools/logging/log_event.sh in a fire-and-forget subprocess.
+    Calls ~/hex/tools/logging/log_event.sh in a fire-and-forget subprocess.
     All BOI events use source="boi".
     """
     cmd = [

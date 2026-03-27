@@ -6,7 +6,7 @@
 #   1. Lifecycle event writing — standardized JSON events to ~/.boi/events/
 #   2. Hook script execution — optional user scripts in ~/.boi/hooks/
 #
-# External systems (Hive heartbeat, notification daemons, etc.) can poll
+# External systems (hex heartbeat, notification daemons, etc.) can poll
 # the events directory. BOI itself does NOT send notifications or integrate
 # with any specific system. It just writes events and runs hook scripts.
 #

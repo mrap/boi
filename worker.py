@@ -42,7 +42,7 @@ class WorkerHooks:
     """Extension point for injecting context into worker prompts.
 
     Subclass this and pass an instance to Worker(hooks=...) to inject
-    additional context (e.g. hive context, project metadata) into the
+    additional context (e.g. hex context, project metadata) into the
     prompt before each iteration.
 
     Default implementation returns empty strings for all hooks.
