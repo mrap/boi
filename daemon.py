@@ -711,6 +711,7 @@ class Daemon:
                     spec_after.get("spec_path", "")
                 )
                 if new_status == "completed":
+                    self._commit_and_push_output(spec_id, target_repo)
                     self.emit_hex_event("boi.spec.completed", {
                         "spec_id": spec_id,
                         "spec_title": spec_title,
@@ -1086,6 +1087,140 @@ class Daemon:
         except Exception:
             pass
         return ""
+
+    def _commit_and_push_output(self, spec_id: str, target_repo: str) -> None:
+        """Commit and push the target repo's changes after spec completion.
+
+        Reads the changed-files manifest from ~/.boi/queue/{spec_id}.changed-files
+        if it exists and stages only those files; otherwise stages all changes.
+        Logs a warning on failure but never raises — spec completion is unaffected.
+        """
+        ops_log = os.path.join(os.path.expanduser("~"), ".boi", "ops-actions.log")
+
+        if not target_repo:
+            logger.warning(
+                "[auto-commit] No target_repo for spec %s — skipping commit", spec_id
+            )
+            return
+
+        # Verify it is a git repo
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "rev-parse", "--git-dir"],
+                check=True,
+                capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.warning(
+                "[auto-commit] %s is not a git repo — skipping", target_repo
+            )
+            return
+
+        # Check if repo is dirty
+        try:
+            result = subprocess.run(
+                ["git", "-C", target_repo, "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if not result.stdout.strip():
+                logger.info(
+                    "[auto-commit] %s is clean — nothing to commit", target_repo
+                )
+                return
+        except subprocess.CalledProcessError as exc:
+            logger.warning("[auto-commit] git status failed in %s: %s", target_repo, exc)
+            return
+
+        # Stage changes
+        manifest_path = os.path.join(
+            os.path.expanduser("~"), ".boi", "queue", f"{spec_id}.changed-files"
+        )
+        try:
+            if os.path.isfile(manifest_path) and os.path.getsize(manifest_path) > 0:
+                with open(manifest_path, encoding="utf-8") as fh:
+                    files = [ln.strip() for ln in fh if ln.strip()]
+                for filepath in files:
+                    full = os.path.join(target_repo, filepath)
+                    if os.path.exists(full):
+                        subprocess.run(
+                            ["git", "-C", target_repo, "add", "--", filepath],
+                            check=True,
+                            capture_output=True,
+                        )
+                    else:
+                        logger.info(
+                            "[auto-commit] Skipping missing manifest file: %s", filepath
+                        )
+            else:
+                logger.warning(
+                    "[auto-commit] No changed-files manifest for %s, falling back to git add -A",
+                    spec_id,
+                )
+                subprocess.run(
+                    ["git", "-C", target_repo, "add", "-A"],
+                    check=True,
+                    capture_output=True,
+                )
+        except subprocess.CalledProcessError as exc:
+            logger.warning("[auto-commit] git add failed in %s: %s", target_repo, exc)
+            return
+
+        # Commit
+        commit_msg = f"feat: BOI {spec_id} output — auto-committed by hex-ops"
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "commit", "-m", commit_msg],
+                check=True,
+                capture_output=True,
+            )
+            logger.info("[auto-commit] Committed in %s: %s", target_repo, commit_msg)
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[auto-commit] git commit failed in %s: %s", target_repo, exc
+            )
+            return
+
+        # Push if remote exists
+        push_status = "no-remote"
+        try:
+            remote_result = subprocess.run(
+                ["git", "-C", target_repo, "remote", "-v"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if remote_result.stdout.strip():
+                try:
+                    subprocess.run(
+                        ["git", "-C", target_repo, "push"],
+                        check=True,
+                        capture_output=True,
+                    )
+                    push_status = "pushed"
+                except subprocess.CalledProcessError:
+                    push_status = "push-failed"
+                    logger.warning(
+                        "[auto-commit] git push failed in %s — branch may be diverged",
+                        target_repo,
+                    )
+        except subprocess.CalledProcessError:
+            pass
+
+        # Log to ops-actions.log
+        try:
+            from datetime import datetime as _dt  # already imported at module level
+            timestamp = _dt.now().strftime("%Y-%m-%d %H:%M")
+            log_line = (
+                f"{timestamp} — auto-commit: {spec_id} in {target_repo} (push={push_status})\n"
+            )
+            os.makedirs(os.path.dirname(ops_log), exist_ok=True)
+            with open(ops_log, "a", encoding="utf-8") as fh:
+                fh.write(log_line)
+            logger.info("[auto-commit] Done: %s", log_line.strip())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[auto-commit] Failed to write ops log: %s", exc)
 
     # ── Helpers ──────────────────────────────────────────────────────
 
