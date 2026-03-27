@@ -46,14 +46,6 @@ from lib.hooks import get_tasks_added_from_telemetry, run_completion_hooks, run_
 from lib.queue import (
     _read_entry,
     _write_entry,
-    complete,
-    dequeue,
-    fail,
-    get_entry,
-    increment_experiment_usage,
-    record_failure,
-    requeue,
-    set_needs_review,
 )
 from lib.spec_parser import (
     BoiTask,
@@ -235,9 +227,9 @@ def process_worker_completion(
     log_dir: str,
     hooks_dir: str,
     script_dir: str,
+    db: Database,
     exit_code: Optional[str] = None,
     timeout: bool = False,
-    db: Optional[Database] = None,
 ) -> dict[str, Any]:
     """Process a worker completion in a single call.
 
@@ -276,10 +268,7 @@ def process_worker_completion(
     timestamp = datetime.now(timezone.utc).isoformat()
 
     # Step 1: Read queue entry
-    if db:
-        entry = db.get_spec(queue_id)
-    else:
-        entry = get_entry(queue_dir, queue_id)
+    entry = db.get_spec(queue_id)
     if entry is None:
         return {"outcome": "error", "reason": f"Queue entry not found: {queue_id}"}
 
@@ -320,30 +309,16 @@ def process_worker_completion(
 
         # 130 (canceled) / 132 (preempted): mark canceled or requeue
         if exit_code == "130":
-            if db:
-                db.cancel(queue_id)
-            else:
-                from lib.queue import cancel
-
-                cancel(queue_dir, queue_id)
+            db.cancel(queue_id)
         elif exit_code == "131":
             # task_skipped: requeue for next task
-            if db:
-                db.requeue(queue_id)
-            else:
-                requeue(queue_dir, queue_id)
+            db.requeue(queue_id)
         elif exit_code == "132":
             # preempted: requeue for higher-priority work
-            if db:
-                db.requeue(queue_id)
-            else:
-                requeue(queue_dir, queue_id)
+            db.requeue(queue_id)
         elif exit_code == "133":
             # deprioritized: requeue at lower priority
-            if db:
-                db.requeue(queue_id)
-            else:
-                requeue(queue_dir, queue_id)
+            db.requeue(queue_id)
 
         return result
 
@@ -364,13 +339,7 @@ def process_worker_completion(
         )
 
         # Requeue without incrementing consecutive_failures
-        if db:
-            db.signal_requeue(queue_id)
-        else:
-            entry_now = _read_entry(queue_dir, queue_id)
-            if entry_now:
-                entry_now["status"] = "requeued"
-                _write_entry(queue_dir, entry_now)
+        db.signal_requeue(queue_id)
 
         write_event(
             events_dir,
@@ -505,10 +474,7 @@ def process_worker_completion(
     # because it was in an elif after the pending_count==0 branch.
     if iteration >= max_iter and pending_count > 0:
         # Max iterations reached with pending tasks — fail
-        if db:
-            db.fail(queue_id, "Max iterations reached")
-        else:
-            fail(queue_dir, queue_id, "Max iterations reached")
+        db.fail(queue_id, "Max iterations reached")
         result["outcome"] = "failed"
         result["reason"] = "max_iterations"
 
@@ -532,10 +498,7 @@ def process_worker_completion(
         # All tasks done — check if critic should run (only if under max-iter)
         if iteration >= max_iter:
             # Past max-iter: complete without critic, don't requeue
-            if db:
-                db.complete(queue_id, done_count, total_count)
-            else:
-                complete(queue_dir, queue_id, done_count, total_count)
+            db.complete(queue_id, done_count, total_count)
             result["outcome"] = "completed"
 
             write_event(
@@ -575,10 +538,7 @@ def process_worker_completion(
 
     else:
         # Still has pending tasks (and under max-iter, checked above), requeue
-        if db:
-            db.requeue(queue_id, done_count, total_count)
-        else:
-            requeue(queue_dir, queue_id, done_count, total_count)
+        db.requeue(queue_id, done_count, total_count)
         result["outcome"] = "requeued"
 
         write_event(
@@ -612,9 +572,9 @@ def _handle_crash(
     log_dir: str,
     spec_path: str,
     timestamp: str,
+    db: Database,
     failure_reason: str = "",
     exit_code_str: Optional[str] = None,
-    db: Optional[Database] = None,
 ) -> dict[str, Any]:
     """Handle a crash or failed iteration.
 
@@ -635,10 +595,7 @@ def _handle_crash(
     log_tail = _read_log_tail(log_dir, queue_id, iteration)
 
     # Record the failure and check threshold
-    if db:
-        max_exceeded = db.record_failure(queue_id)
-    else:
-        max_exceeded = record_failure(queue_dir, queue_id)
+    max_exceeded = db.record_failure(queue_id)
 
     if max_exceeded:
         final_reason = (
@@ -646,10 +603,7 @@ def _handle_crash(
             if failure_reason
             else "Consecutive failures exceeded threshold"
         )
-        if db:
-            db.fail(queue_id, final_reason)
-        else:
-            fail(queue_dir, queue_id, final_reason)
+        db.fail(queue_id, final_reason)
         result["outcome"] = "failed"
         result["reason"] = "consecutive_failures"
         result["failure_reason"] = final_reason
@@ -678,10 +632,7 @@ def _handle_crash(
         run_completion_hooks(hooks_dir, queue_id, spec_path, is_failure=True)
 
     elif iteration >= max_iter:
-        if db:
-            db.fail(queue_id, "Max iterations reached (with crashes)")
-        else:
-            fail(queue_dir, queue_id, "Max iterations reached (with crashes)")
+        db.fail(queue_id, "Max iterations reached (with crashes)")
         result["outcome"] = "failed"
         result["reason"] = "max_iterations_with_crashes"
         result["failure_reason"] = (
@@ -713,13 +664,7 @@ def _handle_crash(
 
     else:
         # Requeue with cooldown (keep consecutive_failures intact)
-        if db:
-            db.crash_requeue(queue_id)
-        else:
-            entry_now = _read_entry(queue_dir, queue_id)
-            if entry_now:
-                entry_now["status"] = "requeued"
-                _write_entry(queue_dir, entry_now)
+        db.crash_requeue(queue_id)
 
         result["outcome"] = "crashed"
         result["failure_reason"] = failure_reason
@@ -887,7 +832,7 @@ def _get_experiment_proposed_tasks(spec_path: str) -> list[str]:
 def _handle_experiment_proposed_return(
     result: dict[str, Any],
     experiment_proposed_tasks: list[str],
-    db: Optional[Database],
+    db: Database,
     queue_dir: str,
     queue_id: str,
     done_count: int,
@@ -900,29 +845,15 @@ def _handle_experiment_proposed_return(
 ) -> dict[str, Any]:
     """Handle EXPERIMENT_PROPOSED tasks — pause the spec for human review."""
     # Increment experiment usage count
-    if db:
-        db.increment_experiment_usage(queue_id, count=len(experiment_proposed_tasks))
-    else:
-        increment_experiment_usage(
-            queue_dir, queue_id, count=len(experiment_proposed_tasks)
-        )
+    db.increment_experiment_usage(queue_id, count=len(experiment_proposed_tasks))
 
     # Pause spec for human review
-    if db:
-        db.set_needs_review(
-            queue_id,
-            experiment_proposed_tasks,
-            done_count,
-            total_count,
-        )
-    else:
-        set_needs_review(
-            queue_dir,
-            queue_id,
-            experiment_proposed_tasks,
-            done_count,
-            total_count,
-        )
+    db.set_needs_review(
+        queue_id,
+        experiment_proposed_tasks,
+        done_count,
+        total_count,
+    )
     result["outcome"] = "needs_review"
     result["experiment_tasks"] = experiment_proposed_tasks
 
@@ -952,7 +883,7 @@ def _handle_experiment_proposed_return(
 
 def _apply_critic_or_complete(
     entry: dict[str, Any],
-    db: Optional[Database],
+    db: Database,
     queue_dir: str,
     queue_id: str,
     done_count: int,
@@ -1007,11 +938,8 @@ def _apply_critic_or_complete(
             )
 
             # Requeue so daemon can pick it up for critic worker
-            if db:
-                db.requeue(queue_id, done_count, total_count)
-                db.update_spec_fields(queue_id, phase="critic")
-            else:
-                requeue(queue_dir, queue_id, done_count, total_count)
+            db.requeue(queue_id, done_count, total_count)
+            db.update_spec_fields(queue_id, phase="critic")
 
             return {
                 "outcome": "critic_review",
@@ -1021,10 +949,7 @@ def _apply_critic_or_complete(
 
         except Exception as exc:
             # If critic prompt generation fails, complete anyway
-            if db:
-                db.complete(queue_id, done_count, total_count)
-            else:
-                complete(queue_dir, queue_id, done_count, total_count)
+            db.complete(queue_id, done_count, total_count)
 
             write_event(
                 events_dir,
@@ -1046,10 +971,7 @@ def _apply_critic_or_complete(
 
     else:
         # Critic disabled or max passes reached — complete normally
-        if db:
-            db.complete(queue_id, done_count, total_count)
-        else:
-            complete(queue_dir, queue_id, done_count, total_count)
+        db.complete(queue_id, done_count, total_count)
 
         write_event(
             events_dir,
@@ -1071,7 +993,7 @@ def _apply_critic_or_complete(
 
 def pick_next_spec(
     queue_dir: str,
-    db: Optional[Database] = None,
+    db: Database,
 ) -> Optional[dict[str, Any]]:
     """Dequeue and return the next eligible spec in one call.
 
@@ -1082,10 +1004,7 @@ def pick_next_spec(
         queue_dir: Path to ~/.boi/queue/
         db: Optional Database instance for SQLite-backed state.
     """
-    if db:
-        entry = db.pick_next_spec()
-    else:
-        entry = dequeue(queue_dir)
+    entry = db.pick_next_spec()
     if entry is None:
         return None
 
@@ -1138,7 +1057,7 @@ def find_parallel_assignments(
 
 def get_active_count(
     queue_dir: str,
-    db: Optional[Database] = None,
+    db: Database,
 ) -> int:
     """Count specs with active statuses (queued, requeued, running, needs_review).
 
@@ -1146,12 +1065,7 @@ def get_active_count(
         queue_dir: Path to ~/.boi/queue/
         db: Optional Database instance for SQLite-backed state.
     """
-    if db:
-        entries = db.get_queue()
-    else:
-        from lib.queue import get_queue
-
-        entries = get_queue(queue_dir)
+    entries = db.get_queue()
     return sum(
         1
         for e in entries
@@ -1165,7 +1079,7 @@ def process_critic_completion(
     events_dir: str,
     hooks_dir: str,
     spec_path: str,
-    db: Optional[Database] = None,
+    db: Database,
 ) -> dict[str, Any]:
     """Process a critic worker's completion.
 
@@ -1205,20 +1119,13 @@ def process_critic_completion(
         pass  # Quality telemetry failure should not block critic flow
 
     # Increment critic_passes
-    if db:
-        entry = db.get_spec(queue_id)
-    else:
-        entry = _read_entry(queue_dir, queue_id)
+    entry = db.get_spec(queue_id)
     if entry is None:
         return {"outcome": "error", "reason": f"Queue entry not found: {queue_id}"}
 
     new_critic_passes = (entry.get("critic_passes") or 0) + 1
-    if db:
-        db.update_spec_fields(queue_id, critic_passes=new_critic_passes)
-        entry["critic_passes"] = new_critic_passes
-    else:
-        entry["critic_passes"] = new_critic_passes
-        _write_entry(queue_dir, entry)
+    db.update_spec_fields(queue_id, critic_passes=new_critic_passes)
+    entry["critic_passes"] = new_critic_passes
 
     if critic_result["approved"]:
         # Critic approved — check if this is a Generate spec needing evaluation
@@ -1236,13 +1143,8 @@ def process_critic_completion(
 
         # For Generate specs, transition to evaluate phase instead of completing
         if is_generate_spec(entry) and entry.get("phase") != "evaluate":
-            if db:
-                db.update_spec_fields(queue_id, phase="evaluate")
-                db.requeue(queue_id, counts["done"], counts["total"])
-            else:
-                entry["phase"] = "evaluate"
-                _write_entry(queue_dir, entry)
-                requeue(queue_dir, queue_id, counts["done"], counts["total"])
+            db.update_spec_fields(queue_id, phase="evaluate")
+            db.requeue(queue_id, counts["done"], counts["total"])
 
             write_event(
                 events_dir,
@@ -1259,10 +1161,7 @@ def process_critic_completion(
 
             return {"outcome": "evaluate_phase_entered", "phase": "evaluate"}
 
-        if db:
-            db.complete(queue_id, counts["done"], counts["total"])
-        else:
-            complete(queue_dir, queue_id, counts["done"], counts["total"])
+        db.complete(queue_id, counts["done"], counts["total"])
 
         write_event(
             events_dir,
@@ -1286,11 +1185,8 @@ def process_critic_completion(
         from lib.spec_parser import count_boi_tasks
 
         counts = count_boi_tasks(spec_path)
-        if db:
-            db.requeue(queue_id, counts["done"], counts["total"])
-            db.update_spec_fields(queue_id, phase="execute")
-        else:
-            requeue(queue_dir, queue_id, counts["done"], counts["total"])
+        db.requeue(queue_id, counts["done"], counts["total"])
+        db.update_spec_fields(queue_id, phase="execute")
 
         write_event(
             events_dir,
@@ -1330,11 +1226,8 @@ def process_critic_completion(
 
         if counts["pending"] > 0:
             # Pending tasks exist — requeue for regular workers to handle.
-            if db:
-                db.requeue(queue_id, counts["done"], counts["total"])
-                db.update_spec_fields(queue_id, phase="execute")
-            else:
-                requeue(queue_dir, queue_id, counts["done"], counts["total"])
+            db.requeue(queue_id, counts["done"], counts["total"])
+            db.update_spec_fields(queue_id, phase="execute")
 
             write_event(
                 events_dir,
@@ -1353,10 +1246,7 @@ def process_critic_completion(
                 "critic_tasks_added": counts["pending"],
             }
 
-        if db:
-            db.complete(queue_id, counts["done"], counts["total"])
-        else:
-            complete(queue_dir, queue_id, counts["done"], counts["total"])
+        db.complete(queue_id, counts["done"], counts["total"])
 
         write_event(
             events_dir,
@@ -1379,8 +1269,8 @@ def process_decomposition_completion(
     queue_id: str,
     events_dir: str,
     spec_path: str,
+    db: Database,
     exit_code: Optional[str] = None,
-    db: Optional[Database] = None,
 ) -> dict[str, Any]:
     """Process a decomposition worker's completion.
 
@@ -1409,10 +1299,7 @@ def process_decomposition_completion(
     """
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    if db:
-        entry = db.get_spec(queue_id)
-    else:
-        entry = _read_entry(queue_dir, queue_id)
+    entry = db.get_spec(queue_id)
     if entry is None:
         return {"outcome": "error", "reason": f"Queue entry not found: {queue_id}"}
 
@@ -1483,25 +1370,15 @@ def process_decomposition_completion(
         )
 
     # Validation passed — transition to execute phase
-    if db:
-        db.update_spec_fields(
-            queue_id,
-            phase="execute",
-            decomposition_retries=0,
-            tasks_total=task_count,
-            tasks_done=validation.done,
-            worker_timeout_seconds=None,
-        )
-        db.requeue(queue_id, validation.done, task_count)
-    else:
-        entry["phase"] = "execute"
-        entry["decomposition_retries"] = 0
-        entry["tasks_total"] = task_count
-        entry["tasks_done"] = validation.done
-        # Clear decomposition-specific timeout so execute phase uses the normal timeout
-        entry.pop("worker_timeout_seconds", None)
-        _write_entry(queue_dir, entry)
-        requeue(queue_dir, queue_id, validation.done, task_count)
+    db.update_spec_fields(
+        queue_id,
+        phase="execute",
+        decomposition_retries=0,
+        tasks_total=task_count,
+        tasks_done=validation.done,
+        worker_timeout_seconds=None,
+    )
+    db.requeue(queue_id, validation.done, task_count)
 
     write_event(
         events_dir,
@@ -1529,23 +1406,18 @@ def _handle_decomposition_failure(
     events_dir: str,
     spec_path: str,
     timestamp: str,
+    db: Database,
     reason: str = "",
     errors: list[str] | None = None,
-    db: Optional[Database] = None,
 ) -> dict[str, Any]:
     """Handle a decomposition failure — retry once, then fail permanently."""
     if retry_count < 1:
         # Retry: increment retry counter and requeue
-        if db:
-            db.update_spec_fields(
-                queue_id,
-                decomposition_retries=retry_count + 1,
-                status="requeued",
-            )
-        else:
-            entry["decomposition_retries"] = retry_count + 1
-            entry["status"] = "requeued"
-            _write_entry(queue_dir, entry)
+        db.update_spec_fields(
+            queue_id,
+            decomposition_retries=retry_count + 1,
+            status="requeued",
+        )
 
         write_event(
             events_dir,
@@ -1570,10 +1442,7 @@ def _handle_decomposition_failure(
         return result
     else:
         # Max retries reached — fail permanently
-        if db:
-            db.fail(queue_id, f"decomposition_failed: {reason}")
-        else:
-            fail(queue_dir, queue_id, f"decomposition_failed: {reason}")
+        db.fail(queue_id, f"decomposition_failed: {reason}")
 
         write_event(
             events_dir,
@@ -1615,7 +1484,7 @@ def check_needs_review_timeouts(
     queue_dir: str,
     events_dir: str,
     state_dir: str,
-    db: Optional[Database] = None,
+    db: Database,
 ) -> list[str]:
     """Check for specs in needs_review that have exceeded the timeout.
 
@@ -1633,12 +1502,7 @@ def check_needs_review_timeouts(
 
     Returns a list of queue IDs that were auto-rejected.
     """
-    if db:
-        entries = db.get_queue()
-    else:
-        from lib.queue import get_queue
-
-        entries = get_queue(queue_dir)
+    entries = db.get_queue()
 
     timeout_hours = _load_experiment_timeout(state_dir)
     now = datetime.now(timezone.utc)
@@ -1681,20 +1545,12 @@ def check_needs_review_timeouts(
             if spec_path
             else {"pending": 0, "done": 0, "total": 0}
         )
-        if db:
-            db.requeue(queue_id, counts["done"], counts["total"])
-            db.update_spec_fields(
-                queue_id,
-                experiment_tasks=None,
-                needs_review_since=None,
-            )
-        else:
-            requeue(queue_dir, queue_id, counts["done"], counts["total"])
-            updated_entry = _read_entry(queue_dir, queue_id)
-            if updated_entry:
-                updated_entry.pop("experiment_tasks", None)
-                updated_entry.pop("needs_review_since", None)
-                _write_entry(queue_dir, updated_entry)
+        db.requeue(queue_id, counts["done"], counts["total"])
+        db.update_spec_fields(
+            queue_id,
+            experiment_tasks=None,
+            needs_review_since=None,
+        )
 
         write_event(
             events_dir,
@@ -1761,20 +1617,14 @@ def _handle_evaluate_crash(
     queue_id: str,
     events_dir: str,
     entry: dict[str, Any],
-    db: Optional[Database],
+    db: Database,
     timestamp: str,
 ) -> dict[str, Any]:
     """Handle a crashed evaluation worker. Returns a result dict describing the outcome."""
-    if db:
-        crash_result = db.record_failure(queue_id)
-    else:
-        crash_result = record_failure(queue_dir, queue_id)
+    crash_result = db.record_failure(queue_id)
 
     if crash_result:
-        if db:
-            db.fail(queue_id, "Evaluation crashed: consecutive failures")
-        else:
-            fail(queue_dir, queue_id, "Evaluation crashed: consecutive failures")
+        db.fail(queue_id, "Evaluation crashed: consecutive failures")
         write_event(
             events_dir,
             {
@@ -1788,10 +1638,7 @@ def _handle_evaluate_crash(
 
     tasks_done = entry.get("tasks_done") or 0
     tasks_total = entry.get("tasks_total") or 0
-    if db:
-        db.requeue(queue_id, tasks_done, tasks_total)
-    else:
-        requeue(queue_dir, queue_id, tasks_done, tasks_total)
+    db.requeue(queue_id, tasks_done, tasks_total)
     write_event(
         events_dir,
         {
@@ -1813,7 +1660,7 @@ def _complete_evaluated_spec(
     entry: dict[str, Any],
     status: str,
     convergence: Any,
-    db: Optional[Database],
+    db: Database,
     timestamp: str,
 ) -> dict[str, Any]:
     """Write completion summary, mark spec done, emit event, run hooks."""
@@ -1825,12 +1672,7 @@ def _complete_evaluated_spec(
     )
     write_completion_summary_to_spec(spec_path, summary)
 
-    if db:
-        db.complete(queue_id, counts["done"], counts["total"])
-    else:
-        entry["phase"] = "completed"
-        _write_entry(queue_dir, entry)
-        complete(queue_dir, queue_id, counts["done"], counts["total"])
+    db.complete(queue_id, counts["done"], counts["total"])
 
     write_event(
         events_dir,
@@ -1867,17 +1709,12 @@ def _loop_back_to_execute(
     entry: dict[str, Any],
     convergence: Any,
     pending_count: int,
-    db: Optional[Database],
+    db: Database,
     timestamp: str,
 ) -> dict[str, Any]:
     """Requeue spec back to execute phase when evaluation finds unmet criteria."""
-    if db:
-        db.update_spec_fields(queue_id, phase="execute")
-        db.requeue(queue_id, counts["done"], counts["total"])
-    else:
-        entry["phase"] = "execute"
-        _write_entry(queue_dir, entry)
-        requeue(queue_dir, queue_id, counts["done"], counts["total"])
+    db.update_spec_fields(queue_id, phase="execute")
+    db.requeue(queue_id, counts["done"], counts["total"])
 
     write_event(
         events_dir,
@@ -1908,8 +1745,8 @@ def process_evaluation_completion(
     events_dir: str,
     hooks_dir: str,
     spec_path: str,
+    db: Database,
     exit_code: Optional[str] = None,
-    db: Optional[Database] = None,
 ) -> dict[str, Any]:
     """Process an evaluation worker's completion.
 
@@ -1939,10 +1776,7 @@ def process_evaluation_completion(
     """
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    if db:
-        entry = db.get_spec(queue_id)
-    else:
-        entry = _read_entry(queue_dir, queue_id)
+    entry = db.get_spec(queue_id)
     if entry is None:
         return {"outcome": "error", "reason": f"Queue entry not found: {queue_id}"}
 
@@ -2012,7 +1846,7 @@ def process_evaluation_completion(
 def self_heal(
     queue_dir: str,
     worker_specs: dict[str, str],
-    db: Optional[Database] = None,
+    db: Database,
 ) -> list[dict[str, Any]]:
     """Detect and recover from stuck states automatically.
 
@@ -2031,10 +1865,12 @@ def self_heal(
     """
     actions: list[dict[str, Any]] = []
 
+    queue = db.get_queue()
+
     actions.extend(_heal_stale_running_specs(queue_dir, db=db))
-    actions.extend(_heal_max_running_duration(queue_dir, db=db))
+    actions.extend(_heal_max_running_duration(queue_dir, db=db, queue=queue))
     actions.extend(_heal_orphaned_workers(queue_dir, worker_specs, db=db))
-    actions.extend(_heal_circular_dependencies(queue_dir, db=db))
+    actions.extend(_heal_circular_dependencies(queue_dir, db=db, queue=queue))
     actions.extend(_heal_blocked_by_cleanup(queue_dir, db=db))
     actions.extend(_heal_stale_lock(queue_dir))
 
@@ -2043,71 +1879,22 @@ def self_heal(
 
 def _heal_stale_running_specs(
     queue_dir: str,
-    db: Optional[Database] = None,
+    db: Database,
 ) -> list[dict[str, Any]]:
     """Find specs with status 'running' where no worker PID is alive.
 
     Reset them to 'requeued' so they can be picked up again.
-    When db is provided, uses db.recover_running_specs() which checks
-    PIDs from the processes table. Otherwise falls back to PID files.
+    Uses db.recover_running_specs() which checks PIDs from the processes table.
     """
-    if db:
-        # DB backend uses recover_running_specs which checks processes table
-        recovered = db.recover_running_specs()
-        return [
-            {
-                "action": "stale_running_recovered",
-                "queue_id": qid,
-                "detail": f"spec {qid} stuck in running with dead PID, reset to requeued",
-            }
-            for qid in recovered
-        ]
-
-    from lib.queue import _is_pid_alive, get_queue
-
-    actions: list[dict[str, Any]] = []
-    entries = get_queue(queue_dir)
-
-    for entry in entries:
-        if entry.get("status") != "running":
-            continue
-
-        queue_id = entry["id"]
-        pid_file = os.path.join(queue_dir, f"{queue_id}.pid")
-        pid_alive = False
-
-        if os.path.isfile(pid_file):
-            try:
-                pid_str = Path(pid_file).read_text(encoding="utf-8").strip()
-                pid = int(pid_str)
-                pid_alive = _is_pid_alive(pid)
-            except (ValueError, OSError):
-                pid_alive = False
-        # else: no PID file means worker never started or exited without cleanup
-
-        if not pid_alive:
-            # Reset to requeued
-            entry["status"] = "requeued"
-            _write_entry(queue_dir, entry)
-
-            # Clean up stale PID/exit files
-            for suffix in [".pid", ".exit"]:
-                stale = os.path.join(queue_dir, f"{queue_id}{suffix}")
-                if os.path.isfile(stale):
-                    try:
-                        os.remove(stale)
-                    except OSError:
-                        pass
-
-            actions.append(
-                {
-                    "action": "stale_running_recovered",
-                    "queue_id": queue_id,
-                    "detail": f"spec {queue_id} stuck in running with dead PID, reset to requeued",
-                }
-            )
-
-    return actions
+    recovered = db.recover_running_specs()
+    return [
+        {
+            "action": "stale_running_recovered",
+            "queue_id": qid,
+            "detail": f"spec {qid} stuck in running with dead PID, reset to requeued",
+        }
+        for qid in recovered
+    ]
 
 
 DEFAULT_WORKER_TIMEOUT_SECONDS = 1800  # 30 minutes
@@ -2115,7 +1902,8 @@ DEFAULT_WORKER_TIMEOUT_SECONDS = 1800  # 30 minutes
 
 def _heal_max_running_duration(
     queue_dir: str,
-    db: Optional[Database] = None,
+    db: Database,
+    queue: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Force-fail specs that have been running longer than their max duration.
 
@@ -2124,12 +1912,7 @@ def _heal_max_running_duration(
     force-fail it. This catches cases where the PID check is broken (PID file
     missing, PID reused by another process) and the spec sits in 'running' forever.
     """
-    if db:
-        entries = db.get_queue()
-    else:
-        from lib.queue import get_queue
-
-        entries = get_queue(queue_dir)
+    entries = queue
 
     actions: list[dict[str, Any]] = []
     now = datetime.now(timezone.utc)
@@ -2167,13 +1950,14 @@ def _heal_max_running_duration(
             elapsed_min = int(elapsed_seconds / 60)
             max_min = int(max_duration / 60)
 
+            # Re-check current status: a prior healer (e.g. stale_running) may
+            # have already changed the status since the queue snapshot was taken.
+            current = db.get_spec(queue_id)
+            if not current or current.get("status") != "running":
+                continue
+
             # Force-fail the spec
-            if db:
-                db.fail(queue_id, "Maximum running duration exceeded")
-            else:
-                entry["status"] = "failed"
-                entry["failure_reason"] = "Maximum running duration exceeded"
-                _write_entry(queue_dir, entry)
+            db.fail(queue_id, "Maximum running duration exceeded")
 
             # Clean up PID/exit files
             for suffix in [".pid", ".exit"]:
@@ -2201,7 +1985,7 @@ def _heal_max_running_duration(
 def _heal_orphaned_workers(
     queue_dir: str,
     worker_specs: dict[str, str],
-    db: Optional[Database] = None,
+    db: Database,
 ) -> list[dict[str, Any]]:
     """Find workers assigned to specs that are already in a terminal state.
 
@@ -2216,10 +2000,7 @@ def _heal_orphaned_workers(
         if not queue_id:
             continue
 
-        if db:
-            entry = db.get_spec(queue_id)
-        else:
-            entry = _read_entry(queue_dir, queue_id)
+        entry = db.get_spec(queue_id)
         if entry is None:
             # Queue entry doesn't exist at all. Worker is orphaned.
             actions.append(
@@ -2247,31 +2028,35 @@ def _heal_orphaned_workers(
 
 def _heal_circular_dependencies(
     queue_dir: str,
-    db: Optional[Database] = None,
+    db: Database,
+    queue: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Detect circular dependencies in blocked_by chains.
 
     If spec A blocks B blocks C blocks A, cancel all specs in the cycle.
     Must run BEFORE _heal_blocked_by_cleanup to detect cycles first.
     """
-    if db:
-        entries = db.get_queue()
-    else:
-        from lib.queue import get_queue
-
-        entries = get_queue(queue_dir)
+    entries = queue
 
     actions: list[dict[str, Any]] = []
 
-    # Build adjacency: spec_id -> set of specs it's blocked by
+    # Build adjacency: spec_id -> list of specs it's blocked by
     blocked_by_map: dict[str, list[str]] = {}
     entry_map: dict[str, dict[str, Any]] = {}
     for entry in entries:
         qid = entry["id"]
         entry_map[qid] = entry
-        deps = entry.get("blocked_by", [])
-        if deps:
-            blocked_by_map[qid] = deps
+
+    # Always load deps from spec_dependencies table when db is available
+    cursor = db.conn.execute(
+        "SELECT spec_id, blocks_on FROM spec_dependencies"
+    )
+    for row in cursor:
+        spec_id = row["spec_id"]
+        blocks_on = row["blocks_on"]
+        if spec_id not in blocked_by_map:
+            blocked_by_map[spec_id] = []
+        blocked_by_map[spec_id].append(blocks_on)
 
     # Find all cycles using DFS
     visited: set[str] = set()
@@ -2302,15 +2087,10 @@ def _heal_circular_dependencies(
     for qid in in_cycle:
         entry = entry_map.get(qid)
         if entry and entry.get("status") not in ("completed", "failed", "canceled"):
-            if db:
-                db.cancel(qid)
-                db.update_spec_fields(
-                    qid, failure_reason="Circular dependency detected"
-                )
-            else:
-                entry["status"] = "canceled"
-                entry["failure_reason"] = "Circular dependency detected"
-                _write_entry(queue_dir, entry)
+            db.cancel(qid)
+            db.update_spec_fields(
+                qid, failure_reason="Circular dependency detected"
+            )
             actions.append(
                 {
                     "action": "circular_dependency_canceled",
@@ -2324,7 +2104,7 @@ def _heal_circular_dependencies(
 
 def _heal_blocked_by_cleanup(
     queue_dir: str,
-    db: Optional[Database] = None,
+    db: Database,
 ) -> list[dict[str, Any]]:
     """Clean up blocked_by references to completed/failed/canceled/missing specs.
 
@@ -2332,47 +2112,9 @@ def _heal_blocked_by_cleanup(
     - If a blocking spec is in a terminal state, remove it from blocked_by.
     - If a blocking spec ID doesn't exist, remove it from blocked_by.
 
-    When db is provided, operates on the spec_dependencies table.
+    Operates on the spec_dependencies table.
     """
-    if db:
-        return _heal_blocked_by_cleanup_db(db)
-
-    from lib.queue import get_queue
-
-    terminal_statuses = {"completed", "failed", "canceled"}
-    actions: list[dict[str, Any]] = []
-    entries = get_queue(queue_dir)
-
-    for entry in entries:
-        blocked_by = entry.get("blocked_by", [])
-        if not blocked_by:
-            continue
-
-        queue_id = entry["id"]
-        new_blocked_by: list[str] = []
-        removed: list[str] = []
-
-        for dep_id in blocked_by:
-            dep = _read_entry(queue_dir, dep_id)
-            if dep is None:
-                removed.append(f"{dep_id} (missing)")
-            elif dep.get("status") in terminal_statuses:
-                removed.append(f"{dep_id} ({dep.get('status')})")
-            else:
-                new_blocked_by.append(dep_id)
-
-        if removed:
-            entry["blocked_by"] = new_blocked_by
-            _write_entry(queue_dir, entry)
-            actions.append(
-                {
-                    "action": "blocked_by_cleaned",
-                    "queue_id": queue_id,
-                    "detail": f"removed blocking deps: {', '.join(removed)}",
-                }
-            )
-
-    return actions
+    return _heal_blocked_by_cleanup_db(db)
 
 
 def _heal_blocked_by_cleanup_db(db: Database) -> list[dict[str, Any]]:

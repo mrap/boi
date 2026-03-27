@@ -24,14 +24,7 @@ from lib.daemon_ops import (
     process_worker_completion,
     self_heal,
 )
-from lib.queue import (
-    _read_entry,
-    _write_entry,
-    complete,
-    enqueue,
-    get_entry,
-    set_running,
-)
+from lib.db import Database
 
 
 class DeadlockTestCase(unittest.TestCase):
@@ -59,7 +52,12 @@ class DeadlockTestCase(unittest.TestCase):
         config_path = os.path.join(critic_dir, "config.json")
         Path(config_path).write_text(json.dumps({"enabled": False}, indent=2) + "\n")
 
+        # Create SQLite database
+        db_path = os.path.join(self.boi_state, "boi.db")
+        self.db = Database(db_path, self.queue_dir)
+
     def tearDown(self):
+        self.db.close()
         self._tmpdir.cleanup()
 
     def _make_spec(
@@ -97,12 +95,60 @@ class DeadlockTestCase(unittest.TestCase):
         Path(spec_path).write_text("".join(lines), encoding="utf-8")
         return spec_path
 
+    def _db_set_running(self, qid: str, worker_id: str, pid: int | None = None) -> None:
+        """Set spec to running in db with a linked worker record."""
+        now = datetime.now(timezone.utc).isoformat()
+        self.db.conn.execute(
+            "INSERT INTO workers (id, worktree_path) VALUES (?, '/tmp') "
+            "ON CONFLICT(id) DO NOTHING",
+            (worker_id,),
+        )
+        self.db.conn.execute(
+            "UPDATE workers SET current_spec_id=?, current_pid=? WHERE id=?",
+            (qid, pid, worker_id),
+        )
+        self.db.conn.execute(
+            "UPDATE specs SET status='running', "
+            "first_running_at=COALESCE(first_running_at, ?) WHERE id=?",
+            (now, qid),
+        )
+        self.db.conn.commit()
+
+    def _db_update_spec(self, qid: str, **fields) -> None:
+        """Update spec columns directly via SQL (bypasses _UPDATABLE_COLUMNS)."""
+        if not fields:
+            return
+        set_clause = ", ".join(f"{k}=?" for k in fields)
+        self.db.conn.execute(
+            f"UPDATE specs SET {set_clause} WHERE id=?",
+            (*fields.values(), qid),
+        )
+        self.db.conn.commit()
+
+    def _db_add_dependency(self, spec_id: str, blocks_on: str) -> None:
+        """Insert a row into spec_dependencies. Temporarily disables FK if needed."""
+        # Disable FK to allow referencing non-existent specs (missing-dep scenario)
+        self.db.conn.execute("PRAGMA foreign_keys=OFF")
+        self.db.conn.execute(
+            "INSERT OR IGNORE INTO spec_dependencies (spec_id, blocks_on) VALUES (?, ?)",
+            (spec_id, blocks_on),
+        )
+        self.db.conn.commit()
+        self.db.conn.execute("PRAGMA foreign_keys=ON")
+
+    def _db_get_blocked_by(self, spec_id: str) -> list:
+        """Return list of blocks_on values for a spec."""
+        cursor = self.db.conn.execute(
+            "SELECT blocks_on FROM spec_dependencies WHERE spec_id=?", (spec_id,)
+        )
+        return [row["blocks_on"] for row in cursor]
+
 
 class TestStaleRunningSpecRecovered(DeadlockTestCase):
     """Scenario 1: Running spec with dead PID gets stuck forever.
 
-    Reproduction: Set spec status to 'running', write a PID file with
-    a dead PID. Without self-heal, the daemon never detects the failure
+    Reproduction: Set spec status to 'running', set a dead PID on the
+    worker record. Without self-heal, the daemon never detects the failure
     and the spec sits in 'running' forever.
 
     Fix: self_heal detects dead PID and resets to 'requeued'.
@@ -110,38 +156,32 @@ class TestStaleRunningSpecRecovered(DeadlockTestCase):
 
     def test_stale_running_spec_recovered(self):
         spec_path = self._make_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self._db_set_running(qid, "w-1", pid=999999999)
 
-        # Write PID file with a definitely-dead PID
-        pid_file = os.path.join(self.queue_dir, f"{qid}.pid")
-        Path(pid_file).write_text("999999999\n")
-
-        actions = self_heal(self.queue_dir, {"w-1": qid})
+        actions = self_heal(self.queue_dir, {"w-1": qid}, db=self.db)
 
         # Spec should be recovered
         stale = [a for a in actions if a["action"] == "stale_running_recovered"]
         self.assertEqual(len(stale), 1)
 
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "requeued")
-        self.assertFalse(os.path.isfile(pid_file))
 
     def test_stale_running_no_pid_file(self):
-        """Running spec with no PID file at all should also be recovered."""
+        """Running spec with no PID (None) at all should also be recovered."""
         spec_path = self._make_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self._db_set_running(qid, "w-1", pid=None)  # No PID = treated as dead
 
-        # No PID file created at all
-        actions = self_heal(self.queue_dir, {"w-1": qid})
+        actions = self_heal(self.queue_dir, {"w-1": qid}, db=self.db)
 
         stale = [a for a in actions if a["action"] == "stale_running_recovered"]
         self.assertEqual(len(stale), 1)
 
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "requeued")
 
 
@@ -158,14 +198,14 @@ class TestOrphanedWorkerFreed(DeadlockTestCase):
 
     def test_orphaned_worker_freed(self):
         spec_path = self._make_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
-        complete(self.queue_dir, qid, 3, 3)
+        self._db_set_running(qid, "w-1")
+        self.db.complete(qid, 3, 3)
 
         # Worker still thinks it owns this spec
         worker_specs = {"w-1": qid, "w-2": ""}
-        actions = self_heal(self.queue_dir, worker_specs)
+        actions = self_heal(self.queue_dir, worker_specs, db=self.db)
 
         orphan = [a for a in actions if a["action"] == "orphaned_worker"]
         self.assertEqual(len(orphan), 1)
@@ -174,16 +214,14 @@ class TestOrphanedWorkerFreed(DeadlockTestCase):
 
     def test_orphaned_worker_failed_spec(self):
         """Worker assigned to a failed spec should also be freed."""
-        from lib.queue import fail
-
         spec_path = self._make_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
-        fail(self.queue_dir, qid, "test failure")
+        self._db_set_running(qid, "w-1")
+        self.db.fail(qid, "test failure")
 
         worker_specs = {"w-1": qid}
-        actions = self_heal(self.queue_dir, worker_specs)
+        actions = self_heal(self.queue_dir, worker_specs, db=self.db)
 
         orphan = [a for a in actions if a["action"] == "orphaned_worker"]
         self.assertEqual(len(orphan), 1)
@@ -201,24 +239,22 @@ class TestBlockedByCompletedSpecUnblocked(DeadlockTestCase):
 
     def test_blocked_by_completed_spec_unblocked(self):
         blocker_path = self._make_spec(tasks_pending=0, tasks_done=1)
-        blocker = enqueue(self.queue_dir, blocker_path)
-        set_running(self.queue_dir, blocker["id"], "w-1")
-        complete(self.queue_dir, blocker["id"], 1, 1)
+        blocker = self.db.enqueue(blocker_path)
+        self._db_set_running(blocker["id"], "w-1")
+        self.db.complete(blocker["id"], 1, 1)
 
         blocked_path = self._make_spec(tasks_pending=2, filename="blocked.md")
-        blocked = enqueue(self.queue_dir, blocked_path, blocked_by=[blocker["id"]])
+        blocked = self.db.enqueue(blocked_path, blocked_by=[blocker["id"]])
 
         # Verify it's blocked
-        entry = get_entry(self.queue_dir, blocked["id"])
-        self.assertEqual(entry["blocked_by"], [blocker["id"]])
+        self.assertEqual(self._db_get_blocked_by(blocked["id"]), [blocker["id"]])
 
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
 
         cleanup = [a for a in actions if a["action"] == "blocked_by_cleaned"]
         self.assertEqual(len(cleanup), 1)
 
-        updated = get_entry(self.queue_dir, blocked["id"])
-        self.assertEqual(updated["blocked_by"], [])
+        self.assertEqual(self._db_get_blocked_by(blocked["id"]), [])
 
 
 class TestBlockedByMissingSpecUnblocked(DeadlockTestCase):
@@ -232,22 +268,19 @@ class TestBlockedByMissingSpecUnblocked(DeadlockTestCase):
 
     def test_blocked_by_missing_spec_unblocked(self):
         spec_path = self._make_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
 
-        # Manually set blocked_by to a nonexistent spec
-        raw = _read_entry(self.queue_dir, qid)
-        raw["blocked_by"] = ["q-999"]
-        _write_entry(self.queue_dir, raw)
+        # Bypass FK to create a dep on a non-existent spec (simulates deleted blocker)
+        self._db_add_dependency(qid, "q-999")
 
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
 
         cleanup = [a for a in actions if a["action"] == "blocked_by_cleaned"]
         self.assertEqual(len(cleanup), 1)
         self.assertIn("missing", cleanup[0]["detail"])
 
-        updated = get_entry(self.queue_dir, qid)
-        self.assertEqual(updated["blocked_by"], [])
+        self.assertEqual(self._db_get_blocked_by(qid), [])
 
 
 class TestCircularDependencyDetected(DeadlockTestCase):
@@ -264,17 +297,15 @@ class TestCircularDependencyDetected(DeadlockTestCase):
         specs = []
         for i in range(3):
             path = self._make_spec(tasks_pending=1, filename=f"spec{i}.md")
-            specs.append(enqueue(self.queue_dir, path))
+            specs.append(self.db.enqueue(path))
 
         a_id, b_id, c_id = specs[0]["id"], specs[1]["id"], specs[2]["id"]
 
         # Create cycle: A->C, B->A, C->B
-        for qid, dep in [(a_id, c_id), (b_id, a_id), (c_id, b_id)]:
-            raw = _read_entry(self.queue_dir, qid)
-            raw["blocked_by"] = [dep]
-            _write_entry(self.queue_dir, raw)
+        for spec_id, dep in [(a_id, c_id), (b_id, a_id), (c_id, b_id)]:
+            self._db_add_dependency(spec_id, dep)
 
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
 
         cycle_actions = [
             a for a in actions if a["action"] == "circular_dependency_canceled"
@@ -282,7 +313,7 @@ class TestCircularDependencyDetected(DeadlockTestCase):
         self.assertEqual(len(cycle_actions), 3)
 
         for spec in specs:
-            updated = get_entry(self.queue_dir, spec["id"])
+            updated = self.db.get_spec(spec["id"])
             self.assertEqual(updated["status"], "canceled")
             self.assertIn("Circular", updated.get("failure_reason", ""))
 
@@ -290,18 +321,13 @@ class TestCircularDependencyDetected(DeadlockTestCase):
         """Even a simple A->B->A cycle should be detected."""
         path_a = self._make_spec(tasks_pending=1, filename="a.md")
         path_b = self._make_spec(tasks_pending=1, filename="b.md")
-        a = enqueue(self.queue_dir, path_a)
-        b = enqueue(self.queue_dir, path_b)
+        a = self.db.enqueue(path_a)
+        b = self.db.enqueue(path_b)
 
-        raw_a = _read_entry(self.queue_dir, a["id"])
-        raw_a["blocked_by"] = [b["id"]]
-        _write_entry(self.queue_dir, raw_a)
+        self._db_add_dependency(a["id"], b["id"])
+        self._db_add_dependency(b["id"], a["id"])
 
-        raw_b = _read_entry(self.queue_dir, b["id"])
-        raw_b["blocked_by"] = [a["id"]]
-        _write_entry(self.queue_dir, raw_b)
-
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
 
         cycle_actions = [
             a for a in actions if a["action"] == "circular_dependency_canceled"
@@ -326,7 +352,7 @@ class TestStaleLockRemoved(DeadlockTestCase):
         Path(lock_path).write_text("")
 
         # self_heal should complete without error
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
 
         # No crash = success. Lock file cleanup is handled by flock mechanics.
         # The important thing is self_heal doesn't hang or error.
@@ -334,7 +360,7 @@ class TestStaleLockRemoved(DeadlockTestCase):
 
     def test_no_lock_file(self):
         """No lock file should produce no lock-related actions."""
-        actions = self_heal(self.queue_dir, {})
+        actions = self_heal(self.queue_dir, {}, db=self.db)
         lock_actions = [a for a in actions if "lock" in a.get("action", "")]
         self.assertEqual(len(lock_actions), 0)
 
@@ -353,26 +379,25 @@ class TestZeroPendingCompletion(DeadlockTestCase):
     def test_zero_pending_no_pid(self):
         """Spec with 0 pending + running status + no PID should be recovered."""
         spec_path = self._make_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self._db_set_running(qid, "w-1", pid=None)
 
-        # Worker exited immediately, no PID file, no exit file
-        # self_heal should detect dead PID and recover
-        actions = self_heal(self.queue_dir, {"w-1": qid})
+        # Worker exited immediately, no PID recorded → dead
+        actions = self_heal(self.queue_dir, {"w-1": qid}, db=self.db)
 
         stale = [a for a in actions if a["action"] == "stale_running_recovered"]
         self.assertEqual(len(stale), 1)
 
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "requeued")
 
     def test_zero_pending_completion_via_process(self):
         """process_worker_completion with exit_code=0 and 0 pending should complete."""
         spec_path = self._make_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self._db_set_running(qid, "w-1")
 
         result = process_worker_completion(
             queue_dir=self.queue_dir,
@@ -382,10 +407,11 @@ class TestZeroPendingCompletion(DeadlockTestCase):
             hooks_dir=self.hooks_dir,
             script_dir=self.script_dir,
             exit_code="0",
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "completed")
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "completed")
 
 
@@ -404,9 +430,9 @@ class TestCriticReviewHandled(DeadlockTestCase):
         """When critic is enabled and tasks are all done, spec should be
         requeued for critic review (not left in running)."""
         spec_path = self._make_spec(tasks_pending=0, tasks_done=3)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self._db_set_running(qid, "w-1")
 
         # Enable critic
         critic_dir = os.path.join(self.boi_state, "critic")
@@ -423,12 +449,13 @@ class TestCriticReviewHandled(DeadlockTestCase):
             hooks_dir=self.hooks_dir,
             script_dir=self.script_dir,
             exit_code="0",
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "critic_review")
 
         # Spec should be requeued, not stuck in running
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "requeued")
 
     def test_critic_completion_approved(self):
@@ -447,9 +474,9 @@ class TestCriticReviewHandled(DeadlockTestCase):
             **Verify:** true
         """)
         spec_path = self._make_spec(content=spec_content)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self._db_set_running(qid, "w-1")
 
         # Simulate critic writing an approval to spec
         approved_content = spec_content + textwrap.dedent("""\
@@ -468,10 +495,11 @@ class TestCriticReviewHandled(DeadlockTestCase):
             events_dir=self.events_dir,
             hooks_dir=self.hooks_dir,
             spec_path=queue_spec_path,
+            db=self.db,
         )
 
         self.assertEqual(result["outcome"], "critic_approved")
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "completed")
 
 
@@ -488,32 +516,32 @@ class TestMaxRunningDurationExceeded(DeadlockTestCase):
 
     def test_max_running_duration_exceeded(self):
         spec_path = self._make_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        # Use live PID so stale_running doesn't trigger
+        self._db_set_running(qid, "w-1", pid=os.getpid())
 
-        # Backdate first_running_at to exceed max duration
-        e = _read_entry(self.queue_dir, qid)
-        e["worker_timeout_seconds"] = 60
-        e["max_iterations"] = 5
-        # 600s > 300s (60*5) limit
-        e["first_running_at"] = (
-            datetime.now(timezone.utc) - timedelta(seconds=600)
-        ).isoformat()
-        _write_entry(self.queue_dir, e)
+        # Backdate first_running_at to exceed max duration (60*5=300s, elapsed=600s)
+        old_time = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
+        self._db_update_spec(
+            qid,
+            worker_timeout_seconds=60,
+            max_iterations=5,
+            first_running_at=old_time,
+        )
 
-        # Write live PID so stale_running doesn't trigger first
+        # Write live PID file (matching worker.current_pid so stale_running skips it)
         pid_file = os.path.join(self.queue_dir, f"{qid}.pid")
         Path(pid_file).write_text(str(os.getpid()) + "\n")
 
-        actions = self_heal(self.queue_dir, {"w-1": qid})
+        actions = self_heal(self.queue_dir, {"w-1": qid}, db=self.db)
 
         duration_actions = [
             a for a in actions if a["action"] == "max_running_duration_exceeded"
         ]
         self.assertEqual(len(duration_actions), 1)
 
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "failed")
         self.assertEqual(updated["failure_reason"], "Maximum running duration exceeded")
         self.assertFalse(os.path.isfile(pid_file))
@@ -532,9 +560,9 @@ class TestDeletedSpecFile(DeadlockTestCase):
 
     def test_deleted_spec_file(self):
         spec_path = self._make_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self._db_set_running(qid, "w-1")
 
         # Delete the spec file from the queue copy
         queue_spec = entry["spec_path"]
@@ -550,11 +578,12 @@ class TestDeletedSpecFile(DeadlockTestCase):
             hooks_dir=self.hooks_dir,
             script_dir=self.script_dir,
             exit_code="0",
+            db=self.db,
         )
 
         # Should complete (0 pending since spec can't be read) or handle gracefully
         # The key assertion: spec is NOT stuck in 'running'
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertNotEqual(
             updated["status"],
             "running",
@@ -575,26 +604,20 @@ class TestDeletedCheckout(DeadlockTestCase):
 
     def test_deleted_checkout(self):
         spec_path = self._make_spec(tasks_pending=2)
-        entry = enqueue(self.queue_dir, spec_path)
+        entry = self.db.enqueue(spec_path)
         qid = entry["id"]
-        set_running(self.queue_dir, qid, "w-1")
+        self._db_set_running(qid, "w-1", pid=999999999)
 
-        # Set a checkout path that doesn't exist
-        e = _read_entry(self.queue_dir, qid)
-        e["worktree"] = "/tmp/nonexistent-checkout-" + str(os.getpid())
-        _write_entry(self.queue_dir, e)
+        # Record a checkout path that doesn't exist
+        self._db_update_spec(qid, worktree="/tmp/nonexistent-checkout-" + str(os.getpid()))
 
-        # Worker would have crashed, leaving a dead PID
-        pid_file = os.path.join(self.queue_dir, f"{qid}.pid")
-        Path(pid_file).write_text("999999999\n")
+        actions = self_heal(self.queue_dir, {"w-1": qid}, db=self.db)
 
-        actions = self_heal(self.queue_dir, {"w-1": qid})
-
-        # Should recover via stale running detection
+        # Should recover via stale running detection (dead PID)
         stale = [a for a in actions if a["action"] == "stale_running_recovered"]
         self.assertEqual(len(stale), 1)
 
-        updated = get_entry(self.queue_dir, qid)
+        updated = self.db.get_spec(qid)
         self.assertEqual(updated["status"], "requeued")
 
 
@@ -607,42 +630,34 @@ class TestMultipleDeadlocksSimultaneous(DeadlockTestCase):
     def test_multiple_deadlocks_resolved(self):
         # Issue 1: Stale running spec with dead PID
         spec1_path = self._make_spec(tasks_pending=2, filename="spec1.md")
-        entry1 = enqueue(self.queue_dir, spec1_path)
-        set_running(self.queue_dir, entry1["id"], "w-1")
-        pid_file = os.path.join(self.queue_dir, f"{entry1['id']}.pid")
-        Path(pid_file).write_text("999999999\n")
+        entry1 = self.db.enqueue(spec1_path)
+        self._db_set_running(entry1["id"], "w-1", pid=999999999)
 
-        # Issue 2: Blocked by missing spec
+        # Issue 2: Blocked by missing spec (bypass FK to create orphan dep)
         spec2_path = self._make_spec(tasks_pending=1, filename="spec2.md")
-        entry2 = enqueue(self.queue_dir, spec2_path)
-        raw2 = _read_entry(self.queue_dir, entry2["id"])
-        raw2["blocked_by"] = ["q-missing"]
-        _write_entry(self.queue_dir, raw2)
+        entry2 = self.db.enqueue(spec2_path)
+        self._db_add_dependency(entry2["id"], "q-missing")
 
-        # Issue 3: Orphaned worker
+        # Issue 3: Orphaned worker (spec completed but worker still assigned)
         spec3_path = self._make_spec(tasks_pending=0, tasks_done=1, filename="spec3.md")
-        entry3 = enqueue(self.queue_dir, spec3_path)
-        set_running(self.queue_dir, entry3["id"], "w-2")
-        complete(self.queue_dir, entry3["id"], 1, 1)
+        entry3 = self.db.enqueue(spec3_path)
+        self._db_set_running(entry3["id"], "w-2")
+        self.db.complete(entry3["id"], 1, 1)
 
-        # Issue 4: Circular dependency
+        # Issue 4: Circular dependency (A <-> B)
         spec4_path = self._make_spec(tasks_pending=1, filename="spec4.md")
         spec5_path = self._make_spec(tasks_pending=1, filename="spec5.md")
-        entry4 = enqueue(self.queue_dir, spec4_path)
-        entry5 = enqueue(self.queue_dir, spec5_path)
-        raw4 = _read_entry(self.queue_dir, entry4["id"])
-        raw4["blocked_by"] = [entry5["id"]]
-        _write_entry(self.queue_dir, raw4)
-        raw5 = _read_entry(self.queue_dir, entry5["id"])
-        raw5["blocked_by"] = [entry4["id"]]
-        _write_entry(self.queue_dir, raw5)
+        entry4 = self.db.enqueue(spec4_path)
+        entry5 = self.db.enqueue(spec5_path)
+        self._db_add_dependency(entry4["id"], entry5["id"])
+        self._db_add_dependency(entry5["id"], entry4["id"])
 
         worker_specs = {
             "w-1": entry1["id"],
             "w-2": entry3["id"],
             "w-3": "",
         }
-        actions = self_heal(self.queue_dir, worker_specs)
+        actions = self_heal(self.queue_dir, worker_specs, db=self.db)
 
         action_types = {a["action"] for a in actions}
         self.assertIn("stale_running_recovered", action_types)
@@ -651,10 +666,10 @@ class TestMultipleDeadlocksSimultaneous(DeadlockTestCase):
         self.assertIn("circular_dependency_canceled", action_types)
 
         # Verify all issues resolved
-        self.assertEqual(get_entry(self.queue_dir, entry1["id"])["status"], "requeued")
-        self.assertEqual(get_entry(self.queue_dir, entry2["id"])["blocked_by"], [])
-        self.assertEqual(get_entry(self.queue_dir, entry4["id"])["status"], "canceled")
-        self.assertEqual(get_entry(self.queue_dir, entry5["id"])["status"], "canceled")
+        self.assertEqual(self.db.get_spec(entry1["id"])["status"], "requeued")
+        self.assertEqual(self._db_get_blocked_by(entry2["id"]), [])
+        self.assertEqual(self.db.get_spec(entry4["id"])["status"], "canceled")
+        self.assertEqual(self.db.get_spec(entry5["id"])["status"], "canceled")
 
 
 if __name__ == "__main__":
