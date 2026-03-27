@@ -230,7 +230,8 @@ class Worker:
         log_ref = '${_LOG_FILE}'
         return (
             f'env -u CLAUDECODE claude -p "$(cat "{prompt_ref}")" '
-            f'--model {model} --effort {effort} --dangerously-skip-permissions'
+            f'--model {model} --effort {effort} --dangerously-skip-permissions '
+            f'--output-format stream-json --verbose'
         )
 
     def run(self) -> int:
