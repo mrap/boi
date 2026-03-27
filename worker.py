@@ -268,8 +268,11 @@ class Worker:
             _write_file(self.exit_file, "0")
             return 0
 
+        # Read spec once; pass to all helpers that need it
+        spec_content = _read_file(self.spec_path)
+
         # Generate prompt and run script
-        self.generate_run_script()
+        self.generate_run_script(spec_content)
 
         # Boundary checker: snapshot main repo state before worker runs
         boundary = WorkspaceBoundaryChecker(
@@ -280,9 +283,8 @@ class Worker:
         boundary.snapshot_before()
 
         # Parse **Target:** from spec to snapshot the TARGET REPO (not BOI worktree)
-        _spec_content_for_target = _read_file(self.spec_path)
         _target_match = re.search(
-            r'^\*\*Target:\*\*\s*(.+)$', _spec_content_for_target, re.MULTILINE
+            r'^\*\*Target:\*\*\s*(.+)$', spec_content, re.MULTILINE
         )
         _target_repo = (
             os.path.expanduser(_target_match.group(1).strip()) if _target_match else None
@@ -339,7 +341,7 @@ class Worker:
         self.post_process()
         return exit_code
 
-    def generate_run_script(self) -> None:
+    def generate_run_script(self, spec_content: str) -> None:
         """Generate the prompt file and bash run script.
 
         Handles all four phases:
@@ -352,21 +354,21 @@ class Worker:
         - {queue_dir}/{spec_id}.prompt.md
         - {queue_dir}/{spec_id}.run.sh
         """
-        self._generate_prompt()
-        self._generate_bash_run_script()
+        self._generate_prompt(spec_content)
+        self._generate_bash_run_script(spec_content)
 
-    def _generate_prompt(self) -> None:
+    def _generate_prompt(self, spec_content: str) -> None:
         """Generate the prompt file based on the current phase."""
         if self.phase == "critic":
             self._generate_critic_prompt()
         elif self.phase == "decompose":
-            self._generate_decompose_prompt()
+            self._generate_decompose_prompt(spec_content)
         elif self.phase == "evaluate":
-            self._generate_evaluate_prompt()
+            self._generate_evaluate_prompt(spec_content)
         else:
-            self._generate_execute_prompt()
+            self._generate_execute_prompt(spec_content)
 
-    def _generate_execute_prompt(self) -> None:
+    def _generate_execute_prompt(self, spec_content: str) -> None:
         """Generate prompt for execute phase.
 
         Loads the worker-prompt.md template, determines mode from
@@ -374,7 +376,6 @@ class Worker:
         project context, and replaces all placeholders.
         """
         template = _read_file(TEMPLATE_PATH)
-        spec_content = _read_file(self.spec_path)
         pending_count = str(self.pre_counts.get("pending", 0))
 
         # Determine mode: constructor override > spec header > default
@@ -440,13 +441,12 @@ class Worker:
         _write_file_atomic(self.prompt_file, result)
         logger.info("Critic prompt generated: %s", self.prompt_file)
 
-    def _generate_decompose_prompt(self) -> None:
+    def _generate_decompose_prompt(self, spec_content: str) -> None:
         """Generate prompt for decompose phase.
 
         Uses generate-decompose-prompt.md template with spec content.
         """
         template = _read_file(DECOMPOSE_TEMPLATE_PATH)
-        spec_content = _read_file(self.spec_path)
 
         result = template.replace("{{SPEC_CONTENT}}", spec_content)
         result = result.replace("{{SPEC_PATH}}", self.spec_path)
@@ -647,14 +647,16 @@ class Worker:
         task_model = None
         if self.phase == "execute" and os.path.isfile(self.spec_path):
             spec_content = _read_file(self.spec_path)
-            # Find the first PENDING task block
-            pending_match = re.search(
-                r'(### t-\d+:.*?\nPENDING\b.*?)(?=\n### t-|\Z)',
-                spec_content,
-                re.DOTALL,
-            )
-            if pending_match:
-                task_model = parse_task_model(pending_match.group(1))
+            # Split by task headings, find first with PENDING status on line 2
+            task_blocks = re.split(r'(?=^### t-\d+:)', spec_content, flags=re.MULTILINE)
+            for block in task_blocks:
+                block = block.strip()
+                if not block:
+                    continue
+                lines = block.split('\n')
+                if len(lines) >= 2 and lines[1].strip() == 'PENDING':
+                    task_model = parse_task_model(block)
+                    break
 
         model_for_cost, _ = (
             task_model
