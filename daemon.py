@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import resource
 import signal
 import subprocess
@@ -712,13 +713,24 @@ class Daemon:
                 )
                 if new_status == "completed":
                     self._commit_and_push_output(spec_id, target_repo)
-                    self.emit_hex_event("boi.spec.completed", {
-                        "spec_id": spec_id,
-                        "spec_title": spec_title,
-                        "target_repo": target_repo,
-                        "tasks_done": tasks_done,
-                        "tasks_total": tasks_total,
-                    })
+                    self._review_committed_output(
+                        spec_id,
+                        target_repo,
+                        spec_after.get("spec_path", ""),
+                    )
+                    # Re-check — review may have requeued the spec
+                    spec_refreshed = self.db.get_spec(spec_id)
+                    refreshed_status = spec_refreshed.get("status", "") if spec_refreshed else ""
+                    if refreshed_status == "completed":
+                        self.emit_hex_event("boi.spec.completed", {
+                            "spec_id": spec_id,
+                            "spec_title": spec_title,
+                            "target_repo": target_repo,
+                            "tasks_done": tasks_done,
+                            "tasks_total": tasks_total,
+                        })
+                    else:
+                        logger.info("Spec %s was requeued by post-commit review — skipping completion event", spec_id)
                 elif new_status == "failed":
                     self.emit_hex_event("boi.spec.failed", {
                         "spec_id": spec_id,
@@ -1221,6 +1233,209 @@ class Daemon:
             logger.info("[auto-commit] Done: %s", log_line.strip())
         except Exception as exc:  # noqa: BLE001
             logger.warning("[auto-commit] Failed to write ops log: %s", exc)
+
+    def _review_committed_output(
+        self, spec_id: str, target_repo: str, spec_path: str
+    ) -> None:
+        """Run a best-effort code review on the last commit in target_repo.
+
+        Spawns `claude -p` with the committed diff and a structured review
+        prompt.  If issues are found, calls _add_review_tasks() to append
+        PENDING fix tasks to the spec.  Never raises — this is advisory only.
+        """
+        if not target_repo or not os.path.isdir(target_repo):
+            logger.info(
+                "[post-commit-review] No target_repo for %s — skipping", spec_id
+            )
+            return
+
+        # Get diff of the last commit
+        try:
+            diff_result = subprocess.run(
+                ["git", "-C", target_repo, "diff", "HEAD~1", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            diff = diff_result.stdout.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            logger.warning(
+                "[post-commit-review] Could not get diff for %s: %s", spec_id, exc
+            )
+            return
+
+        if not diff:
+            logger.info(
+                "[post-commit-review] Empty diff for %s — skipping review", spec_id
+            )
+            return
+
+        prompt = (
+            "Review this code diff for bugs, security issues, incorrect logic, "
+            "broken tests, and style problems. "
+            'Output a JSON object: {"pass": true/false, "issues": [{"severity": '
+            '"high|medium|low", "file": "path", "description": "what\'s wrong"}]}. '
+            "Only flag real problems. Be concise.\n\n"
+            f"```diff\n{diff}\n```"
+        )
+
+        try:
+            review_result = subprocess.run(
+                ["claude", "-p", prompt],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            output = review_result.stdout.strip()
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "[post-commit-review] claude -p timed out for %s — skipping", spec_id
+            )
+            return
+        except (FileNotFoundError, OSError) as exc:
+            logger.warning(
+                "[post-commit-review] Could not run claude -p for %s: %s", spec_id, exc
+            )
+            return
+
+        if not output:
+            logger.warning(
+                "[post-commit-review] Empty output from claude -p for %s", spec_id
+            )
+            return
+
+        # Parse JSON — claude may wrap it in a code fence
+        try:
+            # Strip markdown code fences if present
+            if "```" in output:
+                lines = output.splitlines()
+                json_lines = []
+                in_block = False
+                for line in lines:
+                    if line.strip().startswith("```"):
+                        in_block = not in_block
+                        continue
+                    if in_block:
+                        json_lines.append(line)
+                if json_lines:
+                    output = "\n".join(json_lines)
+            review = json.loads(output)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning(
+                "[post-commit-review] JSON parse failed for %s: %s — raw: %.200s",
+                spec_id,
+                exc,
+                output,
+            )
+            return
+
+        passed = review.get("pass", True)
+        issues = review.get("issues", [])
+
+        if passed or not issues:
+            logger.info(
+                "[post-commit-review] Review passed for %s", spec_id
+            )
+            return
+
+        logger.info(
+            "[post-commit-review] Review found %d issue(s) for %s",
+            len(issues),
+            spec_id,
+        )
+        self._add_review_tasks(spec_id, issues)
+
+    def _add_review_tasks(self, spec_id: str, issues: list) -> None:
+        """Append PENDING [REVIEW] fix tasks to the spec for high/medium issues.
+
+        Low-severity issues are logged as advisory only.  After adding tasks,
+        the spec is requeued so the daemon picks it up for another iteration.
+        Never raises.
+        """
+        spec_file = os.path.join(
+            os.path.expanduser("~"), ".boi", "queue", f"{spec_id}.spec.md"
+        )
+        if not os.path.isfile(spec_file):
+            logger.warning(
+                "[post-commit-review] Spec file not found: %s", spec_file
+            )
+            return
+
+        actionable = [i for i in issues if i.get("severity") in ("high", "medium")]
+        advisory = [i for i in issues if i.get("severity") == "low"]
+
+        for issue in advisory:
+            logger.info(
+                "[post-commit-review] Advisory (low): %s — %s",
+                issue.get("file", "?"),
+                issue.get("description", ""),
+            )
+
+        if not actionable:
+            logger.info(
+                "[post-commit-review] No high/medium issues — no tasks added for %s",
+                spec_id,
+            )
+            return
+
+        # Determine next task number
+        try:
+            with open(spec_file, encoding="utf-8") as fh:
+                content = fh.read()
+        except OSError as exc:
+            logger.warning(
+                "[post-commit-review] Could not read spec %s: %s", spec_file, exc
+            )
+            return
+
+        task_ids = re.findall(r"###\s+t-(\d+):", content)
+        next_id = max((int(x) for x in task_ids), default=0) + 1
+
+        new_tasks = []
+        for issue in actionable:
+            file_hint = issue.get("file", "unknown file")
+            description = issue.get("description", "No description")
+            severity = issue.get("severity", "medium")
+            task_text = (
+                f"\n### t-{next_id}: [REVIEW] Fix: {description}\n"
+                f"PENDING\n\n"
+                f"**Spec:** Fix the following {severity}-severity issue in `{file_hint}`: "
+                f"{description}\n\n"
+                f"**Verify:** `git diff HEAD~1 HEAD -- {file_hint}` shows the fix applied\n"
+                if file_hint != "unknown file"
+                else f"**Verify:** `git diff HEAD~1 HEAD --stat` shows relevant files changed\n"
+            )
+            new_tasks.append(task_text)
+            next_id += 1
+
+        tmp_file = spec_file + ".tmp"
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as fh:
+                fh.write(content)
+                for task_text in new_tasks:
+                    fh.write(task_text)
+            os.replace(tmp_file, spec_file)
+        except OSError as exc:
+            logger.warning(
+                "[post-commit-review] Could not write spec %s: %s", spec_file, exc
+            )
+            if os.path.exists(tmp_file):
+                os.unlink(tmp_file)
+            return
+
+        # Requeue the spec so the daemon picks it up
+        try:
+            self.db.update_spec_status(spec_id, "queued")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[post-commit-review] Could not requeue spec %s: %s", spec_id, exc
+            )
+
+        logger.info(
+            "[post-commit-review] Added %d review task(s) to %s and requeued",
+            len(new_tasks),
+            spec_id,
+        )
 
     # ── Helpers ──────────────────────────────────────────────────────
 

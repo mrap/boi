@@ -67,6 +67,10 @@ _BOI_STATUSES = {
 # Regex to match SUPERSEDED status with "by t-N" reference
 _SUPERSEDED_RE = re.compile(r"^SUPERSEDED\s+by\s+(t-\d+)(.*)$")
 
+# Regex to strip optional [CRITIC] or [REVIEW] prefix from status lines
+# e.g. "[CRITIC] PENDING" → "PENDING", "[REVIEW] DONE" → "DONE"
+_CRITIC_PREFIX_RE = re.compile(r"^\[(?:CRITIC|REVIEW)\]\s+")
+
 # Regex to match #### subsection headings (Experiment, Discovery)
 _SUBSECTION_HEADING_RE = re.compile(r"^####\s+(Experiment|Discovery):\s*(.*)$")
 
@@ -277,6 +281,29 @@ def get_dependencies(content: str) -> dict[str, list[str]]:
 # ─── BOI Spec Parsing (self-evolving spec.md format) ─────────────────────────
 
 
+class BoiTaskList(list):
+    """A list of BoiTask objects with dict-compatible .get() for API compat.
+
+    Existing callers iterate over BoiTask objects as normal.
+    The .get('tasks', []) accessor returns plain dicts for verify-script compat.
+    """
+
+    def get(self, key: str, default=None):  # type: ignore[override]
+        if key == "tasks":
+            return [
+                {
+                    "id": t.id,
+                    "title": t.title,
+                    "status": t.status,
+                    "body": t.body,
+                    "superseded_by": t.superseded_by,
+                    "blocked_by": list(t.blocked_by),
+                }
+                for t in self
+            ]
+        return default
+
+
 # Regex to match **Blocked by:** lines
 _BLOCKED_BY_RE = re.compile(r"^\*\*Blocked\s+by:\*\*\s*(.+)$")
 
@@ -295,8 +322,14 @@ class BoiTask:
     blocked_by: list[str] = field(default_factory=list)  # Task IDs this task depends on
 
 
-def parse_boi_spec(content: str) -> list[BoiTask]:
+def parse_boi_spec(source: str) -> BoiTaskList:
     """Parse a BOI spec.md file and extract tasks with their statuses.
+
+    ``source`` may be either:
+    - Raw spec content (contains newlines) — used by all internal callers.
+    - A file path string — if the string has no newlines and names an existing
+      file, the file is read automatically. This allows verify scripts to call
+      ``parse_boi_spec(path)`` directly.
 
     Expected format:
         ### t-1: Task title
@@ -311,8 +344,18 @@ def parse_boi_spec(content: str) -> list[BoiTask]:
         FAILED
         #### Experiment: description
         #### Discovery: description
+
+    Status lines may have a ``[CRITIC]`` or ``[REVIEW]`` prefix which is
+    stripped before checking the status word, e.g. ``[CRITIC] PENDING``
+    is treated as status ``PENDING``.
     """
-    tasks: list[BoiTask] = []
+    # Auto-detect file path: no newlines + the path exists on disk.
+    if "\n" not in source:
+        candidate = Path(source)
+        if candidate.is_file():
+            source = candidate.read_text(encoding="utf-8")
+
+    tasks: BoiTaskList = BoiTaskList()
     current_id: str | None = None
     current_title: str = ""
     current_status: str | None = None
@@ -350,7 +393,7 @@ def parse_boi_spec(content: str) -> list[BoiTask]:
         current_experiment_lines = []
         current_discovery_lines = []
 
-    for line in content.splitlines():
+    for line in source.splitlines():
         heading_match = _BOI_TASK_HEADING_RE.match(line)
         if heading_match:
             _flush()
@@ -370,7 +413,10 @@ def parse_boi_spec(content: str) -> list[BoiTask]:
                     current_status = "SUPERSEDED"
                     current_superseded_by = superseded_match.group(1)
                     continue
-                first_word = stripped.split()[0] if stripped.split() else ""
+                # Strip optional [CRITIC] / [REVIEW] prefix before checking
+                # the status word — e.g. "[CRITIC] PENDING" → "PENDING".
+                effective = _CRITIC_PREFIX_RE.sub("", stripped)
+                first_word = effective.split()[0] if effective.split() else ""
                 if first_word in _BOI_STATUSES:
                     current_status = first_word
                     continue
@@ -415,7 +461,7 @@ def parse_boi_spec(content: str) -> list[BoiTask]:
 
     # If a ## Dependencies section exists, use it as the authoritative source
     # for blocked_by, overriding any inline **Blocked by:** lines.
-    deps_from_section = parse_deps_section(content)
+    deps_from_section = parse_deps_section(source)
     if deps_from_section is not None:
         for task in tasks:
             task.blocked_by = deps_from_section.get(task.id, [])

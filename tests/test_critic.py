@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from lib.critic import (
+    generate_auto_reject_task,
     generate_critic_prompt,
     parse_critic_result,
     run_critic,
@@ -962,6 +963,49 @@ class TestCriticIntegration(unittest.TestCase):
                 found_critic_event = True
                 self.assertEqual(data["queue_id"], "q-001")
         self.assertTrue(found_critic_event)
+
+
+class TestGenerateAutoRejectTask(unittest.TestCase):
+    """Tests for generate_auto_reject_task format and parseability."""
+
+    def test_auto_reject_task_produces_parseable_pending(self):
+        """generate_auto_reject_task writes a PENDING task that count_boi_tasks counts."""
+        from lib.spec_parser import count_boi_tasks
+
+        task_text = generate_auto_reject_task(0.40, 9)
+        spec = (
+            "# Test\n## Tasks\n"
+            "### t-1: Done\nDONE\n**Spec:** done\n**Verify:** echo ok\n"
+            + task_text
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(spec)
+            path = f.name
+        try:
+            counts = count_boi_tasks(path)
+        finally:
+            os.unlink(path)
+        self.assertGreaterEqual(counts["pending"], 1, f"Expected pending >= 1, got {counts}")
+
+    def test_auto_reject_task_format_bare_pending_status(self):
+        """generate_auto_reject_task uses bare PENDING status, not [CRITIC] PENDING."""
+        task_text = generate_auto_reject_task(0.35, 5)
+        lines = task_text.strip().splitlines()
+        # First non-empty line after heading should be bare PENDING
+        heading_seen = False
+        for line in lines:
+            if line.startswith("### t-"):
+                heading_seen = True
+                continue
+            if heading_seen and line.strip():
+                self.assertEqual(line.strip(), "PENDING", f"Expected bare PENDING, got: {line!r}")
+                break
+
+    def test_auto_reject_task_critic_tag_in_title(self):
+        """generate_auto_reject_task includes [CRITIC] in the task heading."""
+        task_text = generate_auto_reject_task(0.30, 3)
+        first_line = [l for l in task_text.splitlines() if l.startswith("### t-")][0]
+        self.assertIn("[CRITIC]", first_line)
 
 
 if __name__ == "__main__":

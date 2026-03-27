@@ -17,11 +17,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
+
+_logger = logging.getLogger("boi.daemon_ops")
 
 from lib.critic import (
     generate_critic_prompt,
@@ -72,6 +76,82 @@ def _signal_name(signal_num: int) -> str:
         return _signal.Signals(signal_num).name
     except (ValueError, AttributeError):
         return f"SIG{signal_num}"
+
+
+def warn_if_empty_diff(spec_id: str, worktree_path: str, newly_done: int) -> None:
+    """Log a warning if tasks were marked DONE but no real changes exist.
+
+    Two-phase check:
+    1. `git diff HEAD~1 HEAD --stat` — catches false completions where the
+       worker committed but the commit was empty or trivial.
+    2. `git status --porcelain` — catches false completions where the worker
+       never committed at all (working tree is clean).
+
+    If HEAD~1 doesn't exist (first commit only), falls back to phase 2.
+
+    This is a log-only check — it does NOT block completion.
+
+    Args:
+        spec_id: The spec's queue ID (used in the warning message).
+        worktree_path: Path to the git worktree to inspect.
+        newly_done: Number of tasks that were newly marked DONE this iteration.
+    """
+    if newly_done <= 0 or not worktree_path:
+        return
+    try:
+        # Phase 1: Check if the last commit had content
+        diff_result = subprocess.run(
+            ["git", "-C", worktree_path, "diff", "HEAD~1", "HEAD", "--stat"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if diff_result.returncode == 0:
+            if not diff_result.stdout.strip():
+                _logger.warning(
+                    "spec %s — tasks marked DONE but last commit diff is empty "
+                    "(possible false completion)",
+                    spec_id,
+                )
+            return  # Commit exists and has content — no warning needed
+
+        # Phase 1 failed (no HEAD~1 or other error) — fall through to phase 2
+        has_parent = "unknown revision" not in diff_result.stderr and "bad revision" not in diff_result.stderr
+        if has_parent:
+            _logger.debug(
+                "warn_if_empty_diff: git diff failed for spec %s worktree %s: %s",
+                spec_id,
+                worktree_path,
+                diff_result.stderr.strip(),
+            )
+
+        # Phase 2: Check working tree for uncommitted changes
+        status_result = subprocess.run(
+            ["git", "-C", worktree_path, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if status_result.returncode != 0:
+            _logger.debug(
+                "warn_if_empty_diff: git status failed for spec %s worktree %s: %s",
+                spec_id,
+                worktree_path,
+                status_result.stderr.strip(),
+            )
+        elif not status_result.stdout.strip():
+            _logger.warning(
+                "spec %s — tasks marked DONE but git diff is empty "
+                "(possible false completion)",
+                spec_id,
+            )
+    except Exception as exc:
+        _logger.debug(
+            "warn_if_empty_diff: failed to check git diff for spec %s worktree %s: %s",
+            spec_id,
+            worktree_path,
+            exc,
+        )
 
 
 def _parse_json_field(value: Any, default: Any = None) -> Any:
@@ -383,6 +463,19 @@ def process_worker_completion(
     result["pending_count"] = pending_count
     result["done_count"] = done_count
     result["total_count"] = total_count
+
+    # Empty-diff detection: warn if tasks were marked DONE but the worktree
+    # has no new changes (possible false completion / no real work performed).
+    newly_done = done_count - entry.get("tasks_done", 0)
+    if newly_done > 0 and db is not None:
+        last_worker = entry.get("last_worker")
+        if last_worker:
+            try:
+                worker_row = db.get_worker(last_worker)
+                worktree_path = (worker_row or {}).get("worktree_path", "")
+                warn_if_empty_diff(queue_id, worktree_path, newly_done)
+            except Exception:
+                pass  # Never let this block the completion path
 
     # Get tasks_added from telemetry
     tasks_added = get_tasks_added_from_telemetry(queue_dir, queue_id)

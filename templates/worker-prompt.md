@@ -23,6 +23,8 @@ You are a BOI (Beginning of Infinity) worker executing one iteration of a self-e
 
 ## Your Job
 
+> **IMPORTANT: Before marking any task as DONE, you MUST run the **Verify:** commands listed in the task. If the verify commands fail, the task is NOT done — fix the issue first. Do not mark DONE unless verify passes with real output proving the work was completed. Pasting expected output without running the command is not acceptable.**
+
 1. Read the spec above carefully
 2. Find the next PENDING task to execute:
    a. Skip any task with a `**Blocked by:** t-X` line where t-X is not DONE
