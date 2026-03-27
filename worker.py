@@ -99,10 +99,14 @@ def parse_task_model(task_block: str) -> Optional[tuple[str, str]]:
     Returns (model_id, effort) or None if no Model field found.
     Supports: opus, sonnet, haiku, or full model IDs.
     """
-    match = re.search(r'\*\*Model:\*\*\s*(\S+)', task_block)
+    # Match **Model:** only at the start of a line (field, not prose)
+    match = re.search(r'^\*\*Model:\*\*\s*(\S+)', task_block, re.MULTILINE)
     if not match:
         return None
     name = match.group(1).lower().strip()
+    # Reject names that are clearly not model IDs (punctuation, backticks)
+    if not re.match(r'^[a-z0-9]', name):
+        return None
     if name in _MODEL_MAP:
         return _MODEL_MAP[name]
     # Allow full model IDs (e.g., claude-opus-4-6)
@@ -456,13 +460,12 @@ class Worker:
             "Decompose prompt generated: %s", self.prompt_file
         )
 
-    def _generate_evaluate_prompt(self) -> None:
+    def _generate_evaluate_prompt(self, spec_content: str) -> None:
         """Generate prompt for evaluate phase.
 
         Uses evaluate-prompt.md template with spec content.
         """
         template = _read_file(EVALUATE_TEMPLATE_PATH)
-        spec_content = _read_file(self.spec_path)
 
         result = template.replace("{{SPEC_CONTENT}}", spec_content)
         result = result.replace("{{SPEC_PATH}}", self.spec_path)
@@ -626,7 +629,7 @@ class Worker:
             )
         return ""
 
-    def _generate_bash_run_script(self) -> None:
+    def _generate_bash_run_script(self, spec_content: str) -> None:
         """Generate the bash run script that executes inside tmux.
 
         The run script:
@@ -645,8 +648,7 @@ class Worker:
 
         # Per-task model routing: parse **Model:** from first PENDING task
         task_model = None
-        if self.phase == "execute" and os.path.isfile(self.spec_path):
-            spec_content = _read_file(self.spec_path)
+        if self.phase == "execute":
             # Split by task headings, find first with PENDING status on line 2
             task_blocks = re.split(r'(?=^### t-\d+:)', spec_content, flags=re.MULTILINE)
             for block in task_blocks:
