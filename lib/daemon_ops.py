@@ -540,7 +540,7 @@ def process_worker_completion(
             return result
 
         # Run post-execute guardrail hooks before routing to next phase
-        _state_dir = str(Path(queue_dir).parent)
+        _state_dir = str(Path(ctx.queue_dir).parent)
         _gate_result = _run_guardrail_hooks(
             hook_point="post-execute",
             spec_id=queue_id,
@@ -549,12 +549,9 @@ def process_worker_completion(
         )
         if not _gate_result.get("passed", True):
             # Strict gate blocked — GATE-FAIL task appended, requeue to execute
-            if db:
-                db.requeue(queue_id, done_count, total_count)
-            else:
-                requeue(queue_dir, queue_id, done_count, total_count)
+            ctx.db.requeue(queue_id, done_count, total_count)
             write_event(
-                events_dir,
+                ctx.events_dir,
                 {
                     "type": "gate_fail",
                     "queue_id": queue_id,
@@ -583,12 +580,9 @@ def process_worker_completion(
             state_dir=_state_dir,
         )
         if not _pre_commit_gate.get("passed", True):
-            if db:
-                db.requeue(queue_id, done_count, total_count)
-            else:
-                requeue(queue_dir, queue_id, done_count, total_count)
+            ctx.db.requeue(queue_id, done_count, total_count)
             write_event(
-                events_dir,
+                ctx.events_dir,
                 {
                     "type": "gate_fail",
                     "queue_id": queue_id,
