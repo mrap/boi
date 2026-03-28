@@ -27,7 +27,7 @@ Self-evolving autonomous agent fleet. Workers iterate with fresh context per cyc
 
 1. If the user provides a spec file path, validate it exists, then dispatch directly.
 2. If the user describes a task without a spec file:
-   a. Help decompose the task into discrete, ordered tasks (use `10x-engineer:brainstorming` if available)
+   a. Help decompose the task into discrete, ordered tasks
    b. Write a spec.md file (see Spec Format below)
    c. Show the spec to the user for confirmation
    d. On confirmation ("fire it", "dispatch", "go", "yes"), dispatch it
@@ -42,486 +42,255 @@ Options:
 - `--priority N` — Queue priority, lower = higher priority (default: 100)
 - `--max-iter N` — Maximum iterations before marking failed (default: 30)
 - `--worktree PATH` — Pin to a specific worktree
-- `--worktree-isolate` — Create a dedicated worktree and branch for this spec (enables parallel execution without blocking)
-- `--after q-A,q-B` — Dispatch with fleet-level dependencies (this spec waits until q-A and q-B complete)
+- `--worktree-isolate` — Create a dedicated worktree and branch for this spec
+- `--after q-A,q-B` — Wait for listed specs to complete before starting
 - `--no-critic` — Skip critic validation when this spec completes
 - `--mode MODE` / `-m MODE` — Execution mode: `execute` (default), `challenge`, `discover`, `generate` (aliases: `e`, `c`, `d`, `g`)
-- `--experiment-budget N` — Override default experiment budget for the chosen mode
-
-Backward compatibility (converts tasks.md to spec format automatically):
-```bash
-boi dispatch --tasks <path/to/tasks.md>
-```
+- `--project NAME` — Associate with a project (injects project context)
 
 After dispatch, run `boi status` to show initial state.
 
-### `/boi status` — Show queue progress
+### Other Commands
 
 ```bash
-boi status
-```
-
-Output format:
-```
-BOI
-
-QUEUE                         MODE       WORKER  ITER   TASKS       QUALITY    PROGRESS   STATUS
-q-001  add-dark-mode          discover   w-1     3/30   5/8 done    B (0.78)   51%        running
-q-002  api-endpoints          execute    ---     ---    0/9 done    ---        0%         queued
-q-003  polish-onboarding      execute    ---     ---    5/5 done    A (0.91)   100%       completed
-
-Workers: 1/3 busy  |  Queue: 1 running, 1 queued, 1 completed
-```
-
-For live auto-refresh (every 2s):
-```bash
-boi status --watch
-```
-
-For machine-readable output:
-```bash
-boi status --json
-```
-
-### `/boi queue` — Show spec queue
-
-```bash
-boi queue [--json]
-```
-
-Shows all specs in the queue with their status, iteration count, and priority.
-
-### `/boi log <queue-id>` — View worker output
-
-```bash
-boi log <queue-id>          # tail last 50 lines of latest iteration
-boi log <queue-id> --full   # full output
-```
-
-Queue ID is required. If not provided, ask the user.
-
-### `/boi telemetry <queue-id>` — Iteration breakdown
-
-```bash
-boi telemetry <queue-id> [--json]
-```
-
-Output:
-```
-Spec: add-dark-mode (q-001)
-Iterations: 3 of 30
-Total time: 47m 23s
-Tasks: 5/8 done, 2 added (self-evolved), 1 skipped
-
-Iteration breakdown:
-  #1: 2 tasks done, 1 added, 0 skipped (12m 05s)
-  #2: 2 tasks done, 1 added, 0 skipped (18m 41s)
-  #3: 1 task done, 0 added, 1 skipped (16m 37s)
-```
-
-### `/boi cancel <queue-id>` — Cancel a spec
-
-1. Queue ID required. If not provided, ask.
-2. Run: `boi cancel <queue-id>`
-3. Kills any active worker session for that spec.
-
-### `/boi stop` — Stop everything
-
-1. Confirm: "Stop all workers and the BOI daemon?"
-2. Run: `boi stop`
-3. Kills all worker tmux sessions and stops the daemon.
-
-### `/boi workers` — Show worktree status
-
-```bash
-boi workers [--json]
-```
-
-Shows each worker's worktree path and health status (idle, busy, missing, unhealthy).
-
-### `/boi dashboard` — Live dashboard
-
-```bash
-boi dashboard
-```
-
-Compact 60-char tmux-friendly view with color-coded status. Auto-refreshes every 2s. Same as `boi status --watch`.
-
-### `/boi install` — One-time setup
-
-```bash
-boi install [--workers N]
-```
-
-Creates `~/.boi/` state directory, sets up worker worktrees, writes config. Must be run outside Claude Code.
-
-### `/boi resume` — Resume failed or canceled specs
-
-```bash
-boi resume <queue-id>    # Resume a specific failed/canceled spec
-boi resume --all         # Resume all failed/canceled specs
-```
-
-Preserves progress. The spec picks up from where it left off with all DONE tasks intact.
-
-### `/boi cleanup` — Kill orphaned workers
-
-```bash
-boi cleanup
-```
-
-Finds and kills orphaned `claude -p` worker processes not tracked by any active spec.
-
-### Fleet Dependencies (`boi dep`)
-
-Manage inter-spec dependencies so specs execute in the right order across the fleet.
-
-```bash
-boi dep add <spec> --on <dep>       # Add dependency (spec waits for dep)
-boi dep remove <spec> --on <dep>    # Remove dependency
-boi dep set <spec> --on <dep1,dep2> # Replace all deps
-boi dep clear <spec>                # Make independent
-boi dep show [spec]                 # Show deps for one or all specs
-boi dep viz                         # ASCII fleet DAG visualization
-boi dep check                       # Validate DAG (cycles, missing refs)
-```
-
-Dispatch with dependencies:
-```bash
-boi dispatch --spec spec.md --after q-A,q-B   # Waits for q-A and q-B to complete
+boi status [--watch] [--json]             Queue and worker status
+boi log <queue-id> [--full]               Tail worker output
+boi cancel <queue-id>                     Cancel a spec
+boi stop                                  Stop daemon and all workers
+boi install [--workers N]                 One-time setup (outside Claude Code)
+boi resume <queue-id> | --all            Resume failed/canceled specs
+boi cleanup                               Kill orphaned worker processes
+boi workers [--json]                      Show worktree health
+boi telemetry <queue-id> [--json]        Per-iteration metrics
+boi critic status | run | enable | disable | checks
+boi spec <queue-id> [add|skip|next|block|edit|deps]
+boi dep add|remove|set|clear|show|viz|check
+boi project create|list|status|context|delete
 ```
 
 ## Spec Format
 
-A BOI spec.md file is a Markdown document with task headings. Each task has a status line, a spec section, and a verify section.
-
-**Required format:**
-
 ```markdown
-# My Project Spec
+# Spec Title
+
+**Pipeline:** execute → review        # optional — overrides default pipeline
+**Gates:** strict, +lint-pass         # optional — overrides guardrails
 
 ## Tasks
 
-### t-1: First task title
+### t-1: First task
 PENDING
 
-**Spec:** What the worker should do. Be specific: which files to read,
-what to create, what patterns to follow.
+**Spec:** What the worker must do. Be concrete: file paths, function names, patterns.
 
-**Verify:** How to verify the task is complete. Commands to run,
-assertions to check.
+**Verify:**
+```bash
+# Commands that prove the work is done. Non-zero exit = task incomplete.
+test -f output.txt
+python3 -m pytest tests/ -x -q
+```
 
-**Self-evolution:** Optional. What to do if the task reveals new work.
-
-### t-2: Second task title
+### t-2: Second task
 PENDING
+**Blocked by:** t-1
 
-**Spec:** Description of second task...
+**Spec:** Depends on t-1's output.
 
-**Verify:** Verification steps...
+**Verify:**
+```bash
+grep "expected" output.txt
+```
 ```
 
 **Rules:**
-- Task headings must be `### t-N: Title` (three hashes, `t-` prefix, sequential numbers)
-- Status (`PENDING`, `DONE`, `SKIPPED`, `FAILED`, `EXPERIMENT_PROPOSED`, or `SUPERSEDED by t-N`) must be on its own line immediately after the heading
-- `**Spec:**` section is required. Tell the worker exactly what to do.
-- `**Verify:**` section is required. Give concrete verification commands.
-- `**Self-evolution:**` section is optional but recommended for complex tasks
-- `**Blocked by:** t-X, t-Y` declares inline dependencies. A task won't execute until all deps are DONE.
-- `## Dependencies` section declares task dependencies as a DAG (preferred over inline `**Blocked by:**`):
-  ```markdown
-  ## Dependencies
-  t-1: (none)
-  t-2: (none)
-  t-3: t-1, t-2
-  ```
-  Both formats are supported. The `## Dependencies` section is parsed first if present.
-- Tasks are executed by picking the unblocked PENDING task that enables the most downstream work (not just lowest ID)
-- Workers execute one task per iteration, then exit
-
-**Dependency graph:**
-
-After writing all tasks, analyze dependencies and add a `## Dependency Graph` section:
-
-```markdown
-## Dependency Graph
-t-1 --> t-3 (t-3 reads output from t-1)
-t-2 --> t-3
-t-3 --> t-5 (synthesis)
-t-4 (independent)
-```
-
-For each task, check:
-1. Does it reference output from another task (file paths, "read from t-N", "using results from t-N")?
-2. Does it read a file that another task writes?
-3. If yes, add a `**Blocked by:** t-X, t-Y` line after the status line.
-
-Synthesis tasks (combine, recommend, summarize) MUST be blocked by all tasks whose output they consume.
-
-**Environment gate convention:**
-
-If your spec depends on specific tools, services, or infrastructure (devserver capabilities, specific CLI tools, API access), add a `t-0` environment gate task that verifies these prerequisites. If t-0 fails, the spec should abort early rather than wasting iterations.
+- Headings must be `### t-N: Title` with status on the next line
+- `**Spec:**` and `**Verify:**` are required
+- `**Blocked by:** t-X` prevents a task from running until t-X is DONE
+- Workers add new `### t-N: ... PENDING` tasks to self-evolve the spec
+- One task per worker iteration; daemon requeues until all tasks are DONE
 
 **Task-sizing guidelines:**
-- Each task should be completable in a single Claude session (10-30 min)
-- Limit each task to 1-2 data sources. If you need 3+ sources, split into one task per source plus a synthesis task.
-- Limit each task to 1-2 file mutations. If you need 3+, split into one mutation per task.
-- If your spec text exceeds 2000 characters, the task is likely too large. Split it.
-- If your spec text is under 50 characters, the task is likely too vague. Add detail.
+- Each task: 10–30 min of Claude work
+- 1–2 data sources per task; 1–2 file mutations per task
+- Spec text < 2000 chars; > 50 chars
 
-**Writing good specs:**
-- Include file paths, function names, and concrete references
-- Reference earlier tasks if later tasks depend on their output
-- Add verification commands that prove the work is done (test runs, lint checks, file existence)
-- Think about what could go wrong and add self-evolution guidance
+## Phases
 
-**What makes BOI specs special (self-evolution):**
-- During an iteration, a worker can ADD new `### t-N: ... PENDING` tasks to the spec
-- This lets the system discover work it couldn't foresee at planning time
-- The daemon detects new PENDING tasks and requeues the spec automatically
-- Example: a worker implementing a feature discovers it needs a migration, so it adds a new task for the migration
+A **phase** is a named worker role defined by a `.phase.toml` file. The daemon hot-reloads phase files from `~/.boi/phases/` without restart.
 
-## Error Handling
+### Built-in Phases
 
-- If `boi` command not found: "BOI is not installed. Run `bash ~/boi/install.sh` from a tmux pane (outside Claude Code) first."
-- If daemon not running on dispatch: `boi dispatch` starts it automatically.
-- If queue ID invalid: relay the CLI error message.
-- If spec validation fails: show the validation errors and help the user fix the spec format.
+| Phase | Description | Timeout |
+|-------|-------------|---------|
+| `execute` | Execute tasks from the spec | 600s |
+| `review` | Code review: correctness, security, spec compliance | 300s |
+| `critic` | Quality gate: adds `[CRITIC]` tasks on failure | 300s |
+| `decompose` | Decompose a high-level spec into actionable tasks | 600s |
+| `evaluate` | Evaluate spec completion and determine next steps | 300s |
 
-### `/boi spec <queue-id>` — Live spec management
+### Phase File Schema (`~/.boi/phases/*.phase.toml`)
 
-View and modify tasks in a running or queued spec without editing the raw file.
+```toml
+name = "my-phase"                        # optional; derived from filename if omitted
+description = "What this phase does"
+
+[worker]
+prompt_template = "path/to/prompt.md"   # required
+model = "claude-sonnet-4-6"
+effort = "medium"                        # low | medium | high
+timeout = 300                            # seconds
+
+[completion]
+approve_signal = "## Approved"
+reject_signal = "[REJECTED]"
+on_approve = "next"                      # next | complete | commit | phase:<name>
+on_reject = "requeue:execute"            # fail | retry | requeue:<phase> | phase:<name>
+on_crash = "retry"                       # retry | fail
+
+[hooks]
+pre = ["verify-commands-pass"]           # gates before phase starts
+post = ["diff-is-non-empty"]             # gates after phase completes
+```
+
+### Custom Phase Example
+
+```toml
+# ~/.boi/phases/security-scan.phase.toml
+name = "security-scan"
+description = "Run SAST scan and block on high-severity findings"
+
+[worker]
+prompt_template = "~/.boi/phases/templates/security-scan-prompt.md"
+model = "claude-sonnet-4-6"
+effort = "high"
+timeout = 300
+
+[completion]
+approve_signal = "## Security Approved"
+reject_signal = "[SECURITY-FAIL]"
+on_approve = "next"
+on_reject = "requeue:execute"
+on_crash = "retry"
+
+[hooks]
+post = ["no-secrets"]
+```
+
+Use it: `**Pipeline:** execute → security-scan → review`
+
+## Pipelines
+
+An ordered list of phases a spec passes through. Configured globally in `~/.boi/guardrails.toml`:
+
+```toml
+[pipeline]
+default = ["execute", "critic"]
+```
+
+Override per spec with a `**Pipeline:**` header:
+
+```markdown
+**Pipeline:** execute → review → critic
+**Pipeline:** decompose → execute → critic
+**Pipeline:** execute → security-scan
+```
+
+Arrows (`→` or `->`), commas, and spaces are all valid separators.
+
+## Guardrails
+
+Quality gates that run at phase transitions. Configured in `~/.boi/guardrails.toml`.
+
+```toml
+[global]
+strictness = "advisory"   # strict | advisory | permissive
+
+[pipeline]
+default = ["execute", "critic"]
+
+[hooks]
+post-execute = ["verify-commands-pass", "diff-is-non-empty"]
+pre-commit   = ["no-secrets"]
+
+[gates.lint-pass]
+command = "python3 -m flake8 ."
+timeout = 60
+```
+
+**Strictness levels:**
+
+| Level | Behavior on gate failure |
+|-------|--------------------------|
+| `strict` | Blocks phase transition; appends a `[GATE-FAIL]` PENDING task |
+| `advisory` | Logs a warning; execution continues |
+| `permissive` | Silently skips; execution continues |
+
+**Per-spec gate overrides** (`**Gates:**` header):
+
+```markdown
+**Gates:** strict, +lint-pass, -no-secrets
+```
+
+- `strict` / `advisory` / `permissive` — override strictness
+- `+gate-name` — add a gate to all hook points
+- `-gate-name` — remove a gate from all hook points
+
+## Gates
+
+Checks that run at hook points. Return passed or failed.
+
+### Built-in Gates
+
+| Gate | What it checks |
+|------|---------------|
+| `verify-commands-pass` | Parses the `**Verify:**` block and runs each command; fails on non-zero exit |
+| `diff-is-non-empty` | Fails if `git diff HEAD` and `git diff --cached` show no changes |
+| `tests-pass` | Runs the configured test command (default: `python3 -m pytest tests/ -x -q`) |
+| `lint-pass` | Runs the configured lint command (default: `python3 -m flake8 .`) |
+| `no-secrets` | Scans `git diff HEAD` for API keys, tokens, and secret patterns |
+
+### Custom Gates
+
+Drop a shell script at `~/.boi/gates/<name>.sh`. The gate name is the filename without `.sh`.
 
 ```bash
-boi spec <queue-id>                                # Show tasks with status
-boi spec <queue-id> --json                         # Machine-readable output
-boi spec <queue-id> add "Title" [--spec "..."] [--verify "..."]  # Add a new task
-boi spec <queue-id> skip <task-id> [--reason "..."]              # Skip a task
-boi spec <queue-id> next <task-id>                 # Reorder: make this task run next
-boi spec <queue-id> block <task-id> --on <dep-id>  # Mark task as blocked by another
-boi spec <queue-id> edit [<task-id>]               # Open in $EDITOR
+#!/bin/sh
+set -uo pipefail
+# SPEC_PATH and SPEC_ID are available as env vars
+some-check || { echo "Reason" >&2; exit 1; }
+exit 0
 ```
 
-Examples:
-```bash
-boi spec q-001                          # See all tasks and which is next
-boi spec q-001 add "Fix flaky test" --spec "Stabilize the race condition in t-3's test" --verify "python3 -m pytest passes 5x"
-boi spec q-001 skip t-4 --reason "No longer needed after API change"
-boi spec q-001 next t-6                 # Move t-6 to run next
-boi spec q-001 block t-5 --on t-3       # t-5 can't run until t-3 is DONE
-boi spec q-001 edit t-2                 # Edit just t-2 in your editor
+Enable in `guardrails.toml`:
+```toml
+[hooks]
+post-execute = ["my-check"]
 ```
 
-**Task-level dependency management (`deps`):**
-```bash
-boi spec q-001 deps show              # Show task dependency DAG
-boi spec q-001 deps add t-3 --on t-1  # t-3 depends on t-1
-boi spec q-001 deps rm t-3 --on t-1   # Remove dependency
-boi spec q-001 deps set t-3 --on t-1,t-2  # Replace all deps for t-3
-boi spec q-001 deps clear t-3         # Make t-3 independent
-boi spec q-001 deps viz               # ASCII task DAG visualization
-boi spec q-001 deps migrate           # Convert inline **Blocked by:** to ## Dependencies section
-```
+Exit 0 = passed. Any non-zero = failed.
 
-### `/boi project` — Organize specs into projects
-
-Projects group related specs and provide shared context that gets injected into every worker prompt.
-
-```bash
-boi project create <name> [--description "..."]   # Create a project
-boi project list [--json]                          # List all projects
-boi project status <name> [--json]                 # Project metadata + associated specs
-boi project context <name>                         # Print project context.md
-boi project delete <name>                          # Delete a project (confirms first)
-```
-
-Dispatch a spec into a project:
-```bash
-boi dispatch --spec spec.md --project my-project
-```
-
-When a spec belongs to a project, workers automatically receive the project's `context.md` and `research.md` in their prompt. Workers can also append discoveries to `research.md` for future iterations.
-
-Examples:
-```bash
-boi project create ios-app --description "iOS app rewrite"
-boi dispatch --spec feature.md --project ios-app
-boi project status ios-app              # Shows project info + all its specs
-boi project list                        # Overview of all projects
-```
-
-### `/boi do` — Natural language interface
-
-Translate natural language into BOI CLI commands. Claude interprets your request, generates the right commands, and (optionally) executes them.
-
-```bash
-boi do "show me what's running"                    # Generates: boi status
-boi do "cancel the ios spec"                       # Generates: boi cancel q-001
-boi do "add a task to q-002 for database migration"
-boi do --dry-run "stop everything"                 # Show commands without executing
-boi do --yes "skip t-4 in q-001"                   # Execute without confirmation
-```
-
-Options:
-- `--dry-run` — Show generated commands without executing
-- `--yes` / `-y` — Skip confirmation for destructive commands
-
-Destructive commands (cancel, stop, purge, delete, skip) always prompt for confirmation unless `--yes` is passed.
-
-### `/boi review <queue-id>` — Review experiment proposals
-
-When a worker proposes an experiment (Challenge, Discover, or Generate modes), the spec pauses with `needs_review` status. Use this command to review and act on experiments.
-
-```bash
-boi review q-001
-```
-
-For each experiment, choose:
-- `[a]` Adopt: merge the experiment branch, mark the task DONE.
-- `[r]` Reject: delete the experiment branch, reset the task to PENDING.
-- `[d]` Defer: keep the spec paused.
-- `[v]` View: see the full experiment details.
-
-Experiments auto-reject after 24 hours if not reviewed.
-
-### `/boi merge` — Resolve worktree isolation merges
-
-When an isolated spec (`--worktree-isolate`) completes but has merge conflicts, use `boi merge` to resolve them.
-
-```bash
-boi merge --list              # show all specs with pending merges
-boi merge q-003               # attempt merge of q-003's branch into main
-boi merge q-003 --abort       # discard changes, clean up worktree and branch
-```
-
-Flow:
-1. `boi merge q-003` runs `git merge boi/q-003` from the repo root
-2. If clean: updates queue entry, removes worktree, prints success
-3. If conflicts: prints conflicting files, tells user to resolve and run `boi merge q-003` again
-
-### Worktree Isolation
-
-Each spec can optionally get its own git worktree and branch via `--worktree-isolate`. This enables multiple specs to edit the same codebase in parallel without collisions.
-
-```bash
-boi dispatch --spec spec.md --worktree-isolate    # dedicated worktree
-boi dispatch --spec spec.md                        # shared checkout (default)
-```
-
-**How it works:**
-- Creates worktree at `~/.boi/worktrees/q-{id}` on branch `boi/q-{id}`
-- Worker operates in the isolated worktree, not the shared checkout
-- On completion, BOI auto-merges the branch into main
-- If merge conflicts arise, spec moves to `needs_merge` status (resolve with `boi merge`)
-
-**Smart conflict detection:** For non-isolated specs, BOI auto-detects file-level conflicts. If two specs reference the same files, the newer one is auto-blocked. Isolated specs skip this check since worktrees handle isolation.
-
-**Status output with worktree info:**
-```
-q-003  my-spec    isolate  w-2  3/30  5/8 done  running
-q-004  other-spec shared   w-1  1/30  0/3 done  running
-q-005  done-spec  isolate  —    —     3/3 done  needs_merge
-```
-
-### Execution Modes
-
-BOI supports 4 execution modes that control what workers can do:
+## Execution Modes
 
 | Mode | Workers can... | Use when... |
 |------|---------------|-------------|
-| `execute` | Execute tasks only (default) | Tasks are well-defined and straightforward |
+| `execute` | Execute tasks only (default) | Tasks are well-defined |
 | `challenge` | Execute + flag concerns | You want observations alongside execution |
-| `discover` | Execute + add new tasks | Most real-world work (recommended for complex specs) |
+| `discover` | Execute + add new tasks | Most real-world work (recommended) |
 | `generate` | Full creative authority over spec | Goal is clear but path is unclear |
 
-Set the mode via CLI flag, spec header, or default:
-```bash
-boi dispatch --spec spec.md --mode discover    # CLI flag
-boi dispatch --spec spec.md -m g              # Single-letter alias
-```
+## Error Handling
 
-Or in the spec header:
-```markdown
-**Mode:** discover
-```
-
-Generate mode accepts goal-only specs (no pre-defined tasks) with `## Goal`, `## Constraints`, and `## Success Criteria` sections. The title must start with `# [Generate]`.
-
-### `/boi critic` — Manage the critic system
-
-The critic is BOI's quality gate. It reviews completed specs before marking them done, checking for spec integrity issues, weak verification commands, code quality problems, incomplete work, and fleet-readiness gaps. If it finds issues, it adds `[CRITIC]` PENDING tasks and requeues the spec. If everything passes, the spec is approved.
-
-```bash
-boi critic status           # Show critic config, active checks, pass counts
-boi critic run <queue-id>   # Manually trigger critic on a spec
-boi critic disable          # Disable the critic globally
-boi critic enable           # Enable the critic globally
-boi critic checks           # List all active checks (default + custom)
-```
-
-### Customizing the Critic
-
-The critic is configured via `~/.boi/critic/`:
-
-- **Config:** Edit `~/.boi/critic/config.json` to change `enabled`, `max_passes`, or restrict which default checks run.
-- **Custom checks:** Drop `.md` files into `~/.boi/critic/custom/` to add new checks. If a custom check has the same filename as a default check, the custom one replaces the default.
-- **Custom prompt:** Create `~/.boi/critic/prompt.md` to completely replace the default critic prompt template. Use `{{SPEC_CONTENT}}`, `{{CHECKS}}`, `{{QUEUE_ID}}`, `{{ITERATION}}` variables.
-- **Disable per-spec:** Use `boi dispatch --spec spec.md --no-critic` to skip critic validation for a single spec.
-
-### Helping Users Create Custom Checks
-
-When a user wants to create a custom critic check, guide them conversationally:
-
-1. **Ask what they want to catch.** "What kind of issues should this check look for?" Common categories: security, performance, accessibility, API design, test coverage, documentation.
-
-2. **Draft the check file.** A check file is a Markdown document with three sections:
-   - **Title and description** (one paragraph explaining what it validates)
-   - **Checklist** (concrete yes/no items the critic evaluates)
-   - **Examples of violations** (code snippets showing what bad looks like, with severity tags)
-
-3. **Write it to the right location.** Save to `~/.boi/critic/custom/<check-name>.md`.
-
-4. **Verify it's active.** Run `boi critic checks` to confirm the new check appears in the list.
-
-**Example conversation flow:**
-
-User: "I want the critic to check for performance issues"
-
-Claude writes `~/.boi/critic/custom/performance-review.md`:
-```markdown
-# Performance Review
-
-Validates that code changes do not introduce performance regressions.
-
-## Checklist
-
-- [ ] No O(n^2) or worse algorithms on unbounded input
-- [ ] Database queries use indexes (no full table scans on large tables)
-- [ ] No synchronous I/O in hot paths (event loops, request handlers)
-- [ ] Large collections are paginated, not loaded entirely into memory
-- [ ] Cache invalidation is handled correctly (no stale reads, no cache stampedes)
-
-## Examples of Violations
-
-### Quadratic loop (HIGH severity)
-for item in items:
-    if item in other_list:  # O(n) lookup inside O(n) loop = O(n^2)
-        results.append(item)
-
-### Unbounded query (MEDIUM severity)
-users = db.query("SELECT * FROM users")  # loads entire table
-```
-
-Then confirms: `boi critic checks` shows `performance-review (custom)`.
+- `boi` command not found: "BOI is not installed. Run `bash ~/.boi/src/install.sh` from a tmux pane (outside Claude Code) first."
+- Daemon not running on dispatch: `boi dispatch` starts it automatically.
+- Queue ID invalid: relay the CLI error message.
+- Spec validation fails: show validation errors and help fix the spec format.
 
 ## Constraints
 
 - `boi install` runs **outside Claude Code** in a terminal.
-- Workers are headless `claude -p` sessions. Not interactive.
+- Workers are headless `claude -p` sessions — not interactive.
 - Daemon polls every 5 seconds. Status may lag slightly.
 - Default 3 workers, max 5. Set during install.
 - Workers get fresh context each iteration. No memory of previous iterations.
-- Signal-aware failure handling: SIGTERM (exit 143) and SIGKILL (exit 137) do not count as consecutive failures. Workers killed externally are requeued, not failed.
-- Daemon lock prevents multiple daemon instances via `fcntl.flock`.
-- State lives in `~/.boi/` (queue, logs, events, hooks, config).
+- State lives in `~/.boi/` (queue database, logs, phases, guardrails, gates).
 - Python: stdlib only. Shell: `set -uo pipefail`.
