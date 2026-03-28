@@ -35,6 +35,7 @@ PREFIX=""
 NO_SYMLINK=false
 NO_PLUGIN=false
 UPDATE_MODE=false
+RUNTIME=""
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -58,6 +59,7 @@ Options:
   --no-symlink       Skip creating the 'boi' symlink in PATH
   --no-plugin        Skip installing Claude Code plugin
   --update           Update an existing installation
+  --runtime <name>   Set runtime: claude (default) or codex
   -h, --help         Show this help
 
 Prerequisites:
@@ -87,6 +89,11 @@ parse_args() {
             --update)
                 UPDATE_MODE=true
                 shift
+                ;;
+            --runtime)
+                [[ -z "${2:-}" ]] && { log_error "--runtime requires a value (claude or codex)"; exit 1; }
+                RUNTIME="$2"
+                shift 2
                 ;;
             -h|--help)
                 usage
@@ -254,13 +261,129 @@ create_directories() {
   "enabled": true,
   "trigger": "on_complete",
   "max_passes": 2,
-  "checks": ["spec-integrity", "verify-commands", "code-quality", "completeness", "fleet-readiness"],
+  "checks": ["spec-integrity", "verify-commands", "code-quality", "completeness", "fleet-readiness", "blast-radius"],
   "custom_checks_dir": "custom",
   "timeout_seconds": 600
 }
 CRITIC_EOF
         log_info "Created critic config with defaults"
     fi
+}
+
+# ─── Runtime Config ──────────────────────────────────────────────────────────
+
+seed_runtime_config() {
+    local config_file="${BOI_STATE_DIR}/config.json"
+
+    if [[ "${UPDATE_MODE}" == "true" ]]; then
+        # On update: preserve any existing runtime config. Never overwrite.
+        if [[ -f "${config_file}" ]]; then
+            log_info "Preserving existing config.json (not overwriting on --update)"
+            return 0
+        fi
+        # If no config.json yet (upgrade from very old install), fall through to create.
+    fi
+
+    # Determine runtime: explicit flag > default "claude"
+    local runtime="${RUNTIME:-claude}"
+
+    if [[ -f "${config_file}" ]]; then
+        log_info "config.json already exists, skipping runtime seed"
+        return 0
+    fi
+
+    cat > "${config_file}" << CONF_EOF
+{
+  "runtime": {
+    "default": "${runtime}"
+  }
+}
+CONF_EOF
+    log_info "Created config.json with runtime=${runtime}"
+}
+
+# ─── Guardrails ──────────────────────────────────────────────────────────────
+
+seed_guardrails() {
+    local guardrails_file="${BOI_STATE_DIR}/guardrails.toml"
+
+    if [[ -f "${guardrails_file}" ]]; then
+        log_info "guardrails.toml already exists, skipping"
+        return 0
+    fi
+
+    cat > "${guardrails_file}" << 'GUARDRAILS_EOF'
+[pipeline]
+default = ["execute", "review", "critic"]
+GUARDRAILS_EOF
+    log_info "Created guardrails.toml with default pipeline"
+}
+
+# ─── Critic Config Merge ─────────────────────────────────────────────────────
+
+merge_critic_checks() {
+    local critic_config="${BOI_STATE_DIR}/critic/config.json"
+
+    if [[ ! -f "${critic_config}" ]]; then
+        log_info "No critic config to merge — will be created by create_directories"
+        return 0
+    fi
+
+    # Default checks that must be present
+    local default_checks=("spec-integrity" "verify-commands" "code-quality" "completeness" "fleet-readiness" "blast-radius")
+
+    # Use Python to merge checks without removing custom ones
+    python3 - "${critic_config}" "${default_checks[@]}" << 'PYEOF'
+import json, sys
+
+config_path = sys.argv[1]
+required_checks = sys.argv[2:]
+
+with open(config_path) as f:
+    config = json.load(f)
+
+existing = config.get("checks", [])
+added = []
+for check in required_checks:
+    if check not in existing:
+        existing.append(check)
+        added.append(check)
+
+config["checks"] = existing
+
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2)
+
+if added:
+    print(f"[boi] Merged critic checks: added {added}")
+else:
+    print("[boi] Critic checks already up to date")
+PYEOF
+}
+
+# ─── Phase Files Sync ────────────────────────────────────────────────────────
+
+sync_phase_files() {
+    if [[ "${UPDATE_MODE}" != "true" ]]; then
+        return 0
+    fi
+
+    local phases_src="${BOI_SRC_DIR}/phases"
+    local phases_dst="${BOI_STATE_DIR}/phases"
+
+    if [[ ! -d "${phases_src}" ]]; then
+        log_warn "No phases/ directory in source, skipping phase sync"
+        return 0
+    fi
+
+    mkdir -p "${phases_dst}"
+    for phase_file in "${phases_src}"/*.phase.toml; do
+        [[ -f "${phase_file}" ]] || continue
+        local fname
+        fname=$(basename "${phase_file}")
+        cp "${phase_file}" "${phases_dst}/${fname}"
+        log_info "Synced phase: ${fname}"
+    done
 }
 
 # ─── Symlink ─────────────────────────────────────────────────────────────────
@@ -425,6 +548,10 @@ main() {
     check_prerequisites
     clone_or_update_repo
     create_directories
+    seed_runtime_config
+    seed_guardrails
+    merge_critic_checks
+    sync_phase_files
     create_symlink
     install_plugin
     verify_install

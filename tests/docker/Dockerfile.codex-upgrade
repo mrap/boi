@@ -1,0 +1,40 @@
+FROM ubuntu:24.04
+
+# Avoid interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install prerequisites: bash (pre-installed), python3, git, tmux
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    git \
+    tmux \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure git identity so git pull --rebase doesn't fail with "who are you?" errors
+RUN git config --global user.email "test@boi-test.local" \
+    && git config --global user.name "BOI Test"
+
+# Copy BOI source into image (build context must be ~/.boi/src/)
+# This lets us test the local version without needing GitHub access
+# and without needing to push first (see t-8).
+COPY . /boi-src
+
+# Create a non-root test user (closer to real-user install conditions)
+RUN useradd -m -s /bin/bash testuser
+
+# Set git identity and safe.directory for the test user.
+# safe.directory is needed so testuser can run git commands against /boi-src
+# (which was created by root during the Docker build). Without this, git fetch
+# from /boi-src fails with "dubious ownership" and install-public.sh falls back
+# to `git reset --hard origin/main` using a stale cached ref.
+RUN su -c "git config --global user.email 'test@boi-test.local' \
+    && git config --global user.name 'BOI Test' \
+    && git config --global --add safe.directory /boi-src \
+    && git config --global --add safe.directory /boi-src/.git" testuser
+
+USER testuser
+WORKDIR /home/testuser
+
+CMD ["/bin/bash", "/boi-src/tests/docker/test-upgrade-codex-config.sh"]
