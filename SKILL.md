@@ -133,6 +133,7 @@ A **phase** is a named worker role defined by a `.phase.toml` file. The daemon h
 ```toml
 name = "my-phase"                        # optional; derived from filename if omitted
 description = "What this phase does"
+completion_handler = "builtin:execute"   # optional — use built-in routing logic
 
 [worker]
 prompt_template = "path/to/prompt.md"   # required

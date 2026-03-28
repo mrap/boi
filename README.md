@@ -98,6 +98,7 @@ A **phase** is a named worker role defined by a `.phase.toml` file. The daemon l
 # Top-level
 name = "my-phase"                        # required; derived from filename if omitted
 description = "What this phase does"     # optional
+completion_handler = "builtin:execute"   # optional — use built-in routing logic
 
 # Worker configuration
 [worker]
@@ -131,6 +132,8 @@ post = ["diff-is-non-empty"]      # gates to run after this phase completes
 - `phase:<name>` — jump to a named phase
 - `retry` — re-run this phase
 - `fail` — mark the spec failed
+
+**`completion_handler`:** Set this top-level field to delegate routing to a built-in handler (e.g. `"builtin:execute"`). Use it when you want a phase to reuse the same routing logic as a built-in phase rather than defining your own `approve_signal`/`reject_signal` strings. When `completion_handler` is set, the daemon calls the named built-in handler and ignores the `[completion]` signals.
 
 ### Creating a Custom Phase
 
