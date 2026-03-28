@@ -96,7 +96,7 @@ A **phase** is a named worker role defined by a `.phase.toml` file. The daemon l
 
 ```toml
 # Top-level
-name = "my-phase"                        # required; derived from filename if omitted
+name = "my-phase"                        # optional; derived from filename if omitted
 description = "What this phase does"     # optional
 completion_handler = "builtin:execute"   # optional — use built-in routing logic
 
