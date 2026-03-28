@@ -193,21 +193,21 @@ class TestApplyViewFilterDefault(unittest.TestCase):
         result = _apply_view_filter(entries, "default")
         self.assertEqual(len(result), 0)
 
-    def test_default_failed_within_24h_shown(self):
+    def test_default_failed_within_24h_hidden(self):
+        # Failed specs are never shown in default view (summary line shows count)
         entries = [
             _make_entry("q-001", status="failed", last_iteration_at=_ts(23)),
         ]
         result = _apply_view_filter(entries, "default")
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["id"], "q-001")
+        self.assertEqual(len(result), 0)
 
-    def test_default_failed_at_24h_boundary_shown(self):
-        # 23h59m = shown (within 24h)
+    def test_default_failed_at_24h_boundary_hidden(self):
+        # Failed specs are never shown in default view regardless of age
         entries = [
             _make_entry("q-001", status="failed", last_iteration_at=_ts(23.98)),
         ]
         result = _apply_view_filter(entries, "default")
-        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result), 0)
 
     def test_default_failed_older_than_24h_hidden(self):
         entries = [
@@ -237,7 +237,7 @@ class TestApplyViewFilterDefault(unittest.TestCase):
             _make_entry("q-002", status="queued"),
             _make_entry("q-003", status="completed", last_iteration_at=_ts(5)),   # shown
             _make_entry("q-004", status="completed", last_iteration_at=_ts(8)),   # hidden
-            _make_entry("q-005", status="failed", last_iteration_at=_ts(20)),     # shown
+            _make_entry("q-005", status="failed", last_iteration_at=_ts(20)),     # hidden (failed never shown)
             _make_entry("q-006", status="failed", last_iteration_at=_ts(26)),     # hidden
             _make_entry("q-007", status="canceled", last_iteration_at=_ts(0.5)), # never shown
             _make_entry("q-008", status="needs_review"),
@@ -248,11 +248,11 @@ class TestApplyViewFilterDefault(unittest.TestCase):
         self.assertIn("q-002", ids)
         self.assertIn("q-003", ids)
         self.assertNotIn("q-004", ids)
-        self.assertIn("q-005", ids)
+        self.assertNotIn("q-005", ids)
         self.assertNotIn("q-006", ids)
         self.assertNotIn("q-007", ids)
         self.assertIn("q-008", ids)
-        self.assertEqual(len(result), 5)
+        self.assertEqual(len(result), 4)
 
 
 if __name__ == "__main__":

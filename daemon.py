@@ -93,6 +93,7 @@ class Daemon:
         self.log_dir = os.path.join(self.state_dir, "logs")
         self.hooks_dir = os.path.join(self.state_dir, "hooks")
         self.script_dir = str(Path(__file__).resolve().parent)
+        self.phases_dir = os.path.join(self.state_dir, "phases")
 
         # PID / lock files
         self.pid_file = os.path.join(self.state_dir, "daemon.pid")
@@ -100,6 +101,10 @@ class Daemon:
 
         # Active worker subprocesses: worker_id -> subprocess.Popen
         self.worker_procs: dict[str, subprocess.Popen] = {}
+
+        # Phase configs loaded from ~/.boi/phases/ (hot-reloaded each cycle)
+        self.phase_configs: dict[str, Any] = {}
+        self._phase_mtimes: dict[str, float] = {}
 
         # Default worker timeout (can be overridden per-spec)
         self.default_worker_timeout = DEFAULT_WORKER_TIMEOUT
@@ -129,6 +134,262 @@ class Daemon:
         logger.info("Received %s, initiating shutdown", sig_name)
         self._shutdown_requested = True
 
+    # ── Phase discovery ──────────────────────────────────────────────
+
+    def _load_phases(self) -> None:
+        """Discover phase configs from state_dir/phases/ and ~/.boi/phases/.
+
+        Loads all *.phase.toml files from both directories. The state_dir
+        phases take precedence over the global ~/.boi/phases/ directory.
+        Stores loaded configs in self.phase_configs and tracks mtimes for
+        hot-reload detection.
+        """
+        try:
+            from lib.phases import load_phase
+        except ImportError:
+            return
+
+        phases: dict[str, Any] = {}
+        mtimes: dict[str, float] = {}
+
+        # Check both state-local and user-global phases dirs
+        phases_dirs = [
+            os.path.expanduser("~/.boi/phases"),
+            self.phases_dir,
+        ]
+        for d in phases_dirs:
+            if not os.path.isdir(d):
+                continue
+            try:
+                for entry in os.scandir(d):
+                    if entry.name.endswith(".phase.toml") and entry.is_file():
+                        try:
+                            config = load_phase(entry.path)
+                            phases[config.name] = config
+                            mtimes[entry.path] = entry.stat().st_mtime
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to load phase file %s: %s",
+                                entry.path,
+                                exc,
+                            )
+            except OSError:
+                pass
+
+        self.phase_configs = phases
+        self._phase_mtimes = mtimes
+        if phases:
+            logger.info(
+                "Loaded %d phase(s): %s",
+                len(phases),
+                ", ".join(sorted(phases.keys())),
+            )
+
+    def _reload_phases_if_changed(self) -> None:
+        """Check phase file mtimes and reload if any have changed."""
+        changed = False
+        for path, old_mtime in list(self._phase_mtimes.items()):
+            try:
+                if os.path.getmtime(path) != old_mtime:
+                    changed = True
+                    break
+            except OSError:
+                changed = True
+                break
+        # Also check if new phase files appeared in either directory
+        if not changed:
+            for d in [os.path.expanduser("~/.boi/phases"), self.phases_dir]:
+                if not os.path.isdir(d):
+                    continue
+                try:
+                    for entry in os.scandir(d):
+                        if (
+                            entry.name.endswith(".phase.toml")
+                            and entry.is_file()
+                            and entry.path not in self._phase_mtimes
+                        ):
+                            changed = True
+                            break
+                except OSError:
+                    pass
+                if changed:
+                    break
+        if changed:
+            logger.debug("Phase files changed, reloading")
+            self._load_phases()
+
+    # ── Pipeline routing ─────────────────────────────────────────────
+
+    def _advance_pipeline(self, spec_id: str, current_phase: str) -> None:
+        """Advance a spec to the next phase in the configured pipeline.
+
+        Reads the pipeline from ~/.boi/guardrails.toml (defaults to
+        ["execute", "critic"] if not found). If current_phase is the last
+        phase, completes the spec. Otherwise, requeues it for the next phase.
+        """
+        try:
+            from lib.guardrails import load_guardrails
+            guardrails_path = os.path.join(self.state_dir, "guardrails.toml")
+            config = load_guardrails(guardrails_path)
+            pipeline = config.pipeline
+        except Exception:
+            pipeline = ["execute", "critic"]
+
+        spec = self.db.get_spec(spec_id)
+        if spec is None:
+            return
+
+        done = spec.get("tasks_done", 0)
+        total = spec.get("tasks_total", 0)
+
+        try:
+            idx = pipeline.index(current_phase)
+            next_idx = idx + 1
+        except ValueError:
+            # current_phase not in pipeline — complete
+            logger.info(
+                "Phase '%s' not in pipeline for %s, completing",
+                current_phase,
+                spec_id,
+            )
+            self.db.complete(spec_id, done, total)
+            return
+
+        if next_idx >= len(pipeline):
+            logger.info(
+                "Pipeline complete for %s after phase '%s'",
+                spec_id,
+                current_phase,
+            )
+            self.db.complete(spec_id, done, total)
+        else:
+            next_phase = pipeline[next_idx]
+            self.db.requeue(spec_id, done, total)
+            self.db.update_spec_fields(spec_id, phase=next_phase)
+            logger.info(
+                "Pipeline advancing %s: %s → %s",
+                spec_id,
+                current_phase,
+                next_phase,
+            )
+
+    def _handle_custom_phase_completion(
+        self,
+        spec_id: str,
+        phase: str,
+        phase_config: Any,
+        exit_code: int,
+        spec_path: str,
+    ) -> None:
+        """Generic signal-based completion handler for custom phases.
+
+        Reads the spec file for approve_signal or reject_signal and routes
+        accordingly. Falls back to on_crash handling if neither signal found
+        or if exit_code is non-zero.
+        """
+        if exit_code != 0:
+            # Run post hooks even on crash (advisory — errors are ignored)
+            try:
+                from lib.guardrail_runner import run_hooks
+                run_hooks(
+                    hook_point=f"post-{phase}",
+                    spec_id=spec_id,
+                    spec_path=spec_path,
+                    state_dir=self.state_dir,
+                    phase_config=phase_config,
+                )
+            except Exception:
+                pass
+            on_crash = phase_config.on_crash
+            if on_crash == "retry":
+                spec = self.db.get_spec(spec_id)
+                done = spec.get("tasks_done", 0) if spec else 0
+                total = spec.get("tasks_total", 0) if spec else 0
+                self.db.requeue(spec_id, done, total)
+                logger.info("Custom phase '%s' crashed, requeueing %s", phase, spec_id)
+            else:
+                self.db.fail(
+                    spec_id,
+                    f"Phase '{phase}' failed with exit code {exit_code}",
+                )
+            return
+
+        # Run post-phase guardrail hooks on success
+        try:
+            from lib.guardrail_runner import run_hooks
+            _post_result = run_hooks(
+                hook_point=f"post-{phase}",
+                spec_id=spec_id,
+                spec_path=spec_path,
+                state_dir=self.state_dir,
+                phase_config=phase_config,
+            )
+            if not _post_result.get("passed", True):
+                # Strict gate blocked — GATE-FAIL task appended, requeue to execute
+                spec = self.db.get_spec(spec_id)
+                done = spec.get("tasks_done", 0) if spec else 0
+                total = spec.get("tasks_total", 0) if spec else 0
+                self.db.requeue(spec_id, done, total)
+                self.db.update_spec_fields(spec_id, phase="execute")
+                logger.warning(
+                    "Custom phase '%s' post-hook blocked for %s — requeueing to execute",
+                    phase,
+                    spec_id,
+                )
+                return
+        except Exception:
+            logger.exception(
+                "guardrail_runner raised for custom phase '%s' post-hooks for %s",
+                phase,
+                spec_id,
+            )
+
+        # Read spec content for signal detection
+        spec_content = ""
+        if spec_path and os.path.isfile(spec_path):
+            try:
+                spec_content = Path(spec_path).read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        approve_signal = phase_config.approve_signal
+        reject_signal = phase_config.reject_signal
+
+        if approve_signal and approve_signal in spec_content:
+            self._advance_pipeline(spec_id, phase)
+        elif reject_signal and reject_signal in spec_content:
+            on_reject = phase_config.on_reject
+            spec = self.db.get_spec(spec_id)
+            done = spec.get("tasks_done", 0) if spec else 0
+            total = spec.get("tasks_total", 0) if spec else 0
+            if on_reject.startswith("requeue:"):
+                target_phase = on_reject[len("requeue:"):]
+                self.db.requeue(spec_id, done, total)
+                self.db.update_spec_fields(spec_id, phase=target_phase)
+                logger.info(
+                    "Custom phase '%s' rejected for %s, requeueing to '%s'",
+                    phase,
+                    spec_id,
+                    target_phase,
+                )
+            elif on_reject == "fail":
+                self.db.fail(spec_id, f"Phase '{phase}' rejected")
+            else:
+                self.db.requeue(spec_id, done, total)
+        else:
+            # Neither signal found — treat as on_crash
+            on_crash = phase_config.on_crash
+            if on_crash == "retry":
+                spec = self.db.get_spec(spec_id)
+                done = spec.get("tasks_done", 0) if spec else 0
+                total = spec.get("tasks_total", 0) if spec else 0
+                self.db.requeue(spec_id, done, total)
+            else:
+                self.db.fail(
+                    spec_id,
+                    f"Phase '{phase}' did not produce expected signal",
+                )
+
     # ── Main loop ────────────────────────────────────────────────────
 
     def run(self) -> None:
@@ -145,6 +406,9 @@ class Daemon:
 
         # Load worker definitions from config
         self.load_workers()
+
+        # Load phase configs from ~/.boi/phases/ (hot-reloaded each cycle)
+        self._load_phases()
 
         # Startup recovery: reset specs stuck in 'running' with dead PIDs
         recovered = self.db.recover_running_specs()
@@ -176,6 +440,7 @@ class Daemon:
                 self.dispatch_specs()
                 self.write_state_snapshot()
                 self.write_heartbeat()
+                self._reload_phases_if_changed()
 
                 poll_cycle += 1
                 if poll_cycle % SELF_HEAL_INTERVAL == 0:
@@ -409,6 +674,13 @@ class Daemon:
         #    will update after launch)
         self.db.assign_worker(worker_id, spec_id, pid=0, phase=phase)
 
+        # Determine timeout: spec-level first, then phase config, then default
+        timeout = spec.get("worker_timeout_seconds")
+        if timeout is None:
+            phase_config = self.phase_configs.get(phase)
+            if phase_config is not None and phase_config.timeout > 0:
+                timeout = phase_config.timeout
+
         try:
             # 3. Launch worker subprocess
             proc = self.launch_worker(
@@ -418,7 +690,7 @@ class Daemon:
                 iteration=iteration,
                 phase=phase,
                 worker_id=worker_id,
-                timeout=spec.get("worker_timeout_seconds"),
+                timeout=timeout,
             )
         except Exception:
             logger.exception(
@@ -790,6 +1062,76 @@ class Daemon:
             self._fallback_completion(spec_id, exit_code)
             return
 
+        # Check for a phase config to determine routing
+        phase_config = self.phase_configs.get(phase)
+
+        if phase_config is not None:
+            handler = phase_config.completion_handler
+            if handler.startswith("builtin:"):
+                # Route to existing builtin handler by name
+                builtin_name = handler[len("builtin:"):]
+                if builtin_name == "execute":
+                    daemon_ops.process_worker_completion(
+                        queue_dir=self.queue_dir,
+                        queue_id=spec_id,
+                        events_dir=events_dir,
+                        log_dir=self.log_dir,
+                        hooks_dir=self.hooks_dir,
+                        script_dir=self.script_dir,
+                        exit_code=str(exit_code),
+                        db=self.db,
+                    )
+                    return
+                elif builtin_name == "critic":
+                    daemon_ops.process_critic_completion(
+                        queue_dir=self.queue_dir,
+                        queue_id=spec_id,
+                        events_dir=events_dir,
+                        hooks_dir=self.hooks_dir,
+                        spec_path=spec_path,
+                        db=self.db,
+                    )
+                    return
+                elif builtin_name == "decompose":
+                    daemon_ops.process_decomposition_completion(
+                        queue_dir=self.queue_dir,
+                        queue_id=spec_id,
+                        events_dir=events_dir,
+                        spec_path=spec_path,
+                        exit_code=str(exit_code),
+                        db=self.db,
+                    )
+                    return
+                elif builtin_name == "evaluate":
+                    daemon_ops.process_evaluation_completion(
+                        queue_dir=self.queue_dir,
+                        queue_id=spec_id,
+                        events_dir=events_dir,
+                        hooks_dir=self.hooks_dir,
+                        spec_path=spec_path,
+                        exit_code=str(exit_code),
+                        db=self.db,
+                    )
+                    return
+                # Unknown builtin — fall through to legacy routing below
+                logger.warning(
+                    "Unknown builtin completion_handler '%s' for phase '%s', "
+                    "falling back to legacy routing",
+                    handler,
+                    phase,
+                )
+            else:
+                # No completion_handler set: use generic signal-based handler
+                self._handle_custom_phase_completion(
+                    spec_id=spec_id,
+                    phase=phase,
+                    phase_config=phase_config,
+                    exit_code=exit_code,
+                    spec_path=spec_path,
+                )
+                return
+
+        # Legacy hardcoded routing (backward compat when no phase configs loaded)
         if phase == "execute":
             ctx = daemon_ops.CompletionContext(
                 queue_dir=self.queue_dir,
@@ -1147,6 +1489,27 @@ class Daemon:
         except subprocess.CalledProcessError as exc:
             logger.warning("[auto-commit] git status failed in %s: %s", target_repo, exc)
             return
+
+        # Run pre-commit guardrail hooks before staging/committing
+        try:
+            from lib.guardrail_runner import run_hooks
+            spec_entry = self.db.get_spec(spec_id)
+            spec_path_for_hooks = (spec_entry or {}).get("spec_path", "")
+            _pre_commit = run_hooks(
+                hook_point="pre-commit",
+                spec_id=spec_id,
+                spec_path=spec_path_for_hooks,
+                state_dir=self.state_dir,
+            )
+            if not _pre_commit.get("passed", True):
+                logger.warning(
+                    "[auto-commit] pre-commit gate blocked for %s: %s — skipping commit",
+                    spec_id,
+                    [g["gate"] for g in _pre_commit.get("failed_gates", [])],
+                )
+                return
+        except Exception:
+            logger.exception("[auto-commit] pre-commit hook runner raised for %s — proceeding", spec_id)
 
         # Stage changes
         manifest_path = os.path.join(

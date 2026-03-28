@@ -433,7 +433,7 @@ class TestTelemetryFormatting(unittest.TestCase):
         self.assertIn("Worker crashed", output)
 
     def test_queue_table_shows_failure_reason(self):
-        """format_queue_table should show failure reason on a second line for failed specs."""
+        """format_queue_table should show failure reason on a second line for failed specs (--all view)."""
         entry = enqueue(self.queue_dir, self._make_spec("fail-test.md"))
         entry["status"] = "failed"
         entry["failure_reason"] = (
@@ -442,7 +442,8 @@ class TestTelemetryFormatting(unittest.TestCase):
         _write_entry(self.queue_dir, entry)
 
         status = build_queue_status(self.queue_dir)
-        output = format_queue_table(status, color=False)
+        # Failed specs only appear in --all view; verify reason is shown there
+        output = format_queue_table(status, color=False, view_mode="all")
 
         self.assertIn("failed", output)
         self.assertIn("Reason:", output)

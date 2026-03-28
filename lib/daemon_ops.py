@@ -69,6 +69,36 @@ class CompletionContext:
     db: "Database"
 
 
+def _run_guardrail_hooks(
+    hook_point: str,
+    spec_id: str,
+    spec_path: str,
+    state_dir: str,
+    phase_config: Any = None,
+) -> dict[str, Any]:
+    """Run guardrail hooks for a hook point, returning pass/fail result.
+
+    Wraps lib.guardrail_runner.run_hooks with exception isolation so
+    hook failures never block the daemon's core completion logic.
+    """
+    try:
+        from lib.guardrail_runner import run_hooks
+        return run_hooks(
+            hook_point=hook_point,
+            spec_id=spec_id,
+            spec_path=spec_path,
+            state_dir=state_dir,
+            phase_config=phase_config,
+        )
+    except Exception:
+        _logger.exception(
+            "Guardrail hook runner raised for %s at %s — skipping",
+            spec_id,
+            hook_point,
+        )
+        return {"passed": True, "failed_gates": [], "outcome": "error"}
+
+
 def _signal_name(signal_num: int) -> str:
     """Return a human-readable signal name (e.g., 'SIGTERM') for a signal number."""
     import signal as _signal
@@ -509,6 +539,76 @@ def process_worker_completion(
             run_completion_hooks(ctx.hooks_dir, queue_id, spec_path, is_failure=False)
             return result
 
+        # Run post-execute guardrail hooks before routing to next phase
+        _state_dir = str(Path(queue_dir).parent)
+        _gate_result = _run_guardrail_hooks(
+            hook_point="post-execute",
+            spec_id=queue_id,
+            spec_path=spec_path,
+            state_dir=_state_dir,
+        )
+        if not _gate_result.get("passed", True):
+            # Strict gate blocked — GATE-FAIL task appended, requeue to execute
+            if db:
+                db.requeue(queue_id, done_count, total_count)
+            else:
+                requeue(queue_dir, queue_id, done_count, total_count)
+            write_event(
+                events_dir,
+                {
+                    "type": "gate_fail",
+                    "queue_id": queue_id,
+                    "hook_point": "post-execute",
+                    "failed_gates": _gate_result.get("failed_gates", []),
+                    "timestamp": timestamp,
+                },
+            )
+            log_event(
+                queue_id,
+                "gate_fail",
+                f"post-execute gate blocked: "
+                f"{[g['gate'] for g in _gate_result.get('failed_gates', [])]}",
+                {"hook_point": "post-execute"},
+                "warn",
+            )
+            result["outcome"] = "gate_blocked"
+            result["failed_gates"] = _gate_result.get("failed_gates", [])
+            return result
+
+        # Run pre-commit guardrail hooks before entering critic/completion
+        _pre_commit_gate = _run_guardrail_hooks(
+            hook_point="pre-commit",
+            spec_id=queue_id,
+            spec_path=spec_path,
+            state_dir=_state_dir,
+        )
+        if not _pre_commit_gate.get("passed", True):
+            if db:
+                db.requeue(queue_id, done_count, total_count)
+            else:
+                requeue(queue_dir, queue_id, done_count, total_count)
+            write_event(
+                events_dir,
+                {
+                    "type": "gate_fail",
+                    "queue_id": queue_id,
+                    "hook_point": "pre-commit",
+                    "failed_gates": _pre_commit_gate.get("failed_gates", []),
+                    "timestamp": timestamp,
+                },
+            )
+            log_event(
+                queue_id,
+                "gate_fail",
+                f"pre-commit gate blocked: "
+                f"{[g['gate'] for g in _pre_commit_gate.get('failed_gates', [])]}",
+                {"hook_point": "pre-commit"},
+                "warn",
+            )
+            result["outcome"] = "gate_blocked"
+            result["failed_gates"] = _pre_commit_gate.get("failed_gates", [])
+            return result
+
         result.update(
             _apply_critic_or_complete(
                 entry,
@@ -946,7 +1046,40 @@ def _apply_critic_or_complete(
             return {"outcome": "completed", "critic_error": str(exc)}
 
     else:
-        # Critic disabled or max passes reached — complete normally
+        # Critic disabled or max passes reached — run pre-completion hooks then complete
+        _state_dir = str(Path(ctx.queue_dir).parent)
+        _pre_gate = _run_guardrail_hooks(
+            hook_point="pre-completion",
+            spec_id=queue_id,
+            spec_path=spec_path,
+            state_dir=_state_dir,
+        )
+        if not _pre_gate.get("passed", True):
+            # Strict gate blocked — requeue to execute
+            ctx.db.requeue(queue_id, done_count, total_count)
+            write_event(
+                ctx.events_dir,
+                {
+                    "type": "gate_fail",
+                    "queue_id": queue_id,
+                    "hook_point": "pre-completion",
+                    "failed_gates": _pre_gate.get("failed_gates", []),
+                    "timestamp": timestamp,
+                },
+            )
+            log_event(
+                queue_id,
+                "gate_fail",
+                f"pre-completion gate blocked: "
+                f"{[g['gate'] for g in _pre_gate.get('failed_gates', [])]}",
+                {"hook_point": "pre-completion"},
+                "warn",
+            )
+            return {
+                "outcome": "gate_blocked",
+                "failed_gates": _pre_gate.get("failed_gates", []),
+            }
+
         ctx.db.complete(queue_id, done_count, total_count)
 
         write_event(

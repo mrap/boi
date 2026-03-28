@@ -10,6 +10,7 @@
 
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -265,6 +266,7 @@ def build_queue_status(
             **status_counts,
         },
         "workers": workers,
+        "queue_dir": queue_dir,
     }
 
 
@@ -713,11 +715,10 @@ def _apply_view_filter(
 
         return sorted(entries, key=_ts, reverse=True)[:n]
 
-    # default: active specs + failed within 24h + completed within 6h
-    # Canceled is never shown in default view.
+    # default: active specs + completed within 6h
+    # Failed and canceled are never shown in default view (summary line shows failed count).
     now = datetime.now(timezone.utc)
     from datetime import timedelta
-    cutoff_failed = now - timedelta(hours=24)
     cutoff_completed = now - timedelta(hours=6)
 
     def _last_ts(e: dict[str, Any]) -> datetime | None:
@@ -734,15 +735,11 @@ def _apply_view_filter(
         status = e.get("status", "")
         if status in ("running", "requeued", "queued", "needs_review", "assigning"):
             result.append(e)
-        elif status == "failed":
-            ts = _last_ts(e)
-            if ts is not None and ts >= cutoff_failed:
-                result.append(e)
         elif status == "completed":
             ts = _last_ts(e)
             if ts is not None and ts >= cutoff_completed:
                 result.append(e)
-        # canceled: never shown in default view
+        # failed and canceled: never shown in default view
     return result
 
 
@@ -847,12 +844,101 @@ def _format_spec_row_compact(
     return row
 
 
+def _get_iteration_elapsed(spec: dict[str, Any], queue_dir: str) -> str:
+    """Return human-friendly elapsed time for the current running iteration.
+
+    Reads started_at from the latest iteration file if present, otherwise
+    falls back to last_iteration_at / first_running_at on the queue entry.
+    Returns "" if no timing data is available.
+    """
+    if not queue_dir:
+        return ""
+    qid = spec.get("id", "")
+    if not qid:
+        return ""
+
+    iteration = spec.get("iteration", 0)
+    iter_path = Path(queue_dir) / f"{qid}.iteration-{iteration}.json"
+
+    started_at_str = ""
+    if iter_path.is_file():
+        try:
+            data = json.loads(iter_path.read_text(encoding="utf-8"))
+            started_at_str = data.get("started_at", "")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if not started_at_str:
+        started_at_str = (
+            spec.get("last_iteration_at", "")
+            or spec.get("first_running_at", "")
+        )
+
+    if not started_at_str:
+        return ""
+
+    try:
+        started_at = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        if elapsed < 0:
+            return ""
+        if elapsed < 60:
+            return f"{int(elapsed)}s"
+        elif elapsed < 3600:
+            return f"{int(elapsed // 60)}m"
+        else:
+            h = int(elapsed // 3600)
+            m = int((elapsed % 3600) // 60)
+            return f"{h}h{m}m" if m else f"{h}h"
+    except Exception:
+        return ""
+
+
+def _get_current_task(spec: dict[str, Any]) -> str:
+    """Return the first PENDING task heading from the spec file.
+
+    Reads spec_path from the spec entry, parses task headings matching
+    ``### t-N:`` and returns the first one whose status line is PENDING.
+    Formatted as "t-N: {task title}" truncated to ~60 chars.
+    Returns "" if no pending task is found or the file cannot be read.
+    """
+    spec_path = spec.get("spec_path", "")
+    if not spec_path:
+        return ""
+    try:
+        content = Path(spec_path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    heading_re = re.compile(r"^### (t-\d+):\s*(.+)$", re.MULTILINE)
+    lines = content.splitlines()
+    line_index: dict[int, tuple[str, str]] = {}
+    for m in heading_re.finditer(content):
+        lineno = content[: m.start()].count("\n")
+        line_index[lineno] = (m.group(1), m.group(2).strip())
+
+    for lineno, (task_id, title) in sorted(line_index.items()):
+        # Find the first non-empty line after the heading
+        for next_line in lines[lineno + 1 :]:
+            stripped = next_line.strip()
+            if stripped:
+                if stripped == "PENDING":
+                    label = f"{task_id}: {title}"
+                    if len(label) > 60:
+                        label = label[:59] + "\u2026"
+                    return label
+                break  # non-empty, non-PENDING — not pending
+
+    return ""
+
+
 def format_spec_row(
     spec: dict[str, Any],
     columns: int,
     style: str = "default",
     color: bool = True,
     selected: bool = False,
+    queue_dir: str = "",
 ) -> str:
     """Format a single spec entry as a display row at the given width.
 
@@ -896,6 +982,10 @@ def format_spec_row(
     iteration = spec.get("iteration", 0)
     max_iter = spec.get("max_iterations", 30)
     iter_str = f"{iteration}/{max_iter}" if status != "queued" else "-"
+    if status == "running":
+        elapsed = _get_iteration_elapsed(spec, queue_dir)
+        if elapsed:
+            iter_str = f"{iter_str} ({elapsed})"
 
     tasks_done = spec.get("tasks_done", 0)
     tasks_total = spec.get("tasks_total", 0)
@@ -963,6 +1053,7 @@ def render_status(
     style: str = "default",
     selected_row: int = -1,
     emit_queue_ids: bool = False,
+    queue_dir: str = "",
 ) -> str:
     """Unified status renderer — single entry point for all display modes.
 
@@ -1139,8 +1230,16 @@ def render_status(
         if not first_running_id and status == "running":
             first_running_id = entry.get("id", "")
 
-        row = format_spec_row(entry, term_w, style=style, color=color)
+        row = format_spec_row(entry, term_w, style=style, color=color, queue_dir=queue_dir)
         lines.append(row)
+
+        if status == "running":
+            current_task = _get_current_task(entry)
+            if current_task:
+                task_line = f"       Task: {current_task}"
+                if color:
+                    task_line = f"{DIM}{task_line}{NC}"
+                lines.append(task_line)
 
         if status == "failed":
             fail_reason = entry.get("failure_reason", "")
@@ -1251,6 +1350,7 @@ def format_queue_table(
     all_entries = status_data.get("entries", [])
     summary = status_data.get("summary", {})
     workers = status_data.get("workers", [])
+    queue_dir = status_data.get("queue_dir", "")
     total_count = len(all_entries)
 
     entries = filter_specs(all_entries, view_mode)
@@ -1266,6 +1366,7 @@ def format_queue_table(
         workers=workers,
         total_count=total_count,
         view_mode=view_mode,
+        queue_dir=queue_dir,
     )
 
 
