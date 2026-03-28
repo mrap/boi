@@ -133,5 +133,88 @@ class TestCleanupOrphanedProcesses(CleanupTestCase):
                 self.assertNotIn(22222, killed_pids)
 
 
+    def test_cleanup_finds_orphaned_codex_processes(self) -> None:
+        """cleanup_orphans should find orphaned codex worker processes."""
+        from lib.cli_ops import cleanup_orphans
+
+        self._register_worker_with_pid("w-1", "q-001", pid=11111)
+        mock_ps_output = "11111 codex exec BOI Worker\n33333 codex exec BOI Worker\n"
+
+        with patch("subprocess.check_output", return_value=mock_ps_output):
+            with patch("os.kill") as mock_kill:
+                orphans = cleanup_orphans(self.queue_dir)
+                self.assertIn(33333, orphans)
+                self.assertNotIn(11111, orphans)
+
+    def test_cleanup_kills_orphaned_codex_processes(self) -> None:
+        """cleanup_orphans should kill orphaned codex PIDs."""
+        from lib.cli_ops import cleanup_orphans
+
+        self._register_worker_with_pid("w-1", "q-001", pid=11111)
+        mock_ps_output = "11111 codex exec BOI Worker\n33333 codex exec BOI Worker\n"
+
+        with patch("subprocess.check_output", return_value=mock_ps_output):
+            with patch("os.kill") as mock_kill:
+                cleanup_orphans(self.queue_dir)
+                killed_pids = {call.args[0] for call in mock_kill.call_args_list}
+                self.assertNotIn(11111, killed_pids, "Should not kill tracked workers")
+                self.assertIn(33333, killed_pids, "Should kill orphaned codex processes")
+
+    def test_cleanup_mixed_claude_codex_processes(self) -> None:
+        """cleanup_orphans handles a mix of claude and codex workers."""
+        from lib.cli_ops import cleanup_orphans
+
+        self._register_worker_with_pid("w-1", "q-001", pid=11111)
+        self._register_worker_with_pid("w-2", "q-002", pid=22222)
+        mock_ps_output = (
+            "11111 claude -p BOI Worker\n"
+            "22222 codex exec BOI Worker\n"
+            "33333 claude -p BOI Worker\n"
+            "44444 codex exec BOI Worker\n"
+        )
+
+        with patch("subprocess.check_output", return_value=mock_ps_output):
+            with patch("os.kill") as mock_kill:
+                orphans = cleanup_orphans(self.queue_dir)
+                self.assertIn(33333, orphans)
+                self.assertIn(44444, orphans)
+                self.assertNotIn(11111, orphans)
+                self.assertNotIn(22222, orphans)
+
+
+class TestDetectWorkerProcessPatterns(unittest.TestCase):
+    """Test that detect_worker_process uses tight patterns, not bare word matches."""
+
+    def test_claude_matches_claude_dash_p(self) -> None:
+        from lib.runtime import ClaudeRuntime
+        rt = ClaudeRuntime()
+        self.assertTrue(rt.detect_worker_process("claude -p /tmp/prompt.txt"))
+
+    def test_claude_rejects_claude_desktop(self) -> None:
+        from lib.runtime import ClaudeRuntime
+        rt = ClaudeRuntime()
+        self.assertFalse(rt.detect_worker_process("claude-desktop running"))
+
+    def test_claude_rejects_bare_claude(self) -> None:
+        from lib.runtime import ClaudeRuntime
+        rt = ClaudeRuntime()
+        self.assertFalse(rt.detect_worker_process("claude --version"))
+
+    def test_codex_matches_codex_exec(self) -> None:
+        from lib.runtime import CodexRuntime
+        rt = CodexRuntime()
+        self.assertTrue(rt.detect_worker_process("codex exec --model o3"))
+
+    def test_codex_rejects_bare_codex(self) -> None:
+        from lib.runtime import CodexRuntime
+        rt = CodexRuntime()
+        self.assertFalse(rt.detect_worker_process("codex --version"))
+
+    def test_codex_rejects_codexfile(self) -> None:
+        from lib.runtime import CodexRuntime
+        rt = CodexRuntime()
+        self.assertFalse(rt.detect_worker_process("codexfile run"))
+
+
 if __name__ == "__main__":
     unittest.main()

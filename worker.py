@@ -34,6 +34,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from lib.runtime import ClaudeRuntime, Runtime, get_runtime, resolve_runtime
 from lib.spec_parser import count_boi_tasks
 from lib.workspace_guard import WorkspaceBoundaryChecker, diff_status, snapshot_git_status
 
@@ -76,28 +77,23 @@ DECOMPOSE_TEMPLATE_PATH = os.path.join(
 EVALUATE_TEMPLATE_PATH = os.path.join(
     SCRIPT_DIR, "templates", "evaluate-prompt.md"
 )
+REVIEW_TEMPLATE_PATH = os.path.join(
+    SCRIPT_DIR, "templates", "review-worker-prompt.md"
+)
 
 VALID_MODES = {"execute", "challenge", "discover", "generate"}
-VALID_PHASES = {"execute", "critic", "evaluate", "decompose"}
+VALID_PHASES = {"execute", "critic", "evaluate", "decompose", "review"}
 TMUX_POLL_INTERVAL = 5  # seconds between tmux has-session polls
 TMUX_SOCKET = "boi"     # tmux socket name (-L flag)
 
 logger = logging.getLogger("boi.worker")
 
 
-# Model name aliases → (full model ID, effort level)
-_MODEL_MAP = {
-    "opus":   ("claude-opus-4-6", "high"),
-    "sonnet": ("claude-sonnet-4-6", "medium"),
-    "haiku":  ("claude-haiku-4-5-20251001", "low"),
-}
-
-
-def parse_task_model(task_block: str) -> Optional[tuple[str, str]]:
+def parse_task_model(task_block: str) -> Optional[str]:
     """Parse **Model:** field from a task block.
 
-    Returns (model_id, effort) or None if no Model field found.
-    Supports: opus, sonnet, haiku, or full model IDs.
+    Returns the raw alias or model ID string (e.g. 'opus', 'claude-opus-4-6'),
+    or None if no Model field found. Alias resolution is handled by the runtime.
     """
     # Match **Model:** only at the start of a line (field, not prose)
     match = re.search(r'^\*\*Model:\*\*\s*(\S+)', task_block, re.MULTILINE)
@@ -107,10 +103,7 @@ def parse_task_model(task_block: str) -> Optional[tuple[str, str]]:
     # Reject names that are clearly not model IDs (punctuation, backticks)
     if not re.match(r'^[a-z0-9]', name):
         return None
-    if name in _MODEL_MAP:
-        return _MODEL_MAP[name]
-    # Allow full model IDs (e.g., claude-opus-4-6)
-    return (name, "medium")  # default effort for custom models
+    return name
 
 
 class Worker:
@@ -196,43 +189,45 @@ class Worker:
         # Pre-iteration task counts (set during run)
         self.pre_counts: dict[str, int] = {}
 
-        # Model routing: phase → (model, effort)
+        # Runtime: resolved from spec + config in run(). Default is None until run() sets it.
+        self.runtime: Optional[Runtime] = None
+
+        # Model routing: phase → (alias, effort). Aliases are resolved by the runtime.
         # PLAN (decompose) uses Opus at high effort for deep reasoning.
         # WORK (execute) uses Sonnet at medium effort for speed + quality balance.
         # QUALITY (critic, evaluate) uses Sonnet at medium effort.
         self._model_routing = {
-            "decompose": ("claude-opus-4-6", "high"),
-            "execute":   ("claude-sonnet-4-6", "medium"),  # default; per-task **Model:** overrides
-            "critic":    ("claude-sonnet-4-6", "medium"),
-            "evaluate":  ("claude-sonnet-4-6", "medium"),
+            "decompose": ("opus", "high"),
+            "execute":   ("sonnet", "medium"),  # default; per-task **Model:** overrides
+            "critic":    ("sonnet", "medium"),
+            "evaluate":  ("sonnet", "medium"),
         }
 
-    def _claude_cmd(self, model_override: Optional[tuple[str, str]] = None) -> str:
-        """Build the claude -p command with model routing.
+    def _build_exec_cmd(self, model_override: Optional[str] = None) -> str:
+        """Build the worker execution command using the runtime abstraction.
 
-        Priority: per-task **Model:** field > phase-based default.
+        Priority: per-task **Model:** field (alias or full ID) > phase-based default.
 
-        The returned string is interpolated via {self._claude_cmd()} inside
+        model_override: raw alias (e.g. 'opus') or full model ID, or None.
+
+        The returned string is interpolated via {self._build_exec_cmd()} inside
         the outer f-string, so bash variables must use ${{var}} to survive
         the outer f-string's brace resolution ({{x}} → {x} → ${x} in bash).
         """
+        rt = self.runtime if self.runtime is not None else ClaudeRuntime()
         if model_override:
-            model, effort = model_override
+            model = model_override
+            effort = "medium"  # runtime derives correct effort from alias
         else:
             model, effort = self._model_routing.get(
-                self.phase, ("claude-sonnet-4-6", "medium")
+                self.phase, ("sonnet", "medium")
             )
         # NOTE: The outer f-string in generate_run_script() will resolve
-        # {{_PROMPT_FILE}} → {_PROMPT_FILE}. But since _claude_cmd()'s
+        # {{_PROMPT_FILE}} → {_PROMPT_FILE}. But since _build_exec_cmd()'s
         # return is already evaluated by the time the outer f-string runs,
         # we need the literal bash: ${_PROMPT_FILE}.
         prompt_ref = '${_PROMPT_FILE}'
-        log_ref = '${_LOG_FILE}'
-        return (
-            f'env -u CLAUDECODE claude -p "$(cat "{prompt_ref}")" '
-            f'--model {model} --effort {effort} --dangerously-skip-permissions '
-            f'--output-format stream-json --verbose'
-        )
+        return rt.build_exec_cmd(prompt_ref, model, effort)
 
     def run(self) -> int:
         """Execute one iteration: check tasks, generate scripts, launch.
@@ -275,6 +270,10 @@ class Worker:
 
         # Read spec once; pass to all helpers that need it
         spec_content = _read_file(self.spec_path)
+
+        # Resolve runtime: spec header > global config > default (claude)
+        runtime_name = resolve_runtime(self.state_dir, spec_content)
+        self.runtime = get_runtime(runtime_name)
 
         # Generate prompt and run script
         self.generate_run_script(spec_content)
@@ -370,6 +369,8 @@ class Worker:
             self._generate_decompose_prompt(spec_content)
         elif self.phase == "evaluate":
             self._generate_evaluate_prompt(spec_content)
+        elif self.phase == "review":
+            self._generate_review_prompt(spec_content)
         else:
             self._generate_execute_prompt(spec_content)
 
@@ -474,6 +475,75 @@ class Worker:
         _write_file_atomic(self.prompt_file, result)
         logger.info(
             "Evaluate prompt generated: %s", self.prompt_file
+        )
+
+    def _generate_review_prompt(self, spec_content: str) -> None:
+        """Generate prompt for review phase.
+
+        Uses review-worker-prompt.md template with spec content and
+        the git diff from the target repo (HEAD~1..HEAD) so the
+        reviewer sees what the execute phase actually changed.
+        """
+        template = _read_file(REVIEW_TEMPLATE_PATH)
+
+        # Resolve target repo from spec header (**Target:** field).
+        target_match = re.search(
+            r'^\*\*Target:\*\*\s*(.+)$', spec_content, re.MULTILINE
+        )
+        target_repo = (
+            os.path.expanduser(target_match.group(1).strip())
+            if target_match
+            else None
+        )
+
+        git_diff = ""
+        if target_repo and os.path.isdir(target_repo):
+            try:
+                # Try committed diff first (HEAD~1..HEAD).
+                diff_result = subprocess.run(
+                    ["git", "-C", target_repo, "diff", "HEAD~1", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                git_diff = diff_result.stdout.strip()
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+                logger.warning(
+                    "Review phase: could not get commit diff for %s: %s",
+                    self.spec_id,
+                    exc,
+                )
+
+            if not git_diff:
+                # Fall back to staged+unstaged changes vs HEAD.
+                try:
+                    diff_result = subprocess.run(
+                        ["git", "-C", target_repo, "diff", "HEAD"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    git_diff = diff_result.stdout.strip()
+                except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+                    logger.warning(
+                        "Review phase: could not get HEAD diff for %s: %s",
+                        self.spec_id,
+                        exc,
+                    )
+        else:
+            logger.warning(
+                "Review phase: no target repo found for %s; GIT_DIFF will be empty",
+                self.spec_id,
+            )
+
+        result = template.replace("{{SPEC_CONTENT}}", spec_content)
+        result = result.replace("{{GIT_DIFF}}", git_diff or "(no diff available)")
+
+        _write_file_atomic(self.prompt_file, result)
+        logger.info(
+            "Review prompt generated: %s (diff length: %d chars)",
+            self.prompt_file,
+            len(git_diff),
         )
 
     def _resolve_mode(self, spec_content: str) -> str:
@@ -648,7 +718,8 @@ class Worker:
         pre_total = self.pre_counts.get("total", 0)
 
         # Per-task model routing: parse **Model:** from first PENDING task
-        task_model = None
+        rt = self.runtime if self.runtime is not None else ClaudeRuntime()
+        task_model_alias = None
         if self.phase == "execute":
             # Split by task headings, find first with PENDING status on line 2
             task_blocks = re.split(r'(?=^### t-\d+:)', spec_content, flags=re.MULTILINE)
@@ -658,16 +729,16 @@ class Worker:
                     continue
                 lines = block.split('\n')
                 if len(lines) >= 2 and lines[1].strip() == 'PENDING':
-                    task_model = parse_task_model(block)
+                    task_model_alias = parse_task_model(block)
                     break
 
-        model_for_cost, _ = (
-            task_model
-            if task_model
-            else self._model_routing.get(
-                self.phase, ("claude-sonnet-4-6", "medium")
-            )
-        )
+        if task_model_alias:
+            model_for_cost = rt.model_id(task_model_alias)
+        else:
+            phase_alias, _ = self._model_routing.get(self.phase, ("sonnet", "medium"))
+            model_for_cost = rt.model_id(phase_alias)
+
+        price_in, price_out = rt.cost_per_token(model_for_cost)
 
         script = f"""\
 #!/bin/bash
@@ -697,10 +768,10 @@ _PRE_TOTAL={pre_total}
 _START_TIME=$(date +%s)
 _START_ISO=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# ── Run Claude (model routing: phase → model + effort) ──────────────────
+# ── Run worker (model routing: phase → model + effort) ──────────────────
 cd "${{_WORKTREE_PATH}}"
-{self._claude_cmd(model_override=task_model)} > "${{_LOG_FILE}}" 2>&1
-_CLAUDE_EXIT=$?
+{self._build_exec_cmd(model_override=task_model_alias)} > "${{_LOG_FILE}}" 2>&1
+_AGENT_EXIT=$?
 
 # ── Record end time ──────────────────────────────────────────────────────
 _END_TIME=$(date +%s)
@@ -743,7 +814,7 @@ BOI_SCRIPT_DIR="${{_BOI_SCRIPT_DIR}}" python3 - \\
     "${{_ITERATION_FILE}}" \\
     "${{_QUEUE_ID}}" \\
     "${{_ITERATION}}" \\
-    "${{_CLAUDE_EXIT}}" \\
+    "${{_AGENT_EXIT}}" \\
     "${{_DURATION}}" \\
     "${{_START_ISO}}" \\
     "${{_PRE_PENDING}}" "${{_PRE_DONE}}" "${{_PRE_SKIPPED}}" "${{_PRE_TOTAL}}" \\
@@ -752,17 +823,11 @@ BOI_SCRIPT_DIR="${{_BOI_SCRIPT_DIR}}" python3 - \\
     "${{_COST_MODEL}}" "${{_INPUT_TOKENS}}" "${{_OUTPUT_TOKENS}}" <<'PYEOF'
 import json, sys, os
 
-_MODEL_PRICING = {{
-    "claude-opus-4-6":   (15.0, 75.0),
-    "claude-sonnet-4-6": (3.0, 15.0),
-    "claude-haiku-4-5":  (1.0, 5.0),
-}}
-
 target = sys.argv[1]
 _cost_model = sys.argv[18]
 _input_tokens = int(sys.argv[19])
 _output_tokens = int(sys.argv[20])
-_price_in, _price_out = _MODEL_PRICING.get(_cost_model, (3.0, 15.0))
+_price_in, _price_out = ({price_in}, {price_out})
 _estimated_cost = (_input_tokens * _price_in + _output_tokens * _price_out) / 1_000_000
 
 data = {{
@@ -800,7 +865,7 @@ os.rename(tmp, target)
 PYEOF
 
 # ── Write exit code ──────────────────────────────────────────────────────
-echo "${{_CLAUDE_EXIT}}" > "${{_EXIT_FILE}}"
+echo "${{_AGENT_EXIT}}" > "${{_EXIT_FILE}}"
 """
 
         _write_file_atomic(self.run_script, script)

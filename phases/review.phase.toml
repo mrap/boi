@@ -1,0 +1,19 @@
+name = "review"
+description = "Code review phase: checks correctness, security, error handling, and spec compliance"
+
+[worker]
+prompt_template = "templates/review-worker-prompt.md"
+model = "claude-sonnet-4-6"
+effort = "medium"
+timeout = 300
+
+[completion]
+approve_signal = "## Review Approved"
+reject_signal = "[REVIEW]"
+on_approve = "next"
+on_reject = "requeue:execute"
+on_crash = "retry"
+
+[hooks]
+pre = []
+post = []

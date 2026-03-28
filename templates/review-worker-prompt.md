@@ -46,6 +46,22 @@ For each DONE task in the spec, check:
 
 ---
 
+## Beyond the Diff
+
+The diff shows what changed. Equally important is what SHOULD have changed but didn't.
+
+For each DONE task that modified a function signature, renamed a symbol, changed a config key, or replaced a pattern:
+
+1. **Callers check** — grep for callers/importers of the modified function/class. Were they all updated?
+2. **Config consumers** — if a config key changed, grep for all readers of that key. Were they updated?
+3. **Documentation** — do README, SKILL.md, CLAUDE.md, docstrings reference the new names?
+4. **Tests** — do tests reference the new interfaces? Are there tests that still import/mock the old version?
+5. **String literals** — grep for the old name in error messages, log strings, CLI help text.
+
+If you find missed touchpoints, flag them as [REVIEW] tasks. These are HIGH severity because they indicate incomplete refactoring.
+
+---
+
 ## Output Format
 
 If work is acceptable, output exactly:

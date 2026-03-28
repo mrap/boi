@@ -386,7 +386,8 @@ def cleanup_orphans(queue_dir: str) -> list[int]:
         orphans: list[int] = []
         for line in ps_output.strip().split("\n"):
             line = line.strip()
-            if "claude" in line and "BOI Worker" in line:
+            is_worker = ("claude" in line or "codex" in line)
+            if is_worker and "BOI Worker" in line:
                 parts = line.split(None, 1)
                 if parts:
                     try:

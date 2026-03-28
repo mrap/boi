@@ -17,6 +17,7 @@
 #   python3 daemon.py --db PATH          # Custom database path
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ logger = logging.getLogger("boi.daemon")
 def _raise_fd_limit(target: int = 1024) -> None:
     """Raise the file descriptor soft limit if needed.
 
-    At 10+ parallel workers (each with claude -p subprocess + pipes),
+    At 10+ parallel workers (each with agent subprocess + pipes),
     the default 256 FD limit on some systems causes SIGTERM kills.
     """
     try:
@@ -115,6 +116,9 @@ class Daemon:
 
         # Shutdown flag
         self._shutdown_requested = False
+
+        # Hash of last written state snapshot (for change detection)
+        self._last_snapshot_hash: str = ""
 
         # Database connection
         self.db = Database(db_path, self.queue_dir)
@@ -1302,6 +1306,11 @@ class Daemon:
             },
         }
 
+        h = hashlib.md5(json.dumps(state, sort_keys=True).encode()).hexdigest()
+        if h == self._last_snapshot_hash:
+            return
+        self._last_snapshot_hash = h
+
         state_path = os.path.join(self.state_dir, "daemon-state.json")
         tmp = state_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -1608,8 +1617,8 @@ class Daemon:
     ) -> None:
         """Run a best-effort code review on the last commit in target_repo.
 
-        Spawns `claude -p` with the committed diff and a structured review
-        prompt.  If issues are found, calls _add_review_tasks() to append
+        Spawns the configured runtime CLI with the committed diff and a
+        structured review prompt.  If issues are found, calls _add_review_tasks() to append
         PENDING fix tasks to the spec.  Never raises — this is advisory only.
         """
         if not target_repo or not os.path.isdir(target_repo):
@@ -1648,32 +1657,52 @@ class Daemon:
             f"```diff\n{diff}\n```"
         )
 
+        # Resolve runtime: spec header > global config > default (claude)
+        from lib.runtime import resolve_runtime, get_runtime
+        _spec_content = ""
+        if spec_path and os.path.isfile(spec_path):
+            try:
+                _spec_content = Path(spec_path).read_text(encoding="utf-8")
+            except OSError:
+                pass
+        _runtime = get_runtime(resolve_runtime(state_dir=self.state_dir, spec_content=_spec_content))
+        _rt_label = _runtime.name
+
+        # Build command: simple prompt invocation (not full worker execution)
+        if _runtime.name == "codex":
+            _review_cmd = [_runtime.cli_command, "exec", "--dangerously-bypass-approvals-and-sandbox"]
+            _run_kwargs: dict = {"input": prompt}
+        else:
+            _review_cmd = [_runtime.cli_command, "-p", prompt]
+            _run_kwargs = {}
+
         try:
             review_result = subprocess.run(
-                ["claude", "-p", prompt],
+                _review_cmd,
                 capture_output=True,
                 text=True,
                 timeout=120,
+                **_run_kwargs,
             )
             output = review_result.stdout.strip()
         except subprocess.TimeoutExpired:
             logger.warning(
-                "[post-commit-review] claude -p timed out for %s — skipping", spec_id
+                "[post-commit-review] %s timed out for %s — skipping", _rt_label, spec_id
             )
             return
         except (FileNotFoundError, OSError) as exc:
             logger.warning(
-                "[post-commit-review] Could not run claude -p for %s: %s", spec_id, exc
+                "[post-commit-review] Could not run %s for %s: %s", _rt_label, spec_id, exc
             )
             return
 
         if not output:
             logger.warning(
-                "[post-commit-review] Empty output from claude -p for %s", spec_id
+                "[post-commit-review] Empty output from %s for %s", _rt_label, spec_id
             )
             return
 
-        # Parse JSON — claude may wrap it in a code fence
+        # Parse JSON — runtime may wrap it in a code fence
         try:
             # Strip markdown code fences if present
             if "```" in output:

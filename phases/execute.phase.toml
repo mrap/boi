@@ -1,0 +1,12 @@
+name = "execute"
+description = "Execute tasks from the spec using a worker agent"
+completion_handler = "builtin:execute"
+
+[worker]
+prompt_template = "templates/worker-prompt.md"
+model = "claude-sonnet-4-6"
+effort = "medium"
+timeout = 600
+
+[completion]
+approve_signal = ""

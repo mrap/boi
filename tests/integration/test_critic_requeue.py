@@ -63,6 +63,9 @@ class TestCriticRequeue(IntegrationTestCase):
         # Event set when critic phase has completed and requeued the spec
         self._critic_ran = threading.Event()
         self._critic_spec_id: str = ""
+        # Snapshot of spec content at the moment critic phase completed
+        # (saved before requeuing to avoid race with execute worker)
+        self._critic_spec_content: str = ""
         self.harness.start()
         daemon = self.harness._daemon
         daemon._dispatch_phase_completion = self._phase_completion
@@ -135,7 +138,12 @@ class TestCriticRequeue(IntegrationTestCase):
             total_after = counts_after["total"]
 
             if pending_after > 0:
-                # Critic added tasks — back to execute phase
+                # Critic added tasks — snapshot content BEFORE requeuing
+                # so test assertions see the pre-execute state.
+                self._critic_spec_content = Path(spec_path).read_text(
+                    encoding="utf-8"
+                )
+                # Back to execute phase
                 db.update_spec_fields(spec_id, phase="execute")
                 db.requeue(spec_id, done_after, total_after)
                 # Signal that critic phase is done and spec was requeued
@@ -195,9 +203,15 @@ class TestCriticRequeue(IntegrationTestCase):
             "[CRITIC] PENDING tasks correctly.",
         )
 
-        # 8. Spec file must contain the [CRITIC] task with PENDING status
+        # 8. Spec file must contain the [CRITIC] task with PENDING status.
+        # Use the snapshot saved before requeuing to avoid a race where the
+        # execute worker immediately completes the [CRITIC] task.
         queue_spec_path = spec["spec_path"]
-        content = Path(queue_spec_path).read_text(encoding="utf-8")
+        content = self._critic_spec_content
+        self.assertTrue(
+            content,
+            "Critic spec content snapshot must be non-empty",
+        )
         self.assertIn(
             "[CRITIC]",
             content,
@@ -210,10 +224,19 @@ class TestCriticRequeue(IntegrationTestCase):
         )
 
         # 9. count_boi_tasks() must return >= 1 pending — real function,
-        #    real spec file, no mocks
+        #    parsed from the snapshot, no mocks
         from lib.spec_parser import count_boi_tasks
+        import tempfile, os as _os
 
-        counts = count_boi_tasks(queue_spec_path)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
+        try:
+            counts = count_boi_tasks(tmp_path)
+        finally:
+            _os.unlink(tmp_path)
         self.assertGreaterEqual(
             counts["pending"],
             1,

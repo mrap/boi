@@ -51,7 +51,7 @@ For each iteration:
 1. Reads the spec file
 2. Counts PENDING tasks (exits immediately if none)
 3. Generates a prompt from the spec + worker prompt template + mode-specific instructions
-4. Launches `claude -p` in a tmux session (`tmux -L boi`)
+4. Launches the configured runtime CLI (default: `claude -p`; Codex: `codex exec`) in a tmux session (`tmux -L boi`)
 5. Claude reads the prompt, executes the next PENDING task, marks it DONE in the spec file
 6. After Claude exits, writes iteration metadata (tasks done, duration, quality)
 7. Writes exit code file for daemon monitoring
@@ -115,7 +115,7 @@ Computes quality scores across 18 signals in 4 categories (Code Quality, Test Qu
 ~/boi/
   boi.sh                        # CLI entry point
   daemon.py                     # Queue-aware dispatch daemon (Python/SQLite)
-  worker.py                     # Iterative worker (one claude -p per iteration)
+  worker.py                     # Iterative worker (one runtime CLI invocation per iteration)
   dashboard.sh                  # Live-updating compact display
   install.sh                    # Setup (git worktrees, config)
   install-public.sh             # Public install script (curl | bash)

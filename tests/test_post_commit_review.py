@@ -262,5 +262,157 @@ class TestReviewCodeFenceStripping(PostCommitReviewBase):
         self.daemon._add_review_tasks.assert_not_called()
 
 
+# ── Codex spec header used for codex-specific test cases ─────────────────────
+
+CODEX_SPEC_CONTENT = "# Test Spec\n\n**Runtime:** codex\n\n### t-1: Existing task\nDONE\n\n"
+
+
+# ── Test 8: Codex review command includes bypass flag ─────────────────────────
+
+
+class TestCodexReviewBypassFlag(PostCommitReviewBase):
+    @patch("daemon.subprocess.run")
+    def test_codex_command_includes_bypass_flag(self, mock_run: MagicMock) -> None:
+        """Codex review command must include --dangerously-bypass-approvals-and-sandbox."""
+        spec_file = self._write_spec("s-codex-flag", CODEX_SPEC_CONTENT)
+
+        mock_run.side_effect = [
+            _run_result(stdout=FAKE_DIFF),
+            _run_result(stdout='{"pass": true, "issues": []}'),
+        ]
+
+        self.daemon._review_committed_output("s-codex-flag", self.target_repo, spec_file)
+
+        codex_call = mock_run.call_args_list[1]
+        cmd = codex_call[0][0]
+        self.assertEqual(cmd[0], "codex")
+        self.assertIn("exec", cmd)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+
+    @patch("daemon.subprocess.run")
+    def test_codex_prompt_passed_via_stdin(self, mock_run: MagicMock) -> None:
+        """Codex review passes the prompt via stdin (input= kwarg), not as a CLI arg."""
+        spec_file = self._write_spec("s-codex-stdin", CODEX_SPEC_CONTENT)
+
+        mock_run.side_effect = [
+            _run_result(stdout=FAKE_DIFF),
+            _run_result(stdout='{"pass": true, "issues": []}'),
+        ]
+
+        self.daemon._review_committed_output("s-codex-stdin", self.target_repo, spec_file)
+
+        codex_call = mock_run.call_args_list[1]
+        kwargs = codex_call[1]  # keyword args dict
+        self.assertIn("input", kwargs)
+        self.assertIn(FAKE_DIFF, kwargs["input"])
+
+
+# ── Test 9: Codex review parses JSON output correctly ─────────────────────────
+
+
+class TestCodexReviewParsesJSON(PostCommitReviewBase):
+    @patch("daemon.subprocess.run")
+    @patch("daemon.os.path.expanduser")
+    def test_codex_high_severity_adds_review_task(
+        self, mock_expanduser: MagicMock, mock_run: MagicMock
+    ) -> None:
+        """Codex runtime: high-severity issues should be appended as PENDING tasks."""
+        mock_expanduser.return_value = os.path.join(self.state_dir, ".boi_home")
+        boi_queue = os.path.join(self.state_dir, ".boi_home", ".boi", "queue")
+        os.makedirs(boi_queue, exist_ok=True)
+
+        spec_id = "test-codex-high"
+        spec_file = os.path.join(boi_queue, f"{spec_id}.spec.md")
+        with open(spec_file, "w", encoding="utf-8") as fh:
+            fh.write(CODEX_SPEC_CONTENT)
+
+        review_json = json.dumps(
+            {
+                "pass": False,
+                "issues": [
+                    {
+                        "severity": "high",
+                        "file": "bar.py",
+                        "description": "use-after-free",
+                    }
+                ],
+            }
+        )
+        mock_run.side_effect = [
+            _run_result(stdout=FAKE_DIFF),
+            _run_result(stdout=review_json),
+        ]
+        self.daemon.db.update_spec_status = MagicMock()
+
+        self.daemon._review_committed_output(spec_id, self.target_repo, spec_file)
+
+        with open(spec_file, encoding="utf-8") as fh:
+            content = fh.read()
+
+        self.assertIn("[REVIEW] Fix: use-after-free", content)
+        self.assertIn("PENDING", content)
+
+    @patch("daemon.subprocess.run")
+    def test_codex_fenced_json_output_parsed(self, mock_run: MagicMock) -> None:
+        """Codex output wrapped in a code fence should be parsed without error."""
+        spec_file = self._write_spec("s-codex-fence", CODEX_SPEC_CONTENT)
+
+        fenced_response = (
+            "Here is my review:\n"
+            "```json\n"
+            '{"pass": true, "issues": []}\n'
+            "```"
+        )
+        mock_run.side_effect = [
+            _run_result(stdout=FAKE_DIFF),
+            _run_result(stdout=fenced_response),
+        ]
+        self.daemon._add_review_tasks = MagicMock()
+
+        # Should not raise
+        self.daemon._review_committed_output("s-codex-fence", self.target_repo, spec_file)
+
+        # pass=true → no tasks added
+        self.daemon._add_review_tasks.assert_not_called()
+
+
+# ── Test 10: Backward compatibility — default runtime is claude ───────────────
+
+
+class TestDefaultRuntimeBackwardCompat(PostCommitReviewBase):
+    @patch("daemon.subprocess.run")
+    def test_empty_spec_path_uses_claude(self, mock_run: MagicMock) -> None:
+        """No spec_path and no runtime config → falls back to claude -p."""
+        mock_run.side_effect = [
+            _run_result(stdout=FAKE_DIFF),
+            _run_result(stdout='{"pass": true, "issues": []}'),
+        ]
+
+        self.daemon._review_committed_output("s-default", self.target_repo, "")
+
+        claude_call = mock_run.call_args_list[1]
+        cmd = claude_call[0][0]
+        self.assertEqual(cmd[0], "claude")
+        self.assertEqual(cmd[1], "-p")
+
+    @patch("daemon.subprocess.run")
+    def test_explicit_claude_runtime_header_uses_claude(self, mock_run: MagicMock) -> None:
+        """**Runtime:** claude in spec header → command is claude -p."""
+        claude_spec = "# Test\n\n**Runtime:** claude\n\n### t-1: task\nDONE\n\n"
+        spec_file = self._write_spec("s-explicit-claude", claude_spec)
+
+        mock_run.side_effect = [
+            _run_result(stdout=FAKE_DIFF),
+            _run_result(stdout='{"pass": true, "issues": []}'),
+        ]
+
+        self.daemon._review_committed_output("s-explicit-claude", self.target_repo, spec_file)
+
+        claude_call = mock_run.call_args_list[1]
+        cmd = claude_call[0][0]
+        self.assertEqual(cmd[0], "claude")
+        self.assertEqual(cmd[1], "-p")
+
+
 if __name__ == "__main__":
     unittest.main()

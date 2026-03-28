@@ -24,7 +24,7 @@ That's it. BOI creates `~/.boi/` with worker worktrees, config, and a daemon tha
 3. You confirm ("fire it", "dispatch", "go")
 4. `boi dispatch --spec spec.md` adds it to the queue
 5. BOI daemon assigns specs to workers (isolated git worktrees)
-6. Each worker gets a fresh `claude -p` session, reads the spec, executes the next PENDING task, marks it DONE, exits
+6. Each worker gets a fresh session via the configured runtime CLI (default: `claude -p`; Codex: `codex exec`), reads the spec, executes the next PENDING task, marks it DONE, exits
 7. Daemon detects remaining PENDING tasks and requeues for the next iteration
 8. Workers can ADD new `### t-N: ... PENDING` tasks (self-evolution)
 9. Spec completes when all tasks are DONE or SKIPPED
@@ -187,7 +187,7 @@ PENDING
 ## Constraints
 
 - `boi install` runs outside Claude Code (in tmux or terminal)
-- Workers are headless `claude -p` sessions
+- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. Configured globally in `~/.boi/config.json` or per-spec via `**Runtime:** codex` header.
 - Daemon polls every 5 seconds
 - Default 3 workers, max 5
 - Python stdlib only, no pip dependencies

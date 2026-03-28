@@ -84,13 +84,15 @@ A **phase** is a named worker role defined by a `.phase.toml` file. The daemon l
 
 ### Built-in Phases
 
-| Phase | Description | Model | Timeout |
-|-------|-------------|-------|---------|
-| `execute` | Execute tasks from the spec | claude-sonnet-4-6 | 600s |
-| `review` | Code review: correctness, security, spec compliance | claude-sonnet-4-6 | 300s |
-| `critic` | Quality gate: reviews completed work, adds [CRITIC] tasks on failure | claude-sonnet-4-6 | 300s |
-| `decompose` | Decompose a high-level spec into actionable tasks | claude-opus-4-6 | 600s |
-| `evaluate` | Evaluate spec completion and determine next steps | claude-sonnet-4-6 | 300s |
+| Phase | Description | Model (alias) | Timeout |
+|-------|-------------|---------------|---------|
+| `execute` | Execute tasks from the spec | sonnet | 600s |
+| `review` | Code review: correctness, security, spec compliance | sonnet | 300s |
+| `critic` | Quality gate: reviews completed work, adds [CRITIC] tasks on failure | sonnet | 300s |
+| `decompose` | Decompose a high-level spec into actionable tasks | opus | 600s |
+| `evaluate` | Evaluate spec completion and determine next steps | sonnet | 300s |
+
+Model aliases are resolved by the configured runtime. See [Runtime Configuration](#runtime-configuration) below.
 
 ### Phase File Schema (`.phase.toml`)
 
@@ -148,7 +150,7 @@ description = "Run SAST scan and block on high-severity findings"
 
 [worker]
 prompt_template = "~/.boi/phases/templates/security-scan-prompt.md"
-model = "claude-sonnet-4-6"
+model = "sonnet"   # alias; resolved by the configured runtime
 effort = "high"
 timeout = 300
 
@@ -290,6 +292,44 @@ post-execute = ["my-check"]
 
 Exit 0 = passed. Any non-zero exit = failed. Stdout/stderr are captured as the failure message.
 
+## Runtime Configuration
+
+BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) is also supported.
+
+### Global Default
+
+Set in `~/.boi/config.json`:
+
+```json
+{
+  "runtime": { "default": "claude" }
+}
+```
+
+### Per-Spec Override
+
+Add a `**Runtime:**` header to any spec:
+
+```markdown
+**Runtime:** codex
+```
+
+Spec-level override takes precedence over the global default.
+
+### Model Mappings
+
+Phase config accepts either full model IDs or aliases (`opus`, `sonnet`, `haiku`). The runtime resolves them:
+
+| Alias | Claude | Codex |
+|-------|--------|-------|
+| `opus` | claude-opus-4-6 | o3 |
+| `sonnet` | claude-sonnet-4-6 | o4-mini |
+| `haiku` | claude-haiku-4-5-20251001 | o4-mini |
+
+### CLI Check
+
+`boi doctor` validates the configured runtime's CLI is installed. If the global default is `codex`, it checks for `codex` in PATH instead of `claude`.
+
 ## CLI Reference
 
 ```
@@ -333,7 +373,7 @@ boi dispatch → SQLite queue (~/.boi/queue.db)
          +-----------+-----------+
          |           |           |
       Worker 1    Worker 2    Worker 3
-      (claude -p) (claude -p) (claude -p)
+      (runtime)   (runtime)   (runtime)
       worktree    worktree    worktree
          |           |           |
       Reads spec, executes next PENDING task, marks DONE, exits
@@ -347,6 +387,8 @@ boi dispatch → SQLite queue (~/.boi/queue.db)
         reject  → requeue to target phase
         crash   → retry or fail
 ```
+
+The **runtime** is the CLI agent backend. Default is `claude` (`claude -p`); `codex` (`codex exec`) is also supported.
 
 **Key behaviors:**
 

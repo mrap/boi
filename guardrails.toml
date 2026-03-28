@@ -1,0 +1,2 @@
+[pipeline]
+default = ["execute", "review", "critic"]

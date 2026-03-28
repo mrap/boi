@@ -257,8 +257,13 @@ class TestCancelRunningSpec(IntegrationTestCase):
         # Wait for spec to reach 'running'
         self.harness.wait_for_status(spec_id, "running", timeout=10)
 
-        # Get the worker process before canceling
+        # Get the worker process before canceling.
+        # worker_procs is populated after set_running (which writes DB status),
+        # so poll briefly to avoid a race.
         daemon = self.harness._daemon
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and len(daemon.worker_procs) == 0:
+            time.sleep(0.05)
         self.assertEqual(len(daemon.worker_procs), 1)
         worker_id = list(daemon.worker_procs.keys())[0]
         worker_proc = daemon.worker_procs[worker_id]

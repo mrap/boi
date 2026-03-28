@@ -86,3 +86,4 @@ This is a clean Claude session. You have NO memory of previous iterations. The s
 - **Python:** stdlib only, no pip dependencies.
 - **Tests:** mock data only, no live API calls.
 - If you discover information useful for other tasks in this project, append it to: `~/.boi/projects/{{PROJECT}}/research.md`
+- **Blast radius check (refactoring tasks).** When a task involves renaming, replacing, or abstracting something (e.g., replacing hardcoded values with a config, extracting an interface, renaming a function), grep the entire codebase for remaining references BEFORE marking DONE. Use `grep -rn "old_pattern"` on the relevant source directories. If you find references in files not mentioned in the spec, fix them or add a new PENDING task. The goal: zero orphaned references to the thing you just replaced.

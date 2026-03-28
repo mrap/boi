@@ -24,6 +24,7 @@ class PhaseConfig:
     pre_hooks: list[str] = field(default_factory=list)
     post_hooks: list[str] = field(default_factory=list)
     completion_handler: str = ""
+    runtime: str = "claude"  # Runtime name: "claude" or "codex"
 
 
 def load_phase(path: str) -> PhaseConfig:
@@ -59,6 +60,7 @@ def load_phase(path: str) -> PhaseConfig:
         pre_hooks=hooks.get("pre", []),
         post_hooks=hooks.get("post", []),
         completion_handler=data.get("completion_handler", ""),
+        runtime=worker.get("runtime", "claude"),
     )
 
 

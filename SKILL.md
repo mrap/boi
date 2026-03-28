@@ -14,7 +14,7 @@ Self-evolving autonomous agent fleet. Workers iterate with fresh context per cyc
 3. User confirms ("fire it", "dispatch", "go")
 4. Claude runs `boi dispatch --spec <path>`
 5. BOI daemon assigns specs to workers (isolated git worktrees)
-6. Each worker gets a fresh `claude -p` session, reads the spec, executes the next PENDING task, marks it DONE, exits
+6. Each worker gets a fresh runtime session (default: `claude -p`; Codex: `codex exec`), reads the spec, executes the next PENDING task, marks it DONE, exits
 7. Daemon detects remaining PENDING tasks and requeues the spec for the next iteration
 8. Workers can ADD new PENDING tasks to the spec (self-evolution)
 9. Spec completes when all tasks are DONE or SKIPPED
@@ -289,7 +289,7 @@ Exit 0 = passed. Any non-zero = failed.
 ## Constraints
 
 - `boi install` runs **outside Claude Code** in a terminal.
-- Workers are headless `claude -p` sessions — not interactive.
+- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. Configured globally in `~/.boi/config.json` or per-spec via `**Runtime:** codex` header.
 - Daemon polls every 5 seconds. Status may lag slightly.
 - Default 3 workers, max 5. Set during install.
 - Workers get fresh context each iteration. No memory of previous iterations.

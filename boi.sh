@@ -103,6 +103,19 @@ require_config() {
     fi
 }
 
+_get_runtime() {
+    # Read configured runtime from config.json. Returns "claude" or "codex".
+    python3 - "${BOI_CONFIG}" <<'PYEOF' 2>/dev/null || echo "claude"
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        c = json.load(f)
+    print(c.get('runtime', {}).get('default', 'claude'))
+except Exception:
+    print('claude')
+PYEOF
+}
+
 require_daemon() {
     if [[ ! -f "${PID_FILE}" ]]; then
         return 1
@@ -2162,11 +2175,16 @@ cmd_doctor() {
         _doctor_fail "tmux not installed" "Install tmux: sudo apt install tmux"
     fi
 
-    # 2. claude CLI installed
-    if command -v claude >/dev/null 2>&1; then
-        _doctor_pass "claude CLI installed"
+    # 2. configured runtime CLI installed
+    local runtime_name
+    runtime_name=$(_get_runtime)
+    if command -v "${runtime_name}" >/dev/null 2>&1; then
+        _doctor_pass "${runtime_name} CLI installed (runtime: ${runtime_name})"
     else
-        _doctor_fail "claude CLI not installed" "Install claude: see https://docs.anthropic.com/claude-code"
+        case "${runtime_name}" in
+            codex)  _doctor_fail "${runtime_name} CLI not installed" "Install Codex CLI or switch runtime to claude in ~/.boi/config.json" ;;
+            *)      _doctor_fail "${runtime_name} CLI not installed" "Install claude: see https://docs.anthropic.com/claude-code" ;;
+        esac
     fi
 
     # 3. Python 3.10+
@@ -2568,7 +2586,7 @@ _critic_run() {
         die "Queue ID required. Usage: boi critic run <queue-id>"
     fi
 
-    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${BOI_STATE_DIR}" "${QUEUE_DIR}" "${SCRIPT_DIR}" "${queue_id}" <<'PYEOF'
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${BOI_STATE_DIR}" "${QUEUE_DIR}" "${SCRIPT_DIR}" "${queue_id}" "$(_get_runtime)" <<'PYEOF'
 import json
 import os
 import sys
@@ -2582,6 +2600,7 @@ state_dir = sys.argv[1]
 queue_dir = sys.argv[2]
 boi_dir = sys.argv[3]
 queue_id = sys.argv[4]
+runtime_name = sys.argv[5] if len(sys.argv) > 5 else "claude"
 
 entry = get_entry(queue_dir, queue_id)
 if entry is None:
@@ -2607,7 +2626,10 @@ print(f"To review the prompt: cat {result['prompt_path']}")
 print()
 print("The critic prompt has been written. The daemon will pick it up on the next cycle,")
 print("or you can run it manually with:")
-print(f"  claude -p {result['prompt_path']}")
+if runtime_name == "codex":
+    print(f"  codex exec < {result['prompt_path']}")
+else:
+    print(f"  {runtime_name} -p {result['prompt_path']}")
 PYEOF
 }
 
@@ -3617,9 +3639,11 @@ cmd_do() {
 
     [[ -z "${user_input}" ]] && die "Usage: boi do \"your request here\""
 
-    # Check claude is available
-    if ! command -v claude &>/dev/null; then
-        die "claude CLI not found. Install Claude Code to use 'boi do'."
+    # Check configured runtime is available
+    local do_runtime
+    do_runtime=$(_get_runtime)
+    if ! command -v "${do_runtime}" &>/dev/null; then
+        die "${do_runtime} CLI not found. Install the configured runtime to use 'boi do'."
     fi
 
     # Step 1-2: Gather context and build prompt
@@ -3639,10 +3663,13 @@ print(prompt)
 PYEOF
     ) || die "Failed to build prompt"
 
-    # Step 3: Call claude -p with the prompt
-    info "Asking Claude..."
+    # Step 3: Call the configured runtime with the prompt
+    info "Asking ${do_runtime}..."
     local response
-    response=$(claude -p "${prompt}" 2>/dev/null) || die "Claude invocation failed"
+    case "${do_runtime}" in
+        codex)  response=$(echo "${prompt}" | codex exec 2>/dev/null) || die "Codex invocation failed" ;;
+        *)      response=$(claude -p "${prompt}" 2>/dev/null) || die "Claude invocation failed" ;;
+    esac
 
     # Step 4: Parse response
     local parsed

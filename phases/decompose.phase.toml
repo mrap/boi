@@ -1,0 +1,12 @@
+name = "decompose"
+description = "Decompose a high-level spec into actionable tasks"
+completion_handler = "builtin:decompose"
+
+[worker]
+prompt_template = "templates/generate-decompose-prompt.md"
+model = "claude-opus-4-6"
+effort = "high"
+timeout = 600
+
+[completion]
+approve_signal = ""

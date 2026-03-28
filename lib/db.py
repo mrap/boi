@@ -493,6 +493,17 @@ class Database:
                 "WHERE id = ?",
                 (tasks_done, tasks_total, spec_id),
             )
+            # Free any worker assigned to this spec atomically
+            self.conn.execute(
+                "UPDATE workers SET "
+                "current_spec_id = NULL, "
+                "current_pid = NULL, "
+                "start_time = NULL, "
+                "current_phase = NULL, "
+                "current_task_id = NULL "
+                "WHERE current_spec_id = ?",
+                (spec_id,),
+            )
             self._log_event(
                 "completed",
                 f"Spec completed ({tasks_done}/{tasks_total} tasks)",

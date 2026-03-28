@@ -36,6 +36,7 @@ SKIP_WORKTREES=false
 NO_PLUGIN=false
 WORKTREE_PATHS=""
 REPO_PATH=""
+RUNTIME=""
 
 usage() {
     echo "Usage: bash install.sh [OPTIONS]"
@@ -44,6 +45,7 @@ usage() {
     echo "  --workers N              Number of worker worktrees (1-${MAX_WORKERS}, default: ${DEFAULT_WORKERS})"
     echo "  --repo PATH              Git repo to create worktrees from (default: detect current repo)"
     echo "  --worktree-paths P1,P2   Comma-separated existing worktree paths (skips creation)"
+    echo "  --runtime NAME           Worker runtime: 'claude' or 'codex' (default: claude)"
     echo "  --dry-run                Show what would happen without doing it"
     echo "  --skip-worktrees         Skip worktree creation (use pre-existing worktrees)"
     echo "  --no-plugin              Skip installing Claude Code plugin"
@@ -78,6 +80,11 @@ while [[ $# -gt 0 ]]; do
         --skip-worktrees|--skip-clone)
             SKIP_WORKTREES=true
             shift
+            ;;
+        --runtime)
+            [[ -z "${2:-}" ]] && { log_error "--runtime requires a value (claude or codex)"; exit 1; }
+            RUNTIME="$2"
+            shift 2
             ;;
         --no-plugin)
             NO_PLUGIN=true
@@ -130,6 +137,33 @@ if ! [[ "${WORKER_COUNT}" =~ ^[0-9]+$ ]] || [[ "${WORKER_COUNT}" -lt 1 ]] || [[ 
     log_error "Worker count must be between 1 and ${MAX_WORKERS}. Got: ${WORKER_COUNT}"
     exit 1
 fi
+
+ask_runtime() {
+    # If already set via --runtime flag, validate and return
+    if [[ -n "${RUNTIME}" ]]; then
+        case "${RUNTIME}" in
+            claude|codex) return 0 ;;
+            *) log_error "Invalid runtime '${RUNTIME}'. Must be 'claude' or 'codex'."; exit 1 ;;
+        esac
+    fi
+
+    # Interactive prompt only if stdin is a tty
+    if [[ -t 0 ]]; then
+        echo ""
+        echo "Which runtime should workers use?"
+        echo "  [1] claude  — Claude Code (claude -p)  [default]"
+        echo "  [2] codex   — Codex CLI (codex exec)"
+        printf "Runtime [1]: "
+        local choice
+        read -r choice
+        case "${choice}" in
+            2|codex) RUNTIME="codex" ;;
+            *) RUNTIME="claude" ;;
+        esac
+    else
+        RUNTIME="claude"
+    fi
+}
 
 detect_environment() {
     local env_type="unknown"
@@ -185,8 +219,11 @@ check_prerequisites() {
         missing=true
     fi
 
-    if ! command -v claude &>/dev/null; then
-        log_warn "claude CLI not found. Workers will not be able to run."
+    if ! command -v "${RUNTIME}" &>/dev/null; then
+        case "${RUNTIME}" in
+            codex) log_warn "codex CLI not found. Workers will not be able to run. Install Codex CLI first." ;;
+            *)     log_warn "claude CLI not found. Workers will not be able to run. Install claude: see https://docs.anthropic.com/claude-code" ;;
+        esac
     fi
 
     if [[ "${missing}" == "true" ]]; then
@@ -327,7 +364,10 @@ write_config() {
     "pid_file": "${BOI_STATE_DIR}/daemon.pid",
     "log_dir": "${BOI_STATE_DIR}/logs"
   },
-  "boi_dir": "${SCRIPT_DIR}"
+  "boi_dir": "${SCRIPT_DIR}",
+  "runtime": {
+    "default": "${RUNTIME}"
+  }
 }
 ENDJSON
 )
@@ -411,7 +451,7 @@ install_plugin() {
     fi
 
     if [[ "${DRY_RUN}" == "true" ]]; then
-        log_info "[dry-run] Would install Claude Code plugin"
+        log_info "[dry-run] Would install Claude Code plugin (runtime: ${RUNTIME})"
         return 0
     fi
 
@@ -431,6 +471,13 @@ install_plugin() {
     else
         log_info "Claude Code not detected. Skip plugin install."
         log_info "To install later: cp -r ${SCRIPT_DIR}/plugin/skills/boi ~/.claude/skills/"
+    fi
+
+    # Codex does not currently have an equivalent plugin/skills system.
+    # If ~/.codex/ gains a skills mechanism in the future, install there too.
+    if [[ "${RUNTIME}" == "codex" ]]; then
+        log_info "Runtime: codex. No Codex CLI plugin system detected; skipping Codex plugin install."
+        log_info "BOI skill is still available in Claude Code (if installed above)."
     fi
 }
 
@@ -501,6 +548,8 @@ main() {
     echo ""
 
     check_not_in_claude
+    ask_runtime
+    log_info "Runtime: ${RUNTIME}"
     check_prerequisites
 
     # Detect repo root if we need to create worktrees

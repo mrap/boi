@@ -21,7 +21,7 @@ boi.sh (CLI)
 1. User dispatches a spec via `boi dispatch --spec spec.md`
 2. Spec is validated (`lib/spec_validator.py`), copied to `~/.boi/queue/`, and enqueued in SQLite
 3. Daemon polls every 5s: checks worker completions, dispatches queued specs to free workers
-4. Worker reads spec, generates prompt from template + mode rules, launches `claude -p` in a tmux session
+4. Worker reads spec, generates prompt from template + mode rules, launches the configured runtime (`claude -p` by default, or `codex exec`) in a tmux session
 5. Claude executes one PENDING task, marks it DONE in the spec file, exits
 6. Daemon detects completion, runs critic (if enabled), re-dispatches for next task
 7. Repeats until all tasks are DONE or max iterations reached
@@ -137,12 +137,14 @@ What to build.
 
 Each iteration runs one phase:
 
-| Phase | Purpose | Model |
-|-------|---------|-------|
-| `decompose` | Break Generate-mode goals into tasks | Opus (high effort) |
-| `execute` | Complete one PENDING task | Sonnet (medium effort) |
-| `critic` | Validate quality after all tasks done | Sonnet (medium effort) |
-| `evaluate` | Check convergence for Generate specs | Sonnet (medium effort) |
+| Phase | Purpose | Model alias |
+|-------|---------|-------------|
+| `decompose` | Break Generate-mode goals into tasks | opus (high effort) |
+| `execute` | Complete one PENDING task | sonnet (medium effort) |
+| `critic` | Validate quality after all tasks done | sonnet (medium effort) |
+| `evaluate` | Check convergence for Generate specs | sonnet (medium effort) |
+
+Aliases are resolved to runtime-specific IDs by `lib/runtime.py`. Claude default: `claude-sonnet-4-6`/`claude-opus-4-6`. Codex: `o4-mini`/`o3`.
 
 ## Critic System
 
@@ -204,6 +206,15 @@ Tests use mock data only, no live API calls. The test suite includes:
 - Characterization tests (`test_characterization.py`)
 - Eval suites (`eval_boi.py`, `eval_critic.py`)
 - Integration tests (`tests/integration/`)
+
+## Runtime Abstraction
+
+BOI is runtime-agnostic. The execution backend is configured in `~/.boi/config.json` and can be overridden per-spec with `**Runtime:** codex`.
+
+- **`lib/runtime.py`** — `Runtime` ABC with `ClaudeRuntime` and `CodexRuntime` implementations. `get_runtime(name)` factory. `resolve_runtime(state_dir, spec_content)` applies priority: spec header > global config > default (`"claude"`).
+- **`worker.py`** — uses `self.runtime.build_exec_cmd()`, `model_id()`, `cost_per_token()` instead of hardcoded Claude values.
+- **`daemon.py`** — post-commit review path also goes through the runtime abstraction.
+- **`boi.sh`** — `_get_runtime()` reads config; `boi doctor`/`boi do` check/use the configured runtime.
 
 ## Coding Conventions
 
