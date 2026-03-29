@@ -3713,7 +3713,7 @@ PYEOF
     local response
     case "${do_runtime}" in
         codex)  response=$(echo "${prompt}" | codex exec 2>/dev/null) || die "Codex invocation failed" ;;
-        *)      response=$(claude -p "${prompt}" 2>/dev/null) || die "Claude invocation failed" ;;
+        *)      response=$(${do_runtime} -p "${prompt}" 2>/dev/null) || die "Claude invocation failed" ;;
     esac
 
     # Step 4: Parse response

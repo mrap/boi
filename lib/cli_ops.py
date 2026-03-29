@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from lib.db import Database, DuplicateSpecError
 from lib.db_to_json import export_queue_to_json
+from lib.runtime import get_all_runtimes
 
 
 def _get_db(queue_dir: str) -> Database:
@@ -386,7 +387,7 @@ def cleanup_orphans(queue_dir: str) -> list[int]:
         orphans: list[int] = []
         for line in ps_output.strip().split("\n"):
             line = line.strip()
-            is_worker = ("claude" in line or "codex" in line)
+            is_worker = any(rt.detect_worker_process(line) for rt in get_all_runtimes())
             if is_worker and "BOI Worker" in line:
                 parts = line.split(None, 1)
                 if parts:

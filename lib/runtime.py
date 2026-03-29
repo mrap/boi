@@ -7,11 +7,24 @@ CLI agent backends (Claude Code, Codex, etc.) without forking logic.
 import json
 import os
 import re
+import shlex
 import shutil
 from abc import ABC, abstractmethod
 from typing import Optional
 
 DEFAULT_RUNTIME = "claude"
+
+
+def _shell_quote_path(path: str) -> str:
+    """Return shell-quoted path, preserving bare bash variable references.
+
+    Bash variable references (starting with '$') are wrapped in double quotes
+    to allow expansion.  All other paths are quoted with shlex.quote (single
+    quotes) to prevent shell injection.
+    """
+    if path.startswith("$"):
+        return f'"{path}"'
+    return shlex.quote(path)
 
 
 class Runtime(ABC):
@@ -91,7 +104,7 @@ class ClaudeRuntime(Runtime):
                 effort = eff
                 break
         return (
-            f'env -u CLAUDECODE claude -p "$(cat "{prompt_file}")" '
+            f'env -u CLAUDECODE claude -p "$(cat {_shell_quote_path(prompt_file)})" '
             f'--model {resolved_model} --effort {effort} '
             f'--dangerously-skip-permissions '
             f'--output-format stream-json --verbose'
@@ -143,7 +156,7 @@ class CodexRuntime(Runtime):
         return (
             f'codex exec --model {resolved_model} '
             f'--dangerously-bypass-approvals-and-sandbox '
-            f'< "{prompt_file}"'
+            f'< {_shell_quote_path(prompt_file)}'
         )
 
     def model_id(self, alias: str) -> str:
@@ -170,6 +183,11 @@ _REGISTRY = {
     "claude": ClaudeRuntime,
     "codex":  CodexRuntime,
 }
+
+
+def get_all_runtimes() -> list:
+    """Return one instance of every registered runtime."""
+    return [cls() for cls in _REGISTRY.values()]
 
 
 def get_runtime(name: str) -> Runtime:

@@ -201,6 +201,7 @@ class Worker:
             "execute":   ("sonnet", "medium"),  # default; per-task **Model:** overrides
             "critic":    ("sonnet", "medium"),
             "evaluate":  ("sonnet", "medium"),
+            "review":    ("sonnet", "medium"),
         }
 
     def _build_exec_cmd(self, model_override: Optional[str] = None) -> str:

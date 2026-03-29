@@ -18,6 +18,7 @@ class Phase(str, Enum):
     DECOMPOSE = "decompose"
     EVALUATE = "evaluate"
     CRITIC = "critic"
+    REVIEW = "review"
 
 
 class TaskStatus(str, Enum):

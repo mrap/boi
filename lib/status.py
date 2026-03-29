@@ -829,7 +829,7 @@ def _apply_view_filter(
 _COL_MODE = 10    # "execute   " (8 + 2 space)
 _COL_WORKER = 8   # "w-1     "  (6 + 2 space)
 _COL_ITER = 8     # "10 (3m) "  (7 + 1 space)
-_COL_TASKS = 24   # "████████████████  6/6   " (16 bar + 2 sep + 5 count + 1 space)
+_COL_TASKS = 8    # "6/6     " (count only — bar moved to its own line)
 _COL_DEPS = 14    # dep info column
 _COL_STATUS = 12  # "running" right-padded
 _COL_FIXED = _COL_MODE + _COL_WORKER + _COL_ITER + _COL_TASKS + _COL_DEPS + _COL_STATUS
@@ -844,9 +844,9 @@ _MODE_ABBREV: dict[str, str] = {
 # Right-side fixed columns for compact layout: mode(5) + tasks(6) + iter(4) + quality(9) + worker(5) + spacing
 _COL_COMPACT_RIGHT = 30
 
-# Fixed columns for "recently finished" compact rows: tasks(28) + time(10) + status(12)
-# Finished rows use a wider 20-char bar: 20 bar + 2 sep + 5 count + 1 space = 28
-_COL_FINISHED_TASKS = 28
+# Fixed columns for "recently finished" compact rows: tasks(8) + time(10) + status(12)
+# Finished rows show count only — bar moved to its own line below spec name
+_COL_FINISHED_TASKS = 8
 _COL_FINISHED_TIME = 10
 _COL_FINISHED_STATUS = 12
 _COL_FINISHED_FIXED = _COL_FINISHED_TASKS + _COL_FINISHED_TIME + _COL_FINISHED_STATUS
@@ -855,8 +855,9 @@ _COL_FINISHED_FIXED = _COL_FINISHED_TASKS + _COL_FINISHED_TIME + _COL_FINISHED_S
 def _format_finished_row(spec: dict[str, Any], columns: int, color: bool = True) -> str:
     """Format a recently finished spec as a compact row.
 
-    Columns: ID+name (variable), progress bar + task count, time ago, status.
+    Columns: ID+name (variable), task count, time ago, status.
     No mode/worker/iter columns — those are irrelevant for finished specs.
+    For specs with more than 1 task, the caller emits a bar line below this row.
     """
     status = spec.get("status", "completed")
     qid = spec.get("id", "?")
@@ -872,8 +873,7 @@ def _format_finished_row(spec: dict[str, Any], columns: int, color: bool = True)
     tasks_done = spec.get("tasks_done", 0)
     tasks_total = spec.get("tasks_total", 0)
     if tasks_total > 0:
-        _bar = _progress_bar(tasks_done, tasks_total, width=20, color=False, status=status)
-        tasks_str = f"{_bar}  {tasks_done}/{tasks_total}"
+        tasks_str = f"{tasks_done}/{tasks_total}"
     else:
         tasks_str = "-"
 
@@ -1121,8 +1121,7 @@ def format_spec_row(
     tasks_done = spec.get("tasks_done", 0)
     tasks_total = spec.get("tasks_total", 0)
     if tasks_total > 0:
-        _bar = _progress_bar(tasks_done, tasks_total, width=16, color=False, status=status)
-        tasks_str = f"{_bar}  {tasks_done}/{tasks_total}"
+        tasks_str = f"{tasks_done}/{tasks_total}"
     else:
         tasks_str = "-"
 
@@ -1175,6 +1174,133 @@ def format_spec_row(
     return row_text
 
 
+# ─── Minimal display symbols (narrow-terminal / minimal view) ────────────────
+# Used by: _format_running_row_minimal(), _format_finished_row_minimal()
+# Intentionally different from STATUS_ICONS: these are chosen for compactness
+# in narrow terminals (e.g., tmux sidebar ≤40 chars). Smaller glyphs (▸ vs ▶,
+# ○ vs ·) reduce visual weight. Includes blocked/assigning which the compact
+# dashboard doesn't render separately.
+_STATUS_SYMBOLS: dict[str, str] = {
+    "running": "\u25b8",      # ▸ right-pointing small triangle
+    "requeued": "\u21bb",     # ↻ clockwise arrow
+    "completed": "\u2713",    # ✓ checkmark
+    "failed": "\u2717",       # ✗ ballot X
+    "queued": "\u25cb",       # ○ hollow circle
+    "blocked": "\u2298",      # ⊘ circled slash
+    "needs_review": "\u25c6", # ◆ diamond
+    "canceled": "\u00b7",     # · middle dot
+    "assigning": "\u25b8",    # ▸ same as running
+}
+
+
+def _format_running_row_minimal(
+    spec: dict[str, Any],
+    color: bool = True,
+    queue_dir: str = "",
+) -> list[str]:
+    """Format an active spec as 2-3 minimal lines.
+
+    Line 1: ▸ q-326  hex-module-rigor              7/9   8m
+    Line 2:          → t-8: Add hex-doctor to startup
+    Line 3:          ████████████████████████████████░░░░░░░░
+    """
+    status = spec.get("status", "queued")
+    symbol = _STATUS_SYMBOLS.get(status, "\u25cb")
+    color_code = STATUS_COLORS.get(status, "")
+
+    qid = spec.get("id", "?")
+    spec_path = spec.get("original_spec_path", spec.get("spec_path", ""))
+    spec_name = os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
+    # Strip redundant .spec suffix (filenames like foo.spec.md → foo.spec → foo)
+    if spec_name.endswith(".spec"):
+        spec_name = spec_name[:-5]
+
+    # Truncate name at 30 chars with ellipsis
+    if len(spec_name) > 30:
+        spec_name = spec_name[:29] + "\u2026"
+
+    tasks_done = spec.get("tasks_done", 0)
+    tasks_total = spec.get("tasks_total", 0)
+    tasks_str = f"{tasks_done}/{tasks_total}" if tasks_total > 0 else "\u2014"
+
+    elapsed = ""
+    if status in ("running", "requeued", "assigning"):
+        elapsed = _get_iteration_elapsed(spec, queue_dir)
+
+    line1 = f"{symbol} {qid}  {spec_name:<30}  {tasks_str}"
+    if elapsed:
+        line1 += f"  {elapsed}"
+
+    if color and color_code:
+        line1 = f"{color_code}{line1}{NC}"
+
+    lines = [line1]
+
+    # Lines 2 & 3 indented 9 spaces to align under the spec name
+    indent = " " * 9
+
+    # Line 2: current task arrow (running/requeued only)
+    if status in ("running", "requeued"):
+        current_task = _get_current_task(spec)
+        if current_task:
+            task_line = f"{indent}\u2192 {current_task}"
+            if color:
+                task_line = f"{DIM}{task_line}{NC}"
+            lines.append(task_line)
+
+    # Line 3: progress bar
+    if tasks_total > 0:
+        bar = _progress_bar(tasks_done, tasks_total, width=40, color=color, status=status)
+        bar_line = f"{indent}{bar}"
+        lines.append(bar_line)
+
+    return lines
+
+
+def _format_finished_row_minimal(
+    spec: dict[str, Any],
+    color: bool = True,
+) -> str:
+    """Format a recently finished spec as a single minimal line.
+
+    ✓ q-329  context-switching-research    5/6   8m ago
+    ✗ q-318  hex-events-daemon-fix         5/5   50m ago
+    """
+    status = spec.get("status", "completed")
+    symbol = _STATUS_SYMBOLS.get(status, "\u00b7")
+
+    qid = spec.get("id", "?")
+    spec_path = spec.get("original_spec_path", spec.get("spec_path", ""))
+    spec_name = os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
+    # Strip redundant .spec suffix (filenames like foo.spec.md → foo.spec → foo)
+    if spec_name.endswith(".spec"):
+        spec_name = spec_name[:-5]
+
+    # Truncate name at 30 chars with ellipsis
+    if len(spec_name) > 30:
+        spec_name = spec_name[:29] + "\u2026"
+
+    tasks_done = spec.get("tasks_done", 0)
+    tasks_total = spec.get("tasks_total", 0)
+    tasks_str = f"{tasks_done}/{tasks_total}" if tasks_total > 0 else "\u2014"
+
+    time_ago = format_relative_time(spec.get("last_iteration_at"))
+
+    line = f"{symbol} {qid}  {spec_name:<30}  {tasks_str}  {time_ago}"
+
+    if color:
+        if status == "failed":
+            line = f"{RED}{line}{NC}"
+        elif status in ("completed", "canceled"):
+            line = f"{DIM}{line}{NC}"
+        else:
+            color_code = STATUS_COLORS.get(status, "")
+            if color_code:
+                line = f"{color_code}{line}{NC}"
+
+    return line
+
+
 def render_status(
     specs: list[dict[str, Any]],
     sort: str = "queue",
@@ -1189,6 +1315,7 @@ def render_status(
     selected_row: int = -1,
     emit_queue_ids: bool = False,
     queue_dir: str = "",
+    verbose: bool = False,
 ) -> str:
     """Unified status renderer — single entry point for all display modes.
 
@@ -1304,12 +1431,6 @@ def render_status(
         return "\n".join(lines)
     # ── End compact mode ──────────────────────────────────────────────────────
 
-    header = "BOI"
-    if color:
-        header = f"{BOLD}{header}{NC}"
-    lines.append(header)
-    lines.append("")
-
     if not specs:
         lines.append("No specs in queue. Ready to dispatch.")
         total_workers = len(workers)
@@ -1344,27 +1465,11 @@ def render_status(
     if has_active:
         running_header = "RUNNING"
         if color:
-            running_header = f"{BOLD}{running_header}{NC}"
+            if verbose:
+                running_header = f"{BOLD}{running_header}{NC}"
+            else:
+                running_header = f"{DIM}{running_header}{NC}"
         lines.append(running_header)
-        lines.append("")
-
-        col_header = (
-            f"{'SPEC':<{col_spec}}"
-            f"{'MODE':<{_COL_MODE}}"
-            f"{'WORKER':<{_COL_WORKER}}"
-            f"{'ITER':<{_COL_ITER}}"
-            f"{'TASKS':<{_COL_TASKS}}"
-            f"{'Deps':<{_COL_DEPS}}"
-            f"{'STATUS'}"
-        )
-        if color:
-            col_header = f"{BOLD}{col_header}{NC}"
-        lines.append(col_header)
-
-        sep = "\u2500" * term_w
-        if color:
-            sep = f"{DIM}{sep}{NC}"
-        lines.append(sep)
 
         sorted_active = sort_entries(active_specs, sort)
         if sort == "dag":
@@ -1375,31 +1480,66 @@ def render_status(
         else:
             display_active = sorted_active  # type: ignore[assignment]
 
-        generate_details: list[tuple[int, list[str]]] = []
+        if verbose:
+            col_header = (
+                f"{'SPEC':<{col_spec}}"
+                f"{'MODE':<{_COL_MODE}}"
+                f"{'WORKER':<{_COL_WORKER}}"
+                f"{'ITER':<{_COL_ITER}}"
+                f"{'TASKS':<{_COL_TASKS}}"
+                f"{'Deps':<{_COL_DEPS}}"
+                f"{'STATUS'}"
+            )
+            if color:
+                col_header = f"{BOLD}{col_header}{NC}"
+            lines.append(col_header)
 
-        for entry in display_active:
-            entry_status = entry.get("status", "queued")
-            if not first_running_id and entry_status == "running":
-                first_running_id = entry.get("id", "")
+            sep = "\u2500" * term_w
+            if color:
+                sep = f"{DIM}{sep}{NC}"
+            lines.append(sep)
 
-            row = format_spec_row(entry, term_w, style=row_style, color=color, queue_dir=queue_dir)
-            lines.append(row)
+            generate_details: list[tuple[int, list[str]]] = []
 
-            if entry_status == "running":
-                current_task = _get_current_task(entry)
-                if current_task:
-                    task_line = f"       \u2192 {current_task}"
-                    if color:
-                        task_line = f"{DIM}{task_line}{NC}"
-                    lines.append(task_line)
+            for entry in display_active:
+                entry_status = entry.get("status", "queued")
+                if not first_running_id and entry_status == "running":
+                    first_running_id = entry.get("id", "")
 
-            gen_detail = _get_generate_detail(entry)
-            if gen_detail:
-                generate_details.append((len(lines), gen_detail))
+                row = format_spec_row(entry, term_w, style=row_style, color=color, queue_dir=queue_dir)
+                lines.append(row)
 
-        for insert_idx, detail_lines in reversed(generate_details):
-            for i, dl in enumerate(detail_lines):
-                lines.insert(insert_idx + i, dl)
+                if entry_status == "running":
+                    current_task = _get_current_task(entry)
+                    if current_task:
+                        task_line = f"       \u2192 {current_task}"
+                        if color:
+                            task_line = f"{DIM}{task_line}{NC}"
+                        lines.append(task_line)
+                    entry_done = entry.get("tasks_done", 0)
+                    entry_total = entry.get("tasks_total", 0)
+                    if entry_total > 0:
+                        bar_str = _progress_bar(entry_done, entry_total, width=40, color=False, status=entry_status)
+                        bar_line = f"       {bar_str}  {entry_done}/{entry_total}"
+                        if color:
+                            bar_line = f"{DIM}{bar_line}{NC}"
+                        lines.append(bar_line)
+
+                gen_detail = _get_generate_detail(entry)
+                if gen_detail:
+                    generate_details.append((len(lines), gen_detail))
+
+            for insert_idx, detail_lines in reversed(generate_details):
+                for i, dl in enumerate(detail_lines):
+                    lines.insert(insert_idx + i, dl)
+        else:
+            # Minimal format: symbol + ID + name + tasks + elapsed, then task arrow + bar
+            for entry in display_active:
+                entry_status = entry.get("status", "queued")
+                if not first_running_id and entry_status == "running":
+                    first_running_id = entry.get("id", "")
+                for row_line in _format_running_row_minimal(entry, color=color, queue_dir=queue_dir):
+                    lines.append(row_line)
 
         lines.append("")
 
@@ -1409,7 +1549,6 @@ def render_status(
         if color:
             finished_header = f"{DIM}{finished_header}{NC}"
         lines.append(finished_header)
-        lines.append("")
 
         _finished_cap = 8
         _cap_active = view_mode != "all"
@@ -1427,7 +1566,18 @@ def render_status(
         _hidden_count = len(finished_specs) - len(_display_finished)
 
         for entry in _display_finished:
-            lines.append(_format_finished_row(entry, term_w, color=color))
+            done = entry.get("tasks_done", 0)
+            total = entry.get("tasks_total", 0)
+            if verbose:
+                lines.append(_format_finished_row(entry, term_w, color=color))
+                if total > 1:
+                    bar_str = _progress_bar(done, total, width=40, color=False, status=entry.get("status", "completed"))
+                    bar_line = f"       {bar_str}  {done}/{total}"
+                    if color:
+                        bar_line = f"{DIM}{bar_line}{NC}"
+                    lines.append(bar_line)
+            else:
+                lines.append(_format_finished_row_minimal(entry, color=color))
 
         if _hidden_count > 0:
             _more_line = f"  ... and {_hidden_count} more completed in last 6h"
@@ -1449,7 +1599,7 @@ def render_status(
             lines.append(bl)
         lines.append("")
 
-    # Summary line
+    # Summary line — compact: "5/5 busy | 5▸ 3○ 29✗ 256✓"
     total_workers = len(workers)
     running = summary.get("running", 0)
     queued = summary.get("queued", 0) + summary.get("requeued", 0)
@@ -1459,24 +1609,24 @@ def render_status(
 
     parts: list[str] = []
     if total_workers:
-        parts.append(f"Workers: {running}/{total_workers} busy")
+        parts.append(f"{running}/{total_workers} busy")
 
-    count_parts: list[str] = []
+    stat_parts: list[str] = []
     if running:
-        count_parts.append(f"{running} running")
+        stat_parts.append(f"{running}\u25b8")    # N▸ running
     if queued:
-        count_parts.append(f"{queued} queued")
+        stat_parts.append(f"{queued}\u25cb")     # N○ queued
     if needs_review:
-        count_parts.append(f"{needs_review} needs review")
+        stat_parts.append(f"{needs_review}\u25c6")  # N◆ needs_review
     if failed:
-        count_parts.append(f"{failed} failed")
+        stat_parts.append(f"{failed}\u2717")     # N✗ failed
     if completed:
-        count_parts.append(f"{completed} completed")
+        stat_parts.append(f"{completed}\u2713")  # N✓ completed
 
-    if count_parts:
-        parts.append(", ".join(count_parts))
+    if stat_parts:
+        parts.append("  ".join(stat_parts))
 
-    lines.append("  |  ".join(parts) if parts else f"Total: {summary.get('total', 0)}")
+    lines.append(" | ".join(parts) if parts else f"Total: {summary.get('total', 0)}")
 
     if first_running_id:
         hint = f"Run 'boi log {first_running_id}' to see worker output"
@@ -1509,6 +1659,7 @@ def format_queue_table(
     width: int | None = None,
     view_mode: str = "default",
     sort: str = "display",
+    verbose: bool = False,
 ) -> str:
     """Format queue status as a human-readable, full-width table.
 
@@ -1545,6 +1696,7 @@ def format_queue_table(
         total_count=total_count,
         view_mode=view_mode,
         queue_dir=queue_dir,
+        verbose=verbose,
     )
 
 
@@ -1812,6 +1964,11 @@ def format_telemetry_json(telemetry: dict[str, Any]) -> str:
 
 
 # Status icons (no color — color is applied separately)
+# Used by: format_compact_row() (compact dashboard) and DAG-style table rows.
+# Intentionally different from _STATUS_SYMBOLS: these are chosen for wider
+# terminal displays where slightly bolder glyphs (▶ vs ▸, · vs ○) look better
+# in a columnar table. Does not need blocked/assigning — the compact dashboard
+# shows those statuses via color and label only.
 STATUS_ICONS: dict[str, str] = {
     "completed": "\u2713",  # ✓
     "running": "\u25b6",  # ▶
