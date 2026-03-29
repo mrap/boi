@@ -687,9 +687,32 @@ cmd_queue() {
 
 # ─── Subcommand: status ──────────────────────────────────────────────────────
 
+cmd_status_compact() {
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${BOI_CONFIG}" <<'PYEOF'
+import sys, os, json
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.status import build_queue_status, format_sidebar
+
+queue_dir = sys.argv[1]
+config_path = sys.argv[2]
+
+config = None
+if os.path.isfile(config_path):
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except Exception:
+        pass
+
+status_data = build_queue_status(queue_dir, config)
+print(format_sidebar(status_data))
+PYEOF
+}
+
 cmd_status() {
     local watch_mode=false
     local json_mode=false
+    local compact_mode=false
     local sort_mode=""
     local filter_status=""
     local view_mode="default"   # default | all | running | recent:N
@@ -698,6 +721,7 @@ cmd_status() {
         case "$1" in
             --watch) watch_mode=true; shift ;;
             --json) json_mode=true; shift ;;
+            --compact) compact_mode=true; shift ;;
             --all) view_mode="all"; shift ;;
             --running) view_mode="running"; shift ;;
             --recent)
@@ -719,10 +743,11 @@ cmd_status() {
                 filter_status="$2"; shift 2 ;;
             --filter=*) filter_status="${1#--filter=}"; shift ;;
             -h|--help)
-                echo "Usage: boi status [--watch] [--all] [--running] [--recent N] [--json] [--sort MODE] [--filter STATUS]"
+                echo "Usage: boi status [--watch] [--compact] [--all] [--running] [--recent N] [--json] [--sort MODE] [--filter STATUS]"
                 echo ""
                 echo "Options:"
                 echo "  --watch           Auto-refresh interactive dashboard"
+                echo "  --compact         Sidebar-friendly view (≤40 chars wide, auto-refresh every 3s)"
                 echo "  --all             Show all specs (default hides old completed/canceled)"
                 echo "  --running         Show only running specs"
                 echo "  --recent N        Show last N specs by activity"
@@ -732,6 +757,7 @@ cmd_status() {
                 echo ""
                 echo "Examples:"
                 echo "  boi status                          # Running + recent (last 24h)"
+                echo "  boi status --compact                # Sidebar view (40 chars, 3s refresh)"
                 echo "  boi status --all                    # All specs"
                 echo "  boi status --running                # Only running specs"
                 echo "  boi status --recent 10              # Last 10 specs"
@@ -760,6 +786,25 @@ cmd_status() {
     fi
 
     require_config
+
+    # ── Compact/sidebar mode ─────────────────────────────────────────────────
+    if [[ "${compact_mode}" == "true" ]]; then
+        if [ -t 1 ]; then
+            # Interactive TTY: loop with 3s refresh, flicker-free
+            tput civis 2>/dev/null || true
+            trap 'tput cnorm 2>/dev/null; printf "\033[?25h"; exit' INT TERM EXIT
+            while true; do
+                local buf
+                buf=$(cmd_status_compact 2>&1)
+                printf '\033[H\033[J%s\n' "$buf"
+                sleep 3
+            done
+        else
+            # Non-TTY (pipe/test): single render
+            cmd_status_compact
+        fi
+        return
+    fi
 
     if [[ "${watch_mode}" == "true" ]] && [ -t 1 ]; then
         # Flicker-free refresh: render to buffer, then overwrite screen in one shot

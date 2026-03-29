@@ -90,6 +90,42 @@ def _colorize(text: str, color: str) -> str:
     return f"{color}{text}{NC}"
 
 
+def _progress_bar(done: int, total: int, width: int = 20, color: bool = True, status: str = "") -> str:
+    """Generate a Unicode progress bar.
+
+    Args:
+        done: completed tasks
+        total: total tasks
+        width: bar width in characters (default 20)
+        color: whether to add ANSI color codes
+        status: spec status for color selection (running/completed/failed/queued)
+
+    Returns: string like "████████████░░░░░░░░"
+    """
+    FILLED = "\u2588"  # █
+    EMPTY = "\u2591"   # ░
+
+    if total <= 0:
+        bar = EMPTY * width
+    else:
+        filled_count = min(width, round(done / total * width))
+        bar = FILLED * filled_count + EMPTY * (width - filled_count)
+
+    if color:
+        color_code = {
+            "completed": GREEN,
+            "running": YELLOW,
+            "failed": RED,
+            "queued": DIM,
+            "requeued": YELLOW,
+            "canceled": DIM,
+        }.get(status, "")
+        if color_code:
+            bar = f"{color_code}{bar}{NC}"
+
+    return bar
+
+
 def load_queue(queue_dir: str) -> list[dict[str, Any]]:
     """Load all queue entries from the queue directory (JSON files).
 
@@ -460,6 +496,49 @@ def get_terminal_width() -> int:
     return _get_terminal_width()
 
 
+def _get_terminal_height() -> int:
+    """Get terminal height (rows), trying multiple sources with fallback to 9999.
+
+    Sources tried in order:
+    1. os.get_terminal_size() on stdout (fd 1)
+    2. os.get_terminal_size() on stderr (fd 2)
+    3. /dev/tty (works even when stdout/stderr are piped)
+    4. $LINES environment variable
+    5. Fallback: 9999 (effectively unlimited — no truncation)
+
+    Returns 9999 when height is unknown to avoid spurious truncation.
+    """
+    # Try stdout
+    try:
+        rows = os.get_terminal_size(1).lines
+        return max(10, rows)
+    except (ValueError, OSError):
+        pass
+
+    # Try stderr
+    try:
+        rows = os.get_terminal_size(2).lines
+        return max(10, rows)
+    except (ValueError, OSError):
+        pass
+
+    # Try /dev/tty directly (works when stdout/stderr are piped)
+    try:
+        with open("/dev/tty") as tty:
+            rows = os.get_terminal_size(tty.fileno()).lines
+            return max(10, rows)
+    except (ValueError, OSError):
+        pass
+
+    # Try $LINES env var (set by bash/zsh)
+    lines_env = os.environ.get("LINES", "")
+    if lines_env.isdigit():
+        return max(10, int(lines_env))
+
+    # Default fallback: effectively unlimited (no truncation when height unknown)
+    return 9999
+
+
 def _sort_entries_for_display(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Sort entries: running first, then queued/requeued, then completed/canceled.
 
@@ -735,11 +814,11 @@ def _apply_view_filter(
         status = e.get("status", "")
         if status in ("running", "requeued", "queued", "needs_review", "assigning"):
             result.append(e)
-        elif status == "completed":
+        elif status in ("completed", "failed"):
             ts = _last_ts(e)
             if ts is not None and ts >= cutoff_completed:
                 result.append(e)
-        # failed and canceled: never shown in default view
+        # canceled: never shown in default view
     return result
 
 
@@ -749,8 +828,8 @@ def _apply_view_filter(
 
 _COL_MODE = 10    # "execute   " (8 + 2 space)
 _COL_WORKER = 8   # "w-1     "  (6 + 2 space)
-_COL_ITER = 8     # "10/30   "  (7 + 1 space)
-_COL_TASKS = 13   # "6/6 done " (12 + 1 space)
+_COL_ITER = 8     # "10 (3m) "  (7 + 1 space)
+_COL_TASKS = 24   # "████████████████  6/6   " (16 bar + 2 sep + 5 count + 1 space)
 _COL_DEPS = 14    # dep info column
 _COL_STATUS = 12  # "running" right-padded
 _COL_FIXED = _COL_MODE + _COL_WORKER + _COL_ITER + _COL_TASKS + _COL_DEPS + _COL_STATUS
@@ -764,6 +843,59 @@ _MODE_ABBREV: dict[str, str] = {
 }
 # Right-side fixed columns for compact layout: mode(5) + tasks(6) + iter(4) + quality(9) + worker(5) + spacing
 _COL_COMPACT_RIGHT = 30
+
+# Fixed columns for "recently finished" compact rows: tasks(28) + time(10) + status(12)
+# Finished rows use a wider 20-char bar: 20 bar + 2 sep + 5 count + 1 space = 28
+_COL_FINISHED_TASKS = 28
+_COL_FINISHED_TIME = 10
+_COL_FINISHED_STATUS = 12
+_COL_FINISHED_FIXED = _COL_FINISHED_TASKS + _COL_FINISHED_TIME + _COL_FINISHED_STATUS
+
+
+def _format_finished_row(spec: dict[str, Any], columns: int, color: bool = True) -> str:
+    """Format a recently finished spec as a compact row.
+
+    Columns: ID+name (variable), progress bar + task count, time ago, status.
+    No mode/worker/iter columns — those are irrelevant for finished specs.
+    """
+    status = spec.get("status", "completed")
+    qid = spec.get("id", "?")
+    spec_path = spec.get("original_spec_path", spec.get("spec_path", ""))
+    spec_name = os.path.splitext(os.path.basename(spec_path))[0] if spec_path else "?"
+
+    col_spec = max(20, columns - _COL_FINISHED_FIXED)
+    label = f"{qid}  {spec_name}"
+    max_label = col_spec - 2
+    if len(label) > max_label:
+        label = label[: max_label - 1] + "\u2026"
+
+    tasks_done = spec.get("tasks_done", 0)
+    tasks_total = spec.get("tasks_total", 0)
+    if tasks_total > 0:
+        _bar = _progress_bar(tasks_done, tasks_total, width=20, color=False, status=status)
+        tasks_str = f"{_bar}  {tasks_done}/{tasks_total}"
+    else:
+        tasks_str = "-"
+
+    time_ago = format_relative_time(spec.get("last_iteration_at"))
+
+    row_text = (
+        f"{label:<{col_spec}}"
+        f"{tasks_str:<{_COL_FINISHED_TASKS}}"
+        f"  {time_ago:<{_COL_FINISHED_TIME - 2}}"
+        f"{status}"
+    )
+
+    if color:
+        status_color = STATUS_COLORS.get(status, "")
+        if status == "failed":
+            row_text = f"{RED}{row_text}{NC}"
+        elif status in ("completed", "canceled"):
+            row_text = f"{DIM}{row_text}{NC}"
+        elif status_color:
+            row_text = f"{status_color}{row_text}{NC}"
+
+    return row_text
 
 
 def _format_spec_row_compact(
@@ -980,8 +1112,7 @@ def format_spec_row(
         worker = "-"
 
     iteration = spec.get("iteration", 0)
-    max_iter = spec.get("max_iterations", 30)
-    iter_str = f"{iteration}/{max_iter}" if status != "queued" else "-"
+    iter_str = f"{iteration}" if status != "queued" else "-"
     if status == "running":
         elapsed = _get_iteration_elapsed(spec, queue_dir)
         if elapsed:
@@ -989,7 +1120,11 @@ def format_spec_row(
 
     tasks_done = spec.get("tasks_done", 0)
     tasks_total = spec.get("tasks_total", 0)
-    tasks_str = f"{tasks_done}/{tasks_total} done" if tasks_total > 0 else "-"
+    if tasks_total > 0:
+        _bar = _progress_bar(tasks_done, tasks_total, width=16, color=False, status=status)
+        tasks_str = f"{_bar}  {tasks_done}/{tasks_total}"
+    else:
+        tasks_str = "-"
 
     quality_str, _ = _get_quality_display(spec, color=False)
     quality_suffix = (
@@ -1190,74 +1325,117 @@ def render_status(
         lines.append("  boi --help                       See all commands")
         return "\n".join(lines)
 
+    # Split into active (running/queued) and finished (completed/failed/canceled)
+    _active_statuses = {"running", "requeued", "queued", "needs_review", "assigning"}
+    active_specs = [e for e in specs if e.get("status", "") in _active_statuses]
+    finished_specs = [e for e in specs if e.get("status", "") not in _active_statuses]
+
+    # Sort finished by last_iteration_at descending (most recent first)
+    finished_specs = _sort_by_recent(finished_specs)
+
+    has_active = bool(active_specs)
+    has_finished = bool(finished_specs)
+
     col_spec = max(20, term_w - _COL_FIXED)
-    col_header = (
-        f"{'SPEC':<{col_spec}}"
-        f"{'MODE':<{_COL_MODE}}"
-        f"{'WORKER':<{_COL_WORKER}}"
-        f"{'ITER':<{_COL_ITER}}"
-        f"{'TASKS':<{_COL_TASKS}}"
-        f"{'Deps':<{_COL_DEPS}}"
-        f"{'STATUS'}"
-    )
-    if color:
-        col_header = f"{BOLD}{col_header}{NC}"
-    lines.append(col_header)
-
-    sep = "\u2500" * term_w
-    if color:
-        sep = f"{DIM}{sep}{NC}"
-    lines.append(sep)
-
-    # Sort — dag mode embeds _dag_depth into each entry dict
-    style = "dag" if sort == "dag" else "default"
-    sorted_result = sort_entries(specs, sort)
-
-    if sort == "dag":
-        # sort_entries returns list[(entry, depth)] for dag
-        display_entries = []
-        for entry, depth in sorted_result:  # type: ignore[misc]
-            entry["_dag_depth"] = depth
-            display_entries.append(entry)
-    else:
-        display_entries = sorted_result  # type: ignore[assignment]
-
+    row_style = "dag" if sort == "dag" else "default"
     first_running_id = ""
-    generate_details: list[tuple[int, list[str]]] = []
 
-    for entry in display_entries:
-        status = entry.get("status", "queued")
-        if not first_running_id and status == "running":
-            first_running_id = entry.get("id", "")
+    # ── RUNNING section ───────────────────────────────────────────────────────
+    if has_active:
+        running_header = "RUNNING"
+        if color:
+            running_header = f"{BOLD}{running_header}{NC}"
+        lines.append(running_header)
+        lines.append("")
 
-        row = format_spec_row(entry, term_w, style=style, color=color, queue_dir=queue_dir)
-        lines.append(row)
+        col_header = (
+            f"{'SPEC':<{col_spec}}"
+            f"{'MODE':<{_COL_MODE}}"
+            f"{'WORKER':<{_COL_WORKER}}"
+            f"{'ITER':<{_COL_ITER}}"
+            f"{'TASKS':<{_COL_TASKS}}"
+            f"{'Deps':<{_COL_DEPS}}"
+            f"{'STATUS'}"
+        )
+        if color:
+            col_header = f"{BOLD}{col_header}{NC}"
+        lines.append(col_header)
 
-        if status == "running":
-            current_task = _get_current_task(entry)
-            if current_task:
-                task_line = f"       Task: {current_task}"
-                if color:
-                    task_line = f"{DIM}{task_line}{NC}"
-                lines.append(task_line)
+        sep = "\u2500" * term_w
+        if color:
+            sep = f"{DIM}{sep}{NC}"
+        lines.append(sep)
 
-        if status == "failed":
-            fail_reason = entry.get("failure_reason", "")
-            if fail_reason:
-                reason_line = f"       Reason: {fail_reason}"
-                if color:
-                    reason_line = _colorize(reason_line, RED)
-                lines.append(reason_line)
+        sorted_active = sort_entries(active_specs, sort)
+        if sort == "dag":
+            display_active: list[dict[str, Any]] = []
+            for entry, depth in sorted_active:  # type: ignore[misc]
+                entry["_dag_depth"] = depth
+                display_active.append(entry)
+        else:
+            display_active = sorted_active  # type: ignore[assignment]
 
-        gen_detail = _get_generate_detail(entry)
-        if gen_detail:
-            generate_details.append((len(lines), gen_detail))
+        generate_details: list[tuple[int, list[str]]] = []
 
-    for insert_idx, detail_lines in reversed(generate_details):
-        for i, dl in enumerate(detail_lines):
-            lines.insert(insert_idx + i, dl)
+        for entry in display_active:
+            entry_status = entry.get("status", "queued")
+            if not first_running_id and entry_status == "running":
+                first_running_id = entry.get("id", "")
 
-    lines.append("")
+            row = format_spec_row(entry, term_w, style=row_style, color=color, queue_dir=queue_dir)
+            lines.append(row)
+
+            if entry_status == "running":
+                current_task = _get_current_task(entry)
+                if current_task:
+                    task_line = f"       \u2192 {current_task}"
+                    if color:
+                        task_line = f"{DIM}{task_line}{NC}"
+                    lines.append(task_line)
+
+            gen_detail = _get_generate_detail(entry)
+            if gen_detail:
+                generate_details.append((len(lines), gen_detail))
+
+        for insert_idx, detail_lines in reversed(generate_details):
+            for i, dl in enumerate(detail_lines):
+                lines.insert(insert_idx + i, dl)
+
+        lines.append("")
+
+    # ── RECENTLY FINISHED section ─────────────────────────────────────────────
+    if has_finished:
+        finished_header = "RECENTLY FINISHED"
+        if color:
+            finished_header = f"{DIM}{finished_header}{NC}"
+        lines.append(finished_header)
+        lines.append("")
+
+        _finished_cap = 8
+        _cap_active = view_mode != "all"
+        _display_finished = finished_specs[:_finished_cap] if _cap_active else finished_specs
+
+        # Height-based cap: if terminal height is limited, truncate RECENTLY FINISHED
+        # to keep the footer always visible. Reserve 3 lines for footer area
+        # (footer line + optional hint + optional showing hint), and 3 for section
+        # overhead (header already appended above + blank above + trailing blank).
+        _term_h = _get_terminal_height()
+        _height_cap = max(0, _term_h - len(lines) - 6)
+        if _height_cap < len(_display_finished):
+            _display_finished = finished_specs[:_height_cap]
+
+        _hidden_count = len(finished_specs) - len(_display_finished)
+
+        for entry in _display_finished:
+            lines.append(_format_finished_row(entry, term_w, color=color))
+
+        if _hidden_count > 0:
+            _more_line = f"  ... and {_hidden_count} more completed in last 6h"
+            if color:
+                _more_line = f"{DIM}{_more_line}{NC}"
+            lines.append(_more_line)
+
+        lines.append("")
 
     alert_lines = _get_quality_alerts(specs, color)
     if alert_lines:
@@ -1265,7 +1443,7 @@ def render_status(
             lines.append(al)
         lines.append("")
 
-    blocked_lines = _get_blocked_specs_display(specs, color)
+    blocked_lines = _get_blocked_specs_display(active_specs, color)
     if blocked_lines:
         for bl in blocked_lines:
             lines.append(bl)
@@ -1783,3 +1961,174 @@ def get_visible_queue_ids(
         queue_ids.append(entry.get("id", "?"))
 
     return queue_ids
+
+
+# ─── Sidebar compact view (40-char max) ────────────────────────────────────────
+
+
+def _sidebar_spec_name(entry: dict[str, Any], max_len: int = 16) -> str:
+    """Extract a short display name from spec path."""
+    path = entry.get("original_spec_path") or entry.get("spec_path", "")
+    name = os.path.basename(path)
+    # Strip common suffixes
+    for suffix in (".spec.md", ".md"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    if len(name) > max_len:
+        name = name[:max_len]
+    return name
+
+
+def _sidebar_progress_bar(done: int, total: int, width: int = 8) -> str:
+    """Render a compact block progress bar."""
+    if total <= 0:
+        return "░" * width
+    filled = round(done / total * width)
+    filled = max(0, min(width, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _sidebar_next_task(entry: dict[str, Any]) -> str:
+    """Return the next PENDING task id, or empty string."""
+    pre = entry.get("pre_iteration_tasks", "{}")
+    if isinstance(pre, str):
+        try:
+            pre = json.loads(pre)
+        except Exception:
+            return ""
+    return next((t for t, s in pre.items() if s == "PENDING"), "")
+
+
+def format_sidebar(
+    status_data: dict[str, Any],
+    color: bool = True,
+    max_width: int = 40,
+) -> str:
+    """Format queue status as a minimal sidebar view (≤40 chars wide).
+
+    Output example (max_width=40):
+        BOI: 2 running, 1 queued
+        ▸ hex-events-fix  ████░░░░ 2/5 t-3
+        ▸ status-compact  ░░░░░░░░ 0/3 t-1
+        · progress-bars   queued
+
+        Done:
+          smoke-test       3m ago
+          upgrade-audit    15m ago
+    """
+    entries = status_data.get("entries", [])
+    summary = status_data.get("summary", {})
+
+    running_count = summary.get("running", 0) + summary.get("requeued", 0)
+    queued_count = summary.get("queued", 0)
+    failed_count = summary.get("failed", 0)
+    needs_review_count = summary.get("needs_review", 0)
+    pending_count = queued_count + failed_count + needs_review_count
+
+    lines: list[str] = []
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    if running_count == 0 and pending_count == 0:
+        header = "BOI: idle"
+    else:
+        parts: list[str] = []
+        if running_count:
+            parts.append(f"{running_count} running")
+        if pending_count:
+            parts.append(f"{pending_count} queued")
+        header = "BOI: " + ", ".join(parts)
+
+    if color:
+        lines.append(f"{BOLD}{header[:max_width]}{NC}")
+    else:
+        lines.append(header[:max_width])
+
+    # ── Active specs (running + queued) ────────────────────────────────────
+    active_statuses = {"running", "requeued", "queued", "needs_review", "failed"}
+    active = [e for e in entries if e.get("status", "") in active_statuses]
+
+    # Sort: running first, then queued
+    active.sort(
+        key=lambda e: 0 if e.get("status", "") in ("running", "requeued") else 1
+    )
+
+    # Separate running from queued so we can cap queued display
+    running_entries = [e for e in active if e.get("status", "") in ("running", "requeued")]
+    queued_entries = [e for e in active if e.get("status", "") not in ("running", "requeued")]
+    max_queued_shown = 3
+
+    for entry in running_entries:
+        name = _sidebar_spec_name(entry, max_len=15)
+        done = entry.get("tasks_done", 0)
+        total = entry.get("tasks_total", 0)
+        bar = _sidebar_progress_bar(done, total, width=8)
+        fraction = f"{done}/{total}"
+        next_task = _sidebar_next_task(entry)
+        # Layout: "▸ <name15> <bar8> <frac5> <task>"
+        # Fixed: 2 + 15 + 1 + 8 + 1 + 5 + 1 + 4 = 37 max
+        name_padded = name.ljust(15)[:15]
+        frac_padded = fraction.ljust(5)[:5]
+        task_part = next_task[:4] if next_task else ""
+        row = f"▸ {name_padded} {bar} {frac_padded} {task_part}".rstrip()
+        row = row[:max_width]
+        color_code = STATUS_COLORS.get("running", "")
+        if color and color_code:
+            lines.append(f"{color_code}{row}{NC}")
+        else:
+            lines.append(row)
+
+    for entry in queued_entries[:max_queued_shown]:
+        name = _sidebar_spec_name(entry, max_len=15)
+        name_padded = name.ljust(15)[:15]
+        row = f"· {name_padded} queued"
+        row = row[:max_width]
+        color_code = STATUS_COLORS.get("queued", "")
+        if color and color_code:
+            lines.append(f"{color_code}{row}{NC}")
+        else:
+            lines.append(row)
+
+    hidden = len(queued_entries) - max_queued_shown
+    if hidden > 0:
+        row = f"  +{hidden} more queued"
+        row = row[:max_width]
+        if color:
+            lines.append(f"{DIM}{row}{NC}")
+        else:
+            lines.append(row)
+
+    # ── Recently completed ─────────────────────────────────────────────────
+    completed = [
+        e
+        for e in entries
+        if e.get("status", "") in ("completed", "canceled")
+    ]
+    # Sort by last_iteration_at descending, take 3
+    def _sort_key(e: dict[str, Any]) -> str:
+        return e.get("last_iteration_at") or e.get("submitted_at") or ""
+
+    completed.sort(key=_sort_key, reverse=True)
+    recent = completed[:3]
+
+    if recent:
+        lines.append("")
+        if color:
+            lines.append(f"{DIM}Done:{NC}")
+        else:
+            lines.append("Done:")
+        for entry in recent:
+            name = _sidebar_spec_name(entry, max_len=16)
+            time_ago = format_relative_time(
+                entry.get("last_iteration_at") or entry.get("submitted_at")
+            )
+            # Layout: "  <name16>  <time>"  max ~38 chars
+            name_padded = name.ljust(16)[:16]
+            row = f"  {name_padded} {time_ago}"
+            row = row[:max_width]
+            if color:
+                lines.append(f"{DIM}{row}{NC}")
+            else:
+                lines.append(row)
+
+    return "\n".join(lines)
