@@ -85,6 +85,7 @@ VALID_MODES = {"execute", "challenge", "discover", "generate"}
 VALID_PHASES = {"execute", "critic", "evaluate", "decompose", "review"}
 TMUX_POLL_INTERVAL = 5  # seconds between tmux has-session polls
 TMUX_SOCKET = "boi"     # tmux socket name (-L flag)
+NO_TMUX = os.environ.get("BOI_NO_TMUX", "") == "1"  # headless mode for Docker/CI
 
 logger = logging.getLogger("boi.worker")
 
@@ -297,14 +298,20 @@ class Worker:
         _track_target = bool(_target_repo and os.path.isdir(_target_repo))
         pre_target_status = snapshot_git_status(_target_repo) if _track_target else set()
 
-        # Launch tmux session, wait, post-process
-        rc = self.launch_tmux()
+        # Launch worker: tmux (default) or direct subprocess (BOI_NO_TMUX=1)
+        if NO_TMUX:
+            rc = self.launch_direct()
+        else:
+            rc = self.launch_tmux()
         if rc != 0:
-            logger.error("Failed to launch tmux session.")
+            logger.error("Failed to launch worker session.")
             return 1
 
         try:
-            exit_code = self.wait_for_tmux()
+            if NO_TMUX:
+                exit_code = self._direct_exit_code
+            else:
+                exit_code = self.wait_for_tmux()
         except TimeoutError:
             logger.warning(
                 "Worker timed out after %s seconds.",
@@ -872,6 +879,51 @@ echo "${{_AGENT_EXIT}}" > "${{_EXIT_FILE}}"
         _write_file_atomic(self.run_script, script)
         os.chmod(self.run_script, 0o755)
         logger.info("Run script generated: %s", self.run_script)
+
+    def launch_direct(self) -> int:
+        """Launch the run script directly via subprocess (headless/Docker mode).
+
+        Used when BOI_NO_TMUX=1. Runs the bash script synchronously and
+        captures the exit code. No tmux involved.
+
+        Returns:
+            0 on success, non-zero on failure.
+        """
+        self._direct_exit_code = 1
+        if os.path.exists(self.exit_file):
+            os.remove(self.exit_file)
+
+        logger.info("Launching worker directly (no tmux): %s", self.run_script)
+        try:
+            result = subprocess.run(
+                ["bash", self.run_script],
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds or 600,
+                cwd=self.worktree,
+            )
+            logger.info("Direct worker exited with code %d", result.returncode)
+            if result.stderr:
+                logger.debug("Worker stderr: %s", result.stderr[:500])
+        except subprocess.TimeoutExpired:
+            logger.warning("Direct worker timed out after %ds", self.timeout_seconds or 600)
+            self._direct_exit_code = 1
+            return 0  # still "launched" successfully, timeout handled by caller
+        except Exception as e:
+            logger.error("Failed to run worker directly: %s", e)
+            return 1
+
+        # Read exit code from the exit file (written by the run script)
+        if os.path.exists(self.exit_file):
+            try:
+                self._direct_exit_code = int(
+                    open(self.exit_file).read().strip()
+                )
+            except (ValueError, OSError):
+                self._direct_exit_code = result.returncode
+        else:
+            self._direct_exit_code = result.returncode
+        return 0
 
     def launch_tmux(self) -> int:
         """Launch the run script in a detached tmux session.

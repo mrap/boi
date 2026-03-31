@@ -1,0 +1,38 @@
+FROM ubuntu:24.04
+
+# Avoid interactive prompts during apt-get
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install prerequisites: python3, git, tmux (bash is pre-installed)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    git \
+    tmux \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure global git identity so git operations don't fail with "who are you?"
+RUN git config --global user.email "test@boi-test.local" \
+    && git config --global user.name "BOI Test"
+
+# Copy BOI source into image (build context must be ~/.boi/src/)
+# This lets the test run against the local version without network access.
+COPY . /boi-src
+
+# Create a non-root test user (mirrors real-user install conditions)
+RUN useradd -m -s /bin/bash testuser
+
+# Configure git identity and safe.directory for the test user.
+# safe.directory is required because /boi-src was created by root during the
+# Docker build; without it, git commands against /boi-src fail with
+# "dubious ownership" errors.
+RUN su -c "git config --global user.email 'test@boi-test.local' \
+    && git config --global user.name 'BOI Test' \
+    && git config --global --add safe.directory /boi-src \
+    && git config --global --add safe.directory /boi-src/.git" testuser
+
+USER testuser
+WORKDIR /home/testuser
+
+CMD ["/bin/bash", "/boi-src/tests/docker/test-bulletproof-install.sh"]
