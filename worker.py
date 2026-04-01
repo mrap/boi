@@ -34,7 +34,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.runtime import ClaudeRuntime, Runtime, get_runtime, resolve_runtime
+from lib.runtime import ClaudeRuntime, Runtime, get_runtime, resolve_runtime, load_context_root
 from lib.spec_parser import count_boi_tasks
 from lib.workspace_guard import WorkspaceBoundaryChecker, diff_status, snapshot_git_status
 
@@ -156,6 +156,9 @@ class Worker:
         else:
             self.state_dir = state_dir
 
+        # Load context_root for --add-dir injection
+        self.context_root = load_context_root(self.state_dir)
+
         if worker_id is None:
             self.worker_id = os.environ.get("WORKER_ID", "")
         else:
@@ -229,7 +232,8 @@ class Worker:
         # return is already evaluated by the time the outer f-string runs,
         # we need the literal bash: ${_PROMPT_FILE}.
         prompt_ref = '${_PROMPT_FILE}'
-        return rt.build_exec_cmd(prompt_ref, model, effort)
+        context_dirs = [self.context_root] if self.context_root else None
+        return rt.build_exec_cmd(prompt_ref, model, effort, context_dirs=context_dirs)
 
     def run(self) -> int:
         """Execute one iteration: check tasks, generate scripts, launch.
