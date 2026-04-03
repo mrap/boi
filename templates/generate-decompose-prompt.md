@@ -60,6 +60,12 @@ PENDING
 
 10. **Verify commands must be concrete.** Not "check the output" but `python3 -c "from lib.foo import bar; result = bar(42); assert result == 'expected', f'Got {result}'"`. Not "run the tests" but `python3 -m pytest tests/test_foo.py -v`.
 
+11. **Size tasks for one iteration.** Each task must be completable by a worker agent in under 15 minutes. The worker has a 30-minute timeout per iteration and works on exactly one task per iteration. If a task involves multiple substantial steps (e.g., "build a dataset AND write a harness AND run benchmarks"), split it into separate tasks. Signs a task is too large:
+    - It has more than 3 distinct deliverables
+    - It requires reading/processing more than ~50 files
+    - The Spec section is longer than 20 lines
+    - It combines design + implementation + benchmarking in one task
+
 ## Anti-Patterns to Avoid
 
 - **Vague specs:** "Implement the main logic" is too vague. Say what files to create, what functions, what they take and return.
@@ -68,6 +74,7 @@ PENDING
 - **Over-splitting:** "Create file X" then "Add import to file X" then "Add function to file X" is too granular. Combine related work.
 - **Circular deps:** If t-3 depends on t-5 and t-5 depends on t-3, restructure.
 - **Missing constraints:** If the spec says "no pip dependencies," don't create a task that installs packages.
+- **Kitchen-sink tasks:** "Design the framework, build the dataset, write the harness, and run benchmarks" is 4 tasks crammed into one. Each deliverable should be its own task with its own verify step. If a worker gets killed mid-task, all progress is lost.
 
 ## Example: Well-Decomposed Spec
 
