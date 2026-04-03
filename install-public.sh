@@ -335,13 +335,25 @@ seed_runtime_config() {
         return 0
     fi
 
-    cat > "${config_file}" << CONF_EOF
+    local context_root="${BOI_CONTEXT_ROOT:-}"
+    if [[ -n "${context_root}" ]]; then
+        cat > "${config_file}" << CONF_EOF
+{
+  "runtime": {
+    "default": "${runtime}"
+  },
+  "context_root": "${context_root}"
+}
+CONF_EOF
+    else
+        cat > "${config_file}" << CONF_EOF
 {
   "runtime": {
     "default": "${runtime}"
   }
 }
 CONF_EOF
+    fi
     vlog_info "Created config.json with runtime=${runtime}"
 }
 
@@ -454,8 +466,11 @@ _write_workers_to_config() {
     env_type=$(uname | tr '[:upper:]' '[:lower:]')
     if [[ "${env_type}" == "darwin" ]]; then env_type="macos"; fi
 
+    # Pass context_root from env (set by hex-upgrade or user) for --add-dir injection
+    local context_root="${BOI_CONTEXT_ROOT:-}"
+
     python3 - "${config_file}" "${worktree_prefix}" "${WORKER_COUNT}" "${runtime}" \
-        "${BOI_STATE_DIR}" "${BOI_SRC_DIR}" "${timestamp}" "${env_type}" << 'PYEOF'
+        "${BOI_STATE_DIR}" "${BOI_SRC_DIR}" "${timestamp}" "${env_type}" "${context_root}" << 'PYEOF'
 import json, sys, os
 
 config_path    = sys.argv[1]
@@ -466,6 +481,7 @@ boi_state_dir  = sys.argv[5]
 boi_src_dir    = sys.argv[6]
 timestamp      = sys.argv[7]
 env_type       = sys.argv[8]
+context_root   = sys.argv[9] if len(sys.argv) > 9 else ""
 
 # Load existing config if present
 config = {}
@@ -500,6 +516,10 @@ config.setdefault("daemon", {
 })
 config.setdefault("boi_dir", boi_src_dir)
 config["runtime"] = config.get("runtime") or {"default": runtime}
+
+# Auto-configure context_root for --add-dir injection (set by hex-upgrade or BOI_CONTEXT_ROOT env)
+if context_root:
+    config.setdefault("context_root", context_root)
 
 tmp = config_path + ".tmp"
 with open(tmp, "w") as f:

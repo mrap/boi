@@ -36,6 +36,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lib.daemon_lock import DaemonLock
 from lib.db import Database
 
+# Optional coordination cleanup (graceful degradation if module is missing)
+try:
+    _coord_lib = os.path.expanduser("~/.boi/lib")
+    if _coord_lib not in sys.path:
+        sys.path.insert(0, _coord_lib)
+    from coordination import cleanup_expired as _coord_cleanup_expired  # type: ignore[import]
+except Exception:
+    _coord_cleanup_expired = None  # type: ignore[assignment]
+
 # Default daemon constants
 DEFAULT_POLL_INTERVAL = 5
 DEFAULT_WORKER_TIMEOUT = 1800  # 30 minutes
@@ -445,6 +454,11 @@ class Daemon:
                 self.write_state_snapshot()
                 self.write_heartbeat()
                 self._reload_phases_if_changed()
+                if _coord_cleanup_expired is not None:
+                    try:
+                        _coord_cleanup_expired(self.db_path)
+                    except Exception:
+                        pass  # coordination tables may not exist yet
 
                 poll_cycle += 1
                 if poll_cycle % SELF_HEAL_INTERVAL == 0:

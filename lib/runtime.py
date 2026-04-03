@@ -34,7 +34,10 @@ class Runtime(ABC):
     cli_command: str  # "claude" or "codex"
 
     @abstractmethod
-    def build_exec_cmd(self, prompt_file: str, model: str, cost_tier: str) -> str:
+    def build_exec_cmd(
+        self, prompt_file: str, model: str, cost_tier: str,
+        context_dirs: Optional[list] = None,
+    ) -> str:
         """Build the non-interactive execution command string.
 
         Args:
@@ -44,6 +47,8 @@ class Runtime(ABC):
             model: Full model ID (e.g. 'claude-sonnet-4-6') or alias
                    (opus/sonnet/haiku). The runtime resolves aliases.
             cost_tier: Effort tier hint ('high', 'medium', 'low').
+            context_dirs: Optional list of directory paths to pass as
+                          ``--add-dir`` flags (Claude runtime only).
 
         Returns:
             Shell command string suitable for embedding in a bash script.
@@ -95,7 +100,10 @@ class ClaudeRuntime(Runtime):
         "claude-haiku-4-5":         (1.0, 5.0),
     }
 
-    def build_exec_cmd(self, prompt_file: str, model: str, cost_tier: str) -> str:
+    def build_exec_cmd(
+        self, prompt_file: str, model: str, cost_tier: str,
+        context_dirs: Optional[list] = None,
+    ) -> str:
         resolved_model = self.model_id(model)
         # Determine effort from alias mapping or cost_tier fallback
         effort = cost_tier
@@ -103,10 +111,17 @@ class ClaudeRuntime(Runtime):
             if mid == resolved_model:
                 effort = eff
                 break
+
+        # Build --add-dir flags (inserted before --output-format to avoid flag ordering issues)
+        add_dir_flags = ""
+        for d in (context_dirs or []):
+            add_dir_flags += f'--add-dir {_shell_quote_path(d)} '
+
         return (
             f'env -u CLAUDECODE claude -p "$(cat {_shell_quote_path(prompt_file)})" '
             f'--model {resolved_model} --effort {effort} '
             f'--dangerously-skip-permissions '
+            f'{add_dir_flags}'
             f'--output-format stream-json --verbose'
         )
 
@@ -148,7 +163,10 @@ class CodexRuntime(Runtime):
         "o4-mini": (1.1, 4.4),
     }
 
-    def build_exec_cmd(self, prompt_file: str, model: str, cost_tier: str) -> str:
+    def build_exec_cmd(
+        self, prompt_file: str, model: str, cost_tier: str,
+        context_dirs: Optional[list] = None,
+    ) -> str:
         resolved_model = self.model_id(model)
         # --dangerously-bypass-approvals-and-sandbox is the Codex equivalent of
         # Claude's --dangerously-skip-permissions: skips all confirmation prompts
@@ -226,6 +244,35 @@ def load_runtime_from_config(state_dir: str) -> str:
         return data.get("runtime", {}).get("default", DEFAULT_RUNTIME)
     except (OSError, json.JSONDecodeError):
         return DEFAULT_RUNTIME
+
+
+def load_context_root(state_dir: str) -> Optional[str]:
+    """Read the optional context_root from {state_dir}/config.json.
+
+    When set, workers pass ``--add-dir <context_root>`` to the Claude CLI,
+    giving them read access to the agent directory (CLAUDE.md, memory, skills)
+    while running from the target repo worktree.
+
+    Returns:
+        Expanded absolute path, or None if unset/empty/nonexistent.
+    """
+    config_path = os.path.join(state_dir, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("context_root", "")
+        if not raw:
+            return None
+        expanded = os.path.expanduser(raw)
+        if not os.path.isdir(expanded):
+            import logging
+            logging.getLogger(__name__).warning(
+                "context_root '%s' does not exist on disk, ignoring", expanded
+            )
+            return None
+        return expanded
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def resolve_spec_runtime(spec_content: str) -> Optional[str]:

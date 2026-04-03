@@ -72,6 +72,24 @@ All 6 components are required. Scores can use decimals (e.g., 4.2). Margin label
 
 This is a clean Claude session. You have NO memory of previous iterations. The spec file contains all state. If previous iterations completed work, the spec tasks will be marked DONE. Read the spec to understand what has been accomplished and what remains.
 
+## Coordination: Lock Before Write
+
+Before writing to any file in `me/`, `evolution/`, `todo.md`, or `landings/`, acquire a coordination lock first. This prevents data loss when multiple agents write concurrently.
+
+```bash
+# Acquire lock (waits up to 30s with 5s retries if held by another agent)
+python3 ~/.boi/lib/coordination.py lock <file_path> <agent_id>
+
+# ... write the file ...
+
+# Release lock
+python3 ~/.boi/lib/coordination.py unlock <file_path> <agent_id>
+```
+
+Use your worker ID (e.g., `{{QUEUE_ID}}`) as the `<agent_id>`. If the lock cannot be acquired after 30 seconds, skip the write and note the conflict in your output.
+
+To check if a file is locked without acquiring: `python3 ~/.boi/lib/coordination.py check <file_path>`
+
 ## Rules
 
 - **One task per iteration.** Find the next PENDING task, complete it, mark it DONE, then exit.
