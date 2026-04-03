@@ -155,6 +155,7 @@ class Worker:
             self.state_dir = BOI_STATE_DIR
         else:
             self.state_dir = state_dir
+        self.context_root = load_context_root(self.state_dir)
 
         # Load context_root for --add-dir injection
         self.context_root = load_context_root(self.state_dir)

@@ -50,6 +50,8 @@ class Runtime(ABC):
             model: Full model ID (e.g. 'claude-sonnet-4-6') or alias
                    (opus/sonnet/haiku). The runtime resolves aliases.
             cost_tier: Effort tier hint ('high', 'medium', 'low').
+            context_dirs: Optional list of directory paths to pass as
+                          ``--add-dir`` flags (Claude runtime only).
 
         Returns:
             Shell command string suitable for embedding in a bash script.

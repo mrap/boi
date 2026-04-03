@@ -216,6 +216,10 @@ BOI is runtime-agnostic. The execution backend is configured in `~/.boi/config.j
 - **`daemon.py`** — post-commit review path also goes through the runtime abstraction.
 - **`boi.sh`** — `_get_runtime()` reads config; `boi doctor`/`boi do` check/use the configured runtime.
 
+## Multi-Agent Coordination
+
+When writing to shared files (`me/`, `evolution/`, `todo.md`, `landings/`), check the coordination lock first. Run `python3 ~/.boi/lib/coordination.py check <file_path>` before editing. If locked, wait or skip. To acquire a lock: `python3 ~/.boi/lib/coordination.py lock <file_path> <agent_id>`. Release after writing: `python3 ~/.boi/lib/coordination.py unlock <file_path> <agent_id>`.
+
 ## Coding Conventions
 
 - **Python 3.10+**, stdlib only. No pip dependencies.
