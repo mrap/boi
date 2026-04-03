@@ -1,5 +1,11 @@
 #!/bin/bash
 # boi.sh — CLI entry point for BOI (Beginning of Infinity).
+
+# Use Python 3.12+ if available (lib/ uses 3.10+ syntax)
+if command -v /opt/homebrew/bin/python3.12 &>/dev/null; then
+    alias python3=/opt/homebrew/bin/python3.12
+    python3() { /opt/homebrew/bin/python3.12 "$@"; }
+fi
 #
 # Routes subcommands to their implementations:
 #   install   — Run install.sh (create worktrees, write config)
