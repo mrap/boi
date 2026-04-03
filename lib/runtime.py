@@ -197,9 +197,75 @@ class CodexRuntime(Runtime):
         return bool(re.search(r"\bcodex\s+exec\b", process_line))
 
 
+class HermesRuntime(Runtime):
+    """Runtime backed by the Hermes Agent CLI (`hermes chat -q`).
+
+    Hermes extends Claude Code with persistent memory (fact_store,
+    session_search), 120+ auto-discovered skills, web tools (browser,
+    search, extract), and cross-session context.  Using Hermes as the
+    BOI runtime gives workers the full "hex brain" without needing
+    ``--add-dir`` — Hermes carries its own memory and discovers
+    ``.hermes.md`` project context from the working directory.
+
+    Model IDs use the ``provider/model`` format (e.g.
+    ``anthropic/claude-sonnet-4-6``).
+    """
+
+    name = "hermes"
+    cli_command = "hermes"
+
+    _MODEL_MAP = {
+        "opus":   ("anthropic/claude-opus-4-6", "high"),
+        "sonnet": ("anthropic/claude-sonnet-4-6", "medium"),
+        "haiku":  ("anthropic/claude-haiku-4-5-20251001", "low"),
+    }
+
+    # Same underlying Anthropic models — cost is identical to ClaudeRuntime.
+    _COST_TABLE = {
+        "anthropic/claude-opus-4-6":          (15.0, 75.0),
+        "anthropic/claude-sonnet-4-6":        (3.0, 15.0),
+        "anthropic/claude-haiku-4-5-20251001": (1.0, 5.0),
+    }
+
+    def build_exec_cmd(
+        self, prompt_file: str, model: str, cost_tier: str,
+        context_dirs: Optional[list] = None,
+    ) -> str:
+        resolved_model = self.model_id(model)
+        # --quiet: suppress banner/spinner/tool previews (programmatic output)
+        # --yolo: auto-approve all terminal commands (unattended worker)
+        # --max-turns 50: generous but bounded iteration limit
+        # -q "$(cat ...)": read prompt from file via shell substitution
+        return (
+            f'hermes chat -q "$(cat {_shell_quote_path(prompt_file)})" '
+            f'--model {resolved_model} '
+            f'--quiet --yolo --max-turns 50'
+        )
+
+    def model_id(self, alias: str) -> str:
+        alias_lower = alias.lower()
+        if alias_lower in self._MODEL_MAP:
+            return self._MODEL_MAP[alias_lower][0]
+        return alias  # already a full model ID or provider/model format
+
+    def cost_per_token(self, model: str) -> tuple:
+        resolved = self.model_id(model)
+        return self._COST_TABLE.get(resolved, (3.0, 15.0))
+
+    def check_installed(self) -> tuple:
+        path = shutil.which("hermes")
+        if path:
+            return (True, f"hermes found at {path}")
+        return (False, "hermes CLI not found in PATH. Install Hermes Agent.")
+
+    def detect_worker_process(self, process_line: str) -> bool:
+        return bool(re.search(r"\bhermes\s+chat\b", process_line))
+
+
 _REGISTRY = {
     "claude": ClaudeRuntime,
     "codex":  CodexRuntime,
+    "hermes": HermesRuntime,
 }
 
 
@@ -212,7 +278,7 @@ def get_runtime(name: str) -> Runtime:
     """Return a Runtime instance for the given name.
 
     Args:
-        name: Runtime name ("claude" or "codex"). Case-insensitive.
+        name: Runtime name ("claude", "codex", or "hermes"). Case-insensitive.
 
     Returns:
         Runtime instance.
