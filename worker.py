@@ -34,6 +34,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from lib.phases import PhaseConfig
 from lib.runtime import ClaudeRuntime, Runtime, get_runtime, resolve_runtime, load_context_root
 from lib.spec_parser import count_boi_tasks
 from lib.workspace_guard import WorkspaceBoundaryChecker, diff_status, snapshot_git_status
@@ -216,12 +217,10 @@ class Worker:
         if model_override:
             model = model_override
             effort = "medium"  # runtime derives correct effort from alias
-        elif self.phase_config:
-            model = self.phase_config.model
-            effort = self.phase_config.effort
         else:
-            model = "claude-sonnet-4-6"
-            effort = "medium"
+            pc = self.phase_config or PhaseConfig(name=self.phase, prompt_template="", approve_signal="")
+            model = pc.model
+            effort = pc.effort
         # NOTE: The outer f-string in generate_run_script() will resolve
         # {{_PROMPT_FILE}} → {_PROMPT_FILE}. But since _build_exec_cmd()'s
         # return is already evaluated by the time the outer f-string runs,
@@ -775,10 +774,9 @@ class Worker:
 
         if task_model_alias:
             model_for_cost = rt.model_id(task_model_alias)
-        elif self.phase_config:
-            model_for_cost = rt.model_id(self.phase_config.model)
         else:
-            model_for_cost = rt.model_id("claude-sonnet-4-6")
+            pc = self.phase_config or PhaseConfig(name=self.phase, prompt_template="", approve_signal="")
+            model_for_cost = rt.model_id(pc.model)
         price_in, price_out = rt.cost_per_token(model_for_cost)
 
         script = f"""\
