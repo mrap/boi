@@ -97,10 +97,17 @@ class ClaudeRuntime(Runtime):
     }
 
     _COST_TABLE = {
+        # Anthropic models (legacy aliases)
         "claude-opus-4-6":          (15.0, 75.0),
         "claude-sonnet-4-6":        (3.0, 15.0),
         "claude-haiku-4-5-20251001": (1.0, 5.0),
         "claude-haiku-4-5":         (1.0, 5.0),
+        # OpenRouter verified models (2026-04-04)
+        "qwen/qwen3.6-plus:free":   (0.0, 0.0),
+        "qwen/qwen3.5-397b-a17b":   (0.39, 2.34),
+        "minimax/minimax-m2.5":     (0.118, 0.99),
+        "deepseek/deepseek-v3.2":   (0.26, 0.38),
+        "moonshotai/kimi-k2.5":     (0.38, 1.72),
     }
 
     def build_exec_cmd(
@@ -224,11 +231,19 @@ class HermesRuntime(Runtime):
         "haiku":  ("anthropic/claude-haiku-4-5-20251001", "low"),
     }
 
-    # Same underlying Anthropic models — cost is identical to ClaudeRuntime.
+    # OpenRouter verified models (2026-04-04) + legacy Anthropic
     _COST_TABLE = {
+        # Anthropic models (legacy aliases)
         "anthropic/claude-opus-4-6":          (15.0, 75.0),
         "anthropic/claude-sonnet-4-6":        (3.0, 15.0),
         "anthropic/claude-haiku-4-5-20251001": (1.0, 5.0),
+        "anthropic/claude-haiku-4-5":         (1.0, 5.0),
+        # OpenRouter verified models
+        "qwen/qwen3.6-plus:free":             (0.0, 0.0),
+        "qwen/qwen3.5-397b-a17b":             (0.39, 2.34),
+        "minimax/minimax-m2.5":               (0.118, 0.99),
+        "deepseek/deepseek-v3.2":             (0.26, 0.38),
+        "moonshotai/kimi-k2.5":               (0.38, 1.72),
     }
 
     def build_exec_cmd(
@@ -247,10 +262,12 @@ class HermesRuntime(Runtime):
         )
 
     def model_id(self, alias: str) -> str:
+        if "/" in alias:
+            return alias  # Already a provider/model ID
         alias_lower = alias.lower()
         if alias_lower in self._MODEL_MAP:
             return self._MODEL_MAP[alias_lower][0]
-        return alias  # already a full model ID or provider/model format
+        return alias  # already a full model ID (no slash)
 
     def cost_per_token(self, model: str) -> tuple:
         resolved = self.model_id(model)

@@ -237,6 +237,27 @@ class Worker:
         context_dirs = [self.context_root] if self.context_root else None
         return rt.build_exec_cmd(prompt_ref, model, effort, context_dirs=context_dirs)
 
+    def _resolve_execute_model(self, task_block: str) -> str:
+        """Return model ID for execute phase based on task content.
+
+        Heuristic: if task block contains code-related keywords, use MiniMax M2.5,
+        otherwise default to DeepSeek V3.2.
+        """
+        # Keywords that indicate code tasks
+        code_keywords = [
+            "implement", "refactor", "fix", "test",
+            "function", "class", "module", "API", "endpoint", "bug",
+            "code", "script", "program", "algorithm", "patch",
+            "debug", "error", "exception", "compile", "run",
+        ]
+        task_lower = task_block.lower()
+        for kw in code_keywords:
+            if kw in task_lower:
+                return "minimax/minimax-m2.5"
+        # Default general model
+        return "deepseek/deepseek-v3.2"
+
+
     def run(self) -> int:
         """Execute one iteration: check tasks, generate scripts, launch.
 
@@ -734,6 +755,7 @@ class Worker:
         # Per-task model routing: parse **Model:** from first PENDING task
         rt = self.runtime if self.runtime is not None else ClaudeRuntime()
         task_model_alias = None
+        first_pending_task_block = None
         if self.phase == "execute":
             # Split by task headings, find first with PENDING status on line 2
             task_blocks = re.split(r'(?=^### t-\d+:)', spec_content, flags=re.MULTILINE)
@@ -741,17 +763,21 @@ class Worker:
                 block = block.strip()
                 if not block:
                     continue
-                lines = block.split('\n')
-                if len(lines) >= 2 and lines[1].strip() == 'PENDING':
+                lines = block.split("\n")
+                if len(lines) >= 2 and lines[1].strip() == "PENDING":
                     task_model_alias = parse_task_model(block)
+                    first_pending_task_block = block
                     break
+
+        # Heuristic: if no explicit Model field, decide based on task content
+        if task_model_alias is None and self.phase == "execute" and first_pending_task_block:
+            task_model_alias = self._resolve_execute_model(first_pending_task_block)
 
         if task_model_alias:
             model_for_cost = rt.model_id(task_model_alias)
         else:
             phase_alias, _ = self._model_routing.get(self.phase, ("sonnet", "medium"))
             model_for_cost = rt.model_id(phase_alias)
-
         price_in, price_out = rt.cost_per_token(model_for_cost)
 
         script = f"""\
