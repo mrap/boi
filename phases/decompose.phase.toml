@@ -3,8 +3,8 @@ description = "Decompose a high-level spec into actionable tasks"
 completion_handler = "builtin:decompose"
 
 [worker]
-runtime = "hermes"
-model = "qwen/qwen3.6-plus:free"
+runtime = "claude"
+model = "claude-opus-4-6"
 prompt_template = "templates/generate-decompose-prompt.md"
 effort = "high"
 timeout = 600

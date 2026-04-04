@@ -220,7 +220,7 @@ class Worker:
             model = self.phase_config.model
             effort = self.phase_config.effort
         else:
-            model = "deepseek/deepseek-v3.2"
+            model = "claude-sonnet-4-6"
             effort = "medium"
         # NOTE: The outer f-string in generate_run_script() will resolve
         # {{_PROMPT_FILE}} → {_PROMPT_FILE}. But since _build_exec_cmd()'s
@@ -778,7 +778,7 @@ class Worker:
         elif self.phase_config:
             model_for_cost = rt.model_id(self.phase_config.model)
         else:
-            model_for_cost = rt.model_id("deepseek/deepseek-v3.2")
+            model_for_cost = rt.model_id("claude-sonnet-4-6")
         price_in, price_out = rt.cost_per_token(model_for_cost)
 
         script = f"""\

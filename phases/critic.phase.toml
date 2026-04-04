@@ -3,8 +3,8 @@ description = "Review completed work for quality, correctness, and spec complian
 completion_handler = "builtin:critic"
 
 [worker]
-runtime = "hermes"
-model = "moonshotai/kimi-k2.5"
+runtime = "claude"
+model = "claude-sonnet-4-6"
 prompt_template = "templates/critic-worker-prompt.md"
 effort = "high"
 timeout = 300
