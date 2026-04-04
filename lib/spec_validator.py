@@ -302,11 +302,11 @@ def validate_spec(content: str) -> ValidationResult:
             title = heading_match.group(2).strip()
             current_task = _ParsedTask(task_id=task_id, title=title, line_number=i)
 
-            # Check for duplicate IDs
+            # Check for duplicate IDs - emit warning (not error, to avoid blocking dispatch)
             if task_id in seen_ids:
-                result.errors.append(
-                    f"Duplicate task ID '{task_id}' at line {i} "
-                    f"(first seen at line {seen_ids[task_id]})"
+                result.warnings.append(
+                    f"Duplicate task ID {task_id} found "
+                    f"(lines {seen_ids[task_id]} and {i})"
                 )
             seen_ids[task_id] = i
             continue

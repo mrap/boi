@@ -252,8 +252,23 @@ class Daemon:
         if spec is None:
             return
 
-        done = spec.get("tasks_done", 0)
-        total = spec.get("tasks_total", 0)
+        # Re-parse the spec file for fresh task counts. The DB values may be
+        # stale if the critic phase added new tasks after initial dispatch.
+        spec_path = os.path.join(self.state_dir, "queue", f"{spec_id}.spec.md")
+        if os.path.isfile(spec_path):
+            try:
+                from lib.spec_parser import count_boi_tasks
+                counts = count_boi_tasks(spec_path)
+                done = counts.get("done", 0)
+                total = counts.get("total", 0)
+                self.db.update_spec_fields(spec_id, tasks_done=done, tasks_total=total)
+            except Exception:
+                logger.debug("Failed to reparse spec %s for fresh counts", spec_id)
+                done = spec.get("tasks_done", 0)
+                total = spec.get("tasks_total", 0)
+        else:
+            done = spec.get("tasks_done", 0)
+            total = spec.get("tasks_total", 0)
 
         try:
             idx = pipeline.index(current_phase)
