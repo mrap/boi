@@ -197,16 +197,17 @@ class Worker:
         # Runtime: resolved from spec + config in run(). Default is None until run() sets it.
         self.runtime: Optional[Runtime] = None
 
-        # Model routing: phase → (alias, effort). Aliases are resolved by the runtime.
-        # PLAN (decompose) uses Opus at high effort for deep reasoning.
-        # WORK (execute) uses Sonnet at medium effort for speed + quality balance.
-        # QUALITY (critic, evaluate) uses Sonnet at medium effort.
+        # Model routing: phase → (model_id, effort). Full provider/model IDs for OpenRouter.
+        # PLAN (decompose) uses Qwen 3.6+ (free, 78.8% SWE-bench, 1M context) at high effort.
+        # WORK (execute) defaults to DeepSeek V3.2 (general); code tasks override to MiniMax M2.5.
+        # QUALITY (critic, review) uses Kimi K2.5 (ELO 1451, thinking traces, cache $0.19/M) at high effort.
+        # QUALITY (evaluate) uses DeepSeek V3.2 (IMO gold, output $0.38/M).
         self._model_routing = {
-            "decompose": ("opus", "high"),
-            "execute":   ("sonnet", "medium"),  # default; per-task **Model:** overrides
-            "critic":    ("sonnet", "medium"),
-            "evaluate":  ("sonnet", "medium"),
-            "review":    ("sonnet", "medium"),
+            "decompose": ("qwen/qwen3.6-plus:free", "high"),
+            "execute":   ("deepseek/deepseek-v3.2", "medium"),  # default; code tasks use minimax/minimax-m2.5
+            "critic":    ("moonshotai/kimi-k2.5", "high"),
+            "evaluate":  ("deepseek/deepseek-v3.2", "medium"),
+            "review":    ("moonshotai/kimi-k2.5", "high"),
         }
 
     def _build_exec_cmd(self, model_override: Optional[str] = None) -> str:
