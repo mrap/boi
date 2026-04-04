@@ -15,6 +15,7 @@ class PhaseConfig:
     approve_signal: str
     description: str = ""
     model: str = "claude-sonnet-4-6"
+    code_model: str = ""
     effort: str = "medium"
     timeout: int = 300
     reject_signal: str = ""
@@ -50,6 +51,7 @@ def load_phase(path: str) -> PhaseConfig:
         description=data.get("description", ""),
         prompt_template=worker.get("prompt_template", ""),
         model=worker.get("model", "claude-sonnet-4-6"),
+        code_model=worker.get("code_model", ""),
         effort=worker.get("effort", "medium"),
         timeout=worker.get("timeout", 300),
         approve_signal=completion.get("approve_signal", ""),

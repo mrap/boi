@@ -2,9 +2,10 @@ name = "review"
 description = "Code review phase: checks correctness, security, error handling, and spec compliance"
 
 [worker]
+runtime = "hermes"
+model = "moonshotai/kimi-k2.5"
 prompt_template = "templates/review-worker-prompt.md"
-model = "claude-sonnet-4-6"
-effort = "medium"
+effort = "high"
 timeout = 300
 
 [completion]

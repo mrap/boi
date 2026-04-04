@@ -197,18 +197,9 @@ class Worker:
         # Runtime: resolved from spec + config in run(). Default is None until run() sets it.
         self.runtime: Optional[Runtime] = None
 
-        # Model routing: phase → (model_id, effort). Full provider/model IDs for OpenRouter.
-        # PLAN (decompose) uses Qwen 3.6+ (free, 78.8% SWE-bench, 1M context) at high effort.
-        # WORK (execute) defaults to DeepSeek V3.2 (general); code tasks override to MiniMax M2.5.
-        # QUALITY (critic, review) uses Kimi K2.5 (ELO 1451, thinking traces, cache $0.19/M) at high effort.
-        # QUALITY (evaluate) uses DeepSeek V3.2 (IMO gold, output $0.38/M).
-        self._model_routing = {
-            "decompose": ("qwen/qwen3.6-plus:free", "high"),
-            "execute":   ("deepseek/deepseek-v3.2", "medium"),  # default; code tasks use minimax/minimax-m2.5
-            "critic":    ("moonshotai/kimi-k2.5", "high"),
-            "evaluate":  ("deepseek/deepseek-v3.2", "medium"),
-            "review":    ("moonshotai/kimi-k2.5", "high"),
-        }
+        # Phase config: loaded from phases/*.phase.toml in run().
+        # Single source of truth for model, effort, runtime per phase.
+        self.phase_config: Optional['PhaseConfig'] = None
 
     def _build_exec_cmd(self, model_override: Optional[str] = None) -> str:
         """Build the worker execution command using the runtime abstraction.
@@ -225,10 +216,12 @@ class Worker:
         if model_override:
             model = model_override
             effort = "medium"  # runtime derives correct effort from alias
+        elif self.phase_config:
+            model = self.phase_config.model
+            effort = self.phase_config.effort
         else:
-            model, effort = self._model_routing.get(
-                self.phase, ("sonnet", "medium")
-            )
+            model = "deepseek/deepseek-v3.2"
+            effort = "medium"
         # NOTE: The outer f-string in generate_run_script() will resolve
         # {{_PROMPT_FILE}} → {_PROMPT_FILE}. But since _build_exec_cmd()'s
         # return is already evaluated by the time the outer f-string runs,
@@ -237,13 +230,14 @@ class Worker:
         context_dirs = [self.context_root] if self.context_root else None
         return rt.build_exec_cmd(prompt_ref, model, effort, context_dirs=context_dirs)
 
-    def _resolve_execute_model(self, task_block: str) -> str:
-        """Return model ID for execute phase based on task content.
+    def _resolve_execute_model(self, task_block: str) -> Optional[str]:
+        """Return code_model if task content matches code keywords, else None.
 
-        Heuristic: if task block contains code-related keywords, use MiniMax M2.5,
-        otherwise default to DeepSeek V3.2.
+        Uses phase_config.code_model as the override model. If no code_model
+        is configured, returns None (caller uses phase default).
         """
-        # Keywords that indicate code tasks
+        if not self.phase_config or not self.phase_config.code_model:
+            return None
         code_keywords = [
             "implement", "refactor", "fix", "test",
             "function", "class", "module", "API", "endpoint", "bug",
@@ -253,9 +247,8 @@ class Worker:
         task_lower = task_block.lower()
         for kw in code_keywords:
             if kw in task_lower:
-                return "minimax/minimax-m2.5"
-        # Default general model
-        return "deepseek/deepseek-v3.2"
+                return self.phase_config.code_model
+        return None
 
 
     def run(self) -> int:
@@ -300,8 +293,15 @@ class Worker:
         # Read spec once; pass to all helpers that need it
         spec_content = _read_file(self.spec_path)
 
-        # Resolve runtime: spec header > global config > default (claude)
-        runtime_name = resolve_runtime(self.state_dir, spec_content)
+        # Load phase config from .phase.toml (single source of truth for model/runtime)
+        if self.phase_config is None:
+            from lib.phases import load_phase
+            phase_file = os.path.join(SCRIPT_DIR, "phases", f"{self.phase}.phase.toml")
+            if os.path.isfile(phase_file):
+                self.phase_config = load_phase(phase_file)
+
+        # Resolve runtime: phase config > spec header > global config > default (claude)
+        runtime_name = self.phase_config.runtime if self.phase_config else resolve_runtime(self.state_dir, spec_content)
         self.runtime = get_runtime(runtime_name)
 
         # Generate prompt and run script
@@ -775,9 +775,10 @@ class Worker:
 
         if task_model_alias:
             model_for_cost = rt.model_id(task_model_alias)
+        elif self.phase_config:
+            model_for_cost = rt.model_id(self.phase_config.model)
         else:
-            phase_alias, _ = self._model_routing.get(self.phase, ("sonnet", "medium"))
-            model_for_cost = rt.model_id(phase_alias)
+            model_for_cost = rt.model_id("deepseek/deepseek-v3.2")
         price_in, price_out = rt.cost_per_token(model_for_cost)
 
         script = f"""\

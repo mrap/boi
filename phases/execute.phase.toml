@@ -3,8 +3,10 @@ description = "Execute tasks from the spec using a worker agent"
 completion_handler = "builtin:execute"
 
 [worker]
+runtime = "hermes"
+model = "deepseek/deepseek-v3.2"
+code_model = "minimax/minimax-m2.5"
 prompt_template = "templates/worker-prompt.md"
-model = "claude-sonnet-4-6"
 effort = "medium"
 timeout = 600
 

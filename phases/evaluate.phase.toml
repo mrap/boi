@@ -3,8 +3,9 @@ description = "Evaluate spec completion and determine next steps"
 completion_handler = "builtin:evaluate"
 
 [worker]
+runtime = "hermes"
+model = "deepseek/deepseek-v3.2"
 prompt_template = "templates/evaluate-prompt.md"
-model = "claude-sonnet-4-6"
 effort = "medium"
 timeout = 300
 
