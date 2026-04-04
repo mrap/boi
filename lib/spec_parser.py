@@ -370,12 +370,15 @@ def parse_boi_spec(source: str) -> BoiTaskList:
         nonlocal current_id, current_title, current_status, current_superseded_by
         nonlocal current_blocked_by, current_body_lines, current_subsection
         nonlocal current_experiment_lines, current_discovery_lines
-        if current_id is not None and current_status is not None:
+        if current_id is not None:
+            # Default to PENDING when no explicit status line was found.
+            # Previously, tasks without a status were silently dropped.
+            effective_status = current_status if current_status is not None else "PENDING"
             tasks.append(
                 BoiTask(
                     id=current_id,
                     title=current_title,
-                    status=current_status,
+                    status=effective_status,
                     body="\n".join(current_body_lines).strip(),
                     superseded_by=current_superseded_by,
                     experiment="\n".join(current_experiment_lines).strip(),
@@ -420,6 +423,9 @@ def parse_boi_spec(source: str) -> BoiTaskList:
                 if first_word in _BOI_STATUSES:
                     current_status = first_word
                     continue
+                # Non-blank, non-status line found while looking for status.
+                # Capture it as body content instead of silently discarding.
+                current_body_lines.append(line)
             # Skip blank lines before status
             continue
 

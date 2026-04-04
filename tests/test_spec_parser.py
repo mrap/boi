@@ -404,8 +404,8 @@ class TestParseBoiSpec(unittest.TestCase):
         tasks = parse_boi_spec(content)
         self.assertEqual(len(tasks), 0)
 
-    def test_task_without_status_skipped(self):
-        """Tasks without a valid status line should be skipped."""
+    def test_task_without_status_defaults_to_pending(self):
+        """Tasks without a valid status line should default to PENDING."""
         content = textwrap.dedent("""\
             ### t-1: No status line
 
@@ -417,9 +417,44 @@ class TestParseBoiSpec(unittest.TestCase):
             **Spec:** This one is fine.
         """)
         tasks = parse_boi_spec(content)
-        # t-1 has no status, so only t-2 should appear
+        # t-1 has no explicit status → defaults to PENDING
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(tasks[0].id, "t-1")
+        self.assertEqual(tasks[0].status, "PENDING")
+        self.assertIn("**Spec:**", tasks[0].body)
+        self.assertEqual(tasks[1].id, "t-2")
+        self.assertEqual(tasks[1].status, "PENDING")
+
+    def test_content_before_status_preserved(self):
+        """Content between heading and status line should be kept in body."""
+        content = textwrap.dedent("""\
+            ### t-1: Task with pre-status content
+
+            **Spec:** Placed before status by mistake.
+            **Verify:** echo ok
+
+            PENDING
+        """)
+        tasks = parse_boi_spec(content)
         self.assertEqual(len(tasks), 1)
-        self.assertEqual(tasks[0].id, "t-2")
+        self.assertEqual(tasks[0].status, "PENDING")
+        self.assertIn("**Spec:**", tasks[0].body)
+        self.assertIn("**Verify:**", tasks[0].body)
+
+    def test_multiple_blank_lines_before_status(self):
+        """Multiple blank lines between heading and status should work."""
+        content = textwrap.dedent("""\
+            ### t-1: Task with many blank lines
+
+
+
+            PENDING
+
+            **Spec:** Do it.
+        """)
+        tasks = parse_boi_spec(content)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].status, "PENDING")
 
     def test_preamble_ignored(self):
         content = textwrap.dedent("""\
