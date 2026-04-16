@@ -126,3 +126,28 @@ CREATE INDEX IF NOT EXISTS idx_events_spec_id ON events(spec_id);
 CREATE INDEX IF NOT EXISTS idx_iterations_spec_id ON iterations(spec_id);
 CREATE INDEX IF NOT EXISTS idx_messages_spec ON messages(spec_id);
 CREATE INDEX IF NOT EXISTS idx_messages_unacked ON messages(acked_at) WHERE acked_at IS NULL;
+
+-- Config table: stores key-value configuration.
+CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Notifications table: tracks which spec completion notifications have been sent.
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    spec_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    notified_at TEXT NOT NULL
+);
+
+-- Unique index to prevent duplicate notifications for same spec/status.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_unique ON notifications(spec_id, status);
+
+-- Index for config lookups.
+CREATE INDEX IF NOT EXISTS idx_config_key ON config(key);
+
+-- Index for notification tracking.
+CREATE INDEX IF NOT EXISTS idx_notifications_spec ON notifications(spec_id);

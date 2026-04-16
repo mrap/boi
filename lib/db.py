@@ -2215,3 +2215,97 @@ class Database:
                 self.conn.commit()
 
         return recovered
+
+    # ── Configuration methods ────────────────────────────────────────
+
+    def get_config_value(self, key: str, default: Any = None) -> Any:
+        """Read a configuration value from the config table.
+
+        Args:
+            key: The configuration key.
+            default: Default value if key not found.
+
+        Returns:
+            The configuration value, or default if not found.
+        """
+        cursor = self.conn.execute(
+            "SELECT value FROM config WHERE key = ?", (key,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return default
+        # Try to parse as JSON for complex types, otherwise return as string
+        value = row["value"]
+        if value.lower() == "true":
+            return True
+        if value.lower() == "false":
+            return False
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+
+    def set_config_value(self, key: str, value: Any) -> None:
+        """Set a configuration value in the config table.
+
+        Args:
+            key: The configuration key.
+            value: The value to store (will be JSON-serialized if not a string).
+        """
+        with self.lock:
+            # Convert value to string for storage
+            if isinstance(value, bool):
+                str_value = "true" if value else "false"
+            elif isinstance(value, (dict, list)):
+                str_value = json.dumps(value)
+            else:
+                str_value = str(value)
+
+            self.conn.execute(
+                "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, str_value, self._now_iso()),
+            )
+            self.conn.commit()
+
+    # ── Notification tracking methods ─────────────────────────────────
+
+    def record_notification(
+        self, spec_id: str, status: str, channel: str
+    ) -> bool:
+        """Record that a notification was sent for a spec.
+
+        Args:
+            spec_id: The spec ID.
+            status: The status (completed, failed, etc.).
+            channel: The notification channel (slack, etc.).
+
+        Returns:
+            True if record was newly created, False if already exists.
+        """
+        with self.lock:
+            cursor = self.conn.execute(
+                "INSERT OR IGNORE INTO notifications "
+                "(spec_id, status, channel, notified_at) "
+                "VALUES (?, ?, ?, ?)",
+                (spec_id, status, channel, self._now_iso()),
+            )
+            self.conn.commit()
+            return cursor.rowcount > 0
+
+    def has_notification_been_sent(self, spec_id: str, status: str) -> bool:
+        """Check if a notification has already been sent for a spec.
+
+        Args:
+            spec_id: The spec ID.
+            status: The status to check.
+
+        Returns:
+            True if notification has been sent, False otherwise.
+        """
+        cursor = self.conn.execute(
+            "SELECT 1 FROM notifications WHERE spec_id = ? AND status = ?",
+            (spec_id, status),
+        )
+        return cursor.fetchone() is not None
