@@ -120,7 +120,7 @@ class TestEmitHexEventCallArgs(HexEventTestCase):
         Path(self.fake_emit).touch()
 
     def test_calls_hex_emit_with_event_type_and_json_payload(self):
-        payload = {"spec_id": "q-42", "target_repo": "~/github.com/mrap/boi"}
+        payload = {"spec_id": "q-42", "target_repo": "~/.boi"}
         with patch("os.path.expanduser", return_value=self.fake_emit):
             with patch("subprocess.run") as mock_run:
                 self.daemon.emit_hex_event("boi.spec.completed", payload)

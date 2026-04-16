@@ -36,12 +36,12 @@ class TestExtractTargetRepo(unittest.TestCase):
         self.assertEqual(result, "/tmp/test-repo")
 
     def test_target_repo_tilde_expansion(self):
-        """**Target repo:** ~/mrap-hex should return expanded path."""
+        """**Target repo:** ~/my-project should return expanded path."""
         spec_path = self._write_spec(
-            "# Test Spec\n\n**Target repo:** ~/mrap-hex\n"
+            "# Test Spec\n\n**Target repo:** ~/my-project\n"
         )
         result = Daemon._extract_target_repo(spec_path)
-        expected = str(Path("~/mrap-hex").expanduser())
+        expected = str(Path("~/my-project").expanduser())
         self.assertEqual(result, expected)
 
     def test_target_repo_backtick_wrapped(self):

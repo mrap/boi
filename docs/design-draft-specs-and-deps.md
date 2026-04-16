@@ -3193,7 +3193,7 @@ boi promote spec.md
 | Iteration | Edit files directly with any editor | No audit trail of changes, no status tracking |
 | Consistency | Filesystem is simple and reliable | Race conditions possible if daemon scans drafts dir; no transactional guarantees |
 
-**Verdict:** This approach is appealing for its simplicity but fundamentally breaks the "single pane of glass" UX goal. Mike's framing — "keep our drafts there and iterate on them" — implies drafts should live alongside queued specs, not in a separate location. The inability to assign queue IDs to drafts means dependencies cannot reference them, which eliminates half the feature. File-system drafts would work as a lightweight "spec scratchpad" but fall short of the integrated draft lifecycle we need.
+**Verdict:** This approach is appealing for its simplicity but fundamentally breaks the "single pane of glass" UX goal. The author's framing — "keep our drafts there and iterate on them" — implies drafts should live alongside queued specs, not in a separate location. The inability to assign queue IDs to drafts means dependencies cannot reference them, which eliminates half the feature. File-system drafts would work as a lightweight "spec scratchpad" but fall short of the integrated draft lifecycle we need.
 
 ---
 
@@ -3328,7 +3328,7 @@ The in-database `draft` status is the clear winner because it:
 2. **Maintains a single source of truth** — one table, one ID namespace, one set of queries.
 3. **Keeps the state machine explicit** — `draft` is a real lifecycle state, not a tag or a separate entity.
 4. **Minimizes migration risk** — adding a value to a CHECK constraint (or dropping it) is the simplest possible schema change.
-5. **Aligns with Mike's vision** — "keep our drafts there" implies drafts live alongside queued specs, not in a parallel system.
+5. **Aligns with the user's vision** — "keep our drafts there" implies drafts live alongside queued specs, not in a parallel system.
 
 ## 10. Migration & Rollout
 
