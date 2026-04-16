@@ -275,7 +275,7 @@ cmd_dispatch() {
     local project=""
     local experiment_budget=""
     local after=""
-    local source="mike"
+    local source="cli"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -522,7 +522,7 @@ mode = sys.argv[7] if len(sys.argv) > 7 and sys.argv[7] else "execute"
 project_name = sys.argv[8] if len(sys.argv) > 8 and sys.argv[8] else None
 experiment_budget_str = sys.argv[9] if len(sys.argv) > 9 and sys.argv[9] else None
 after_str = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else ""
-source_val = sys.argv[11] if len(sys.argv) > 11 and sys.argv[11] else "mike"
+source_val = sys.argv[11] if len(sys.argv) > 11 and sys.argv[11] else "cli"
 
 # Parse --after CLI flag (comma-separated queue IDs)
 blocked_by_cli = [d.strip() for d in after_str.split(",") if d.strip()] if after_str else []
@@ -722,6 +722,7 @@ cmd_status() {
     local sort_mode=""
     local filter_status=""
     local view_mode="default"   # default | all | running | recent:N
+    local blocked_mode=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -730,6 +731,7 @@ cmd_status() {
             --compact) compact_mode=true; shift ;;
             --all) view_mode="all"; shift ;;
             --running) view_mode="running"; shift ;;
+            --blocked) blocked_mode=true; shift ;;
             --recent)
                 if [[ $# -lt 2 ]]; then
                     die_usage "--recent requires a number"
@@ -749,13 +751,14 @@ cmd_status() {
                 filter_status="$2"; shift 2 ;;
             --filter=*) filter_status="${1#--filter=}"; shift ;;
             -h|--help)
-                echo "Usage: boi status [--watch] [--compact] [--all] [--running] [--recent N] [--json] [--sort MODE] [--filter STATUS]"
+                echo "Usage: boi status [--watch] [--compact] [--all] [--running] [--blocked] [--recent N] [--json] [--sort MODE] [--filter STATUS]"
                 echo ""
                 echo "Options:"
                 echo "  --watch           Auto-refresh interactive dashboard"
                 echo "  --compact         Sidebar-friendly view (≤40 chars wide, auto-refresh every 3s)"
                 echo "  --all             Show all specs (default hides old completed/canceled)"
                 echo "  --running         Show only running specs"
+                echo "  --blocked         Show only blocked specs with reasons"
                 echo "  --recent N        Show last N specs by activity"
                 echo "  --json            Output machine-readable JSON"
                 echo "  --sort MODE       Sort by: queue, status, progress, dag, name, recent"
@@ -766,6 +769,7 @@ cmd_status() {
                 echo "  boi status --compact                # Sidebar view (40 chars, 3s refresh)"
                 echo "  boi status --all                    # All specs"
                 echo "  boi status --running                # Only running specs"
+                echo "  boi status --blocked                # Only blocked specs"
                 echo "  boi status --recent 10              # Last 10 specs"
                 echo "  boi status --sort progress          # Sorted output"
                 echo "  boi status --watch --sort dag       # Interactive with initial sort"
@@ -774,6 +778,12 @@ cmd_status() {
             *) die_usage "Unknown option: $1" ;;
         esac
     done
+
+    # Handle --blocked mode: show only blocked specs with details
+    if [[ "${blocked_mode}" == "true" ]]; then
+        cmd_blocked_specs
+        return
+    fi
 
     # Validate sort mode if provided
     if [[ -n "${sort_mode}" ]]; then
@@ -1227,6 +1237,183 @@ try:
 except ValueError as e:
     print(f"Error: {e}", file=sys.stderr)
     sys.exit(1)
+PYEOF
+}
+
+# ─── Subcommand: unblock ────────────────────────────────────────────────────
+
+cmd_unblock() {
+    local queue_id=""
+    local reason=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --reason)
+                [[ -z "${2:-}" ]] && die_usage "--reason requires a value"
+                reason="$2"
+                shift 2
+                ;;
+            -h|--help)
+                echo "Usage: boi unblock <queue-id> [--reason \"...\"]"
+                echo ""
+                echo "Unblock a spec and return it to queued status."
+                echo ""
+                echo "Options:"
+                echo "  --reason TEXT   Optional reason for unblocking"
+                echo ""
+                echo "Example:"
+                echo "  boi unblock q-123"
+                echo "  boi unblock q-123 --reason \"Fixed the issue\""
+                exit 0
+                ;;
+            -*)
+                die_usage "Unknown option: $1"
+                ;;
+            *)
+                if [[ -z "${queue_id}" ]]; then
+                    queue_id="$1"
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    require_config
+
+    if [[ -z "${queue_id}" ]]; then
+        die_usage "Usage: boi unblock <queue-id> [--reason \"...\"]"
+    fi
+
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" "${reason}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import unblock_spec
+
+queue_dir = sys.argv[1]
+spec_id = sys.argv[2]
+reason = sys.argv[3] if len(sys.argv) > 3 else None
+
+try:
+    unblock_spec(queue_dir, spec_id, reason)
+    print(f"Unblocked {spec_id}. Spec will be requeued.")
+except ValueError as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+# ─── Subcommand: why-blocked ────────────────────────────────────────────────
+
+cmd_why_blocked() {
+    local queue_id=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: boi why-blocked <queue-id>"
+                echo ""
+                echo "Show detailed information about why a spec is blocked."
+                echo ""
+                echo "Displays:"
+                echo "  - Blocked reason"
+                echo "  - Blocked timestamp"
+                echo "  - Last progress iteration"
+                echo "  - Consecutive zero-progress count"
+                exit 0
+                ;;
+            -*)
+                die_usage "Unknown option: $1"
+                ;;
+            *)
+                if [[ -z "${queue_id}" ]]; then
+                    queue_id="$1"
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    require_config
+
+    if [[ -z "${queue_id}" ]]; then
+        die_usage "Usage: boi why-blocked <queue-id>"
+    fi
+
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" "${queue_id}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import get_blocked_spec_details
+
+queue_dir = sys.argv[1]
+spec_id = sys.argv[2]
+
+try:
+    details = get_blocked_spec_details(queue_dir, spec_id)
+
+    # Check if spec is actually blocked
+    if details.get("status") != "blocked":
+        print(f"Spec {spec_id} is not blocked (status: {details.get('status')})")
+        sys.exit(0)
+
+    print(f"━━━ Blocked Spec: {spec_id} ━━━")
+    print("")
+    print(f"  Blocked reason:   {details.get('blocked_reason') or '(none)'}")
+    print(f"  Blocked at:       {details.get('blocked_at') or '(unknown)'}")
+    print(f"  Current iteration: {details.get('iteration', 0)}")
+    print(f"  Last progress:    iteration {details.get('last_progress_iteration', 0)}")
+    print(f"  Zero-progress:    {details.get('zero_progress_count', 0)} consecutive iteration(s)")
+    print(f"  Tasks:            {details.get('tasks_done', 0)}/{details.get('tasks_total', 0)} done")
+    print("")
+    print(f"Run 'boi unblock {spec_id}' to resume after fixing the issue.")
+except ValueError as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+}
+
+# ─── Helper: Show blocked specs ─────────────────────────────────────────────
+
+cmd_blocked_specs() {
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${QUEUE_DIR}" <<'PYEOF'
+import sys, os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.cli_ops import get_blocked_specs
+
+queue_dir = sys.argv[1]
+
+specs = get_blocked_specs(queue_dir)
+
+if not specs:
+    print("No blocked specs.")
+    sys.exit(0)
+
+print(f"━━━ Blocked Specs ({len(specs)}) ━━━")
+print("")
+
+for spec in specs:
+    sid = spec.get("id", "unknown")
+    reason = spec.get("blocked_reason") or "(no reason)"
+    blocked_at = spec.get("blocked_at") or "(unknown)"
+    iteration = spec.get("iteration", 0)
+    tasks_done = spec.get("tasks_done", 0)
+    tasks_total = spec.get("tasks_total", 0)
+
+    # Format blocked_at to be more readable (remove microseconds if present)
+    if blocked_at and "." in blocked_at:
+        blocked_at = blocked_at.split(".")[0]
+
+    print(f"  {sid}")
+    print(f"    Reason: {reason}")
+    print(f"    Blocked at: {blocked_at}")
+    print(f"    Progress: iteration {iteration}, {tasks_done}/{tasks_total} tasks")
+    print("")
+
+print(f"Run 'boi why-blocked <queue-id>' for more details.")
+print(f"Run 'boi unblock <queue-id>' to resume a spec.")
 PYEOF
 }
 
@@ -2456,6 +2643,111 @@ print(json.dumps(result, indent=2))
     else
         echo ""
         echo -e "Results: ${GREEN}${pass_count} passed${NC}, ${RED}${fail_count} failed${NC}, ${YELLOW}${warn_count} warning(s)${NC}"
+    fi
+}
+
+# ─── Subcommand: config ──────────────────────────────────────────────────────
+
+cmd_config() {
+    local action=""
+    local key=""
+    local value=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --set)
+                [[ -z "${2:-}" ]] && die_usage "--set requires a key"
+                [[ -z "${3:-}" ]] && die_usage "--set requires a value"
+                action="set"
+                key="$2"
+                value="$3"
+                shift 3
+                ;;
+            --get)
+                [[ -z "${2:-}" ]] && die_usage "--get requires a key"
+                action="get"
+                key="$2"
+                shift 2
+                ;;
+            -h|--help)
+                echo "Usage: boi config --set <key> <value>"
+                echo "       boi config --get <key>"
+                echo ""
+                echo "Manage BOI configuration settings."
+                echo ""
+                echo "Options:"
+                echo "  --set KEY VALUE    Set a configuration value"
+                echo "  --get KEY          Get a configuration value"
+                echo ""
+                echo "Configuration keys:"
+                echo "  notify_on_complete    Enable/disable completion notifications (true/false)"
+                echo ""
+                echo "Examples:"
+                echo "  boi config --set notify_on_complete true"
+                echo "  boi config --get notify_on_complete"
+                exit 0
+                ;;
+            *)
+                die_usage "Unknown option: $1. Use 'boi config --help' for usage."
+                ;;
+        esac
+    done
+
+    if [[ -z "${action}" ]]; then
+        die_usage "Specify --set or --get. Use 'boi config --help' for usage."
+    fi
+
+    require_config
+
+    local db_file="${BOI_STATE_DIR}/boi.db"
+
+    if [[ "${action}" == "set" ]]; then
+        # Convert boolean strings to proper Python booleans
+        local py_value="${value}"
+        if [[ "${value}" == "true" ]] || [[ "${value}" == "True" ]]; then
+            py_value="True"
+        elif [[ "${value}" == "false" ]] || [[ "${value}" == "False" ]]; then
+            py_value="False"
+        fi
+
+        BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${db_file}" "${key}" "${py_value}" <<'PYEOF'
+import sys
+import os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.db import Database
+
+db_path = sys.argv[1]
+key = sys.argv[2]
+value = sys.argv[3]
+
+# Parse value as boolean if it looks like one
+if value == "True":
+    value = True
+elif value == "False":
+    value = False
+
+db = Database(db_path, os.path.dirname(db_path) + "/queue")
+db.set_config_value(key, value)
+print(f"{key} set to: {value}")
+PYEOF
+    else
+        # --get action
+        BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${db_file}" "${key}" <<'PYEOF'
+import sys
+import os
+sys.path.insert(0, os.environ["BOI_SCRIPT_DIR"])
+from lib.db import Database
+
+db_path = sys.argv[1]
+key = sys.argv[2]
+
+db = Database(db_path, os.path.dirname(db_path) + "/queue")
+value = db.get_config_value(key)
+if value is None:
+    print("null")
+else:
+    print(value)
+PYEOF
     fi
 }
 
@@ -3842,6 +4134,7 @@ usage() {
     echo "  do          Translate natural language into BOI commands"
     echo "  upgrade     Update BOI to the latest version"
     echo "  doctor      Check prerequisites and environment health"
+    echo "  config      Manage BOI configuration settings"
     echo "  dashboard   Live-updating queue progress"
     echo ""
     echo "Examples:"
@@ -4355,6 +4648,8 @@ main() {
         log)        cmd_log "$@" ;;
         cancel)     cmd_cancel "$@" ;;
         resume)     cmd_resume "$@" ;;
+        unblock)    cmd_unblock "$@" ;;
+        why-blocked) cmd_why_blocked "$@" ;;
         review)     cmd_review "$@" ;;
         daemon)     cmd_daemon "$@" ;;
         stop)       cmd_stop "$@" ;;
@@ -4363,6 +4658,7 @@ main() {
         workers)    cmd_workers "$@" ;;
         telemetry)  cmd_telemetry "$@" ;;
         doctor)     cmd_doctor "$@" ;;
+        config)     cmd_config "$@" ;;
         upgrade)    cmd_upgrade "$@" ;;
         critic)     cmd_critic "$@" ;;
         spec)       cmd_spec "$@" ;;
