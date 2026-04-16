@@ -64,7 +64,7 @@ def dispatch(
     project: Optional[str] = None,
     experiment_budget: Optional[int] = None,
     blocked_by: Optional[list[str]] = None,
-    source: str = "mike",
+    source: str = "cli",
 ) -> dict[str, Any]:
     """Enqueue a spec into the SQLite database.
 
@@ -434,5 +434,68 @@ def migrate_db(
     db = _get_db(queue_dir)
     try:
         return migrate_queue_to_db(db, queue_dir, events_dir)
+    finally:
+        db.close()
+
+
+def unblock_spec(queue_dir: str, spec_id: str, reason: Optional[str] = None) -> str:
+    """Unblock a spec and return it to queued status.
+
+    Calls db.unblock_spec() to reset status from 'blocked' to 'queued'.
+    Returns the spec_id on success.
+    Raises ValueError if spec not found.
+    """
+    db = _get_db(queue_dir)
+    try:
+        db.unblock_spec(spec_id, reason)
+        return spec_id
+    finally:
+        db.close()
+
+
+def get_blocked_specs(queue_dir: str) -> list[dict[str, Any]]:
+    """Get all specs with status 'blocked'.
+
+    Returns list of spec dicts including blocked_reason and blocked_at.
+    """
+    db = _get_db(queue_dir)
+    try:
+        all_specs = db.get_queue()
+        return [s for s in all_specs if s.get("status") == "blocked"]
+    finally:
+        db.close()
+
+
+def get_blocked_spec_details(queue_dir: str, spec_id: str) -> dict[str, Any]:
+    """Get detailed information about a blocked spec.
+
+    Returns dict with spec info including:
+    - blocked_reason
+    - blocked_at
+    - last_progress_iteration
+    - consecutive zero-progress count (iteration - last_progress_iteration)
+
+    Raises ValueError if spec not found.
+    """
+    db = _get_db(queue_dir)
+    try:
+        spec = db.get_spec(spec_id)
+        if spec is None:
+            raise ValueError(f"Spec not found: {spec_id}")
+
+        iteration = spec.get("iteration", 0)
+        last_progress = spec.get("last_progress_iteration", 0)
+
+        return {
+            "spec_id": spec_id,
+            "status": spec.get("status"),
+            "blocked_reason": spec.get("blocked_reason"),
+            "blocked_at": spec.get("blocked_at"),
+            "iteration": iteration,
+            "last_progress_iteration": last_progress,
+            "zero_progress_count": iteration - last_progress,
+            "tasks_done": spec.get("tasks_done", 0),
+            "tasks_total": spec.get("tasks_total", 0),
+        }
     finally:
         db.close()

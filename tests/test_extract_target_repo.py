@@ -30,10 +30,10 @@ class TestExtractTargetRepo(unittest.TestCase):
     def test_target_repo_format(self):
         """**Target repo:** format (141/216 specs) should return the path."""
         spec_path = self._write_spec(
-            "# Test Spec\n\n**Target repo:** /Users/mrap/mrap-hex\n"
+            "# Test Spec\n\n**Target repo:** /tmp/test-repo\n"
         )
         result = Daemon._extract_target_repo(spec_path)
-        self.assertEqual(result, "/Users/mrap/mrap-hex")
+        self.assertEqual(result, "/tmp/test-repo")
 
     def test_target_repo_tilde_expansion(self):
         """**Target repo:** ~/mrap-hex should return expanded path."""
@@ -45,20 +45,20 @@ class TestExtractTargetRepo(unittest.TestCase):
         self.assertEqual(result, expected)
 
     def test_target_repo_backtick_wrapped(self):
-        """**Target repo:** `/Users/mrap/mrap-hex` (backtick-wrapped) should strip backticks."""
+        """**Target repo:** `/tmp/test-repo` (backtick-wrapped) should strip backticks."""
         spec_path = self._write_spec(
-            "# Test Spec\n\n**Target repo:** `/Users/mrap/mrap-hex`\n"
+            "# Test Spec\n\n**Target repo:** `/tmp/test-repo`\n"
         )
         result = Daemon._extract_target_repo(spec_path)
-        self.assertEqual(result, "/Users/mrap/mrap-hex")
+        self.assertEqual(result, "/tmp/test-repo")
 
     def test_legacy_target_format_still_works(self):
-        """**Target:** /Users/mrap/mrap-hex (legacy format) should still work."""
+        """**Target:** /tmp/test-repo (legacy format) should still work."""
         spec_path = self._write_spec(
-            "# Test Spec\n\n**Target:** /Users/mrap/mrap-hex\n"
+            "# Test Spec\n\n**Target:** /tmp/test-repo\n"
         )
         result = Daemon._extract_target_repo(spec_path)
-        self.assertEqual(result, "/Users/mrap/mrap-hex")
+        self.assertEqual(result, "/tmp/test-repo")
 
     def test_no_target_returns_empty(self):
         """Spec with no Target field should return empty string."""
