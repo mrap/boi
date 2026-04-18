@@ -1026,12 +1026,12 @@ def _get_iteration_elapsed(spec: dict[str, Any], queue_dir: str) -> str:
         return ""
 
 
-def _get_current_task(spec: dict[str, Any]) -> str:
+def _get_current_task(spec: dict[str, Any], max_width: int = 60) -> str:
     """Return the first PENDING task heading from the spec file.
 
     Reads spec_path from the spec entry, parses task headings matching
     ``### t-N:`` and returns the first one whose status line is PENDING.
-    Formatted as "t-N: {task title}" truncated to ~60 chars.
+    Formatted as "t-N: {task title}" truncated to ~max_width chars.
     Returns "" if no pending task is found or the file cannot be read.
     """
     spec_path = spec.get("spec_path", "")
@@ -1056,8 +1056,8 @@ def _get_current_task(spec: dict[str, Any]) -> str:
             if stripped:
                 if stripped == "PENDING":
                     label = f"{task_id}: {title}"
-                    if len(label) > 60:
-                        label = label[:59] + "\u2026"
+                    if max_width > 0 and len(label) > max_width:
+                        label = label[: max_width - 1] + "\u2026"
                     return label
                 break  # non-empty, non-PENDING — not pending
 
@@ -1197,12 +1197,18 @@ def _format_running_row_minimal(
     spec: dict[str, Any],
     color: bool = True,
     queue_dir: str = "",
+    columns: int = 0,
 ) -> list[str]:
     """Format an active spec as 2-3 minimal lines.
 
     Line 1: ▸ q-326  hex-module-rigor              7/9   8m
     Line 2:          → t-8: Add hex-doctor to startup
     Line 3:          ████████████████████████████████░░░░░░░░
+
+    When ``columns`` is 0 or unset, falls back to a compact 30-char name width
+    (original behavior). When set, the spec name column expands to fill the
+    available terminal width and the current-task arrow uses the rest of the
+    line instead of truncating at 60 chars.
     """
     status = spec.get("status", "queued")
     symbol = _STATUS_SYMBOLS.get(status, "\u25cb")
@@ -1215,10 +1221,6 @@ def _format_running_row_minimal(
     if spec_name.endswith(".spec"):
         spec_name = spec_name[:-5]
 
-    # Truncate name at 30 chars with ellipsis
-    if len(spec_name) > 30:
-        spec_name = spec_name[:29] + "\u2026"
-
     tasks_done = spec.get("tasks_done", 0)
     tasks_total = spec.get("tasks_total", 0)
     tasks_str = f"{tasks_done}/{tasks_total}" if tasks_total > 0 else "\u2014"
@@ -1227,7 +1229,18 @@ def _format_running_row_minimal(
     if status in ("running", "requeued", "assigning"):
         elapsed = _get_iteration_elapsed(spec, queue_dir)
 
-    line1 = f"{symbol} {qid}  {spec_name:<30}  {tasks_str}"
+    # Fixed overhead on line 1:
+    #   "{symbol} " (2) + "{qid}  " (len(qid)+2) + "  {tasks_str}" (len+2)
+    #   + optional "  {elapsed}" (len+2)
+    fixed = 2 + len(qid) + 2 + 2 + len(tasks_str)
+    if elapsed:
+        fixed += 2 + len(elapsed)
+
+    name_width = max(30, columns - fixed) if columns > 0 else 30
+    if len(spec_name) > name_width:
+        spec_name = spec_name[: name_width - 1] + "\u2026"
+
+    line1 = f"{symbol} {qid}  {spec_name:<{name_width}}  {tasks_str}"
     if elapsed:
         line1 += f"  {elapsed}"
 
@@ -1241,14 +1254,16 @@ def _format_running_row_minimal(
 
     # Line 2: current task arrow (running/requeued only)
     if status in ("running", "requeued"):
-        current_task = _get_current_task(spec)
+        # Indent (9) + "→ " (2) = 11 chars of overhead before task label
+        task_max = columns - 11 if columns > 0 else 60
+        current_task = _get_current_task(spec, max_width=max(60, task_max))
         if current_task:
             task_line = f"{indent}\u2192 {current_task}"
             if color:
                 task_line = f"{DIM}{task_line}{NC}"
             lines.append(task_line)
 
-    # Line 3: progress bar
+    # Line 3: progress bar (kept at 40 — visual anchor, not a data field)
     if tasks_total > 0:
         bar = _progress_bar(tasks_done, tasks_total, width=40, color=color, status=status)
         bar_line = f"{indent}{bar}"
@@ -1260,11 +1275,15 @@ def _format_running_row_minimal(
 def _format_finished_row_minimal(
     spec: dict[str, Any],
     color: bool = True,
+    columns: int = 0,
 ) -> str:
     """Format a recently finished spec as a single minimal line.
 
     ✓ q-329  context-switching-research    5/6   8m ago
     ✗ q-318  hex-events-daemon-fix         5/5   50m ago
+
+    When ``columns`` is 0 or unset, falls back to a compact 30-char name width
+    (original behavior). When set, expands to fill the available width.
     """
     status = spec.get("status", "completed")
     symbol = _STATUS_SYMBOLS.get(status, "\u00b7")
@@ -1276,17 +1295,21 @@ def _format_finished_row_minimal(
     if spec_name.endswith(".spec"):
         spec_name = spec_name[:-5]
 
-    # Truncate name at 30 chars with ellipsis
-    if len(spec_name) > 30:
-        spec_name = spec_name[:29] + "\u2026"
-
     tasks_done = spec.get("tasks_done", 0)
     tasks_total = spec.get("tasks_total", 0)
     tasks_str = f"{tasks_done}/{tasks_total}" if tasks_total > 0 else "\u2014"
 
     time_ago = format_relative_time(spec.get("last_iteration_at"))
 
-    line = f"{symbol} {qid}  {spec_name:<30}  {tasks_str}  {time_ago}"
+    # Fixed overhead:
+    #   "{symbol} " (2) + "{qid}  " (len(qid)+2) + "  {tasks_str}" (len+2)
+    #   + "  {time_ago}" (len+2)
+    fixed = 2 + len(qid) + 2 + 2 + len(tasks_str) + 2 + len(time_ago)
+    name_width = max(30, columns - fixed) if columns > 0 else 30
+    if len(spec_name) > name_width:
+        spec_name = spec_name[: name_width - 1] + "\u2026"
+
+    line = f"{symbol} {qid}  {spec_name:<{name_width}}  {tasks_str}  {time_ago}"
 
     if color:
         if status == "failed":
@@ -1538,7 +1561,7 @@ def render_status(
                 entry_status = entry.get("status", "queued")
                 if not first_running_id and entry_status == "running":
                     first_running_id = entry.get("id", "")
-                for row_line in _format_running_row_minimal(entry, color=color, queue_dir=queue_dir):
+                for row_line in _format_running_row_minimal(entry, color=color, queue_dir=queue_dir, columns=term_w):
                     lines.append(row_line)
 
         lines.append("")
@@ -1577,7 +1600,7 @@ def render_status(
                         bar_line = f"{DIM}{bar_line}{NC}"
                     lines.append(bar_line)
             else:
-                lines.append(_format_finished_row_minimal(entry, color=color))
+                lines.append(_format_finished_row_minimal(entry, color=color, columns=term_w))
 
         if _hidden_count > 0:
             _more_line = f"  ... and {_hidden_count} more completed in last 6h"
