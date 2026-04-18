@@ -1263,9 +1263,10 @@ def _format_running_row_minimal(
                 task_line = f"{DIM}{task_line}{NC}"
             lines.append(task_line)
 
-    # Line 3: progress bar (kept at 40 — visual anchor, not a data field)
+    # Line 3: progress bar — scales with terminal width (indent=9 chars overhead)
     if tasks_total > 0:
-        bar = _progress_bar(tasks_done, tasks_total, width=40, color=color, status=status)
+        bar_width = max(40, columns - len(indent)) if columns > 0 else 40
+        bar = _progress_bar(tasks_done, tasks_total, width=bar_width, color=color, status=status)
         bar_line = f"{indent}{bar}"
         lines.append(bar_line)
 
