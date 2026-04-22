@@ -987,6 +987,18 @@ class Daemon:
             spec.get("iteration", 0),
         )
 
+        # 2a. Branch lifecycle: create or ensure spec branch before phase handler
+        _early_repo = self._extract_target_repo(spec.get("spec_path", ""))
+        if _early_repo:
+            if phase == "execute":
+                _base_branch_path = os.path.join(
+                    self.queue_dir, f"{spec_id}.base-branch"
+                )
+                if not os.path.exists(_base_branch_path):
+                    self._create_spec_branch(spec_id, _early_repo)
+            elif phase in ("task-verify", "code-review"):
+                self._ensure_on_spec_branch(spec_id, _early_repo)
+
         # 2. Delegate to phase-specific handler
         try:
             self._dispatch_phase_completion(
@@ -1017,14 +1029,34 @@ class Daemon:
                 spec_title = self._extract_spec_title(
                     spec_after.get("spec_path", "")
                 )
+
+                # Per-iteration commit: stage and commit any changed files to
+                # the spec branch after each execute iteration.
+                if phase == "execute" and target_repo and new_status in (
+                    "queued",
+                    "completed",
+                ):
+                    self._commit_iteration(spec_id, target_repo, iteration_num)
+
                 if new_status == "completed":
-                    self._commit_and_push_output(spec_id, target_repo)
+                    if target_repo:
+                        # Squash-merge the spec branch into the original branch.
+                        if not self._merge_spec_branch(spec_id, target_repo):
+                            logger.warning(
+                                "[spec-branch] Squash-merge failed for %s"
+                                " -- branch boi/%s preserved in %s",
+                                spec_id,
+                                spec_id,
+                                target_repo,
+                            )
+                    else:
+                        self._commit_and_push_output(spec_id, target_repo)
                     self._review_committed_output(
                         spec_id,
                         target_repo,
                         spec_after.get("spec_path", ""),
                     )
-                    # Re-check — review may have requeued the spec
+                    # Re-check -- review may have requeued the spec
                     spec_refreshed = self.db.get_spec(spec_id)
                     refreshed_status = spec_refreshed.get("status", "") if spec_refreshed else ""
                     if refreshed_status == "completed":
@@ -1036,8 +1068,20 @@ class Daemon:
                             "tasks_total": tasks_total,
                         })
                     else:
-                        logger.info("Spec %s was requeued by post-commit review — skipping completion event", spec_id)
+                        logger.info(
+                            "Spec %s was requeued by post-commit review"
+                            " -- skipping completion event",
+                            spec_id,
+                        )
                 elif new_status == "failed":
+                    if target_repo:
+                        logger.info(
+                            "Spec %s failed -- changes preserved on branch"
+                            " boi/%s in %s",
+                            spec_id,
+                            spec_id,
+                            target_repo,
+                        )
                     self.emit_hex_event("boi.spec.failed", {
                         "spec_id": spec_id,
                         "spec_title": spec_title,
@@ -1486,6 +1530,360 @@ class Daemon:
         except Exception:
             pass
         return ""
+
+    def _create_spec_branch(self, spec_id: str, target_repo: str) -> str:
+        """Create branch boi/{spec_id} in target_repo off HEAD.
+
+        If the branch already exists (resume case), checks it out instead.
+        Writes the current branch name to queue/{spec_id}.base-branch so we
+        know where to merge back.  Returns the branch name on success, "" on
+        any git error (caller falls back to current branch).
+        """
+        if not target_repo:
+            return ""
+
+        branch = f"boi/{spec_id}"
+        base_branch_path = os.path.join(self.queue_dir, f"{spec_id}.base-branch")
+
+        # Capture current branch before we switch -- needed for base-branch file
+        current_branch = "main"
+        try:
+            result = subprocess.run(
+                ["git", "-C", target_repo, "rev-parse", "--abbrev-ref", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            current_branch = result.stdout.strip() or "main"
+        except subprocess.CalledProcessError:
+            pass
+
+        # Attempt to create a new branch; fall back to checkout if it exists
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "checkout", "-b", branch],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError:
+            # Branch already exists -- just check it out
+            try:
+                subprocess.run(
+                    ["git", "-C", target_repo, "checkout", branch],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                logger.warning(
+                    "[spec-branch] Failed to create/checkout %s in %s: %s",
+                    branch,
+                    target_repo,
+                    exc,
+                )
+                return ""
+
+        # Write base-branch file only when we just created the branch
+        # (file absent means first time; don't overwrite on resume)
+        if not os.path.exists(base_branch_path):
+            try:
+                with open(base_branch_path, "w", encoding="utf-8") as fh:
+                    fh.write(current_branch)
+            except OSError as exc:
+                logger.warning(
+                    "[spec-branch] Could not write base-branch file for %s: %s",
+                    spec_id,
+                    exc,
+                )
+
+        return branch
+
+    def _ensure_on_spec_branch(self, spec_id: str, target_repo: str) -> bool:
+        """Verify target_repo is on branch boi/{spec_id}; check it out if not.
+
+        Returns True if on the correct branch after the call, False on failure.
+        """
+        if not target_repo:
+            return False
+
+        branch = f"boi/{spec_id}"
+
+        try:
+            result = subprocess.run(
+                ["git", "-C", target_repo, "rev-parse", "--abbrev-ref", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            current = result.stdout.strip()
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[spec-branch] Could not determine current branch in %s: %s",
+                target_repo,
+                exc,
+            )
+            return False
+
+        if current == branch:
+            return True
+
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "checkout", branch],
+                check=True,
+                capture_output=True,
+            )
+            return True
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[spec-branch] Failed to checkout %s in %s: %s",
+                branch,
+                target_repo,
+                exc,
+            )
+            return False
+
+    def _get_original_branch(self, spec_id: str, target_repo: str) -> str:
+        """Read the original branch name from queue/{spec_id}.base-branch.
+
+        Returns the branch name, or "main" as fallback when the file does not
+        exist or cannot be read.
+        """
+        base_branch_path = os.path.join(self.queue_dir, f"{spec_id}.base-branch")
+        try:
+            with open(base_branch_path, encoding="utf-8") as fh:
+                branch = fh.read().strip()
+            return branch if branch else "main"
+        except OSError:
+            return "main"
+
+    def _merge_spec_branch(self, spec_id: str, target_repo: str) -> bool:
+        """Squash-merge the spec branch into the original branch.
+
+        Steps:
+        1. Checkout the original branch.
+        2. git merge --squash boi/{spec_id}.
+        3. Commit with a clean message.
+        4. Delete the spec branch.
+        5. Clean up the base-branch file.
+        Returns True on success, False on any error (branch preserved for inspection).
+        """
+        original_branch = self._get_original_branch(spec_id, target_repo)
+        spec_branch = f"boi/{spec_id}"
+
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "checkout", original_branch],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[merge-branch] Failed to checkout %s for %s: %s",
+                original_branch,
+                spec_id,
+                exc,
+            )
+            return False
+
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "merge", "--squash", spec_branch],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[merge-branch] Squash merge failed for %s: %s -- branch %s preserved",
+                spec_id,
+                exc,
+                spec_branch,
+            )
+            try:
+                subprocess.run(
+                    ["git", "-C", target_repo, "checkout", original_branch],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError:
+                pass
+            return False
+
+        commit_msg = f"feat: BOI {spec_id} output -- auto-committed by hex-ops"
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "commit", "-m", commit_msg],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[merge-branch] Commit after squash merge failed for %s: %s",
+                spec_id,
+                exc,
+            )
+            try:
+                subprocess.run(
+                    ["git", "-C", target_repo, "checkout", original_branch],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError:
+                pass
+            return False
+
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "branch", "-D", spec_branch],
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[merge-branch] Failed to delete branch %s: %s", spec_branch, exc
+            )
+
+        base_branch_path = os.path.join(self.queue_dir, f"{spec_id}.base-branch")
+        try:
+            os.remove(base_branch_path)
+        except OSError:
+            pass
+
+        logger.info(
+            "[merge-branch] Squash-merged %s into %s in %s",
+            spec_branch,
+            original_branch,
+            target_repo,
+        )
+        return True
+
+    def _commit_iteration(
+        self, spec_id: str, target_repo: str, iteration: int
+    ) -> None:
+        """Commit changed files to the spec branch after one execute iteration.
+
+        Calls _ensure_on_spec_branch first; returns early if the branch check
+        fails or the changed-files manifest is absent/empty.  Clears the
+        manifest after a successful commit so the next iteration starts fresh.
+        Git errors are logged as warnings and never re-raised.
+        """
+        if not self._ensure_on_spec_branch(spec_id, target_repo):
+            return
+
+        manifest_path = os.path.join(self.queue_dir, f"{spec_id}.changed-files")
+        if not os.path.isfile(manifest_path):
+            return
+
+        with open(manifest_path, encoding="utf-8") as fh:
+            files = [ln.strip() for ln in fh if ln.strip()]
+
+        if not files:
+            return
+
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "add", "--"] + files,
+                check=True,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[iter-commit] git add failed for %s iter %d: %s",
+                spec_id,
+                iteration,
+                exc,
+            )
+            return
+
+        commit_msg = f"wip: BOI {spec_id} iter {iteration}"
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "commit", "-m", commit_msg],
+                check=True,
+                capture_output=True,
+            )
+            logger.info(
+                "[iter-commit] Committed %s iter %d in %s",
+                spec_id,
+                iteration,
+                target_repo,
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[iter-commit] git commit failed for %s iter %d: %s",
+                spec_id,
+                iteration,
+                exc,
+            )
+            return
+
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            fh.write("")
+
+    def _commit_iteration_output(
+        self, spec_id: str, target_repo: str, iteration: int
+    ) -> None:
+        """Commit staged changes to target_repo after a single execute-phase iteration.
+
+        Reads the changed-files manifest; if absent or empty, returns immediately.
+        Stages only the listed files, commits with a wip message, then clears the
+        manifest so the next iteration starts fresh.  Git errors are logged as
+        warnings and never re-raised -- a failed iteration commit must not block
+        the daemon.
+        """
+        manifest_path = os.path.join(self.queue_dir, f"{spec_id}.changed-files")
+
+        if not os.path.isfile(manifest_path):
+            return
+
+        with open(manifest_path, encoding="utf-8") as fh:
+            files = [ln.strip() for ln in fh if ln.strip()]
+
+        if not files:
+            return
+
+        try:
+            for filepath in files:
+                subprocess.run(
+                    ["git", "-C", target_repo, "add", "--", filepath],
+                    check=True,
+                    capture_output=True,
+                )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[iter-commit] git add failed for %s iter %d: %s",
+                spec_id,
+                iteration,
+                exc,
+            )
+            return
+
+        commit_msg = (
+            f"wip: BOI {spec_id} iter {iteration} -- auto-committed by hex-ops"
+        )
+        try:
+            subprocess.run(
+                ["git", "-C", target_repo, "commit", "-m", commit_msg],
+                check=True,
+                capture_output=True,
+            )
+            logger.info(
+                "[iter-commit] Committed %s iter %d in %s",
+                spec_id,
+                iteration,
+                target_repo,
+            )
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "[iter-commit] git commit failed for %s iter %d: %s",
+                spec_id,
+                iteration,
+                exc,
+            )
+            return
+
+        # Clear manifest so next iteration starts with a clean slate
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            fh.write("")
 
     def _commit_and_push_output(self, spec_id: str, target_repo: str) -> None:
         """Commit and push the target repo's changes after spec completion.
