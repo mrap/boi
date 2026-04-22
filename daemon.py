@@ -1773,8 +1773,16 @@ class Daemon:
         if not os.path.isfile(manifest_path):
             return
 
-        with open(manifest_path, encoding="utf-8") as fh:
-            files = [ln.strip() for ln in fh if ln.strip()]
+        try:
+            with open(manifest_path, encoding="utf-8") as fh:
+                files = [ln.strip() for ln in fh if ln.strip()]
+        except OSError as exc:
+            logger.warning(
+                "[iter-commit] Could not read manifest for %s: %s",
+                spec_id,
+                exc,
+            )
+            return
 
         if not files:
             return
@@ -1816,74 +1824,15 @@ class Daemon:
             )
             return
 
-        with open(manifest_path, "w", encoding="utf-8") as fh:
-            fh.write("")
-
-    def _commit_iteration_output(
-        self, spec_id: str, target_repo: str, iteration: int
-    ) -> None:
-        """Commit staged changes to target_repo after a single execute-phase iteration.
-
-        Reads the changed-files manifest; if absent or empty, returns immediately.
-        Stages only the listed files, commits with a wip message, then clears the
-        manifest so the next iteration starts fresh.  Git errors are logged as
-        warnings and never re-raised -- a failed iteration commit must not block
-        the daemon.
-        """
-        manifest_path = os.path.join(self.queue_dir, f"{spec_id}.changed-files")
-
-        if not os.path.isfile(manifest_path):
-            return
-
-        with open(manifest_path, encoding="utf-8") as fh:
-            files = [ln.strip() for ln in fh if ln.strip()]
-
-        if not files:
-            return
-
         try:
-            for filepath in files:
-                subprocess.run(
-                    ["git", "-C", target_repo, "add", "--", filepath],
-                    check=True,
-                    capture_output=True,
-                )
-        except subprocess.CalledProcessError as exc:
+            with open(manifest_path, "w", encoding="utf-8") as fh:
+                fh.write("")
+        except OSError as exc:
             logger.warning(
-                "[iter-commit] git add failed for %s iter %d: %s",
+                "[iter-commit] Could not clear manifest for %s: %s",
                 spec_id,
-                iteration,
                 exc,
             )
-            return
-
-        commit_msg = (
-            f"wip: BOI {spec_id} iter {iteration} -- auto-committed by hex-ops"
-        )
-        try:
-            subprocess.run(
-                ["git", "-C", target_repo, "commit", "-m", commit_msg],
-                check=True,
-                capture_output=True,
-            )
-            logger.info(
-                "[iter-commit] Committed %s iter %d in %s",
-                spec_id,
-                iteration,
-                target_repo,
-            )
-        except subprocess.CalledProcessError as exc:
-            logger.warning(
-                "[iter-commit] git commit failed for %s iter %d: %s",
-                spec_id,
-                iteration,
-                exc,
-            )
-            return
-
-        # Clear manifest so next iteration starts with a clean slate
-        with open(manifest_path, "w", encoding="utf-8") as fh:
-            fh.write("")
 
     def _commit_and_push_output(self, spec_id: str, target_repo: str) -> None:
         """Commit and push the target repo's changes after spec completion.

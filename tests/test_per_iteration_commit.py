@@ -1,4 +1,4 @@
-# test_per_iteration_commit.py -- Unit tests for Daemon._commit_iteration_output.
+# test_per_iteration_commit.py -- Unit tests for Daemon._commit_iteration.
 #
 # Covers:
 #   1. No manifest file -- no-op
@@ -88,9 +88,10 @@ class TestNoManifest(IterCommitTestCase):
         # Manifest does not exist
         assert not os.path.exists(self.manifest_path)
 
-        self.daemon._commit_iteration_output(
-            self.spec_id, self.target_repo, self.iteration
-        )
+        with patch.object(self.daemon, "_ensure_on_spec_branch", return_value=True):
+            self.daemon._commit_iteration(
+                self.spec_id, self.target_repo, self.iteration
+            )
 
         mock_run.assert_not_called()
 
@@ -103,9 +104,10 @@ class TestEmptyManifest(IterCommitTestCase):
     def test_no_git_calls_when_manifest_empty(self, mock_run):
         self._write_manifest([])
 
-        self.daemon._commit_iteration_output(
-            self.spec_id, self.target_repo, self.iteration
-        )
+        with patch.object(self.daemon, "_ensure_on_spec_branch", return_value=True):
+            self.daemon._commit_iteration(
+                self.spec_id, self.target_repo, self.iteration
+            )
 
         mock_run.assert_not_called()
 
@@ -119,9 +121,10 @@ class TestManifestWithFiles(IterCommitTestCase):
         self._write_manifest(["src/foo.py", "src/bar.py"])
         mock_run.return_value = self._make_run_ok()
 
-        self.daemon._commit_iteration_output(
-            self.spec_id, self.target_repo, self.iteration
-        )
+        with patch.object(self.daemon, "_ensure_on_spec_branch", return_value=True):
+            self.daemon._commit_iteration(
+                self.spec_id, self.target_repo, self.iteration
+            )
 
         calls = mock_run.call_args_list
         # Should have at least 2 add calls and 1 commit call
@@ -148,11 +151,12 @@ class TestGitFailure(IterCommitTestCase):
         self._write_manifest(["src/foo.py"])
         mock_run.side_effect = subprocess.CalledProcessError(1, "git")
 
-        with self.assertLogs("boi.daemon", level="WARNING") as cm:
-            # Must not raise
-            self.daemon._commit_iteration_output(
-                self.spec_id, self.target_repo, self.iteration
-            )
+        with patch.object(self.daemon, "_ensure_on_spec_branch", return_value=True):
+            with self.assertLogs("boi.daemon", level="WARNING") as cm:
+                # Must not raise
+                self.daemon._commit_iteration(
+                    self.spec_id, self.target_repo, self.iteration
+                )
 
         self.assertTrue(
             any("WARNING" in line or "warning" in line.lower() for line in cm.output),
@@ -170,10 +174,11 @@ class TestGitFailure(IterCommitTestCase):
 
         mock_run.side_effect = side_effect
 
-        with self.assertLogs("boi.daemon", level="WARNING") as cm:
-            self.daemon._commit_iteration_output(
-                self.spec_id, self.target_repo, self.iteration
-            )
+        with patch.object(self.daemon, "_ensure_on_spec_branch", return_value=True):
+            with self.assertLogs("boi.daemon", level="WARNING") as cm:
+                self.daemon._commit_iteration(
+                    self.spec_id, self.target_repo, self.iteration
+                )
 
         self.assertTrue(
             any("WARNING" in line or "warning" in line.lower() for line in cm.output),
@@ -189,9 +194,10 @@ class TestManifestClearedAfterCommit(IterCommitTestCase):
         self._write_manifest(["src/foo.py"])
         mock_run.return_value = self._make_run_ok()
 
-        self.daemon._commit_iteration_output(
-            self.spec_id, self.target_repo, self.iteration
-        )
+        with patch.object(self.daemon, "_ensure_on_spec_branch", return_value=True):
+            self.daemon._commit_iteration(
+                self.spec_id, self.target_repo, self.iteration
+            )
 
         # Manifest should be empty (cleared) after a successful commit
         self.assertTrue(os.path.exists(self.manifest_path), "Manifest file should still exist")
@@ -204,10 +210,11 @@ class TestManifestClearedAfterCommit(IterCommitTestCase):
         self._write_manifest(["src/foo.py"])
         mock_run.side_effect = subprocess.CalledProcessError(1, "git add")
 
-        with self.assertLogs("boi.daemon", level="WARNING"):
-            self.daemon._commit_iteration_output(
-                self.spec_id, self.target_repo, self.iteration
-            )
+        with patch.object(self.daemon, "_ensure_on_spec_branch", return_value=True):
+            with self.assertLogs("boi.daemon", level="WARNING"):
+                self.daemon._commit_iteration(
+                    self.spec_id, self.target_repo, self.iteration
+                )
 
         # Manifest should still have content
         with open(self.manifest_path, encoding="utf-8") as fh:
