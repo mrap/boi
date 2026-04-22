@@ -283,10 +283,75 @@ class HermesRuntime(Runtime):
         return bool(re.search(r"\bhermes\s+chat\b", process_line))
 
 
+class OllamaRuntime(Runtime):
+    """Runtime backed by a local Ollama instance.
+
+    Shells to a ReAct-style parsing loop (Action: / Observation: lines) because
+    Gemma 4 native tool calling is unproven in unattended BOI contexts.  The
+    wrapper script at lib/ollama_react_worker.py reads the prompt file, drives
+    the ollama REST API, and parses Action:/Observation: turns until the model
+    outputs a final answer or the loop bound is exceeded.
+    """
+
+    name = "ollama"
+    cli_command = "ollama"
+
+    _MODEL_MAP = {
+        "gemma-small": "gemma4:e4b",
+        "gemma":       "gemma4:26b",
+        "gemma-large": "gemma4:31b",
+    }
+
+    def build_exec_cmd(
+        self, prompt_file: str, model: str, cost_tier: str,
+        context_dirs: Optional[list] = None,
+    ) -> str:
+        resolved_model = self.model_id(model)
+        # _shell_quote_path handles both literal paths and bash variable refs.
+        # context_dirs are not passed to ollama_react_worker (no --add-dir equiv).
+        script = os.path.join(os.path.dirname(__file__), "ollama_react_worker.py")
+        return (
+            f'python3 {shlex.quote(script)} '
+            f'--model {shlex.quote(resolved_model)} '
+            f'--prompt-file {_shell_quote_path(prompt_file)}'
+        )
+
+    def model_id(self, alias: str) -> str:
+        alias_lower = alias.lower()
+        if alias_lower in self._MODEL_MAP:
+            return self._MODEL_MAP[alias_lower]
+        return alias  # already a full Ollama model tag (e.g. gemma4:26b)
+
+    def cost_per_token(self, model: str) -> tuple:
+        # Local inference — no per-token billing.
+        return (0.0, 0.0)
+
+    def check_installed(self) -> tuple:
+        path = shutil.which("ollama")
+        if not path:
+            return (False, "ollama CLI not found in PATH. Install Ollama (https://ollama.com).")
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["ollama", "ps"],
+                capture_output=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                return (True, f"ollama found at {path} and responding")
+            return (False, f"ollama found at {path} but 'ollama ps' failed (is the daemon running?)")
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            return (False, f"ollama check failed: {exc}")
+
+    def detect_worker_process(self, process_line: str) -> bool:
+        return bool(re.search(r"ollama_react_worker\.py", process_line))
+
+
 _REGISTRY = {
-    "claude": ClaudeRuntime,
-    "codex":  CodexRuntime,
-    "hermes": HermesRuntime,
+    "claude":  ClaudeRuntime,
+    "codex":   CodexRuntime,
+    "hermes":  HermesRuntime,
+    "ollama":  OllamaRuntime,
 }
 
 

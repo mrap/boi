@@ -1,4 +1,4 @@
-# test_critic_config.py — Tests for critic configuration system.
+# test_task_verify_config.py -- Tests for task-verify configuration system.
 
 import json
 import os
@@ -33,19 +33,19 @@ class TestLoadCriticConfig(unittest.TestCase):
         config = load_critic_config(self.tmpdir)
         self.assertEqual(config, DEFAULT_CONFIG)
         # Config file should now exist
-        config_path = os.path.join(self.tmpdir, "critic", "config.json")
+        config_path = os.path.join(self.tmpdir, "task-verify", "config.json")
         self.assertTrue(os.path.isfile(config_path))
 
     def test_creates_critic_directory(self):
         load_critic_config(self.tmpdir)
-        self.assertTrue(os.path.isdir(os.path.join(self.tmpdir, "critic")))
+        self.assertTrue(os.path.isdir(os.path.join(self.tmpdir, "task-verify")))
 
     def test_creates_custom_directory(self):
         load_critic_config(self.tmpdir)
-        self.assertTrue(os.path.isdir(os.path.join(self.tmpdir, "critic", "custom")))
+        self.assertTrue(os.path.isdir(os.path.join(self.tmpdir, "task-verify", "custom")))
 
     def test_loads_existing_config(self):
-        critic_dir = os.path.join(self.tmpdir, "critic")
+        critic_dir = os.path.join(self.tmpdir, "task-verify")
         os.makedirs(critic_dir, exist_ok=True)
         custom_config = {"enabled": False, "max_passes": 5}
         config_path = os.path.join(critic_dir, "config.json")
@@ -60,7 +60,7 @@ class TestLoadCriticConfig(unittest.TestCase):
         self.assertEqual(config["timeout_seconds"], 600)
 
     def test_handles_corrupt_config(self):
-        critic_dir = os.path.join(self.tmpdir, "critic")
+        critic_dir = os.path.join(self.tmpdir, "task-verify")
         os.makedirs(critic_dir, exist_ok=True)
         config_path = os.path.join(critic_dir, "config.json")
         with open(config_path, "w") as f:
@@ -127,7 +127,7 @@ class TestGetActiveChecks(unittest.TestCase):
         self.checks_dir = os.path.join(self.tmpdir, "default_checks")
         os.makedirs(self.checks_dir)
         self.state_dir = os.path.join(self.tmpdir, "state")
-        os.makedirs(os.path.join(self.state_dir, "critic", "custom"), exist_ok=True)
+        os.makedirs(os.path.join(self.state_dir, "task-verify", "custom"), exist_ok=True)
 
         # Create some default check files
         for name in ["spec-integrity", "code-quality", "completeness"]:
@@ -159,7 +159,7 @@ class TestGetActiveChecks(unittest.TestCase):
         self.assertNotIn("nonexistent-check", names)
 
     def test_loads_custom_checks(self):
-        custom_dir = os.path.join(self.state_dir, "critic", "custom")
+        custom_dir = os.path.join(self.state_dir, "task-verify", "custom")
         with open(os.path.join(custom_dir, "security-review.md"), "w") as f:
             f.write("# Security Review\nCustom security check.\n")
 
@@ -174,7 +174,7 @@ class TestGetActiveChecks(unittest.TestCase):
         self.assertEqual(len(custom_checks), 1)
 
     def test_custom_overrides_default(self):
-        custom_dir = os.path.join(self.state_dir, "critic", "custom")
+        custom_dir = os.path.join(self.state_dir, "task-verify", "custom")
         with open(os.path.join(custom_dir, "spec-integrity.md"), "w") as f:
             f.write("# Custom Spec Integrity\nOverridden check.\n")
 
@@ -191,7 +191,7 @@ class TestGetActiveChecks(unittest.TestCase):
     def test_no_custom_dir(self):
         import shutil
 
-        custom_dir = os.path.join(self.state_dir, "critic", "custom")
+        custom_dir = os.path.join(self.state_dir, "task-verify", "custom")
         shutil.rmtree(custom_dir, ignore_errors=True)
 
         config = {
@@ -218,7 +218,7 @@ class TestGetCriticPrompt(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         self.state_dir = os.path.join(self.tmpdir, "state")
         self.boi_dir = os.path.join(self.tmpdir, "boi")
-        os.makedirs(os.path.join(self.state_dir, "critic"), exist_ok=True)
+        os.makedirs(os.path.join(self.state_dir, "task-verify"), exist_ok=True)
         os.makedirs(os.path.join(self.boi_dir, "templates"), exist_ok=True)
 
     def tearDown(self):
@@ -227,21 +227,21 @@ class TestGetCriticPrompt(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_loads_default_prompt(self):
-        default_path = os.path.join(self.boi_dir, "templates", "critic-prompt.md")
+        default_path = os.path.join(self.boi_dir, "templates", "task-verify-prompt.md")
         with open(default_path, "w") as f:
-            f.write("# Default Critic Prompt\n{{SPEC_CONTENT}}\n")
+            f.write("# Default Task Verify Prompt\n{{SPEC_CONTENT}}\n")
 
         prompt = get_critic_prompt(self.state_dir, self.boi_dir)
-        self.assertIn("Default Critic Prompt", prompt)
+        self.assertIn("Default Task Verify Prompt", prompt)
         self.assertIn("{{SPEC_CONTENT}}", prompt)
 
     def test_user_override_takes_precedence(self):
         # Create both default and user override
-        default_path = os.path.join(self.boi_dir, "templates", "critic-prompt.md")
+        default_path = os.path.join(self.boi_dir, "templates", "task-verify-prompt.md")
         with open(default_path, "w") as f:
             f.write("# Default Prompt\n")
 
-        user_path = os.path.join(self.state_dir, "critic", "prompt.md")
+        user_path = os.path.join(self.state_dir, "task-verify", "prompt.md")
         with open(user_path, "w") as f:
             f.write("# Custom User Prompt\n")
 
@@ -267,19 +267,19 @@ class TestEnsureCriticDirs(unittest.TestCase):
 
     def test_creates_all_directories(self):
         ensure_critic_dirs(self.tmpdir)
-        self.assertTrue(os.path.isdir(os.path.join(self.tmpdir, "critic")))
-        self.assertTrue(os.path.isdir(os.path.join(self.tmpdir, "critic", "custom")))
+        self.assertTrue(os.path.isdir(os.path.join(self.tmpdir, "task-verify")))
+        self.assertTrue(os.path.isdir(os.path.join(self.tmpdir, "task-verify", "custom")))
 
     def test_creates_default_config(self):
         ensure_critic_dirs(self.tmpdir)
-        config_path = os.path.join(self.tmpdir, "critic", "config.json")
+        config_path = os.path.join(self.tmpdir, "task-verify", "config.json")
         self.assertTrue(os.path.isfile(config_path))
         with open(config_path, "r") as f:
             config = json.load(f)
         self.assertTrue(config["enabled"])
 
     def test_does_not_overwrite_existing_config(self):
-        critic_dir = os.path.join(self.tmpdir, "critic")
+        critic_dir = os.path.join(self.tmpdir, "task-verify")
         os.makedirs(critic_dir, exist_ok=True)
         config_path = os.path.join(critic_dir, "config.json")
         with open(config_path, "w") as f:
@@ -295,21 +295,21 @@ class TestRunCritic(unittest.TestCase):
     """Tests for run_critic()."""
 
     def test_generates_prompt_file(self):
-        """run_critic generates a critic prompt file in the queue dir."""
+        """run_critic generates a task-verify prompt file in the queue dir."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Set up dirs
             state_dir = os.path.join(tmpdir, "state")
             queue_dir = os.path.join(state_dir, "queue")
             boi_dir = os.path.join(tmpdir, "boi")
             checks_dir = os.path.join(boi_dir, "templates", "checks")
-            critic_dir = os.path.join(state_dir, "critic")
+            critic_dir = os.path.join(state_dir, "task-verify")
 
             os.makedirs(queue_dir)
             os.makedirs(checks_dir)
             os.makedirs(os.path.join(critic_dir, "custom"))
 
-            # Write critic prompt template
-            Path(os.path.join(boi_dir, "templates", "critic-prompt.md")).write_text(
+            # Write task-verify prompt template
+            Path(os.path.join(boi_dir, "templates", "task-verify-prompt.md")).write_text(
                 "{{SPEC_CONTENT}}\n{{CHECKS}}\n{{QUEUE_ID}}\n{{ITERATION}}\n"
             )
 
@@ -344,13 +344,13 @@ class TestRunCritic(unittest.TestCase):
             queue_dir = os.path.join(state_dir, "queue")
             boi_dir = os.path.join(tmpdir, "boi")
             checks_dir = os.path.join(boi_dir, "templates", "checks")
-            critic_dir = os.path.join(state_dir, "critic")
+            critic_dir = os.path.join(state_dir, "task-verify")
 
             os.makedirs(queue_dir)
             os.makedirs(checks_dir)
             os.makedirs(os.path.join(critic_dir, "custom"))
 
-            Path(os.path.join(boi_dir, "templates", "critic-prompt.md")).write_text(
+            Path(os.path.join(boi_dir, "templates", "task-verify-prompt.md")).write_text(
                 "{{SPEC_CONTENT}}\n{{CHECKS}}\n{{QUEUE_ID}}\n{{ITERATION}}\n"
             )
             Path(os.path.join(critic_dir, "config.json")).write_text(

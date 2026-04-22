@@ -407,17 +407,23 @@ def parse_critic_result(spec_path: str) -> dict[str, Any]:
             "quality_signals": None,
         }
 
-    # Check for Critic Approved section
-    approved = bool(re.search(r"^## Critic Approved", content, re.MULTILINE))
-
-    # Count [CRITIC] PENDING tasks
-    critic_pending = len(
-        re.findall(
-            r"^### t-\d+:.*\[CRITIC\].*\n\s*PENDING",
+    # Check for approve signal (accept both old and new names)
+    approved = bool(
+        re.search(
+            r"^## (Critic Approved|Task Verification Approved)",
             content,
             re.MULTILINE,
         )
     )
+
+    # Count review-tagged PENDING tasks (accept both [CRITIC] and [TASK-VERIFY])
+    new_task_matches = re.findall(
+        r"^### t-\d+:.*\[(?:CRITIC|TASK-VERIFY)\].*\n\s*PENDING",
+        content,
+        re.MULTILINE,
+    )
+    critic_pending = len(new_task_matches)
+    new_tasks = new_task_matches  # expose raw matches for callers that need the list
 
     # Extract quality score from JSON block
     quality_score = None
@@ -438,6 +444,7 @@ def parse_critic_result(spec_path: str) -> dict[str, Any]:
     return {
         "approved": approved,
         "critic_tasks_added": critic_pending,
+        "new_tasks": new_tasks,
         "quality_score": quality_score,
         "quality_gate": quality_gate,
         "quality_signals": quality_signals,
@@ -481,29 +488,52 @@ def _extract_quality_json(content: str) -> Optional[dict[str, Any]]:
 
 
 def generate_auto_reject_task(
-    quality_score: float,
-    next_task_id: int,
-) -> str:
-    """Generate a [CRITIC] PENDING task for auto-reject due to low quality score.
+    quality_score_or_path,
+    next_task_id_or_reason,
+):
+    """Generate a task-verify rejection task.
 
-    Args:
-        quality_score: The quality score that triggered auto-reject.
-        next_task_id: The next available task ID number.
+    Two calling conventions are supported:
 
-    Returns:
-        The task definition string to append to the spec.
+    New API (preferred):
+        generate_auto_reject_task(spec_path: str, reason: str) -> None
+        Appends a [TASK-VERIFY] PENDING task directly to the spec file.
+
+    Legacy API (backward compat):
+        generate_auto_reject_task(quality_score: float, next_task_id: int) -> str
+        Returns the task string using [CRITIC] tag (existing callers).
     """
-    return (
-        f"\n### t-{next_task_id}: [CRITIC] Quality score below threshold\n"
-        "PENDING\n\n"
-        f"**Spec:** Quality score is below threshold ({quality_score:.2f}). "
-        "Review and improve error handling, test coverage, and verify commands. "
-        "Focus on: (1) adding try/except blocks around I/O operations, "
-        "(2) writing tests for new functions, (3) replacing trivial verify "
-        "commands with substantive checks that validate actual behavior.\n\n"
-        "**Verify:** Run the quality scoring prompt again and confirm the "
-        "overall quality score is >= 0.50.\n"
-    )
+    if isinstance(quality_score_or_path, str):
+        # New API: spec_path, reason
+        spec_path = quality_score_or_path
+        reason = next_task_id_or_reason
+        content = Path(spec_path).read_text(encoding="utf-8")
+        next_id = get_next_task_id(content)
+        task_text = (
+            f"\n### t-{next_id}: [TASK-VERIFY] Quality review required\n"
+            "PENDING\n\n"
+            f"**Spec:** {reason} Review and improve error handling, test coverage, "
+            "and verify commands.\n\n"
+            "**Verify:** Re-run task verification and confirm it passes.\n"
+        )
+        with open(spec_path, "a", encoding="utf-8") as fh:
+            fh.write(task_text)
+        return None
+    else:
+        # Legacy API: quality_score (float), next_task_id (int) -> str
+        quality_score = float(quality_score_or_path)
+        next_task_id = int(next_task_id_or_reason)
+        return (
+            f"\n### t-{next_task_id}: [CRITIC] Quality score below threshold\n"
+            "PENDING\n\n"
+            f"**Spec:** Quality score is below threshold ({quality_score:.2f}). "
+            "Review and improve error handling, test coverage, and verify commands. "
+            "Focus on: (1) adding try/except blocks around I/O operations, "
+            "(2) writing tests for new functions, (3) replacing trivial verify "
+            "commands with substantive checks that validate actual behavior.\n\n"
+            "**Verify:** Run the quality scoring prompt again and confirm the "
+            "overall quality score is >= 0.50.\n"
+        )
 
 
 def get_next_task_id(spec_content: str) -> int:

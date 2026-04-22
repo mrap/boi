@@ -1,0 +1,20 @@
+name = "plan-critique"
+description = "Evaluate spec quality before execution: catch non-executable verifies, unbounded scope, missing dependencies, and implicit assumptions"
+
+[worker]
+runtime = "claude"
+model = "claude-sonnet-4-6"
+prompt_template = "templates/plan-critique-prompt.md"
+effort = "medium"
+timeout = 300
+
+[completion]
+approve_signal = "## Plan Approved"
+reject_signal = "[PLAN-CRITIQUE]"
+on_approve = "next"
+on_reject = "fail"
+on_crash = "retry"
+
+[hooks]
+pre = []
+post = []

@@ -83,7 +83,7 @@ REVIEW_TEMPLATE_PATH = os.path.join(
 )
 
 VALID_MODES = {"execute", "challenge", "discover", "generate"}
-VALID_PHASES = {"execute", "critic", "evaluate", "decompose", "review"}
+VALID_PHASES = {"execute", "task-verify", "evaluate", "decompose", "review", "plan-critique", "code-review"}
 TMUX_POLL_INTERVAL = 5  # seconds between tmux has-session polls
 TMUX_SOCKET = "boi"     # tmux socket name (-L flag)
 NO_TMUX = os.environ.get("BOI_NO_TMUX", "") == "1"  # headless mode for Docker/CI
@@ -397,7 +397,7 @@ class Worker:
 
     def _generate_prompt(self, spec_content: str) -> None:
         """Generate the prompt file based on the current phase."""
-        if self.phase == "critic":
+        if self.phase == "task-verify":
             self._generate_critic_prompt()
         elif self.phase == "decompose":
             self._generate_decompose_prompt(spec_content)

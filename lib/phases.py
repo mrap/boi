@@ -26,6 +26,7 @@ class PhaseConfig:
     post_hooks: list[str] = field(default_factory=list)
     completion_handler: str = ""
     runtime: str = "claude"  # Runtime name: "claude" or "codex"
+    trigger_min_lines_changed: int = 0  # 0 means always trigger; >0 means only when lines changed exceeds this
 
 
 def load_phase(path: str) -> PhaseConfig:
@@ -63,6 +64,7 @@ def load_phase(path: str) -> PhaseConfig:
         post_hooks=hooks.get("post", []),
         completion_handler=data.get("completion_handler", ""),
         runtime=worker.get("runtime", "claude"),
+        trigger_min_lines_changed=data.get("trigger", {}).get("min_lines_changed", 0),
     )
 
 
@@ -120,3 +122,14 @@ def validate_phase(config: PhaseConfig) -> list[str]:
         )
 
     return errors
+
+
+def should_trigger(config: PhaseConfig, lines_changed: int) -> bool:
+    """Return True if the phase should run given the number of lines changed.
+
+    When trigger_min_lines_changed <= 0, the phase always runs.
+    Otherwise it only runs when lines_changed strictly exceeds the threshold.
+    """
+    if config.trigger_min_lines_changed <= 0:
+        return True
+    return lines_changed > config.trigger_min_lines_changed

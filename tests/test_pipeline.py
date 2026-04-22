@@ -1,10 +1,12 @@
-"""Tests for three-phase pipeline advancement (execute → review → critic).
+"""Tests for pipeline advancement (execute → review → critic, and new 4-phase).
 
 Covers:
   1. _advance_pipeline with ["execute", "review", "critic"] advances correctly.
   2. Review rejection ([REVIEW] signal) requeues back to execute phase.
   3. Review approval (## Review Approved) advances to critic.
-  4. Backward compat: missing guardrails.toml defaults to ["execute", "critic"].
+  4. Backward compat: missing guardrails.toml defaults to 4-phase pipeline.
+  5. New default 4-phase pipeline order: plan-critique -> execute -> task-verify -> code-review.
+  6. All 4 pipeline phases are discoverable from the phases directory.
 """
 
 from __future__ import annotations
@@ -146,7 +148,7 @@ class TestReviewPhaseCompletion(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 4. Backward compat: missing guardrails.toml → default ["execute", "critic"]
+# 4. Backward compat: missing guardrails.toml → default 4-phase pipeline
 # ---------------------------------------------------------------------------
 
 class TestAdvancePipelineDefaultFallback(unittest.TestCase):
@@ -162,18 +164,18 @@ class TestAdvancePipelineDefaultFallback(unittest.TestCase):
     def _make(self):
         return _make_daemon(self.state_dir)
 
-    def test_no_guardrails_execute_advances_to_critic(self):
-        """Without guardrails.toml, execute phase advances directly to critic."""
+    def test_no_guardrails_execute_advances_to_task_verify(self):
+        """Without guardrails.toml, execute phase advances to task-verify."""
         d = self._make()
         d._advance_pipeline("q-1", "execute")
         d.db.requeue.assert_called_once_with("q-1", 2, 5)
-        d.db.update_spec_fields.assert_called_once_with("q-1", phase="critic")
+        d.db.update_spec_fields.assert_called_once_with("q-1", phase="task-verify")
         d.db.complete.assert_not_called()
 
-    def test_no_guardrails_critic_completes(self):
-        """Without guardrails.toml, critic is the final phase → spec completes."""
+    def test_no_guardrails_code_review_completes(self):
+        """Without guardrails.toml, code-review is the final phase → spec completes."""
         d = self._make()
-        d._advance_pipeline("q-1", "critic")
+        d._advance_pipeline("q-1", "code-review")
         d.db.complete.assert_called_once_with("q-1", 2, 5)
         d.db.requeue.assert_not_called()
 
@@ -181,8 +183,105 @@ class TestAdvancePipelineDefaultFallback(unittest.TestCase):
         """Without guardrails.toml, 'review' is not in the default pipeline → completes."""
         d = self._make()
         d._advance_pipeline("q-1", "review")
-        # review not in default pipeline — treated as unknown → complete
+        # review not in default pipeline -- treated as unknown -> complete
         d.db.complete.assert_called_once_with("q-1", 2, 5)
+
+
+# ---------------------------------------------------------------------------
+# 5. New default 4-phase pipeline order
+# ---------------------------------------------------------------------------
+
+class TestNewDefaultPipelineOrder(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self._tmp.name
+        guardrails = os.path.join(self.state_dir, "guardrails.toml")
+        with open(guardrails, "w") as f:
+            f.write(
+                '[pipeline]\n'
+                'default = ["plan-critique", "execute", "task-verify", "code-review"]\n'
+            )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _make(self):
+        return _make_daemon(self.state_dir)
+
+    def test_plan_critique_advances_to_execute(self):
+        d = self._make()
+        d._advance_pipeline("q-1", "plan-critique")
+        d.db.requeue.assert_called_once_with("q-1", 2, 5)
+        d.db.update_spec_fields.assert_called_once_with("q-1", phase="execute")
+        d.db.complete.assert_not_called()
+
+    def test_execute_advances_to_task_verify(self):
+        d = self._make()
+        d._advance_pipeline("q-1", "execute")
+        d.db.requeue.assert_called_once_with("q-1", 2, 5)
+        d.db.update_spec_fields.assert_called_once_with("q-1", phase="task-verify")
+        d.db.complete.assert_not_called()
+
+    def test_task_verify_advances_to_code_review(self):
+        d = self._make()
+        d._advance_pipeline("q-1", "task-verify")
+        d.db.requeue.assert_called_once_with("q-1", 2, 5)
+        d.db.update_spec_fields.assert_called_once_with("q-1", phase="code-review")
+        d.db.complete.assert_not_called()
+
+    def test_code_review_completes_spec(self):
+        d = self._make()
+        d._advance_pipeline("q-1", "code-review")
+        d.db.complete.assert_called_once_with("q-1", 2, 5)
+        d.db.requeue.assert_not_called()
+
+    def test_pipeline_order(self):
+        """Verify the guardrails.toml new default pipeline order."""
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from lib.guardrails import load_guardrails
+        guardrails_path = os.path.join(self.state_dir, "guardrails.toml")
+        config = load_guardrails(guardrails_path)
+        self.assertEqual(
+            config.pipeline,
+            ["plan-critique", "execute", "task-verify", "code-review"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. All 4 pipeline phases discoverable from phases directory
+# ---------------------------------------------------------------------------
+
+class TestPhasesDiscoverable(unittest.TestCase):
+
+    def test_all_four_phases_have_toml_files(self):
+        """All 4 new pipeline phases must have a .phase.toml in phases/."""
+        phases_dir = Path(__file__).resolve().parent.parent / "phases"
+        required_phases = ["plan-critique", "execute", "task-verify", "code-review"]
+        for phase in required_phases:
+            toml_path = phases_dir / f"{phase}.phase.toml"
+            self.assertTrue(
+                toml_path.exists(),
+                f"Missing phase file: {toml_path}",
+            )
+
+    def test_phase_toml_files_are_loadable(self):
+        """Each phase TOML must be parseable and contain a name field."""
+        import tomllib
+        phases_dir = Path(__file__).resolve().parent.parent / "phases"
+        required_phases = ["plan-critique", "execute", "task-verify", "code-review"]
+        for phase in required_phases:
+            toml_path = phases_dir / f"{phase}.phase.toml"
+            with open(toml_path, "rb") as f:
+                data = tomllib.load(f)
+            self.assertIn(
+                "name", data,
+                f"{phase}.phase.toml missing 'name' key",
+            )
+            self.assertEqual(
+                data["name"], phase,
+                f"{phase}.phase.toml name mismatch: {data['name']!r}",
+            )
 
 
 if __name__ == "__main__":

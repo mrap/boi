@@ -1,0 +1,23 @@
+name = "code-review"
+description = "4-persona code review: quality, testing, security, and architecture -- only runs when >50 lines changed"
+
+[worker]
+runtime = "claude"
+model = "claude-sonnet-4-6"
+prompt_template = "templates/code-review-prompt.md"
+effort = "high"
+timeout = 600
+
+[completion]
+approve_signal = "## Code Review Approved"
+reject_signal = "[CODE-REVIEW]"
+on_approve = "next"
+on_reject = "requeue:execute"
+on_crash = "retry"
+
+[trigger]
+min_lines_changed = 50
+
+[hooks]
+pre = []
+post = []

@@ -237,8 +237,9 @@ class Daemon:
         """Advance a spec to the next phase in the configured pipeline.
 
         Reads the pipeline from ~/.boi/guardrails.toml (defaults to
-        ["execute", "critic"] if not found). If current_phase is the last
-        phase, completes the spec. Otherwise, requeues it for the next phase.
+        ["plan-critique", "execute", "task-verify", "code-review"] if not
+        found). If current_phase is the last phase, completes the spec.
+        Otherwise, requeues it for the next phase.
         """
         try:
             from lib.guardrails import load_guardrails
@@ -246,7 +247,7 @@ class Daemon:
             config = load_guardrails(guardrails_path)
             pipeline = config.pipeline
         except Exception:
-            pipeline = ["execute", "critic"]
+            pipeline = ["plan-critique", "execute", "task-verify", "code-review"]
 
         spec = self.db.get_spec(spec_id)
         if spec is None:
@@ -1118,7 +1119,7 @@ class Daemon:
                         exit_code=str(exit_code),
                     )
                     return
-                elif builtin_name == "critic":
+                elif builtin_name == "task-verify":
                     daemon_ops.process_critic_completion(
                         queue_dir=self.queue_dir,
                         queue_id=spec_id,
@@ -1182,7 +1183,7 @@ class Daemon:
                 queue_id=spec_id,
                 exit_code=str(exit_code),
             )
-        elif phase == "critic":
+        elif phase == "task-verify":
             daemon_ops.process_critic_completion(
                 queue_dir=self.queue_dir,
                 queue_id=spec_id,

@@ -1,17 +1,17 @@
-name = "critic"
+name = "task-verify"
 description = "Review completed work for quality, correctness, and spec compliance"
-completion_handler = "builtin:critic"
+completion_handler = "builtin:task-verify"
 
 [worker]
 runtime = "claude"
 model = "claude-sonnet-4-6"
-prompt_template = "templates/critic-worker-prompt.md"
+prompt_template = "templates/task-verify-worker-prompt.md"
 effort = "high"
 timeout = 300
 
 [completion]
-approve_signal = "## Critic Approved"
-reject_signal = "[CRITIC]"
+approve_signal = "## Task Verification Approved"
+reject_signal = "[TASK-VERIFY]"
 on_approve = "next"
 on_reject = "requeue:execute"
 on_crash = "retry"

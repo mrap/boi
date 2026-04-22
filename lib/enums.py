@@ -17,7 +17,7 @@ class Phase(str, Enum):
     EXECUTE = "execute"
     DECOMPOSE = "decompose"
     EVALUATE = "evaluate"
-    CRITIC = "critic"
+    CRITIC = "task-verify"
     REVIEW = "review"
 
 

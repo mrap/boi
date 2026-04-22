@@ -18,7 +18,7 @@ class SpecOverride:
 @dataclass
 class GuardrailConfig:
     strictness: str = "advisory"
-    pipeline: list[str] = field(default_factory=lambda: ["execute", "critic"])
+    pipeline: list[str] = field(default_factory=lambda: ["execute", "task-verify"])
     hooks: dict[str, list[str]] = field(default_factory=dict)
     gate_configs: dict[str, dict] = field(default_factory=dict)
 
@@ -37,7 +37,7 @@ def _config_from_data(data: dict) -> GuardrailConfig:
     hooks_section = data.get("hooks", {})
     gates_section = data.get("gates", {})
 
-    pipeline = pipeline_section.get("default", ["execute", "critic"])
+    pipeline = pipeline_section.get("default", ["execute", "task-verify"])
     strictness = global_section.get("strictness", "advisory")
 
     hooks: dict[str, list[str]] = {}

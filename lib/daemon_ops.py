@@ -1009,7 +1009,7 @@ def _apply_critic_or_complete(
 
             # Requeue so daemon can pick it up for critic worker
             ctx.db.requeue(queue_id, done_count, total_count)
-            ctx.db.update_spec_fields(queue_id, phase="critic")
+            ctx.db.update_spec_fields(queue_id, phase="task-verify")
 
             return {
                 "outcome": "critic_review",

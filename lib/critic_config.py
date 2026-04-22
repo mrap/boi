@@ -58,7 +58,7 @@ def load_critic_config(state_dir: str) -> dict[str, Any]:
     Returns:
         The critic configuration dict.
     """
-    critic_dir = os.path.join(state_dir, "critic")
+    critic_dir = os.path.join(state_dir, "task-verify")
     config_path = os.path.join(critic_dir, "config.json")
     custom_dir = os.path.join(critic_dir, DEFAULT_CONFIG["custom_checks_dir"])
 
@@ -98,7 +98,7 @@ def save_critic_config(state_dir: str, config: dict[str, Any]) -> None:
         state_dir: Path to ~/.boi/ state directory.
         config: The configuration dict to save.
     """
-    config_path = os.path.join(state_dir, "critic", "config.json")
+    config_path = os.path.join(state_dir, "task-verify", "config.json")
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
     _write_config(config_path, config)
 
@@ -135,7 +135,7 @@ def get_active_checks(
     """
     enabled_checks = config.get("checks", DEFAULT_CHECKS)
     custom_dir_name = config.get("custom_checks_dir", "custom")
-    custom_dir = os.path.join(state_dir, "critic", custom_dir_name)
+    custom_dir = os.path.join(state_dir, "task-verify", custom_dir_name)
 
     # Collect custom check names for override detection
     custom_check_names: set[str] = set()
@@ -207,7 +207,7 @@ def get_generate_checks(
     """
     generate_check_names = config.get("generate_checks", ["goal-alignment"])
     custom_dir_name = config.get("custom_checks_dir", "custom")
-    custom_dir = os.path.join(state_dir, "critic", custom_dir_name)
+    custom_dir = os.path.join(state_dir, "task-verify", custom_dir_name)
 
     # Collect custom check names for override detection
     custom_check_names: set[str] = set()
@@ -260,13 +260,13 @@ def get_critic_prompt(state_dir: str, boi_dir: str) -> str:
         FileNotFoundError: If no prompt template is found.
     """
     # Check for user override
-    user_prompt = os.path.join(state_dir, "critic", "prompt.md")
+    user_prompt = os.path.join(state_dir, "task-verify", "prompt.md")
     if os.path.isfile(user_prompt):
         with open(user_prompt, "r") as f:
             return f.read()
 
     # Fall back to default
-    default_prompt = os.path.join(boi_dir, "templates", "critic-prompt.md")
+    default_prompt = os.path.join(boi_dir, "templates", "task-verify-prompt.md")
     if os.path.isfile(default_prompt):
         with open(default_prompt, "r") as f:
             return f.read()
@@ -287,7 +287,7 @@ def ensure_critic_dirs(state_dir: str) -> None:
     Args:
         state_dir: Path to ~/.boi/ state directory.
     """
-    critic_dir = os.path.join(state_dir, "critic")
+    critic_dir = os.path.join(state_dir, "task-verify")
     custom_dir = os.path.join(critic_dir, "custom")
 
     os.makedirs(critic_dir, exist_ok=True)
