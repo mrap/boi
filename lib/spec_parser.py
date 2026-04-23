@@ -9,6 +9,9 @@
 # Also supports BOI spec.md format with ### t-N: headings and
 # PENDING/DONE/SKIPPED/FAILED/EXPERIMENT_PROPOSED/SUPERSEDED status lines
 # for self-evolving specs.
+#
+# Also supports YAML spec format (.yaml/.yml) as an alternative to markdown.
+# See ~/.boi/src/docs/yaml-spec-schema.md for the schema.
 
 import json
 import re
@@ -353,6 +356,9 @@ def parse_boi_spec(source: str) -> BoiTaskList:
     if "\n" not in source:
         candidate = Path(source)
         if candidate.is_file():
+            # Route YAML files to the YAML parser.
+            if candidate.suffix.lower() in {".yaml", ".yml"}:
+                return parse_yaml_spec(source)
             source = candidate.read_text(encoding="utf-8")
 
     tasks: BoiTaskList = BoiTaskList()
@@ -469,6 +475,109 @@ def parse_boi_spec(source: str) -> BoiTaskList:
     return tasks
 
 
+# ─── YAML Spec Parsing ────────────────────────────────────────────────────────
+
+_YAML_VALID_STATUSES = {"PENDING", "DONE", "FAILED", "SKIPPED"}
+_YAML_VALID_MODES = {"execute", "generate", "challenge", "discover"}
+
+
+def parse_yaml_spec(source: str) -> BoiTaskList:
+    """Parse a YAML spec file into a BoiTaskList.
+
+    Accepts either raw YAML content or a file path (auto-detected when the
+    string has no newlines and names an existing file).
+
+    The YAML format is defined in ~/.boi/src/docs/yaml-spec-schema.md.
+    """
+    import yaml  # PyYAML is available in the BOI environment
+
+    if "\n" not in source:
+        candidate = Path(source)
+        if candidate.is_file():
+            source = candidate.read_text(encoding="utf-8")
+
+    try:
+        data = yaml.safe_load(source)
+    except yaml.YAMLError as e:
+        raise ValueError(f"YAML parse error: {e}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError("YAML spec must be a mapping (dict) at the top level")
+
+    raw_tasks = data.get("tasks", []) or []
+    tasks: BoiTaskList = BoiTaskList()
+
+    for entry in raw_tasks:
+        if not isinstance(entry, dict):
+            raise ValueError(f"Each task must be a mapping; got: {entry!r}")
+
+        task_id = str(entry.get("id", "")).strip()
+        title = str(entry.get("title", "")).strip()
+        status = str(entry.get("status", "PENDING")).strip().upper()
+        spec_text = str(entry.get("spec", "")).strip()
+        verify_text = str(entry.get("verify", "")).strip()
+        depends = entry.get("depends") or []
+
+        # Normalise depends to a flat list of strings
+        if isinstance(depends, str):
+            depends = [d.strip() for d in depends.split(",") if d.strip()]
+        else:
+            depends = [str(d).strip() for d in depends if str(d).strip()]
+
+        # Reconstruct a markdown-style body so workers and status tools work
+        body_parts: list[str] = []
+        if spec_text:
+            body_parts.append(f"**Spec:**\n{spec_text}")
+        if verify_text:
+            body_parts.append(f"**Verify:** `{verify_text}`")
+        body = "\n\n".join(body_parts)
+
+        tasks.append(
+            BoiTask(
+                id=task_id,
+                title=title,
+                status=status,
+                body=body,
+                blocked_by=depends,
+            )
+        )
+
+    return tasks
+
+
+def is_yaml_spec_path(filepath: str) -> bool:
+    """Return True if the filepath has a YAML extension (.yaml or .yml)."""
+    return Path(filepath).suffix.lower() in {".yaml", ".yml"}
+
+
+def content_is_yaml(content: str) -> bool:
+    """Return True if content looks like a YAML spec (not markdown).
+
+    YAML specs start with a top-level mapping key like 'title:' or 'tasks:'.
+    Markdown specs start with a '#' heading. This sniff handles queue copies
+    that always receive a .spec.md extension regardless of the original format.
+    """
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            break
+        if stripped.startswith("title:") or stripped.startswith("tasks:"):
+            return True
+        break
+    return False
+
+
+# Keep private alias for backward compat with internal callers
+_content_is_yaml = content_is_yaml
+
+
+def parse_spec(content: str) -> "BoiTaskList":
+    """Parse spec content routing to YAML or markdown parser by content type."""
+    if content_is_yaml(content):
+        return parse_yaml_spec(content)
+    return parse_boi_spec(content)
+
+
 def count_boi_tasks(filepath: str) -> dict[str, int]:
     """Count task statuses in a BOI spec.md file.
 
@@ -494,7 +603,12 @@ def count_boi_tasks(filepath: str) -> dict[str, int]:
         }
 
     content = path.read_text(encoding="utf-8")
-    tasks = parse_boi_spec(content)
+    # Route YAML files to the YAML parser; markdown files use parse_boi_spec.
+    # Content-sniffing handles queue copies that always use .spec.md extension.
+    if path.suffix.lower() in {".yaml", ".yml"} or _content_is_yaml(content):
+        tasks = parse_yaml_spec(content)
+    else:
+        tasks = parse_boi_spec(content)
 
     counts = {
         "pending": 0,

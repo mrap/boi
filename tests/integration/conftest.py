@@ -89,6 +89,7 @@ class MockClaude:
         self.critic_approve = critic_approve
         self.criteria_to_meet = criteria_to_meet or []
         self.fail_silently = fail_silently
+        self.task_id: Optional[str] = None
 
     def generate_script(self, spec_path: str, output_dir: str) -> str:
         """Generate a standalone Python script that simulates Claude.
@@ -104,7 +105,8 @@ class MockClaude:
         Returns:
             Path to the generated mock script.
         """
-        script_path = os.path.join(output_dir, "mock_claude.py")
+        suffix = f"_{self.task_id}" if self.task_id else ""
+        script_path = os.path.join(output_dir, f"mock_claude{suffix}.py")
         script = self._build_script(spec_path)
         Path(script_path).write_text(script, encoding="utf-8")
         os.chmod(script_path, 0o755)
@@ -125,6 +127,8 @@ class MockClaude:
             f"CRITIC_APPROVE = {self.critic_approve}",
             f"CRITERIA_TO_MEET = {self.criteria_to_meet!r}",
             f"FAIL_SILENTLY = {self.fail_silently}",
+            # task_id: if set, mark only this specific task DONE
+            f"TASK_ID = {self.task_id!r}",
             "",
         ]
 
@@ -140,7 +144,25 @@ class MockClaude:
                 os.rename(tmp, SPEC_PATH)
 
             def mark_tasks_done(content, count):
-                \"\"\"Mark the first `count` PENDING tasks as DONE.\"\"\"
+                \"\"\"Mark the first `count` PENDING tasks as DONE.
+                If TASK_ID is set, mark only that specific task DONE.\"\"\"
+                if TASK_ID:
+                    # Mark only the specific assigned task DONE
+                    lines = content.split('\\n')
+                    result = []
+                    in_target = False
+                    for line in lines:
+                        if re.match(r'^###\\s+' + re.escape(TASK_ID) + r':', line):
+                            in_target = True
+                        elif re.match(r'^###\\s+t-\\d+:', line):
+                            in_target = False
+                        if in_target and line.strip() == 'PENDING':
+                            result.append(line.replace('PENDING', 'DONE'))
+                            in_target = False  # only mark first PENDING in section
+                        else:
+                            result.append(line)
+                    return '\\n'.join(result)
+                # Fallback: mark first `count` PENDING tasks
                 marked = 0
                 lines = content.split('\\n')
                 result = []
@@ -254,7 +276,8 @@ class MockClaude:
         """
         mock_script = self.generate_script(spec_path, output_dir)
 
-        run_script_path = os.path.join(output_dir, "mock_run.sh")
+        suffix = f"_{self.task_id}" if self.task_id else ""
+        run_script_path = os.path.join(output_dir, f"mock_run{suffix}.sh")
         run_script = textwrap.dedent(f"""\
             #!/bin/bash
             set -uo pipefail
@@ -374,6 +397,7 @@ class DaemonTestHarness:
         phase: str,
         worker_id: str,
         timeout: Optional[int] = None,
+        task_id: Optional[str] = None,
     ) -> subprocess.Popen:
         """Launch a mock worker process instead of real Claude.
 
@@ -388,6 +412,7 @@ class DaemonTestHarness:
             mock = MockClaude(
                 phase=phase, tasks_to_complete=1, exit_code=0
             )
+        mock.task_id = task_id
 
         # Generate mock script in queue dir
         script_dir = os.path.join(self.queue_dir, f"{spec_id}-mock")

@@ -1273,8 +1273,16 @@ def main() -> int:
         default=None,
         help="State directory (default: ~/.boi)",
     )
+    parser.add_argument(
+        "--task-id",
+        default=None,
+        help="Specific task ID for parallel task dispatch (sets BOI_TASK_ID env)",
+    )
 
     args = parser.parse_args()
+
+    if args.task_id:
+        os.environ["BOI_TASK_ID"] = args.task_id
 
     logging.basicConfig(
         level=logging.INFO,

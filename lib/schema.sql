@@ -40,6 +40,26 @@ CREATE TABLE IF NOT EXISTS specs (
     CHECK (phase IN ('execute','critic','evaluate','decompose'))
 );
 
+-- Task-level parallel execution: one row per task within a spec.
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    spec_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    title TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK (status IN ('PENDING','ASSIGNED','RUNNING','DONE','FAILED','SKIPPED')),
+    worker_id TEXT,
+    depends_on TEXT NOT NULL DEFAULT '[]',
+    worktree_path TEXT,
+    branch_name TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    output TEXT,
+    FOREIGN KEY (spec_id) REFERENCES specs(id) ON DELETE CASCADE,
+    UNIQUE (spec_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_spec_status ON tasks(spec_id, status);
+
 -- Spec dependency DAG: blocks_on must complete before spec_id can run.
 CREATE TABLE IF NOT EXISTS spec_dependencies (
     spec_id TEXT NOT NULL,

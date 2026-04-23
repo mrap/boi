@@ -235,9 +235,9 @@ class Database:
             initial_task_ids: list[str] = []
             content = Path(spec_copy_path).read_text(encoding="utf-8")
             try:
-                from lib.spec_parser import parse_boi_spec
+                from lib.spec_parser import parse_spec
 
-                initial_tasks = parse_boi_spec(content)
+                initial_tasks = parse_spec(content)
                 initial_task_ids = [t.id for t in initial_tasks]
             except Exception:
                 pass
@@ -645,10 +645,10 @@ class Database:
             spec_path = row["spec_path"]
             if spec_path and os.path.isfile(spec_path):
                 try:
-                    from lib.spec_parser import parse_boi_spec
+                    from lib.spec_parser import parse_spec
 
                     content = Path(spec_path).read_text(encoding="utf-8")
-                    tasks = parse_boi_spec(content)
+                    tasks = parse_spec(content)
                     pre_tasks = {t.id: t.status for t in tasks}
                 except Exception:
                     pass
@@ -2307,5 +2307,134 @@ class Database:
         cursor = self.conn.execute(
             "SELECT 1 FROM notifications WHERE spec_id = ? AND status = ?",
             (spec_id, status),
+        )
+        return cursor.fetchone() is not None
+
+    # ── Parallel task dispatch ────────────────────────────────────────────────
+
+    def populate_tasks_from_spec(
+        self,
+        spec_id: str,
+        tasks: list,
+    ) -> None:
+        """Insert task rows from parsed BoiTask objects into the tasks table.
+
+        Uses INSERT OR IGNORE so re-populating an already-populated spec
+        is safe (won't overwrite in-progress task state).
+        """
+        with self.lock:
+            for task in tasks:
+                depends_on = json.dumps(list(task.blocked_by))
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO tasks "
+                    "(spec_id, task_id, title, status, depends_on) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        spec_id,
+                        task.id,
+                        task.title,
+                        task.status if task.status in (
+                            "PENDING", "DONE", "FAILED", "SKIPPED"
+                        ) else "PENDING",
+                        depends_on,
+                    ),
+                )
+            self.conn.commit()
+
+    def get_tasks_for_spec(self, spec_id: str) -> list[dict[str, Any]]:
+        """Return all task rows for a spec from the tasks table."""
+        cursor = self.conn.execute(
+            "SELECT * FROM tasks WHERE spec_id = ? ORDER BY id",
+            (spec_id,),
+        )
+        return [self._row_to_dict(row) for row in cursor]
+
+    def get_eligible_task_ids(self, spec_id: str) -> list[str]:
+        """Return PENDING task IDs whose dependencies are all DONE/SKIPPED.
+
+        Excludes tasks that are already ASSIGNED/RUNNING (in-progress).
+        """
+        _RESOLVED = {"DONE", "SKIPPED"}
+        _BLOCKED = {"ASSIGNED", "RUNNING"}
+
+        tasks = self.get_tasks_for_spec(spec_id)
+        if not tasks:
+            return []
+
+        status_by_id: dict[str, str] = {t["task_id"]: t["status"] for t in tasks}
+
+        eligible: list[str] = []
+        for task in tasks:
+            if task["status"] != "PENDING":
+                continue
+            deps = json.loads(task.get("depends_on") or "[]")
+            if all(status_by_id.get(dep) in _RESOLVED for dep in deps):
+                eligible.append(task["task_id"])
+
+        return eligible
+
+    def assign_task_to_worker(
+        self, spec_id: str, task_id: str, worker_id: str
+    ) -> None:
+        """Mark a task as ASSIGNED with the given worker."""
+        with self.lock:
+            now = self._now_iso()
+            self.conn.execute(
+                "UPDATE tasks SET status = 'ASSIGNED', worker_id = ?, started_at = ? "
+                "WHERE spec_id = ? AND task_id = ? AND status = 'PENDING'",
+                (worker_id, now, spec_id, task_id),
+            )
+            self.conn.commit()
+
+    def update_task_worktree(
+        self,
+        spec_id: str,
+        task_id: str,
+        worktree_path: str,
+        branch_name: str,
+    ) -> None:
+        """Store the task-specific worktree path and branch name."""
+        with self.lock:
+            self.conn.execute(
+                "UPDATE tasks SET worktree_path = ?, branch_name = ? "
+                "WHERE spec_id = ? AND task_id = ?",
+                (worktree_path, branch_name, spec_id, task_id),
+            )
+            self.conn.commit()
+
+    def complete_task(
+        self,
+        spec_id: str,
+        task_id: str,
+        status: str,
+        output: str = "",
+    ) -> None:
+        """Mark a task DONE or FAILED with optional output text."""
+        with self.lock:
+            now = self._now_iso()
+            self.conn.execute(
+                "UPDATE tasks SET status = ?, completed_at = ?, output = ? "
+                "WHERE spec_id = ? AND task_id = ?",
+                (status, now, output, spec_id, task_id),
+            )
+            self.conn.commit()
+
+    def all_tasks_terminal(self, spec_id: str) -> bool:
+        """Return True if every task for the spec is in a terminal state.
+
+        Terminal states: DONE, FAILED, SKIPPED.
+        Returns True vacuously if there are no tasks.
+        """
+        _TERMINAL = ("DONE", "FAILED", "SKIPPED")
+        tasks = self.get_tasks_for_spec(spec_id)
+        if not tasks:
+            return True
+        return all(t["status"] in _TERMINAL for t in tasks)
+
+    def any_task_failed(self, spec_id: str) -> bool:
+        """Return True if any task for the spec has status FAILED."""
+        cursor = self.conn.execute(
+            "SELECT 1 FROM tasks WHERE spec_id = ? AND status = 'FAILED' LIMIT 1",
+            (spec_id,),
         )
         return cursor.fetchone() is not None

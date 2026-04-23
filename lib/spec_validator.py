@@ -30,7 +30,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from lib.spec_parser import parse_boi_spec
+from lib.spec_parser import content_is_yaml, parse_boi_spec, parse_yaml_spec
 
 # Regex to match BOI task headings: ### t-N: Title
 _BOI_TASK_HEADING_RE = re.compile(r"^###\s+(t-\d+):\s+(.+)$")
@@ -428,7 +428,31 @@ def validate_spec_file(filepath: str) -> ValidationResult:
         result.errors.append(f"Cannot read file {filepath}: {e}")
         return result
 
+    if path.suffix.lower() in {".yaml", ".yml"} or content_is_yaml(content):
+        return _validate_yaml_spec(content)
     return validate_spec(content)
+
+
+def _validate_yaml_spec(content: str) -> "ValidationResult":
+    """Validate a YAML spec by attempting to parse it."""
+    result = ValidationResult()
+    try:
+        tasks = parse_yaml_spec(content)
+        if not tasks:
+            result.errors.append("YAML spec contains no tasks.")
+        result.total = len(tasks)
+        for t in tasks:
+            if t.status == "PENDING":
+                result.pending += 1
+            elif t.status == "DONE":
+                result.done += 1
+            elif t.status == "SKIPPED":
+                result.skipped += 1
+    except ValueError as e:
+        result.errors.append(str(e))
+    if result.errors:
+        result.valid = False
+    return result
 
 
 # Regex patterns for Generate spec validation
@@ -571,9 +595,11 @@ def validate_generate_spec_file(filepath: str) -> ValidationResult:
 def auto_validate(content: str) -> ValidationResult:
     """Auto-detect spec type and validate accordingly.
 
-    If the spec title starts with # [Generate], uses Generate validation.
-    Otherwise, uses standard task-based validation.
+    Routes YAML specs to YAML validation, Generate specs to Generate
+    validation, and all others to standard task-based validation.
     """
+    if content_is_yaml(content):
+        return _validate_yaml_spec(content)
     if is_generate_spec(content):
         return validate_generate_spec(content)
     return validate_spec(content)
@@ -594,4 +620,7 @@ def auto_validate_file(filepath: str) -> ValidationResult:
         result.errors.append(f"Cannot read file {filepath}: {e}")
         return result
 
+    # Check extension first, then fall back to content-sniffing
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        return _validate_yaml_spec(content)
     return auto_validate(content)

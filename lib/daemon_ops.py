@@ -49,6 +49,7 @@ from lib.spec_parser import (
     check_status_regression,
     count_boi_tasks,
     parse_boi_spec,
+    parse_spec,
 )
 from lib.spec_validator import validate_spec_file
 from lib.telemetry import update_telemetry
@@ -864,7 +865,7 @@ def _check_regression_and_record(
         return None
     try:
         content = Path(spec_path).read_text(encoding="utf-8")
-        current_tasks = parse_boi_spec(content)
+        current_tasks = parse_spec(content)
         previous_tasks = [
             BoiTask(id=tid, title="", status=status)
             for tid, status in pre_iteration_tasks.items()
@@ -897,7 +898,7 @@ def _get_experiment_proposed_tasks(spec_path: str) -> list[str]:
         return []
     try:
         content = Path(spec_path).read_text(encoding="utf-8")
-        current_tasks = parse_boi_spec(content)
+        current_tasks = parse_spec(content)
         return [t.id for t in current_tasks if t.status == "EXPERIMENT_PROPOSED"]
     except Exception:
         return []
@@ -1142,7 +1143,7 @@ def find_parallel_assignments(
     from lib.dag import downstream_count, find_assignable_tasks
 
     spec_content = Path(spec_path).read_text(encoding="utf-8")
-    tasks = parse_boi_spec(spec_content)
+    tasks = parse_spec(spec_content)
     if not tasks:
         return []
 

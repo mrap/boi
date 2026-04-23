@@ -255,7 +255,8 @@ class Daemon:
 
         # Re-parse the spec file for fresh task counts. The DB values may be
         # stale if the critic phase added new tasks after initial dispatch.
-        spec_path = os.path.join(self.state_dir, "queue", f"{spec_id}.spec.md")
+        # Use the stored spec_path from DB to support both .md and .yaml formats.
+        spec_path = spec.get("spec_path") or os.path.join(self.state_dir, "queue", f"{spec_id}.spec.md")
         if os.path.isfile(spec_path):
             try:
                 from lib.spec_parser import count_boi_tasks
@@ -654,11 +655,16 @@ class Daemon:
     # ── Dispatch (Task 7) ───────────────────────────────────────────
 
     def dispatch_specs(self) -> None:
-        """Assign queued specs to free workers.
+        """Assign queued specs and parallel tasks to free workers.
 
-        Loops until either no free worker or no eligible spec remains.
-        Each iteration: get a free worker, pick the next spec, assign it.
+        Each tick:
+          1. Pick new specs from the queue; parallel specs are populated
+             into the tasks table and no worker is consumed.
+          2. Dispatch parallel tasks for all running specs (including
+             those just populated in step 1).
+        Loops until no free worker remains.
         """
+        # Phase 1: dispatch new specs from the queue
         while not self._shutdown_requested:
             worker = self.db.get_free_worker()
             if worker is None:
@@ -676,6 +682,146 @@ class Daemon:
                     spec["id"],
                     worker["id"],
                 )
+
+        # Phase 2: dispatch parallel tasks for all running specs
+        # (including any parallel specs just transitioned to running above)
+        self._dispatch_parallel_tasks()
+
+    def _dispatch_parallel_tasks(self) -> None:
+        """Assign free workers to parallel-eligible tasks in running specs.
+
+        For each running spec that has tasks populated in the DB,
+        find tasks that are PENDING with all deps satisfied, and assign
+        a free worker to each (up to available workers).
+        """
+        from lib.daemon_ops import find_parallel_assignments
+
+        running_specs = self.db.get_queue()
+        running_specs = [s for s in running_specs if s.get("status") == "running"]
+
+        for spec in running_specs:
+            spec_id = spec["id"]
+            spec_path = spec.get("spec_path", "")
+            if not spec_path or not os.path.isfile(spec_path):
+                continue
+
+            # Only apply task-level dispatch to specs that have tasks in DB
+            db_tasks = self.db.get_tasks_for_spec(spec_id)
+            if not db_tasks:
+                continue
+
+            eligible = self.db.get_eligible_task_ids(spec_id)
+            if not eligible:
+                continue
+
+            for task_id in eligible:
+                worker = self.db.get_free_worker()
+                if worker is None:
+                    return  # No free workers remain
+
+                try:
+                    self._assign_task_to_worker(spec, worker, task_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to assign task %s of %s to %s",
+                        task_id,
+                        spec_id,
+                        worker["id"],
+                    )
+
+    def _assign_task_to_worker(
+        self,
+        spec: dict[str, Any],
+        worker: dict[str, Any],
+        task_id: str,
+    ) -> None:
+        """Assign a single task to a worker for parallel execution.
+
+        The spec is already running — do NOT call set_running here as
+        that would incorrectly increment the iteration counter.
+        """
+        spec_id = spec["id"]
+        worker_id = worker["id"]
+        phase = spec.get("phase", "execute")
+
+        # Spec is already running; just read the current iteration.
+        spec = self.db.get_spec(spec_id)
+        assert spec is not None
+        iteration = spec["iteration"]
+
+        self.db.assign_worker(worker_id, spec_id, pid=0, phase=phase, task_id=task_id)
+        self.db.assign_task_to_worker(spec_id, task_id, worker_id)
+
+        # Create a fresh per-task worktree so parallel tasks are isolated.
+        task_worktree_path = worker["worktree_path"]  # fallback
+        try:
+            from lib.task_worktree import (
+                create_task_worktree,
+                get_main_repo_from_worker,
+            )
+            main_repo = get_main_repo_from_worker(worker["worktree_path"])
+            if main_repo:
+                wt_info = create_task_worktree(main_repo, worker_id, spec_id, task_id)
+                task_worktree_path = wt_info["worktree_path"]
+                self.db.update_task_worktree(
+                    spec_id, task_id,
+                    wt_info["worktree_path"],
+                    wt_info["branch_name"],
+                )
+                logger.info(
+                    "Fresh worktree for task %s/%s: %s (branch=%s)",
+                    spec_id, task_id, task_worktree_path, wt_info["branch_name"],
+                )
+            else:
+                logger.warning(
+                    "Could not resolve main repo for worker %s; "
+                    "using shared worktree for task %s/%s",
+                    worker_id, spec_id, task_id,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to create task worktree for %s/%s; "
+                "falling back to shared worktree",
+                spec_id, task_id,
+            )
+
+        timeout = spec.get("worker_timeout_seconds")
+        if timeout is None:
+            phase_config = self.phase_configs.get(phase)
+            if phase_config is not None and phase_config.timeout > 0:
+                timeout = phase_config.timeout
+
+        try:
+            proc = self.launch_worker(
+                spec_id=spec_id,
+                worktree=task_worktree_path,
+                spec_path=spec["spec_path"],
+                iteration=iteration,
+                phase=phase,
+                worker_id=worker_id,
+                timeout=timeout,
+                task_id=task_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to launch worker for task %s of %s on %s",
+                task_id, spec_id, worker_id,
+            )
+            self.db.free_worker(worker_id)
+            self.db.complete_task(spec_id, task_id, "FAILED", "Worker launch failed")
+            return
+
+        self.db.assign_worker(worker_id, spec_id, pid=proc.pid, phase=phase, task_id=task_id)
+        self.db.register_process(
+            pid=proc.pid, spec_id=spec_id, worker_id=worker_id,
+            iteration=iteration, phase=phase,
+        )
+        self.worker_procs[worker_id] = proc
+
+        logger.info(
+            "Assigned task %s of %s to %s (pid=%d, iteration=%d)",
+            task_id, spec_id, worker_id, proc.pid, iteration,
+        )
 
     def assign_spec_to_worker(
         self,
@@ -703,6 +849,30 @@ class Daemon:
         spec = self.db.get_spec(spec_id)
         assert spec is not None
         iteration = spec["iteration"]
+
+        # For parallel specs (any task has blocked_by deps): populate tasks table
+        # and let _dispatch_parallel_tasks handle per-task assignment.
+        # The passed-in worker is returned to the pool unused.
+        if phase == "execute":
+            spec_path = spec.get("spec_path", "")
+            try:
+                from pathlib import Path as _Path
+                from lib.spec_parser import parse_boi_spec as _parse_boi_spec
+                content = _Path(spec_path).read_text(encoding="utf-8")
+                parsed_tasks = _parse_boi_spec(content)
+                if parsed_tasks:
+                    self.db.populate_tasks_from_spec(spec_id, parsed_tasks)
+                    logger.info(
+                        "Parallel spec %s: populated %d tasks, "
+                        "worker %s returned to pool",
+                        spec_id, len(parsed_tasks), worker_id,
+                    )
+                    return
+            except Exception:
+                logger.exception(
+                    "Failed to check parallel tasks for %s; using sequential flow",
+                    spec_id,
+                )
 
         # 2. Assign worker in DB before launching (no PID yet,
         #    will update after launch)
@@ -771,6 +941,7 @@ class Daemon:
         phase: str,
         worker_id: str,
         timeout: Optional[int] = None,
+        task_id: Optional[str] = None,
     ) -> subprocess.Popen:
         """Spawn a worker.py subprocess in a new session.
 
@@ -782,6 +953,7 @@ class Daemon:
             phase: Phase to execute (execute|critic|evaluate|decompose).
             worker_id: ID of the worker slot.
             timeout: Optional per-spec timeout in seconds.
+            task_id: Optional specific task ID for parallel execution.
 
         Returns:
             The Popen object for the spawned worker process.
@@ -805,6 +977,8 @@ class Daemon:
         # Set up environment
         env = os.environ.copy()
         env["WORKER_ID"] = worker_id
+        if task_id is not None:
+            env["BOI_TASK_ID"] = task_id
 
         # Log file for this iteration
         log_file = os.path.join(
@@ -962,6 +1136,7 @@ class Daemon:
         spec_id = worker.get("current_spec_id")
         pid = worker.get("current_pid")
         phase = worker.get("current_phase", "execute")
+        task_id = worker.get("current_task_id")
 
         if spec_id is None:
             self.worker_procs.pop(worker_id, None)
@@ -978,11 +1153,12 @@ class Daemon:
             self.db.end_process(pid, spec_id, exit_code)
 
         logger.info(
-            "Worker %s completed: spec=%s, phase=%s, "
+            "Worker %s completed: spec=%s, phase=%s, task=%s "
             "exit_code=%d, iteration=%d",
             worker_id,
             spec_id,
             phase,
+            task_id,
             exit_code,
             spec.get("iteration", 0),
         )
@@ -999,7 +1175,68 @@ class Daemon:
             elif phase in ("task-verify", "code-review"):
                 self._ensure_on_spec_branch(spec_id, _early_repo)
 
-        # 2. Delegate to phase-specific handler
+        # 2b. For parallel task workers: update task state and check spec completion.
+        if task_id:
+            task_status = "DONE" if exit_code == 0 else "FAILED"
+            self.db.complete_task(spec_id, task_id, task_status)
+            logger.info(
+                "Task %s of %s marked %s (exit_code=%d)",
+                task_id, spec_id, task_status, exit_code,
+            )
+
+            self._cleanup_task_worktree(spec_id, task_id, worker)
+
+            if self.db.all_tasks_terminal(spec_id):
+                db_tasks = self.db.get_tasks_for_spec(spec_id)
+                tasks_done = sum(1 for t in db_tasks if t["status"] == "DONE")
+                tasks_total = len(db_tasks)
+
+                now_iso = self.db._now_iso()
+                spec_fresh = self.db.get_spec(spec_id)
+                first_started = min(
+                    (t.get("started_at") or now_iso for t in db_tasks),
+                    default=now_iso,
+                )
+                try:
+                    dur = int((
+                        datetime.fromisoformat(now_iso)
+                        - datetime.fromisoformat(first_started)
+                    ).total_seconds())
+                except Exception:
+                    dur = 0
+                final_exit = 0 if tasks_done == tasks_total else 1
+                try:
+                    self.db.insert_iteration(
+                        spec_id=spec_id,
+                        iteration=(spec_fresh or spec).get("iteration", 0),
+                        phase=phase,
+                        worker_id=worker_id,
+                        started_at=first_started,
+                        ended_at=now_iso,
+                        duration_seconds=dur,
+                        tasks_completed=tasks_done,
+                        exit_code=final_exit,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not insert iteration record for %s: %s",
+                        spec_id, "constraint conflict (ignored)",
+                    )
+
+                if self.db.any_task_failed(spec_id):
+                    self.db.fail(spec_id, reason="One or more parallel tasks failed")
+                else:
+                    self._merge_task_branches_for_spec(spec_id, db_tasks, worker)
+                    self.db.complete(spec_id, tasks_done=tasks_done, tasks_total=tasks_total)
+                logger.info(
+                    "All tasks terminal for %s (%d/%d done)",
+                    spec_id, tasks_done, tasks_total,
+                )
+            self.db.free_worker(worker_id)
+            self.worker_procs.pop(worker_id, None)
+            return
+
+        # 2c. Delegate to phase-specific handler for non-parallel workers
         try:
             self._dispatch_phase_completion(
                 spec_id=spec_id,
@@ -1107,6 +1344,93 @@ class Daemon:
 
         # 4. Remove from tracked procs
         self.worker_procs.pop(worker_id, None)
+
+    def _cleanup_task_worktree(
+        self,
+        spec_id: str,
+        task_id: str,
+        worker: dict[str, Any],
+    ) -> None:
+        """Remove the dedicated worktree for a completed task, if one was created."""
+        try:
+            task_rows = self.db.get_tasks_for_spec(spec_id)
+            task_row = next((t for t in task_rows if t["task_id"] == task_id), None)
+            if task_row is None:
+                return
+            wt_path = task_row.get("worktree_path") or ""
+            if not wt_path or wt_path == worker.get("worktree_path"):
+                # No dedicated worktree was created (fell back to shared path).
+                return
+            from lib.task_worktree import (
+                get_main_repo_from_worker,
+                remove_task_worktree,
+            )
+            main_repo = get_main_repo_from_worker(worker["worktree_path"])
+            if main_repo:
+                remove_task_worktree(main_repo, wt_path)
+            else:
+                logger.warning(
+                    "Cannot resolve main repo to remove task worktree %s", wt_path
+                )
+        except Exception:
+            logger.exception(
+                "Error cleaning up task worktree for %s/%s", spec_id, task_id
+            )
+
+    def _merge_task_branches_for_spec(
+        self,
+        spec_id: str,
+        db_tasks: list[dict[str, Any]],
+        worker: dict[str, Any],
+    ) -> None:
+        """Merge all DONE task branches into the spec branch at level boundary.
+
+        Only runs if at least one task has a non-null branch_name, indicating
+        fresh task worktrees were used. Marks the spec needs_review if any
+        merge produces conflicts.
+        """
+        branches = [t for t in db_tasks if t.get("branch_name")]
+        if not branches:
+            return
+
+        try:
+            from lib.task_worktree import (
+                get_main_repo_from_worker,
+                merge_level_branches,
+            )
+            main_repo = get_main_repo_from_worker(worker["worktree_path"])
+            if not main_repo:
+                logger.warning(
+                    "Cannot resolve main repo to merge task branches for %s", spec_id
+                )
+                return
+
+            result = merge_level_branches(main_repo, spec_id, db_tasks)
+            status = result.get("merge_status", "nothing_to_merge")
+
+            if status == "merged":
+                logger.info(
+                    "Merged %d task branches for %s: %s",
+                    len(result.get("merged_tasks", [])),
+                    spec_id,
+                    result.get("merged_tasks"),
+                )
+            elif status == "conflict":
+                logger.warning(
+                    "Merge conflict in spec %s: tasks=%s files=%s",
+                    spec_id,
+                    result.get("conflicting_tasks"),
+                    result.get("conflicting_files"),
+                )
+                # Mark spec needs_review so a human can resolve the conflict.
+                self.db.set_needs_review(
+                    spec_id,
+                    experiment_tasks=result.get("conflicting_tasks", []),
+                )
+        except Exception:
+            logger.exception(
+                "Error merging task branches for %s", spec_id
+            )
 
     def _dispatch_phase_completion(
         self,
@@ -2127,7 +2451,8 @@ class Daemon:
         the spec is requeued so the daemon picks it up for another iteration.
         Never raises.
         """
-        spec_file = os.path.join(
+        spec_row = self.db.get_spec(spec_id)
+        spec_file = (spec_row.get("spec_path") if spec_row else None) or os.path.join(
             os.path.expanduser("~"), ".boi", "queue", f"{spec_id}.spec.md"
         )
         if not os.path.isfile(spec_file):
