@@ -545,6 +545,63 @@ def parse_yaml_spec(source: str) -> BoiTaskList:
     return tasks
 
 
+def parse_spec_header_fields(source: str) -> dict[str, str]:
+    """Extract spec-level metadata fields from a spec (markdown or YAML).
+
+    Returns a dict with keys ``push``, ``commit_scope``, and ``target_repos``.
+    Defaults: push='false', commit_scope='', target_repos=''.
+
+    Markdown: scans header lines for ``**Push:** value``,
+    ``**Commit-Scope:** value``, and ``**Target-Repos:** path1, path2``
+    (before the first ### task heading).
+
+    YAML: reads top-level ``push:``, ``commit_scope:``, and ``target_repos:`` keys.
+    """
+    result: dict[str, str] = {"push": "false", "commit_scope": "", "target_repos": ""}
+
+    # Auto-detect file path
+    if "\n" not in source:
+        candidate = Path(source)
+        if candidate.is_file():
+            source = candidate.read_text(encoding="utf-8")
+
+    if content_is_yaml(source):
+        try:
+            import yaml  # PyYAML is available in the BOI environment
+
+            data = yaml.safe_load(source)
+            if isinstance(data, dict):
+                push_val = data.get("push")
+                if push_val is not None:
+                    result["push"] = str(push_val).strip().lower()
+                commit_scope_val = data.get("commit_scope")
+                if commit_scope_val is not None:
+                    result["commit_scope"] = str(commit_scope_val).strip()
+                target_repos_val = data.get("target_repos")
+                if target_repos_val is not None:
+                    if isinstance(target_repos_val, list):
+                        result["target_repos"] = ", ".join(str(r).strip() for r in target_repos_val)
+                    else:
+                        result["target_repos"] = str(target_repos_val).strip()
+        except Exception:
+            pass
+        return result
+
+    # Markdown: scan lines before first ### task heading
+    for line in source.splitlines():
+        if _BOI_TASK_HEADING_RE.match(line):
+            break
+        stripped = line.strip()
+        if stripped.startswith("**Push:**"):
+            result["push"] = stripped[len("**Push:**"):].strip().lower()
+        elif stripped.startswith("**Commit-Scope:**"):
+            result["commit_scope"] = stripped[len("**Commit-Scope:**"):].strip()
+        elif stripped.startswith("**Target-Repos:**"):
+            result["target_repos"] = stripped[len("**Target-Repos:**"):].strip()
+
+    return result
+
+
 def is_yaml_spec_path(filepath: str) -> bool:
     """Return True if the filepath has a YAML extension (.yaml or .yml)."""
     return Path(filepath).suffix.lower() in {".yaml", ".yml"}

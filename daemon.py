@@ -1277,7 +1277,6 @@ class Daemon:
 
                 if new_status == "completed":
                     if target_repo:
-                        # Squash-merge the spec branch into the original branch.
                         if not self._merge_spec_branch(spec_id, target_repo):
                             logger.warning(
                                 "[spec-branch] Squash-merge failed for %s"
@@ -1286,8 +1285,10 @@ class Daemon:
                                 spec_id,
                                 target_repo,
                             )
-                    else:
-                        self._commit_and_push_output(spec_id, target_repo)
+                    ship_ok = self._run_ship_phase(spec_id, spec_after)
+                    if not ship_ok:
+                        logger.info("[ship] Ship phase failed for %s — skipping completion", spec_id)
+                        return
                     self._review_committed_output(
                         spec_id,
                         target_repo,
@@ -2536,6 +2537,332 @@ class Daemon:
             len(new_tasks),
             spec_id,
         )
+
+    # ── Ship phase ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _find_git_root(path: str) -> str:
+        """Walk up from ``path`` to find the nearest directory containing .git.
+
+        Returns the absolute path of the git root, or '' if none is found.
+        ``path`` may be a file or directory.
+        """
+        from pathlib import Path as _Path
+        current = _Path(path).expanduser().resolve()
+        if current.is_file():
+            current = current.parent
+        for candidate in [current, *current.parents]:
+            if (candidate / ".git").exists():
+                return str(candidate)
+        return ""
+
+    @staticmethod
+    def _extract_spec_push_field(spec_path: str) -> str:
+        """Read push field from spec (markdown or YAML). Returns 'false' if absent."""
+        try:
+            from lib.spec_parser import parse_spec_header_fields
+            return parse_spec_header_fields(spec_path)["push"]
+        except Exception:
+            pass
+        return "false"
+
+    @staticmethod
+    def _extract_spec_target_repos(spec_path: str) -> list[str]:
+        """Read target_repos list from spec header. Returns [] if absent."""
+        try:
+            from lib.spec_parser import parse_spec_header_fields
+            from pathlib import Path as _Path
+            raw = parse_spec_header_fields(spec_path).get("target_repos", "")
+            if not raw:
+                return []
+            repos = []
+            for part in raw.split(","):
+                part = part.strip().strip("`")
+                if part:
+                    if part.startswith("~"):
+                        part = str(_Path(part).expanduser())
+                    repos.append(part)
+            return repos
+        except Exception:
+            return []
+
+    def _ship_single_repo(
+        self,
+        repo_path: str,
+        spec_id: str,
+        commit_msg: str,
+        commit_scope: str,
+        manifest_path: str,
+        push_remote: str,
+    ) -> tuple[bool, str]:
+        """Add, commit, and optionally push changes in one git repo.
+
+        Returns (success, commit_sha). On 'nothing to commit', returns (True, '').
+        On error, returns (False, '').
+        """
+        import glob as _glob
+
+        # Verify it is a git repo
+        try:
+            subprocess.run(
+                ["git", "-C", repo_path, "rev-parse", "--git-dir"],
+                check=True,
+                capture_output=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            logger.info("[ship] %s is not a git repo — skipping", repo_path)
+            return True, ""
+
+        # Check if dirty
+        try:
+            status_result = subprocess.run(
+                ["git", "-C", repo_path, "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            if not status_result.stdout.strip():
+                logger.info("[ship] %s is clean — nothing to commit for %s", repo_path, spec_id)
+                return True, ""
+        except subprocess.CalledProcessError as exc:
+            logger.warning("[ship] git status failed in %s: %s", repo_path, exc)
+            return True, ""
+
+        # git add
+        try:
+            if commit_scope:
+                matched = _glob.glob(commit_scope, root_dir=repo_path)
+                if matched:
+                    for f in matched:
+                        subprocess.run(
+                            ["git", "-C", repo_path, "add", "--", f],
+                            check=True, capture_output=True,
+                        )
+                else:
+                    logger.warning("[ship] commit_scope '%s' matched no files in %s", commit_scope, repo_path)
+            elif manifest_path and os.path.isfile(manifest_path) and os.path.getsize(manifest_path) > 0:
+                with open(manifest_path, encoding="utf-8") as fh:
+                    files = [ln.strip() for ln in fh if ln.strip()]
+                for filepath in files:
+                    full = os.path.join(repo_path, filepath)
+                    if os.path.exists(full):
+                        subprocess.run(
+                            ["git", "-C", repo_path, "add", "--", filepath],
+                            check=True, capture_output=True,
+                        )
+            else:
+                subprocess.run(
+                    ["git", "-C", repo_path, "add", "-A"],
+                    check=True, capture_output=True,
+                )
+        except subprocess.CalledProcessError as exc:
+            logger.warning("[ship] git add failed in %s: %s", repo_path, exc)
+            return False, ""
+
+        # git commit
+        try:
+            subprocess.run(
+                ["git", "-C", repo_path, "commit", "-m", commit_msg],
+                check=True, capture_output=True,
+            )
+            sha_result = subprocess.run(
+                ["git", "-C", repo_path, "rev-parse", "HEAD"],
+                check=True, capture_output=True, text=True,
+            )
+            commit_sha = sha_result.stdout.strip()
+            logger.info("[ship] Committed %s in %s: %s", spec_id, repo_path, commit_sha[:12])
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+            if "nothing to commit" in stderr or "nothing added to commit" in stderr:
+                logger.info("[ship] Nothing to commit in %s for %s — treating as success", repo_path, spec_id)
+                return True, ""
+            logger.warning("[ship] git commit failed in %s: %s", repo_path, stderr[:400])
+            return False, ""
+
+        # git push
+        if push_remote:
+            try:
+                subprocess.run(
+                    ["git", "-C", repo_path, "push", push_remote, "HEAD"],
+                    check=True, capture_output=True,
+                )
+                logger.info("[ship] Pushed %s to %s/%s", spec_id, push_remote, repo_path)
+            except subprocess.CalledProcessError as exc:
+                logger.warning("[ship] git push failed for %s in %s: %s", spec_id, repo_path, exc)
+
+        return True, commit_sha
+
+    @staticmethod
+    def _extract_spec_commit_scope(spec_path: str) -> str:
+        """Read commit_scope glob from spec (markdown or YAML). Returns '' if absent."""
+        try:
+            from lib.spec_parser import parse_spec_header_fields
+            return parse_spec_header_fields(spec_path)["commit_scope"]
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _extract_verify_commands(spec_path: str) -> list[str]:
+        """Return verify commands for all DONE tasks in the spec."""
+        cmds: list[str] = []
+        try:
+            from lib.spec_parser import parse_boi_spec
+            tasks = parse_boi_spec(spec_path)
+            verify_re = re.compile(r"\*\*Verify:\*\*\s+(.*)", re.IGNORECASE)
+            for task in tasks:
+                if task.status != "DONE":
+                    continue
+                # Scan body for **Verify:** lines
+                for line in task.body.splitlines():
+                    m = verify_re.search(line)
+                    if m:
+                        raw = m.group(1).strip().strip("`")
+                        # Split by && into individual commands
+                        for cmd in raw.split("&&"):
+                            cmd = cmd.strip()
+                            if cmd:
+                                cmds.append(cmd)
+        except Exception as exc:
+            logger.warning("[ship] Could not extract verify commands: %s", exc)
+        return cmds
+
+    def _run_ship_phase(self, spec_id: str, spec: dict[str, Any]) -> bool:
+        """Run the ship phase: verify → commit (multi-repo) → push.
+
+        Returns True if the spec was successfully committed (or had nothing
+        to commit). Returns False if verify failed or any commit failed, in
+        which case spec status is set to needs_review.
+
+        Multi-repo: if the spec header lists ``**Target-Repos:**`` (markdown)
+        or ``target_repos:`` (YAML), each repo is committed separately with
+        the same BOI commit message. All commit SHAs are recorded in the
+        ship sidecar.
+        """
+        spec_path = spec.get("spec_path", "")
+        spec_title = self._extract_spec_title(spec_path)
+        worktree = spec.get("worktree", "")
+        target_repo = self._extract_target_repo(spec_path)
+        # Prefer explicit target_repo; fall back to worktree path
+        primary_repo = target_repo or worktree
+        queue_dir = os.path.join(self.state_dir, "queue")
+
+        logger.info("[ship] Starting ship phase for %s", spec_id)
+
+        # ── Step 1: Re-run verify commands for all DONE tasks ──────────
+        verify_cmds = self._extract_verify_commands(spec_path)
+        if verify_cmds:
+            for cmd in verify_cmds:
+                logger.info("[ship] Running verify: %s", cmd)
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        cwd=primary_repo or None,
+                    )
+                    if result.returncode != 0:
+                        error_detail = (result.stderr or result.stdout or "")[:500]
+                        reason = f"Ship verify failed: `{cmd}` exited {result.returncode}. {error_detail}"
+                        logger.warning("[ship] %s", reason)
+                        try:
+                            self.db.update_spec_fields(spec_id, status="needs_review", failure_reason=reason)
+                        except Exception as exc2:
+                            logger.warning("[ship] Could not set needs_review: %s", exc2)
+                        return False
+                except subprocess.TimeoutExpired:
+                    reason = f"Ship verify timed out: `{cmd}`"
+                    logger.warning("[ship] %s", reason)
+                    try:
+                        self.db.update_spec_fields(spec_id, status="needs_review", failure_reason=reason)
+                    except Exception:
+                        pass
+                    return False
+                except Exception as exc:
+                    logger.warning("[ship] Verify command error for `%s`: %s", cmd, exc)
+        else:
+            logger.info("[ship] No verify commands found for %s — skipping verify gate", spec_id)
+
+        # ── Step 2: Build list of repos to commit ──────────────────────
+        # Always include the primary repo; append any additional repos from
+        # the spec's target_repos field (multi-repo support).
+        repos_to_commit: list[str] = []
+        if primary_repo and os.path.isdir(primary_repo):
+            repos_to_commit.append(primary_repo)
+
+        additional_repos = self._extract_spec_target_repos(spec_path)
+        for extra in additional_repos:
+            if extra and os.path.isdir(extra) and extra not in repos_to_commit:
+                repos_to_commit.append(extra)
+
+        if not repos_to_commit:
+            logger.info("[ship] No repo paths for %s — skipping git operations", spec_id)
+            return True
+
+        # ── Step 3: Commit each repo ───────────────────────────────────
+        commit_msg = f"feat: BOI {spec_id} — {spec_title}\n\nAuto-committed by BOI ship phase."
+        commit_scope = spec.get("commit_scope") or self._extract_spec_commit_scope(spec_path)
+        manifest_path = os.path.join(queue_dir, f"{spec_id}.changed-files")
+        push_field = (spec.get("push") or self._extract_spec_push_field(spec_path)).lower()
+        push_remote = "" if push_field in ("false", "", "no", "0") else (
+            "origin" if push_field == "true" else push_field
+        )
+
+        all_commits: list[dict[str, str]] = []
+        any_failed = False
+
+        for repo_path in repos_to_commit:
+            # For additional (non-primary) repos, don't pass the manifest since
+            # it contains paths relative to the primary repo.
+            manifest = manifest_path if repo_path == primary_repo else ""
+            ok, sha = self._ship_single_repo(
+                repo_path=repo_path,
+                spec_id=spec_id,
+                commit_msg=commit_msg,
+                commit_scope=commit_scope,
+                manifest_path=manifest,
+                push_remote=push_remote,
+            )
+            if not ok:
+                reason = f"Ship commit failed in repo: {repo_path}"
+                logger.warning("[ship] %s", reason)
+                try:
+                    self.db.update_spec_fields(spec_id, status="needs_review", failure_reason=reason)
+                except Exception:
+                    pass
+                any_failed = True
+            elif sha:
+                all_commits.append({"repo": repo_path, "sha": sha})
+
+        if any_failed:
+            return False
+
+        # ── Step 4: Record all commit SHAs ────────────────────────────
+        if all_commits:
+            sidecar_path = os.path.join(queue_dir, f"{spec_id}.ship.json")
+            try:
+                sidecar = {
+                    "spec_id": spec_id,
+                    # Backward compat: first commit SHA at top level
+                    "commit_sha": all_commits[0]["sha"],
+                    "repo": all_commits[0]["repo"],
+                    "commits": all_commits,
+                }
+                tmp = sidecar_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(sidecar, fh)
+                os.replace(tmp, sidecar_path)
+            except Exception as exc:
+                logger.warning("[ship] Could not write ship sidecar: %s", exc)
+
+        logger.info(
+            "[ship] Ship phase complete for %s (%d repo(s) committed)",
+            spec_id,
+            len(all_commits),
+        )
+        return True
 
     # ── Helpers ──────────────────────────────────────────────────────
 

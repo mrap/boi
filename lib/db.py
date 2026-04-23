@@ -82,6 +82,18 @@ class Database:
         schema_path = Path(__file__).parent / "schema.sql"
         schema_sql = schema_path.read_text(encoding="utf-8")
         self.conn.executescript(schema_sql)
+        # Add columns introduced after initial schema deployment.
+        for col, ddl in [
+            ("push", "ALTER TABLE specs ADD COLUMN push TEXT DEFAULT 'false'"),
+            ("commit_scope", "ALTER TABLE specs ADD COLUMN commit_scope TEXT DEFAULT ''"),
+        ]:
+            existing = {
+                row[1]
+                for row in self.conn.execute("PRAGMA table_info(specs)")
+            }
+            if col not in existing:
+                self.conn.execute(ddl)
+        self.conn.commit()
 
     def close(self) -> None:
         """Close the database connection."""
@@ -234,11 +246,17 @@ class Database:
             # Snapshot initial task IDs
             initial_task_ids: list[str] = []
             content = Path(spec_copy_path).read_text(encoding="utf-8")
+            initial_task_ids: list[str] = []
+            spec_push = "false"
+            spec_commit_scope = ""
             try:
-                from lib.spec_parser import parse_spec
+                from lib.spec_parser import parse_spec, parse_spec_header_fields
 
                 initial_tasks = parse_spec(content)
                 initial_task_ids = [t.id for t in initial_tasks]
+                header = parse_spec_header_fields(content)
+                spec_push = header["push"]
+                spec_commit_scope = header["commit_scope"]
             except Exception:
                 pass
 
@@ -249,8 +267,8 @@ class Database:
                 "INSERT INTO specs ("
                 "  id, spec_path, original_spec_path, worktree, priority,"
                 "  status, phase, submitted_at, iteration, max_iterations,"
-                "  sync_back, project, initial_task_ids"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  sync_back, project, initial_task_ids, push, commit_scope"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     queue_id,
                     abs_copy_path,
@@ -265,6 +283,8 @@ class Database:
                     1 if sync_back else 0,
                     project,
                     json.dumps(initial_task_ids),
+                    spec_push,
+                    spec_commit_scope,
                 ),
             )
 
@@ -1043,6 +1063,8 @@ class Database:
             "status",
             "max_experiment_invocations",
             "experiment_invocations_used",
+            "push",
+            "commit_scope",
         }
     )
 

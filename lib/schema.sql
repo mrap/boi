@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS specs (
     max_experiment_invocations INTEGER DEFAULT 0,
     experiment_invocations_used INTEGER DEFAULT 0,
     decomposition_retries INTEGER DEFAULT 0,
+    push TEXT DEFAULT 'false',
+    commit_scope TEXT DEFAULT '',
     CHECK (status IN ('queued','assigning','running','completed','failed','canceled','needs_review','requeued')),
     CHECK (phase IN ('execute','critic','evaluate','decompose'))
 );
