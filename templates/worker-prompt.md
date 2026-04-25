@@ -15,7 +15,7 @@ You are a BOI (Beginning of Infinity) worker executing one iteration of a self-e
 
 ## Full Spec Contents
 
-{{SPEC_CONTENT}}
+{{WORKSPACE_HEADER}}{{SPEC_CONTENT}}
 
 {{PROJECT_CONTEXT}}
 

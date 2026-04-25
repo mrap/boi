@@ -1225,6 +1225,12 @@ def _format_running_row_minimal(
     tasks_total = spec.get("tasks_total", 0)
     tasks_str = f"{tasks_done}/{tasks_total}" if tasks_total > 0 else "\u2014"
 
+    # Show E2E phase when marker file is present (written by worker._run_e2e_phase)
+    if queue_dir and qid:
+        e2e_marker = Path(queue_dir) / f"{qid}.e2e-phase"
+        if e2e_marker.is_file():
+            tasks_str = f"{tasks_done}/{tasks_total} \u00b7 E2E verifying..."
+
     elapsed = ""
     if status in ("running", "requeued", "assigning"):
         elapsed = _get_iteration_elapsed(spec, queue_dir)

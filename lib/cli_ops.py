@@ -30,7 +30,76 @@ def _get_db(queue_dir: str) -> Database:
     return Database(db_path, queue_dir)
 
 
-def _emit_dispatched_event(spec_id: str, source: str) -> None:
+def _inject_workspace_header_if_missing(spec_path: str, queue_dir: str) -> None:
+    """Inject workspace header into queue copy when absent.
+
+    YAML specs receive a YAML-format key (workspace: /path) so that
+    content_is_yaml() continues to detect them correctly after injection.
+    Markdown specs receive the legacy **Workspace:** bold header.
+    """
+    from lib.runtime import load_context_root
+    from lib.spec_parser import content_is_yaml
+
+    state_dir = str(Path(queue_dir).parent)
+    context_root = load_context_root(state_dir)
+    if not context_root:
+        return
+    p = Path(spec_path)
+    content = p.read_text(encoding="utf-8")
+    if "**Workspace:**" in content or content.startswith("workspace:") or "\nworkspace:" in content:
+        return
+    if content_is_yaml(content):
+        p.write_text(f"workspace: {context_root}\n{content}", encoding="utf-8")
+    else:
+        lines = content.splitlines(keepends=True)
+        insert_at = next((i + 1 for i, l in enumerate(lines) if l.startswith("#")), 0)
+        lines.insert(insert_at, f"\n**Workspace:** {context_root}\n")
+        p.write_text("".join(lines), encoding="utf-8")
+
+
+def _check_initiative_linkage(spec_path: str) -> tuple[bool, bool, str]:
+    """Check whether a spec links to an initiative or experiment.
+
+    Returns (allowed, is_emergency, reason).
+    - allowed=True means dispatch should proceed.
+    - is_emergency=True means bypass was used (for audit logging).
+    - reason is a human-readable explanation.
+
+    Supported fields (markdown):
+        **Initiative:** init-<id>
+        **Experiment:** exp-NNN
+        **Emergency:** true
+
+    Supported fields (YAML top-level keys):
+        initiative: init-<id>
+        experiment: exp-NNN
+        emergency: true
+    """
+    import re
+
+    try:
+        content = Path(spec_path).read_text(encoding="utf-8")
+    except OSError:
+        return True, False, "spec file unreadable — skipping linkage check"
+
+    # Case-insensitive patterns for both markdown bold-field and YAML key formats.
+    emergency_md = re.search(r"^\*\*Emergency:\*\*\s*true\b", content, re.MULTILINE | re.IGNORECASE)
+    emergency_yaml = re.search(r"^emergency:\s*true\b", content, re.MULTILINE | re.IGNORECASE)
+    if emergency_md or emergency_yaml:
+        return True, True, "emergency bypass"
+
+    initiative_md = re.search(r"^\*\*Initiative:\*\*\s*\S+", content, re.MULTILINE | re.IGNORECASE)
+    initiative_yaml = re.search(r"^initiative:\s*\S+", content, re.MULTILINE | re.IGNORECASE)
+    experiment_md = re.search(r"^\*\*Experiment:\*\*\s*\S+", content, re.MULTILINE | re.IGNORECASE)
+    experiment_yaml = re.search(r"^experiment:\s*\S+", content, re.MULTILINE | re.IGNORECASE)
+
+    if initiative_md or initiative_yaml or experiment_md or experiment_yaml:
+        return True, False, "linked"
+
+    return False, False, "no initiative or experiment linkage found"
+
+
+def _emit_dispatched_event(spec_id: str, source: str, spec_path: str = "", is_emergency: bool = False) -> None:
     """Fire-and-forget: emit boi.spec.dispatched to hex-events.
 
     Silently ignores all errors — BOI must never fail because hex-events
@@ -43,7 +112,7 @@ def _emit_dispatched_event(spec_id: str, source: str) -> None:
         if not os.path.exists(hex_emit):
             return
 
-        payload = {"spec_id": spec_id, "source": source}
+        payload = {"spec_id": spec_id, "source": source, "spec_file": spec_path, "emergency": is_emergency}
         subprocess.Popen(
             ["python3", hex_emit, "boi.spec.dispatched", _json.dumps(payload), source],
             stdout=subprocess.DEVNULL,
@@ -78,6 +147,25 @@ def dispatch(
     from lib.spec_parser import count_boi_tasks
     from lib.spec_validator import is_generate_spec
 
+    # Enforce initiative/experiment linkage before touching the DB.
+    allowed, is_emergency, reason = _check_initiative_linkage(spec_path)
+    if not allowed:
+        raise ValueError(
+            "Spec must link to an initiative or experiment.\n\n"
+            "Add one of these to your spec header:\n"
+            "  **Initiative:** init-<id>      (markdown)\n"
+            "  **Experiment:** exp-NNN        (markdown)\n"
+            "  initiative: init-<id>          (YAML)\n"
+            "  experiment: exp-NNN            (YAML)\n\n"
+            "To bypass for emergency fixes, add:\n"
+            "  **Emergency:** true            (markdown)\n"
+            "  emergency: true                (YAML)\n\n"
+            "Emergency bypasses are audited. The work must be retroactively\n"
+            "linked to an initiative within 48h or flagged as an orphan.\n\n"
+            "Active initiatives: python3 $AGENT_DIR/.hex/scripts/hex-initiative.py list\n"
+            "Active experiments: python3 $AGENT_DIR/.hex/scripts/hex-experiment.py list"
+        )
+
     db = _get_db(queue_dir)
     try:
         counts = count_boi_tasks(spec_path)
@@ -90,6 +178,7 @@ def dispatch(
             project=project,
             blocked_by=blocked_by or None,
         )
+        _inject_workspace_header_if_missing(entry["spec_path"], queue_dir)
 
         spec_id = entry["id"]
 
@@ -115,7 +204,7 @@ def dispatch(
 
         db.update_spec_fields(spec_id, **updates)
 
-        _emit_dispatched_event(spec_id, source)
+        _emit_dispatched_event(spec_id, source, spec_path=entry["spec_path"], is_emergency=is_emergency)
 
         return {
             "id": spec_id,

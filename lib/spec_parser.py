@@ -496,6 +496,11 @@ def parse_yaml_spec(source: str) -> BoiTaskList:
         if candidate.is_file():
             source = candidate.read_text(encoding="utf-8")
 
+    # Strip injected markdown workspace header that breaks YAML parsing
+    source = "\n".join(
+        l for l in source.splitlines() if not l.strip().startswith("**Workspace:**")
+    )
+
     try:
         data = yaml.safe_load(source)
     except yaml.YAMLError as e:
@@ -610,15 +615,22 @@ def is_yaml_spec_path(filepath: str) -> bool:
 def content_is_yaml(content: str) -> bool:
     """Return True if content looks like a YAML spec (not markdown).
 
-    YAML specs start with a top-level mapping key like 'title:' or 'tasks:'.
-    Markdown specs start with a '#' heading. This sniff handles queue copies
-    that always receive a .spec.md extension regardless of the original format.
+    YAML specs start with a top-level mapping key like 'title:', 'tasks:',
+    or 'workspace:' (injected by _inject_workspace_header_if_missing).
+    Markdown specs start with a '#' heading.  This sniff handles queue
+    copies that always receive a .spec.md extension regardless of the
+    original format.
     """
+    _YAML_TOP_KEYS = ("title:", "tasks:", "workspace:", "mode:", "context:")
     for line in content.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped:
+            continue
+        if stripped.startswith("**Workspace:**"):
+            continue
+        if stripped.startswith("#"):
             break
-        if stripped.startswith("title:") or stripped.startswith("tasks:"):
+        if any(stripped.startswith(k) for k in _YAML_TOP_KEYS):
             return True
         break
     return False

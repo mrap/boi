@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from lib.phases import PhaseConfig
 from lib.runtime import ClaudeRuntime, Runtime, get_runtime, resolve_runtime, load_context_root
-from lib.spec_parser import count_boi_tasks
+from lib.spec_parser import count_boi_tasks, parse_spec
 from lib.workspace_guard import WorkspaceBoundaryChecker, diff_status, snapshot_git_status
 
 
@@ -281,13 +281,22 @@ class Worker:
         self.pre_counts = count_boi_tasks(self.spec_path)
         pre_pending = self.pre_counts.get("pending", 0)
 
-        # If no pending tasks and we're in execute phase, exit success
+        # If no pending tasks and we're in execute phase, run E2E phase then exit
         if pre_pending == 0 and self.phase == "execute":
-            logger.info(
-                "No PENDING tasks in spec. Exiting with success."
-            )
-            _write_file(self.exit_file, "0")
-            return 0
+            spec_content = _read_file(self.spec_path)
+            e2e_passed = self._run_e2e_phase(spec_content)
+            if e2e_passed:
+                logger.info(
+                    "No PENDING tasks in spec and E2E phase passed. Exiting with success."
+                )
+                _write_file(self.exit_file, "0")
+                return 0
+            else:
+                logger.warning(
+                    "E2E phase FAILED for %s — last task reset to PENDING.", self.spec_id
+                )
+                _write_file(self.exit_file, "1")
+                return 1
 
         # Read spec once; pass to all helpers that need it
         spec_content = _read_file(self.spec_path)
@@ -408,6 +417,37 @@ class Worker:
         else:
             self._generate_execute_prompt(spec_content)
 
+    def _build_workspace_header(self, spec_content: str) -> str:
+        """Build a compact workspace context header to reduce spec corruption.
+
+        Reads workspace_header_enabled from config.json. Returns empty string
+        if disabled or if parsing fails.
+        """
+        config_path = os.path.join(self.state_dir, "config.json")
+        try:
+            with open(config_path, "r") as f:
+                cfg = json.load(f)
+            if not cfg.get("workspace_header_enabled", True):
+                return ""
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass  # Default to enabled if config unreadable
+
+        try:
+            tasks = list(parse_spec(spec_content))
+            total = len([t for t in tasks if t.status != "SUPERSEDED"])
+            done = len([t for t in tasks if t.status in ("DONE", "SKIPPED")])
+            pending_tasks = [t for t in tasks if t.status == "PENDING"]
+            next_id = pending_tasks[0].id if pending_tasks else "none"
+        except Exception:
+            return ""
+
+        return (
+            "> **WORKSPACE GUARD** — Format: `### t-N: Title` then `PENDING`/`DONE` on its own line. "
+            f"Tasks: {done}/{total} done. Next PENDING: {next_id}.\n"
+            "> Do NOT alter DONE tasks. Do NOT add prose between headings and status lines. "
+            "Do NOT duplicate task sections.\n\n"
+        )
+
     def _generate_execute_prompt(self, spec_content: str) -> None:
         """Generate prompt for execute phase.
 
@@ -453,6 +493,9 @@ class Worker:
         )
         result = result.replace(
             "{{WORKTREE_CONTEXT}}", worktree_context
+        )
+        result = result.replace(
+            "{{WORKSPACE_HEADER}}", self._build_workspace_header(spec_content)
         )
         result = result.replace("{{SPEC_CONTENT}}", spec_content)
 
@@ -1065,6 +1108,219 @@ echo "${{_AGENT_EXIT}}" > "${{_EXIT_FILE}}"
 
         # Read exit code from .exit file written by the run script
         return self._read_exit_code()
+
+    # ── E2E Phase ──────────────────────────────────────────────────────────────
+
+    def _detect_web_artifacts(self, spec_content: str) -> list[str]:
+        """Scan spec content and modified files for web signals."""
+        signals: list[str] = []
+        web_patterns = [
+            "HTTPServer", "ThreadingHTTPServer", "uvicorn", "flask",
+            "FastAPI", "http.server", "EventSource", "SSE",
+        ]
+        web_file_suffixes = ["server.py", "index.html", "app.py", "index.htm"]
+        web_keywords = ["dashboard", "localhost:", "http://", "https://", "serve", " web ",
+                        "index.html", "index.htm", ".html", ".htm"]
+
+        # Check spec content for code patterns and web keywords
+        for pattern in web_patterns:
+            if pattern in spec_content:
+                signals.append(f"pattern:{pattern}")
+
+        for kw in web_keywords:
+            if kw.lower() in spec_content.lower():
+                signals.append(f"keyword:{kw}")
+
+        # Check worktree for modified files with web-related names (fast: git diff only)
+        try:
+            result = subprocess.run(
+                ["git", "-C", self.worktree, "diff", "--name-only", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for f in result.stdout.splitlines():
+                f = f.strip()
+                if any(f.endswith(suf) for suf in web_file_suffixes):
+                    signals.append(f"file:{f}")
+        except Exception:
+            pass
+
+        return signals
+
+    def _detect_service_url(self, spec_content: str, web_signals: list[str]) -> str:
+        """Auto-detect the URL to test from hex-router ROUTES, spec content, or modified files.
+
+        Priority: hex-router routes > explicit URLs in spec > localhost port from files.
+        """
+        router_path = os.path.join(
+            os.environ.get("AGENT_DIR", os.path.expanduser("~/hex")), ".hex", "scripts", "hex-router", "router.py"
+        )
+        base_host = "https://mac-mini.tailbd5748.ts.net"
+
+        # 1. Parse hex-router ROUTES and check if any route matches spec content
+        if os.path.isfile(router_path):
+            try:
+                router_src = Path(router_path).read_text(encoding="utf-8")
+                route_re = re.compile(
+                    r'^\s*\("(/\w+)"[^,]*,\s*"[^"]*",\s*(\d+)',
+                    re.MULTILINE,
+                )
+                for m in route_re.finditer(router_src):
+                    prefix = m.group(1)
+                    port = m.group(2)
+                    # Check if the spec mentions this route prefix or port
+                    if prefix.strip("/") in spec_content.lower() or port in spec_content:
+                        return f"{base_host}{prefix}/"
+            except Exception:
+                pass
+
+        # 2. Scan spec content for explicit URLs
+        url_re = re.compile(r'https?://[^\s\'"<>]+')
+        for m in url_re.finditer(spec_content):
+            url = m.group(0).rstrip(".,;)")
+            if url:
+                return url
+
+        # 3. localhost:PORT from spec content
+        localhost_re = re.compile(r'localhost:(\d{4,5})')
+        m = localhost_re.search(spec_content)
+        if m:
+            return f"http://localhost:{m.group(1)}/"
+
+        # 4. PORT = NNNN from modified server.py files
+        try:
+            result = subprocess.run(
+                ["git", "-C", self.worktree, "diff", "--name-only", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            for f in result.stdout.splitlines():
+                f = f.strip()
+                if f.endswith("server.py") or f.endswith("app.py"):
+                    full_path = os.path.join(self.worktree, f)
+                    if os.path.isfile(full_path):
+                        src = Path(full_path).read_text(encoding="utf-8", errors="replace")
+                        port_m = re.search(r'PORT\s*=\s*(\d{4,5})', src)
+                        if port_m:
+                            return f"http://localhost:{port_m.group(1)}/"
+        except Exception:
+            pass
+
+        return ""
+
+    def _run_e2e_phase(self, spec_content: str) -> bool:
+        """E2E verification phase — runs after all tasks pass, before COMPLETED.
+
+        Returns True to proceed to COMPLETED, False to block and reset last task.
+        """
+        logger.info("E2E phase: starting detection for %s", self.spec_id)
+
+        # 1. Detect web artifacts
+        web_signals = self._detect_web_artifacts(spec_content)
+        if not web_signals:
+            logger.info("E2E phase: not applicable (no web artifacts) for %s", self.spec_id)
+            return True
+
+        logger.info("E2E phase: web signals found: %s", web_signals)
+
+        # 2. Detect URL
+        url = self._detect_service_url(spec_content, web_signals)
+        if not url:
+            logger.warning(
+                "E2E phase: web artifacts found but could not detect URL for %s — skipping",
+                self.spec_id,
+            )
+            return True
+
+        # 3. Find the verify.py script path
+        e2e_guard_candidates = [
+            os.path.join(
+                os.environ.get("AGENT_DIR", os.path.expanduser("~/hex")), ".hex", "scripts", "e2e-guard", "verify.py"
+            ),
+        ]
+        e2e_guard_path = next((p for p in e2e_guard_candidates if os.path.isfile(p)), None)
+        if not e2e_guard_path:
+            logger.warning(
+                "E2E phase: verify.py not found — skipping for %s", self.spec_id
+            )
+            return True
+
+        # 4. Check Playwright availability (graceful skip if missing)
+        try:
+            import importlib.util
+            if importlib.util.find_spec("playwright") is None:
+                logger.warning(
+                    "E2E phase: skipped (Playwright not available) for %s", self.spec_id
+                )
+                return True
+        except Exception:
+            pass
+
+        # 5. Run verify.py — write marker file so `boi status` shows "E2E verifying..."
+        e2e_marker = os.path.join(self.queue_dir, f"{self.spec_id}.e2e-phase")
+        logger.info("E2E phase: running verify.py for %s against %s", self.spec_id, url)
+        try:
+            _write_file(e2e_marker, url)
+            result = subprocess.run(
+                ["python3", e2e_guard_path, "--url", url, "--timeout", "30"],
+                capture_output=True, text=True, timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("E2E phase: verify.py timed out for %s", self.spec_id)
+            return False
+        except Exception as exc:
+            logger.error("E2E phase: error running verify.py for %s: %s", self.spec_id, exc)
+            return True  # Don't block on runner errors
+        finally:
+            try:
+                os.remove(e2e_marker)
+            except OSError:
+                pass
+
+        if result.returncode == 0:
+            logger.info("E2E phase: PASS for %s (%s)", self.spec_id, url)
+            self._append_e2e_result_to_log(f"E2E phase: PASS ({url})")
+            return True
+
+        logger.warning(
+            "E2E phase: FAIL for %s (%s)\n%s", self.spec_id, url, result.stdout[:2000]
+        )
+        self._append_e2e_result_to_log(f"E2E phase: FAIL ({url})\n{result.stdout[:2000]}")
+        self._reset_last_done_task_to_pending(spec_content)
+        return False
+
+    def _append_e2e_result_to_log(self, message: str) -> None:
+        """Append E2E phase result to the iteration log file."""
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n[E2E] {message}\n")
+        except Exception:
+            pass
+
+    def _reset_last_done_task_to_pending(self, spec_content: str) -> None:
+        """Reset the last DONE task back to PENDING so the worker must re-fix it."""
+        from lib.spec_parser import parse_boi_spec
+        try:
+            tasks = parse_boi_spec(spec_content)
+            # Find the highest-numbered DONE task
+            done_tasks = [t for t in tasks if t.status == "DONE"]
+            if not done_tasks:
+                return
+            last_done = done_tasks[-1]
+            # Rewrite the spec file: change "DONE" → "PENDING" for that task's heading block
+            new_content = re.sub(
+                r'(###\s+' + re.escape(last_done.id) + r':.*\n)DONE(\b)',
+                r'\1PENDING\2',
+                spec_content,
+                count=1,
+            )
+            if new_content != spec_content:
+                _write_file_atomic(self.spec_path, new_content)
+                logger.info(
+                    "E2E phase: reset task %s from DONE to PENDING in %s",
+                    last_done.id, self.spec_path,
+                )
+        except Exception as exc:
+            logger.error("E2E phase: failed to reset task to PENDING: %s", exc)
 
     def post_process(self) -> None:
         """Post-process after tmux session completes.
