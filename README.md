@@ -80,11 +80,9 @@ A **phase** is a named worker role defined by a `.phase.toml` file. The daemon l
 
 | Phase | Description | Model (alias) | Timeout |
 |-------|-------------|---------------|---------|
-| `plan-critique` | Evaluate spec quality before execution: catches non-executable verifies, unbounded scope, missing dependencies | sonnet | 300s |
 | `execute` | Execute tasks from the spec | sonnet | 600s |
-| `task-verify` | Review completed work for quality, correctness, and spec compliance | sonnet | 300s |
-| `code-review` | 4-persona code review: quality, testing, security, architecture (only runs when >50 lines changed) | sonnet | 300s |
 | `review` | Code review: correctness, security, spec compliance | sonnet | 300s |
+| `critic` | Quality antagonist: challenge assumptions, surface edge cases, verify correctness | sonnet | 300s |
 | `decompose` | Decompose a high-level spec into actionable tasks | opus | 600s |
 | `evaluate` | Evaluate spec completion and determine next steps | sonnet | 300s |
 
@@ -173,7 +171,7 @@ Configured in `~/.boi/guardrails.toml`:
 
 ```toml
 [pipeline]
-default = ["plan-critique", "execute", "task-verify", "code-review"]
+default = ["execute", "review", "critic"]
 ```
 
 To use a shorter pipeline, edit `guardrails.toml`. For example, execute-only:
@@ -194,7 +192,7 @@ Guardrails define quality gates that run at phase transitions. Configured global
 strictness = "advisory"   # strict | advisory | permissive
 
 [pipeline]
-default = ["plan-critique", "execute", "task-verify", "code-review"]
+default = ["execute", "review", "critic"]
 
 [hooks]
 post-execute = ["verify-commands-pass", "diff-is-non-empty"]
@@ -324,7 +322,6 @@ boi project create|list|status|context|delete
 
 | Flag | Description |
 |------|-------------|
-| `--spec FILE` | Spec file path (required) |
 | `--priority N` | Lower = higher priority (default: 100) |
 | `--max-iter N` | Max iterations before marking failed (default: 30) |
 | `--mode MODE` | `execute` \| `challenge` \| `discover` \| `generate` (aliases: e/c/d/g) |
