@@ -102,7 +102,7 @@ def _critic_completion_handler(
                 db.conn.execute(
                     "UPDATE specs SET "
                     "status = 'requeued', "
-                    "phase = 'critic', "
+                    "phase = 'task-verify', "
                     "tasks_done = ?, "
                     "tasks_total = ? "
                     "WHERE id = ?",
@@ -117,7 +117,7 @@ def _critic_completion_handler(
         else:
             db.requeue(spec_id, done, total)
 
-    elif phase == "critic":
+    elif phase == "task-verify":
         # Re-read spec file after critic modified it
         content = Path(spec_path).read_text(encoding="utf-8")
         tasks = parse_boi_spec(content)
@@ -208,20 +208,20 @@ class TestCriticLifecycle(IntegrationTestCase):
                 tasks_to_complete=99,
                 exit_code=0,
             )
-        elif phase == "critic":
+        elif phase == "task-verify":
             key = f"{spec_id}-critic"
             count = self._critic_call_counts.get(key, 0)
             self._critic_call_counts[key] = count + 1
 
             if count == 0:
                 return MockClaude(
-                    phase="critic",
+                    phase="task-verify",
                     add_tasks=2,
                     exit_code=0,
                 )
             else:
                 return MockClaude(
-                    phase="critic",
+                    phase="task-verify",
                     critic_approve=True,
                     exit_code=0,
                 )
@@ -257,7 +257,7 @@ class TestCriticLifecycle(IntegrationTestCase):
             it for it in iterations if it["phase"] == "execute"
         ]
         critic_iters = [
-            it for it in iterations if it["phase"] == "critic"
+            it for it in iterations if it["phase"] == "task-verify"
         ]
 
         # 2 execute passes (initial + post-critic)
@@ -369,7 +369,7 @@ class TestCriticPassesCounter(IntegrationTestCase):
                 tasks_to_complete=99,
                 exit_code=0,
             )
-        elif phase == "critic":
+        elif phase == "task-verify":
             key = f"{spec_id}-critic"
             count = self._critic_call_counts.get(key, 0)
             self._critic_call_counts[key] = count + 1
@@ -377,14 +377,14 @@ class TestCriticPassesCounter(IntegrationTestCase):
             if count < 3:
                 # Passes 1-3: add 1 task each
                 return MockClaude(
-                    phase="critic",
+                    phase="task-verify",
                     add_tasks=1,
                     exit_code=0,
                 )
             else:
                 # Pass 4: approve
                 return MockClaude(
-                    phase="critic",
+                    phase="task-verify",
                     critic_approve=True,
                     exit_code=0,
                 )
@@ -447,7 +447,7 @@ class TestCriticPassesCounter(IntegrationTestCase):
             it for it in iterations if it["phase"] == "execute"
         ]
         critic_iters = [
-            it for it in iterations if it["phase"] == "critic"
+            it for it in iterations if it["phase"] == "task-verify"
         ]
 
         # 4 execute passes: initial + 3 post-critic
@@ -500,10 +500,10 @@ class TestCriticCrashSafetyValve(IntegrationTestCase):
                 tasks_to_complete=99,
                 exit_code=0,
             )
-        elif phase == "critic":
+        elif phase == "task-verify":
             # Critic crashes: produces no output, exits 0
             return MockClaude(
-                phase="critic",
+                phase="task-verify",
                 fail_silently=True,
                 exit_code=0,
             )

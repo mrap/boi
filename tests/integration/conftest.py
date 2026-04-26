@@ -698,9 +698,9 @@ class IntegrationTestCase(unittest.TestCase):
             return MockClaude(
                 phase="execute", tasks_to_complete=1, exit_code=0
             )
-        elif phase == "critic":
+        elif phase == "task-verify":
             return MockClaude(
-                phase="critic", critic_approve=True, exit_code=0
+                phase="task-verify", critic_approve=True, exit_code=0
             )
         elif phase == "evaluate":
             return MockClaude(

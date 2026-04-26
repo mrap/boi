@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -281,8 +282,22 @@ class Worker:
         self.pre_counts = count_boi_tasks(self.spec_path)
         pre_pending = self.pre_counts.get("pending", 0)
 
-        # If no pending tasks and we're in execute phase, run E2E phase then exit
+        # If no pending tasks and we're in execute phase, run outcome verification
+        # then E2E phase before marking COMPLETED.
         if pre_pending == 0 and self.phase == "execute":
+            spec_content = _read_file(self.spec_path)
+
+            # Outcome verification: runs before E2E
+            outcomes_passed = self._run_outcome_verification(spec_content)
+            if not outcomes_passed:
+                logger.warning(
+                    "Outcome verification FAILED for %s — last task reset to PENDING.",
+                    self.spec_id,
+                )
+                _write_file(self.exit_file, "1")
+                return 1
+
+            # Re-read spec after potential outcome-driven reset
             spec_content = _read_file(self.spec_path)
             e2e_passed = self._run_e2e_phase(spec_content)
             if e2e_passed:
@@ -383,6 +398,15 @@ class Worker:
         except Exception:
             logger.exception(
                 "Failed to write changed-files manifest for %s", self.spec_id
+            )
+
+        # Collect and preserve all outputs before any potential worktree cleanup.
+        try:
+            self.collect_outputs()
+        except Exception:
+            logger.exception(
+                "collect_outputs failed for %s — worktree preserved, not deleted",
+                self.spec_id,
             )
 
         self.post_process()
@@ -1296,7 +1320,7 @@ echo "${{_AGENT_EXIT}}" > "${{_EXIT_FILE}}"
         except Exception:
             pass
 
-    def _reset_last_done_task_to_pending(self, spec_content: str) -> None:
+    def _reset_last_done_task_to_pending(self, spec_content: str, note: str = "") -> None:
         """Reset the last DONE task back to PENDING so the worker must re-fix it."""
         from lib.spec_parser import parse_boi_spec
         try:
@@ -1306,21 +1330,210 @@ echo "${{_AGENT_EXIT}}" > "${{_EXIT_FILE}}"
             if not done_tasks:
                 return
             last_done = done_tasks[-1]
+            # Build replacement: PENDING, optionally with a note line
+            replacement = r'\1PENDING'
+            if note:
+                safe_note = note.replace("\\", "\\\\")
+                replacement += f"\n\n{safe_note}"
             # Rewrite the spec file: change "DONE" → "PENDING" for that task's heading block
             new_content = re.sub(
                 r'(###\s+' + re.escape(last_done.id) + r':.*\n)DONE(\b)',
-                r'\1PENDING\2',
+                replacement,
                 spec_content,
                 count=1,
             )
             if new_content != spec_content:
                 _write_file_atomic(self.spec_path, new_content)
                 logger.info(
-                    "E2E phase: reset task %s from DONE to PENDING in %s",
+                    "Reset task %s from DONE to PENDING in %s%s",
                     last_done.id, self.spec_path,
+                    f" (note: {note})" if note else "",
                 )
         except Exception as exc:
-            logger.error("E2E phase: failed to reset task to PENDING: %s", exc)
+            logger.error("Failed to reset task to PENDING: %s", exc)
+
+    # ── Outcome Verification Phase ─────────────────────────────────────────────
+
+    def _run_outcome_verification(self, spec_content: str) -> bool:
+        """Run spec-level outcome verification after all tasks are DONE.
+
+        Runs each outcome's verify command; marks outcomes PASS or FAIL.
+        Returns True if all outcomes pass (or none are declared).
+        Returns False and resets the last DONE task if any outcome fails.
+        """
+        from lib.spec_parser import parse_spec
+
+        spec_data = parse_spec(spec_content)
+        outcomes = spec_data.outcomes
+
+        if not outcomes:
+            logger.info(
+                "Outcome verification: no outcomes declared for %s", self.spec_id
+            )
+            return True
+
+        logger.info(
+            "Outcome verification: running %d outcome(s) for %s",
+            len(outcomes),
+            self.spec_id,
+        )
+
+        all_pass = True
+        result_lines: list[str] = []
+
+        for outcome in outcomes:
+            try:
+                proc = subprocess.run(
+                    outcome.verify,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if proc.returncode == 0:
+                    outcome.status = "PASS"
+                    result_lines.append(f"  ✓ {outcome.description}")
+                    logger.info("Outcome PASS: %s", outcome.description)
+                else:
+                    outcome.status = "FAIL"
+                    all_pass = False
+                    detail = (proc.stdout + proc.stderr).strip()[:200]
+                    result_lines.append(
+                        f"  ✗ {outcome.description}"
+                        + (f" — {detail}" if detail else "")
+                    )
+                    logger.warning(
+                        "Outcome FAIL: %s — %s", outcome.description, detail
+                    )
+            except subprocess.TimeoutExpired:
+                outcome.status = "FAIL"
+                all_pass = False
+                result_lines.append(
+                    f"  ✗ {outcome.description} — timed out after 60s"
+                )
+                logger.warning("Outcome FAIL (timeout): %s", outcome.description)
+            except Exception as exc:
+                outcome.status = "FAIL"
+                all_pass = False
+                result_lines.append(
+                    f"  ✗ {outcome.description} — error: {exc}"
+                )
+                logger.error("Outcome error: %s: %s", outcome.description, exc)
+
+        pass_count = sum(1 for o in outcomes if o.status == "PASS")
+        total = len(outcomes)
+        log_msg = (
+            f"Outcomes: {pass_count}/{total} passed\n" + "\n".join(result_lines)
+        )
+        self._append_outcome_results_to_log(log_msg)
+
+        if not all_pass:
+            failed = [o for o in outcomes if o.status == "FAIL"]
+            note = (
+                f"Outcome verification failed: {failed[0].description}. "
+                "Fix and re-verify."
+            )
+            logger.warning(
+                "Outcome verification: %d/%d failed for %s — resetting last task",
+                total - pass_count,
+                total,
+                self.spec_id,
+            )
+            self._reset_last_done_task_to_pending(spec_content, note=note)
+
+        return all_pass
+
+    def _append_outcome_results_to_log(self, message: str) -> None:
+        """Append outcome verification results to the iteration log file."""
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            with open(self.log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n[OUTCOMES] {message}\n")
+        except Exception:
+            pass
+
+    def collect_outputs(self) -> None:
+        """Preserve all spec outputs to ~/.boi/outputs/{spec_id}/ before cleanup.
+
+        Detects files created or modified in the worktree (git diff + untracked),
+        copies them to a permanent outputs directory along with the spec file and
+        a manifest.json.  Called after the agent completes and before any worktree
+        cleanup so outputs are never destroyed.
+
+        If collection fails the error is logged but the caller should NOT delete
+        the worktree — better to leave a stale worktree than lose outputs.
+        """
+        outputs_dir = os.path.join(self.state_dir, "outputs", self.spec_id)
+        files_dir = os.path.join(outputs_dir, "files")
+        os.makedirs(files_dir, exist_ok=True)
+
+        # 1. Copy the final spec file so we preserve the all-DONE state.
+        if os.path.isfile(self.spec_path):
+            shutil.copy2(self.spec_path, os.path.join(outputs_dir, "spec.md"))
+
+        # 2. Detect changed/new files in worktree via git.
+        changed: list[dict] = []
+        try:
+            r = subprocess.run(
+                ["git", "-C", self.worktree, "diff", "--name-only", "HEAD"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    f = line.strip()
+                    if f:
+                        changed.append({"path": f, "action": "modified"})
+
+            r = subprocess.run(
+                ["git", "-C", self.worktree, "ls-files", "--others", "--exclude-standard"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    f = line.strip()
+                    if f:
+                        changed.append({"path": f, "action": "created"})
+        except Exception:
+            logger.warning("collect_outputs: git enumerate failed for %s", self.spec_id)
+
+        # 3. Copy each changed file preserving relative directory structure.
+        file_entries: list[dict] = []
+        for entry in changed:
+            rel = entry["path"]
+            src = os.path.join(self.worktree, rel)
+            if not os.path.isfile(src):
+                continue
+            dst = os.path.join(files_dir, rel)
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            shutil.copy2(src, dst)
+            file_entries.append({"path": rel, "action": entry["action"], "size": os.path.getsize(src)})
+
+        # 4. Write manifest.json describing all preserved outputs.
+        manifest = {
+            "queue_id": self.spec_id,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "files": file_entries,
+        }
+        _write_file_atomic(
+            os.path.join(outputs_dir, "manifest.json"),
+            json.dumps(manifest, indent=2) + "\n",
+        )
+
+        # 5. Append iteration log tail to verify-outputs.log.
+        verify_log = os.path.join(outputs_dir, "verify-outputs.log")
+        if os.path.isfile(self.log_file):
+            try:
+                with open(self.log_file, encoding="utf-8", errors="replace") as lf:
+                    with open(verify_log, "a", encoding="utf-8") as vf:
+                        vf.write(f"\n=== {self.spec_id} iter {self.iteration} ===\n")
+                        vf.write(lf.read())
+            except Exception:
+                logger.warning("collect_outputs: could not append log for %s", self.spec_id)
+
+        logger.info(
+            "collect_outputs: preserved %d files for %s → %s",
+            len(file_entries), self.spec_id, outputs_dir,
+        )
 
     def post_process(self) -> None:
         """Post-process after tmux session completes.

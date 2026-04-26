@@ -402,6 +402,14 @@ def validate_spec(content: str) -> ValidationResult:
     # Check workspace policy (produces warnings, never errors)
     result.warnings.extend(check_workspace_policy(content))
 
+    # Warn if no outcomes section (will become required after migration)
+    if "outcomes:" not in content and "**Outcomes:**" not in content:
+        result.warnings.append(
+            "Spec has no 'outcomes:' section. Add an outcomes section so readers "
+            "know what the spec delivers. This will become a hard error after "
+            "existing specs are migrated."
+        )
+
     # Set valid flag
     if result.errors:
         result.valid = False
@@ -448,6 +456,12 @@ def _validate_yaml_spec(content: str) -> "ValidationResult":
                 result.done += 1
             elif t.status == "SKIPPED":
                 result.skipped += 1
+        if not tasks.outcomes:
+            result.warnings.append(
+                "Spec has no 'outcomes:' field. Add an outcomes section so readers "
+                "know what the spec delivers. This will become a hard error after "
+                "existing specs are migrated."
+            )
     except ValueError as e:
         result.errors.append(str(e))
     if result.errors:

@@ -11,13 +11,27 @@
 # for self-evolving specs.
 #
 # Also supports YAML spec format (.yaml/.yml) as an alternative to markdown.
-# See ~/.boi/src/docs/yaml-spec-schema.md for the schema.
+# See docs/yaml-spec-schema.md for the schema.
 
 import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+@dataclass
+class Outcome:
+    """A spec-level outcome declared before tasks.
+
+    Each outcome has a human-readable description and a shell verify command.
+    After all tasks are DONE, the worker runs each verify command; outcomes are
+    marked PASS (exit 0) or FAIL (non-zero).
+    """
+
+    description: str
+    verify: str
+    status: str = "PENDING"  # PENDING, PASS, FAIL
 
 
 @dataclass
@@ -289,7 +303,12 @@ class BoiTaskList(list):
 
     Existing callers iterate over BoiTask objects as normal.
     The .get('tasks', []) accessor returns plain dicts for verify-script compat.
+    The .get('outcomes', []) accessor returns spec-level Outcome dicts.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.outcomes: list[Outcome] = []
 
     def get(self, key: str, default=None):  # type: ignore[override]
         if key == "tasks":
@@ -303,6 +322,15 @@ class BoiTaskList(list):
                     "blocked_by": list(t.blocked_by),
                 }
                 for t in self
+            ]
+        if key == "outcomes":
+            return [
+                {
+                    "description": o.description,
+                    "verify": o.verify,
+                    "status": o.status,
+                }
+                for o in self.outcomes
             ]
         return default
 
@@ -487,7 +515,7 @@ def parse_yaml_spec(source: str) -> BoiTaskList:
     Accepts either raw YAML content or a file path (auto-detected when the
     string has no newlines and names an existing file).
 
-    The YAML format is defined in ~/.boi/src/docs/yaml-spec-schema.md.
+    The YAML format is defined in docs/yaml-spec-schema.md.
     """
     import yaml  # PyYAML is available in the BOI environment
 
@@ -510,7 +538,18 @@ def parse_yaml_spec(source: str) -> BoiTaskList:
         raise ValueError("YAML spec must be a mapping (dict) at the top level")
 
     raw_tasks = data.get("tasks", []) or []
+    raw_outcomes = data.get("outcomes", []) or []
     tasks: BoiTaskList = BoiTaskList()
+
+    for entry in raw_outcomes:
+        if not isinstance(entry, dict):
+            continue
+        tasks.outcomes.append(
+            Outcome(
+                description=str(entry.get("description", "")).strip(),
+                verify=str(entry.get("verify", "")).strip(),
+            )
+        )
 
     for entry in raw_tasks:
         if not isinstance(entry, dict):
@@ -621,7 +660,7 @@ def content_is_yaml(content: str) -> bool:
     copies that always receive a .spec.md extension regardless of the
     original format.
     """
-    _YAML_TOP_KEYS = ("title:", "tasks:", "workspace:", "mode:", "context:")
+    _YAML_TOP_KEYS = ("title:", "tasks:", "workspace:", "mode:", "context:", "outcomes:")
     for line in content.splitlines():
         stripped = line.strip()
         if not stripped:

@@ -18,7 +18,29 @@ Use `.yaml` or `.yml` extension. BOI detects format by extension:
 | `context` | No | string | Free-text background information for workers |
 | `workspace` | No | string | Pin spec to a specific worktree path |
 | `blocked_by` | No | list of strings | Queue IDs this spec depends on (e.g. `[q-001, q-002]`) |
+| `outcomes` | Recommended | list of outcome objects | Spec-level declarations of what this spec delivers. Verified after all tasks DONE. |
 | `tasks` | Yes | list of task objects | Ordered list of tasks |
+
+## Outcome Object Fields
+
+The `outcomes` field declares what the spec produces as a whole. Each outcome is verified after all tasks are DONE; if any outcome fails, the spec is not marked COMPLETED.
+
+| Field | Required | Type | Description |
+|-------|----------|------|-------------|
+| `description` | Yes | string | Human-readable statement of what was produced |
+| `verify` | Yes | string | Shell command that exits 0 if the outcome was delivered |
+
+```yaml
+outcomes:
+  - description: "User avatar upload endpoint is live"
+    verify: "curl -s http://localhost:8000/users/1/avatar | grep avatar_url"
+  - description: "Avatar migration applied to dev database"
+    verify: "python3 -c \"from src.models.user import User; print(User.avatar_url)\""
+```
+
+**How it differs from task `verify`:** Task `verify` proves a single task step was done. `outcomes` prove the whole spec delivered what it promised. A spec can have all tasks pass but still fail outcomes if the combined result is wrong.
+
+**Validation:** Specs without `outcomes` emit a WARNING. After existing specs are migrated, this will become a hard ERROR.
 
 ## Task Object Fields
 
@@ -62,6 +84,9 @@ context: |              # optional, free text
 workspace: /path        # optional
 blocked_by:             # optional
   - q-001
+outcomes:               # recommended — verified after all tasks DONE
+  - description: "Artifact exists and is correct"
+    verify: "test -f /path/to/artifact"
 tasks:                  # required, list of task objects
   - id: t-1             # required, unique
     title: string       # required

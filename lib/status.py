@@ -1193,6 +1193,68 @@ _STATUS_SYMBOLS: dict[str, str] = {
 }
 
 
+def _parse_outcome_results_from_log(log_dir: str, queue_id: str) -> tuple[int, int]:
+    """Parse outcome pass/fail counts from the latest iteration log.
+
+    Returns (pass_count, total_count). Returns (0, 0) if not found.
+    """
+    if not log_dir or not queue_id:
+        return (0, 0)
+    log_path_dir = Path(log_dir)
+    log_files = sorted(log_path_dir.glob(f"{queue_id}-iter-*.log"))
+    if not log_files:
+        return (0, 0)
+    try:
+        content = log_files[-1].read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return (0, 0)
+    m = re.search(r'\[OUTCOMES\]\s*Outcomes:\s*(\d+)/(\d+)\s*passed', content)
+    if not m:
+        return (0, 0)
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def _get_outcome_display_suffix(spec: dict[str, Any], queue_dir: str) -> str:
+    """Return outcome counts display suffix for a spec row.
+
+    Returns strings like:
+        " · 3/3 outcomes ✓"   (completed, all pass)
+        " · 1/3 outcomes ✗"   (completed, some fail)
+        " · 3 outcomes"        (active, count only)
+        ""                     (no outcomes or can't read)
+    """
+    spec_path = spec.get("spec_path", "")
+    if not spec_path:
+        return ""
+    try:
+        content = Path(spec_path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if "outcomes:" not in content.lower():
+        return ""
+    try:
+        from lib.spec_parser import parse_spec as _parse_spec
+        task_list = _parse_spec(content)
+        outcomes = task_list.outcomes
+    except Exception:
+        return ""
+    if not outcomes:
+        return ""
+    total = len(outcomes)
+    status = spec.get("status", "")
+    if status in ("completed", "failed") and queue_dir:
+        log_dir = str(Path(queue_dir).parent / "logs")
+        qid = spec.get("id", "")
+        if qid:
+            pass_count, log_total = _parse_outcome_results_from_log(log_dir, qid)
+            if log_total > 0:
+                if pass_count == log_total:
+                    return f" · {pass_count}/{total} outcomes ✓"
+                else:
+                    return f" · {pass_count}/{total} outcomes ✗"
+    return f" · {total} outcomes"
+
+
 def _format_running_row_minimal(
     spec: dict[str, Any],
     color: bool = True,
@@ -1230,6 +1292,11 @@ def _format_running_row_minimal(
         e2e_marker = Path(queue_dir) / f"{qid}.e2e-phase"
         if e2e_marker.is_file():
             tasks_str = f"{tasks_done}/{tasks_total} \u00b7 E2E verifying..."
+
+    # Append outcome counts if spec declares outcomes
+    outcome_suffix = _get_outcome_display_suffix(spec, queue_dir)
+    if outcome_suffix:
+        tasks_str = f"{tasks_str}{outcome_suffix}"
 
     elapsed = ""
     if status in ("running", "requeued", "assigning"):
@@ -1283,6 +1350,7 @@ def _format_finished_row_minimal(
     spec: dict[str, Any],
     color: bool = True,
     columns: int = 0,
+    queue_dir: str = "",
 ) -> str:
     """Format a recently finished spec as a single minimal line.
 
@@ -1305,6 +1373,11 @@ def _format_finished_row_minimal(
     tasks_done = spec.get("tasks_done", 0)
     tasks_total = spec.get("tasks_total", 0)
     tasks_str = f"{tasks_done}/{tasks_total}" if tasks_total > 0 else "\u2014"
+
+    # Append outcome counts if spec declares outcomes
+    outcome_suffix = _get_outcome_display_suffix(spec, queue_dir)
+    if outcome_suffix:
+        tasks_str = f"{tasks_str}{outcome_suffix}"
 
     time_ago = format_relative_time(spec.get("last_iteration_at"))
 
@@ -1607,7 +1680,7 @@ def render_status(
                         bar_line = f"{DIM}{bar_line}{NC}"
                     lines.append(bar_line)
             else:
-                lines.append(_format_finished_row_minimal(entry, color=color, columns=term_w))
+                lines.append(_format_finished_row_minimal(entry, color=color, columns=term_w, queue_dir=queue_dir))
 
         if _hidden_count > 0:
             _more_line = f"  ... and {_hidden_count} more completed in last 6h"

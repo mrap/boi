@@ -1083,6 +1083,25 @@ print(d.get('failure_reason', 'Unknown error'))
         echo ""
         tail -n 50 "${latest_log}"
     fi
+
+    # Show formatted Outcomes section if present in the log
+    if grep -q '\[OUTCOMES\]' "${latest_log}" 2>/dev/null; then
+        echo ""
+        python3 - "${latest_log}" <<'PYEOF'
+import sys, re
+
+content = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r'\[OUTCOMES\]\s*(Outcomes:.*?)(?=\n\[|\Z)', content, re.DOTALL)
+if m:
+    block = m.group(1).strip()
+    # Replace "[OUTCOMES] " prefix on first line (already stripped above)
+    lines = block.splitlines()
+    print("\nOutcomes:")
+    for line in lines[1:] if lines else []:
+        if line.strip():
+            print(line)
+PYEOF
+    fi
 }
 
 # ─── Subcommand: cancel ──────────────────────────────────────────────────────
@@ -2311,6 +2330,148 @@ if json_mode:
     print(format_telemetry_json(telemetry))
 else:
     print(format_telemetry_table(telemetry))
+PYEOF
+}
+
+# ─── Subcommand: outputs ─────────────────────────────────────────────────────
+
+cmd_outputs() {
+    local queue_id=""
+    local recent_mode=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --recent) recent_mode=true; shift ;;
+            -h|--help)
+                echo "Usage: boi outputs <queue-id>"
+                echo "       boi outputs --recent"
+                echo ""
+                echo "Show files preserved after a completed spec."
+                echo ""
+                echo "Options:"
+                echo "  --recent    Show last 10 completed specs with output counts"
+                exit 0
+                ;;
+            -*)
+                die_usage "Unknown option: $1"
+                ;;
+            *)
+                if [[ -z "${queue_id}" ]]; then
+                    queue_id="$1"
+                else
+                    die_usage "Unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ "${recent_mode}" == "true" ]]; then
+        BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${BOI_STATE_DIR}" <<'PYEOF'
+import sys, os, json
+
+state_dir = sys.argv[1]
+outputs_dir = os.path.join(state_dir, "outputs")
+if not os.path.isdir(outputs_dir):
+    print("No outputs found. Run a spec to completion first.")
+    sys.exit(0)
+
+entries = []
+for qid in os.listdir(outputs_dir):
+    d = os.path.join(outputs_dir, qid)
+    if not os.path.isdir(d):
+        continue
+    manifest_path = os.path.join(d, "manifest.json")
+    mtime = os.path.getmtime(d)
+    file_count = 0
+    completed_at = ""
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path) as f:
+                m = json.load(f)
+            file_count = len(m.get("files", []))
+            completed_at = m.get("completed_at", "")[:19].replace("T", " ")
+        except Exception:
+            pass
+    entries.append((mtime, qid, file_count, completed_at))
+
+entries.sort(reverse=True)
+entries = entries[:10]
+
+if not entries:
+    print("No outputs found.")
+    sys.exit(0)
+
+print(f"{'QUEUE-ID':<12}  {'COMPLETED':<20}  {'FILES':>5}")
+print("-" * 42)
+for _, qid, file_count, completed_at in entries:
+    print(f"{qid:<12}  {completed_at:<20}  {file_count:>5}")
+PYEOF
+        return
+    fi
+
+    if [[ -z "${queue_id}" ]]; then
+        die_usage "Specify a queue-id: boi outputs <queue-id>"
+    fi
+
+    BOI_SCRIPT_DIR="${SCRIPT_DIR}" python3 - "${BOI_STATE_DIR}" "${queue_id}" <<'PYEOF'
+import sys, os, json, re
+
+state_dir = sys.argv[1]
+queue_id = sys.argv[2]
+outputs_dir = os.path.join(state_dir, "outputs", queue_id)
+
+if not os.path.isdir(outputs_dir):
+    print(f"Error: No outputs found for {queue_id}. Either the spec hasn't completed or outputs weren't collected.", file=sys.stderr)
+    sys.exit(1)
+
+manifest_path = os.path.join(outputs_dir, "manifest.json")
+if not os.path.isfile(manifest_path):
+    print(f"Error: manifest.json missing in {outputs_dir}", file=sys.stderr)
+    sys.exit(1)
+
+with open(manifest_path) as f:
+    manifest = json.load(f)
+
+# Extract name/mode/initiative from preserved spec.md
+spec_name = queue_id
+mode = ""
+initiative = ""
+spec_md = os.path.join(outputs_dir, "spec.md")
+if os.path.isfile(spec_md):
+    with open(spec_md, encoding="utf-8", errors="replace") as f:
+        content = f.read()
+    m = re.search(r"^# (.+)$", content, re.MULTILINE)
+    if m:
+        spec_name = m.group(1).strip()
+    m = re.search(r"\*\*Mode:\*\*\s*(.+)", content)
+    if m:
+        mode = m.group(1).strip()
+    m = re.search(r"\*\*Initiative:\*\*\s*(.+)", content)
+    if m:
+        initiative = m.group(1).strip()
+
+files = manifest.get("files", [])
+completed_at = manifest.get("completed_at", "")[:19].replace("T", " ") if manifest.get("completed_at") else ""
+
+print(f"Spec: {spec_name} ({queue_id})")
+if completed_at:
+    print(f"Completed: {completed_at}Z")
+if mode:
+    print(f"Mode: {mode}")
+if initiative:
+    print(f"Initiative: {initiative}")
+print()
+print(f"Outputs ({len(files)} files):")
+for fe in files:
+    size_kb = fe.get("size", 0) / 1024
+    size_str = f"{size_kb:.1f}KB"
+    action = fe.get("action", "")
+    path = fe.get("path", "")
+    print(f"  {path:<50} ({action}, {size_str})")
+
+print()
+print(f"Files preserved at: ~/.boi/outputs/{queue_id}/files/")
 PYEOF
 }
 
@@ -4126,6 +4287,7 @@ usage() {
     echo "  stop        Stop daemon and all workers"
     echo "  workers     Show worker/worktree status"
     echo "  telemetry   Show per-iteration breakdown"
+    echo "  outputs     Show files preserved from a completed spec"
     echo "  review      Review experiment proposals on a paused spec"
     echo "  purge       Remove completed/failed/canceled specs"
     echo "  critic      Manage the critic validation system"
@@ -4657,6 +4819,7 @@ main() {
         purge)      cmd_purge "$@" ;;
         workers)    cmd_workers "$@" ;;
         telemetry)  cmd_telemetry "$@" ;;
+        outputs)    cmd_outputs "$@" ;;
         doctor)     cmd_doctor "$@" ;;
         config)     cmd_config "$@" ;;
         upgrade)    cmd_upgrade "$@" ;;

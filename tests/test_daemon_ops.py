@@ -1166,7 +1166,7 @@ class TestCriticReviewDaemonIntegration(DaemonOpsTestCase):
         os.makedirs(checks_dir, exist_ok=True)
 
     def test_critic_review_triggers_phase_transition(self):
-        """After critic_review outcome, setting phase to 'critic' enables
+        """After critic_review outcome, setting phase to 'task-verify' enables
         process_critic_completion to be called on next completion."""
 
         spec_path = self._create_spec(tasks_pending=0, tasks_done=3)
@@ -1181,9 +1181,9 @@ class TestCriticReviewDaemonIntegration(DaemonOpsTestCase):
         )
         self.assertEqual(result["outcome"], "critic_review")
 
-        # Step 2: Simulate daemon setting phase to "critic" (as daemon.py does)
-        self.db.update_spec_fields(entry["id"], phase="critic")
-        self.db.set_running(entry["id"], "w-1", phase="critic")
+        # Step 2: Simulate daemon setting phase to "task-verify" (as daemon.py does)
+        self.db.update_spec_fields(entry["id"], phase="task-verify")
+        self.db.set_running(entry["id"], "w-1", phase="task-verify")
 
         # Step 3: Simulate critic worker completing with approval
         # Add "## Critic Approved" to the copied spec
@@ -2594,10 +2594,10 @@ class TestUpdateSpecFieldsDB(DaemonOpsDBTestCase):
         spec_path = self._create_spec(tasks_pending=2)
         entry = self.db.enqueue(spec_path)
 
-        self.db.update_spec_fields(entry["id"], phase="critic")
+        self.db.update_spec_fields(entry["id"], phase="task-verify")
 
         updated = self.db.get_spec(entry["id"])
-        self.assertEqual(updated["phase"], "critic")
+        self.assertEqual(updated["phase"], "task-verify")
 
     def test_update_multiple_fields(self):
         """Update multiple fields at once."""
@@ -2629,7 +2629,7 @@ class TestUpdateSpecFieldsDB(DaemonOpsDBTestCase):
     def test_missing_spec_raises(self):
         """Updating a nonexistent spec raises ValueError."""
         with self.assertRaises(ValueError):
-            self.db.update_spec_fields("q-nonexistent", phase="critic")
+            self.db.update_spec_fields("q-nonexistent", phase="task-verify")
 
     def test_update_no_fields_is_noop(self):
         """Calling with no fields is a no-op."""

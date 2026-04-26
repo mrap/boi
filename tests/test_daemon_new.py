@@ -316,18 +316,18 @@ class TestAssignSpecToWorker(DaemonTestCase):
         """Critic phase is passed through to launch_worker and DB."""
         mock_launch.return_value = self._make_mock_proc(pid=3001)
 
-        spec_id = self._enqueue_spec(phase="critic")
+        spec_id = self._enqueue_spec(phase="task-verify")
         spec = self.daemon.db.pick_next_spec()
         worker = self.daemon.db.get_worker("w1")
 
         self.daemon.assign_spec_to_worker(spec, worker)
 
         call_kwargs = mock_launch.call_args.kwargs
-        self.assertEqual(call_kwargs["phase"], "critic")
+        self.assertEqual(call_kwargs["phase"], "task-verify")
 
         # Worker should record phase
         w = self.daemon.db.get_worker("w1")
-        self.assertEqual(w["current_phase"], "critic")
+        self.assertEqual(w["current_phase"], "task-verify")
 
     @patch.object(Daemon, "launch_worker")
     def test_assign_passes_timeout(
@@ -561,13 +561,13 @@ class TestLaunchWorker(DaemonTestCase):
             worktree=self.worktree_a,
             spec_path=spec_path,
             iteration=1,
-            phase="critic",
+            phase="task-verify",
             worker_id="w1",
         )
 
         cmd = mock_popen.call_args.args[0]
         phase_idx = cmd.index("--phase")
-        self.assertEqual(cmd[phase_idx + 1], "critic")
+        self.assertEqual(cmd[phase_idx + 1], "task-verify")
 
 
 # ─── Integration-style tests (mock subprocess only) ───────────────────
@@ -975,14 +975,14 @@ class TestProcessWorkerCompletion(DaemonTestCase):
         """Phase from worker record is passed to phase handler."""
         mock_launch.return_value = self._make_mock_proc(pid=10002)
 
-        spec_id = self._enqueue_spec(phase="critic")
+        spec_id = self._enqueue_spec(phase="task-verify")
         self.daemon.dispatch_specs()
 
         self.daemon.process_worker_completion("w1", exit_code=0)
 
         mock_dispatch.assert_called_once_with(
             spec_id=spec_id,
-            phase="critic",
+            phase="task-verify",
             exit_code=0,
             worker_id="w1",
         )

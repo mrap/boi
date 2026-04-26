@@ -77,7 +77,7 @@ class TestAdvancePipelineThreePhase(unittest.TestCase):
         d = self._make()
         d._advance_pipeline("q-1", "review")
         d.db.requeue.assert_called_once_with("q-1", 2, 5)
-        d.db.update_spec_fields.assert_called_once_with("q-1", phase="critic")
+        d.db.update_spec_fields.assert_called_once_with("q-1", phase="task-verify")
         d.db.complete.assert_not_called()
 
     def test_critic_completes_spec(self):
@@ -131,9 +131,9 @@ class TestReviewPhaseCompletion(unittest.TestCase):
         # Patch run_hooks to avoid actual hook execution
         with patch("lib.guardrail_runner.run_hooks", return_value=MagicMock(approved=True, blocked=False)):
             d._handle_custom_phase_completion("q-1", "review", self.review_phase, 0, self.spec_path)
-        # review approved → _advance_pipeline("q-1", "review") → requeue + phase=critic
+        # review approved → _advance_pipeline("q-1", "review") → requeue + phase=task-verify
         d.db.requeue.assert_called_once_with("q-1", 2, 5)
-        d.db.update_spec_fields.assert_called_once_with("q-1", phase="critic")
+        d.db.update_spec_fields.assert_called_once_with("q-1", phase="task-verify")
 
     def test_review_reject_requeues_to_execute(self):
         """Spec containing '[REVIEW]' sends spec back to execute phase."""

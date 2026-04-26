@@ -48,10 +48,10 @@ class TestCriticRequeue(IntegrationTestCase):
             return MockClaude(
                 phase="execute", tasks_to_complete=10, exit_code=0
             )
-        elif phase == "critic":
+        elif phase == "task-verify":
             # Always add 1 [CRITIC] task — never approve
             return MockClaude(
-                phase="critic",
+                phase="task-verify",
                 add_tasks=1,
                 critic_approve=False,
                 exit_code=0,
@@ -125,12 +125,12 @@ class TestCriticRequeue(IntegrationTestCase):
         if phase == "execute":
             if pending == 0 and total > 0:
                 # All tasks done — trigger critic
-                db.update_spec_fields(spec_id, phase="critic")
+                db.update_spec_fields(spec_id, phase="task-verify")
                 db.requeue(spec_id, done, total)
             else:
                 db.requeue(spec_id, done, total)
 
-        elif phase == "critic":
+        elif phase == "task-verify":
             # Re-read counts AFTER critic modified spec
             counts_after = count_boi_tasks(spec_path)
             pending_after = counts_after["pending"]

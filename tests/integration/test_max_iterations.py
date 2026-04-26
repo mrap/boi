@@ -273,20 +273,20 @@ class TestCriticDoesNotIncrementIteration(IntegrationTestCase):
                 tasks_to_complete=99,
                 exit_code=0,
             )
-        elif phase == "critic":
+        elif phase == "task-verify":
             key = f"{spec_id}-critic"
             count = self._critic_call_counts.get(key, 0)
             self._critic_call_counts[key] = count + 1
 
             if count == 0:
                 return MockClaude(
-                    phase="critic",
+                    phase="task-verify",
                     add_tasks=2,
                     exit_code=0,
                 )
             else:
                 return MockClaude(
-                    phase="critic",
+                    phase="task-verify",
                     critic_approve=True,
                     exit_code=0,
                 )
@@ -341,7 +341,7 @@ class TestCriticDoesNotIncrementIteration(IntegrationTestCase):
                     db.conn.execute(
                         "UPDATE specs SET "
                         "status = 'requeued', "
-                        "phase = 'critic', "
+                        "phase = 'task-verify', "
                         "tasks_done = ?, "
                         "tasks_total = ? "
                         "WHERE id = ?",
@@ -355,7 +355,7 @@ class TestCriticDoesNotIncrementIteration(IntegrationTestCase):
                     db.conn.commit()
             else:
                 db.requeue(spec_id, done, total)
-        elif phase == "critic":
+        elif phase == "task-verify":
             # Re-read spec file after critic modified it
             content = Path(spec_path).read_text(encoding="utf-8")
             tasks = parse_boi_spec(content)
@@ -417,7 +417,7 @@ class TestCriticDoesNotIncrementIteration(IntegrationTestCase):
             it for it in iterations if it["phase"] == "execute"
         ]
         critic_iterations = [
-            it for it in iterations if it["phase"] == "critic"
+            it for it in iterations if it["phase"] == "task-verify"
         ]
 
         # Should have 2 execute passes (initial + post-critic)
@@ -444,7 +444,7 @@ class TestCriticDoesNotIncrementIteration(IntegrationTestCase):
         for it in sorted_iters:
             if it["phase"] == "execute":
                 last_exec_iter = it["iteration"]
-            elif it["phase"] == "critic":
+            elif it["phase"] == "task-verify":
                 self.assertEqual(
                     it["iteration"],
                     last_exec_iter,
@@ -496,7 +496,7 @@ class TestCriticDoesNotIncrementIteration(IntegrationTestCase):
         iterations = self.harness.get_iterations(spec_id)
         phases = {it["phase"] for it in iterations}
         self.assertIn("execute", phases)
-        self.assertIn("critic", phases)
+        self.assertIn("task-verify", phases)
 
 
 if __name__ == "__main__":

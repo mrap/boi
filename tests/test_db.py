@@ -214,7 +214,7 @@ class TestCheckConstraints(DbTestCase):
             self._insert_spec(status="bogus")
 
     def test_valid_phase_accepted(self) -> None:
-        valid_phases = ["execute", "critic", "evaluate", "decompose"]
+        valid_phases = ["execute", "task-verify", "evaluate", "decompose"]
         for i, phase in enumerate(valid_phases):
             self._insert_spec(id=f"q-{i+1:03d}", phase=phase)
         cursor = self.db.conn.execute("SELECT COUNT(*) FROM specs")
@@ -947,11 +947,11 @@ class TestSetRunning(CrudTestCase):
         self.db.requeue(sid)
         self.db.pick_next_spec()
         # Run as critic
-        self.db.set_running(sid, "w-1", phase="critic")
+        self.db.set_running(sid, "w-1", phase="task-verify")
         spec = self.db.get_spec(sid)
         # iteration should still be 1 (critic doesn't increment)
         self.assertEqual(spec["iteration"], 1)
-        self.assertEqual(spec["phase"], "critic")
+        self.assertEqual(spec["phase"], "task-verify")
 
     def test_evaluate_phase_does_not_increment_iteration(self) -> None:
         sid = self._enqueue_and_assign()
@@ -1073,7 +1073,7 @@ class TestMaxIterations(CrudTestCase):
         # Critic (doesn't count)
         self.db.requeue(sid)
         self.db.pick_next_spec()
-        self.db.set_running(sid, "w-1", phase="critic")
+        self.db.set_running(sid, "w-1", phase="task-verify")
         self.assertFalse(self.db.has_reached_max_iterations(sid))
 
         # Execute 2
@@ -1399,7 +1399,7 @@ class TestFullLifecycle(CrudTestCase):
         # Critic (doesn't increment)
         self.db.requeue(sid)
         self.db.pick_next_spec()
-        self.db.set_running(sid, "w-1", phase="critic")
+        self.db.set_running(sid, "w-1", phase="task-verify")
         self.assertEqual(self.db.get_spec(sid)["iteration"], 1)
 
         # Execute 2
@@ -1513,10 +1513,10 @@ class TestAssignWorker(CrudTestCase):
         entry = self.db.enqueue(spec)
         sid = entry["id"]
         self.db.pick_next_spec()
-        self.db.set_running(sid, "w-1", phase="critic")
-        self.db.assign_worker("w-1", sid, pid=4567, phase="critic")
+        self.db.set_running(sid, "w-1", phase="task-verify")
+        self.db.assign_worker("w-1", sid, pid=4567, phase="task-verify")
         w = self.db.get_worker("w-1")
-        self.assertEqual(w["current_phase"], "critic")
+        self.assertEqual(w["current_phase"], "task-verify")
 
 
 class TestFreeWorker(CrudTestCase):
@@ -2093,7 +2093,7 @@ class TestInsertIteration(CrudTestCase):
         self.db.insert_iteration(
             spec_id="q-001",
             iteration=1,
-            phase="critic",
+            phase="task-verify",
             worker_id="w-1",
             started_at="2026-01-01T00:06:00+00:00",
             ended_at="2026-01-01T00:08:00+00:00",
@@ -2103,7 +2103,7 @@ class TestInsertIteration(CrudTestCase):
         self.assertEqual(len(iters), 2)
         phases = [it["phase"] for it in iters]
         self.assertIn("execute", phases)
-        self.assertIn("critic", phases)
+        self.assertIn("task-verify", phases)
 
     def test_insert_iteration_logs_event(self) -> None:
         spec = self._make_spec_file()
