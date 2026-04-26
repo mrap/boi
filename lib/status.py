@@ -1029,8 +1029,7 @@ def _get_iteration_elapsed(spec: dict[str, Any], queue_dir: str) -> str:
 def _get_current_task(spec: dict[str, Any], max_width: int = 60) -> str:
     """Return the first PENDING task heading from the spec file.
 
-    Reads spec_path from the spec entry, parses task headings matching
-    ``### t-N:`` and returns the first one whose status line is PENDING.
+    Handles both markdown (### t-N: headings) and YAML (tasks: array) formats.
     Formatted as "t-N: {task title}" truncated to ~max_width chars.
     Returns "" if no pending task is found or the file cannot be read.
     """
@@ -1042,6 +1041,25 @@ def _get_current_task(spec: dict[str, Any], max_width: int = 60) -> str:
     except OSError:
         return ""
 
+    # Try YAML format first (tasks: array)
+    if "tasks:" in content and not content.lstrip().startswith("#"):
+        try:
+            import yaml
+            data = yaml.safe_load(content)
+            if isinstance(data, dict) and isinstance(data.get("tasks"), list):
+                for task in data["tasks"]:
+                    if isinstance(task, dict) and str(task.get("status", "")).upper() == "PENDING":
+                        task_id = task.get("id", "t-?")
+                        title = task.get("title", "")
+                        label = f"{task_id}: {title}"
+                        if max_width > 0 and len(label) > max_width:
+                            label = label[: max_width - 1] + "\u2026"
+                        return label
+                return ""
+        except Exception:
+            pass
+
+    # Markdown format fallback (### t-N: headings)
     heading_re = re.compile(r"^### (t-\d+):\s*(.+)$", re.MULTILINE)
     lines = content.splitlines()
     line_index: dict[int, tuple[str, str]] = {}
@@ -1050,7 +1068,6 @@ def _get_current_task(spec: dict[str, Any], max_width: int = 60) -> str:
         line_index[lineno] = (m.group(1), m.group(2).strip())
 
     for lineno, (task_id, title) in sorted(line_index.items()):
-        # Find the first non-empty line after the heading
         for next_line in lines[lineno + 1 :]:
             stripped = next_line.strip()
             if stripped:
@@ -1059,10 +1076,9 @@ def _get_current_task(spec: dict[str, Any], max_width: int = 60) -> str:
                     if max_width > 0 and len(label) > max_width:
                         label = label[: max_width - 1] + "\u2026"
                     return label
-                break  # non-empty, non-PENDING — not pending
+                break
 
     return ""
-
 
 def format_spec_row(
     spec: dict[str, Any],
