@@ -312,6 +312,8 @@ boi resume <queue-id> | --all            Resume failed or canceled specs
 boi cleanup                               Kill orphaned worker processes
 boi workers [--json]                      Show worktree health
 boi telemetry <queue-id> [--json]        Per-iteration metrics
+boi outputs <queue-id>                    Show files produced by a completed spec
+boi outputs --recent                      Show last 10 completed specs with output counts
 boi critic status | run | enable | disable | checks
 boi spec <queue-id> [add|skip|next|block|edit|deps]
 boi dep add|remove|set|clear|show|viz|check
@@ -329,6 +331,50 @@ boi project create|list|status|context|delete
 | `--worktree-isolate` | Dedicated git worktree and branch for this spec |
 | `--after q-A,q-B` | Wait for listed specs to complete before starting |
 | `--project NAME` | Associate with a project (injects project context) |
+
+## Output Preservation
+
+BOI automatically preserves the work product of every completed spec so outputs are never lost when the worktree is cleaned up.
+
+### Where outputs go
+
+```
+~/.boi/outputs/<queue-id>/
+  ├── spec.md              # final spec file with all tasks DONE
+  ├── manifest.json        # list of all files created/modified, with paths and sizes
+  ├── files/               # copies of created/modified files (relative paths preserved)
+  │   └── path/to/file.py
+  └── verify-outputs.log   # stdout/stderr from all verify commands
+```
+
+Files written **outside** the worktree (e.g. to `~/.hex/`, permanent config paths) are already in persistent locations — they are listed in `manifest.json` under `action: outside_worktree` but not copied.
+
+### Viewing outputs
+
+```bash
+boi outputs q-823
+```
+
+```
+Spec: pulse-message-persistence (q-823)
+Completed: 2026-04-25T20:15:00Z
+Mode: execute
+
+Outputs (3 files):
+  path/to/server.py          (modified, 41KB)
+  ~/.hex/audit/events.jsonl  (outside_worktree, 0KB)
+  docs/context-eval.md       (created, 2.1KB)
+
+Files preserved at: ~/.boi/outputs/q-823/files/
+```
+
+```bash
+boi outputs --recent    # last 10 completed specs
+```
+
+### Failure safety
+
+If output collection fails (disk full, permission error), BOI logs the error and **does not delete the worktree**. The worktree is only removed after outputs have been successfully preserved.
 
 ## Architecture
 

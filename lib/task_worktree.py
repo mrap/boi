@@ -69,6 +69,89 @@ def get_main_repo_from_worker(worktree_path: str) -> Optional[str]:
     return None
 
 
+def snapshot_worktree_files(worktree_path: str, snapshot_path: str) -> dict:
+    """Snapshot all files in a non-git worktree for later diff.
+
+    Called at worktree creation time so preserve_task_outputs can detect
+    new/modified files even when the worktree is not a git repo.
+
+    Args:
+        worktree_path: Path to the worktree directory to snapshot.
+        snapshot_path: Destination path for the persisted snapshot JSON.
+
+    Returns:
+        The snapshot dict mapping relative path → {mtime, size}.
+    """
+    import json
+
+    snapshot: dict = {}
+    try:
+        for dirpath, dirnames, filenames in os.walk(worktree_path):
+            # Skip hidden directories (e.g. .git) to keep snapshot small.
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fname in filenames:
+                full = os.path.join(dirpath, fname)
+                rel = os.path.relpath(full, worktree_path)
+                try:
+                    st = os.stat(full)
+                    snapshot[rel] = {"mtime": st.st_mtime, "size": st.st_size}
+                except OSError:
+                    pass
+    except OSError as exc:
+        logger.warning("snapshot_worktree_files: walk failed for %s: %s", worktree_path, exc)
+
+    tmp = snapshot_path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(snapshot_path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f)
+        os.rename(tmp, snapshot_path)
+        logger.info(
+            "snapshot_worktree_files: %d files snapshotted → %s", len(snapshot), snapshot_path
+        )
+    except OSError as exc:
+        logger.warning("snapshot_worktree_files: could not persist snapshot: %s", exc)
+
+    return snapshot
+
+
+def _detect_changed_from_snapshot(worktree_path: str, snapshot: dict) -> list:
+    """Return files new or modified since the snapshot was taken.
+
+    Used for non-git worktrees where git diff is unavailable.
+    Walks the current filesystem state and compares mtime/size against
+    the pre-execution snapshot created by snapshot_worktree_files().
+
+    Args:
+        worktree_path: Path to the worktree directory.
+        snapshot: Dict of {rel_path: {mtime, size}} from snapshot_worktree_files.
+
+    Returns:
+        List of {"path": rel, "action": "created"|"modified"} dicts.
+    """
+    changed = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(worktree_path):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fname in filenames:
+                full = os.path.join(dirpath, fname)
+                rel = os.path.relpath(full, worktree_path)
+                try:
+                    st = os.stat(full)
+                    if rel not in snapshot:
+                        changed.append({"path": rel, "action": "created"})
+                    elif (
+                        st.st_mtime > snapshot[rel].get("mtime", 0)
+                        or st.st_size != snapshot[rel].get("size", -1)
+                    ):
+                        changed.append({"path": rel, "action": "modified"})
+                except OSError:
+                    pass
+    except OSError as exc:
+        logger.warning("_detect_changed_from_snapshot: walk failed: %s", exc)
+    return changed
+
+
 def compute_task_worktree_path(worker_id: str, spec_id: str, task_id: str) -> str:
     """Return the path where the task's worktree should be created.
 
@@ -140,14 +223,186 @@ def create_task_worktree(
     return {"worktree_path": wt_path, "branch_name": branch}
 
 
-def remove_task_worktree(main_repo: str, worktree_path: str) -> None:
+def preserve_task_outputs(worktree_path: str, state_dir: Optional[str] = None) -> None:
+    """Copy outputs from a task worktree to the permanent outputs directory.
+
+    Extracts the spec_id from the worktree path (convention:
+    ~/.boi/worktrees/{worker_id}-{spec_id}-{task_id}), then copies all
+    git-tracked changes and untracked files to ~/.boi/outputs/{spec_id}/files/.
+    Writes a manifest.json listing every preserved file.
+
+    Called before removing the worktree so outputs are never destroyed.
+    Errors are logged but do not raise — caller should keep the worktree on failure.
+    """
+    import json
+    import re
+    import shutil
+    import subprocess
+    from datetime import datetime, timezone
+
+    if state_dir is None:
+        state_dir = os.path.expanduser("~/.boi")
+
+    # Extract spec_id from worktree basename (e.g. w-1-q-123-t-2 → q-123).
+    basename = os.path.basename(worktree_path.rstrip("/"))
+    m = re.search(r'(q-\d+)', basename)
+    if not m:
+        logger.warning("preserve_task_outputs: cannot extract spec_id from %s", worktree_path)
+        return
+    spec_id = m.group(1)
+
+    outputs_dir = os.path.join(state_dir, "outputs", spec_id)
+    files_dir = os.path.join(outputs_dir, "files")
+    try:
+        os.makedirs(files_dir, exist_ok=True)
+    except OSError as exc:
+        logger.error("preserve_task_outputs: cannot create outputs dir: %s", exc)
+        return
+
+    # Detect modified and untracked files.
+    # Git repos use git diff; non-git worktrees fall back to snapshot diffing.
+    changed: list[dict] = []
+
+    _is_git = subprocess.run(
+        ["git", "-C", worktree_path, "rev-parse", "--git-dir"],
+        capture_output=True, text=True, timeout=10,
+    ).returncode == 0
+
+    if _is_git:
+        try:
+            r = subprocess.run(
+                ["git", "-C", worktree_path, "diff", "--name-only", "HEAD"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    f = line.strip()
+                    if f:
+                        changed.append({"path": f, "action": "modified"})
+
+            r = subprocess.run(
+                ["git", "-C", worktree_path, "ls-files", "--others", "--exclude-standard"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    f = line.strip()
+                    if f:
+                        changed.append({"path": f, "action": "created"})
+        except Exception:
+            logger.warning("preserve_task_outputs: git enumerate failed for %s", worktree_path)
+    else:
+        # Non-git worktree: diff current filesystem state against the pre-execution snapshot.
+        snap_path = os.path.join(outputs_dir, ".worktree-snapshot.json")
+        snapshot: dict = {}
+        if os.path.isfile(snap_path):
+            try:
+                with open(snap_path, encoding="utf-8") as sf:
+                    snapshot = json.load(sf)
+            except Exception:
+                logger.warning(
+                    "preserve_task_outputs: could not load snapshot from %s", snap_path
+                )
+        else:
+            logger.warning(
+                "preserve_task_outputs: no snapshot found for non-git worktree %s — "
+                "file detection may be incomplete",
+                worktree_path,
+            )
+        changed = _detect_changed_from_snapshot(worktree_path, snapshot)
+
+    file_entries: list[dict] = []
+    for entry in changed:
+        rel = entry["path"]
+        src = os.path.join(worktree_path, rel)
+        if not os.path.isfile(src):
+            continue
+        dst = os.path.join(files_dir, rel)
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        shutil.copy2(src, dst)
+        file_entries.append({"path": rel, "action": entry["action"], "size": os.path.getsize(src)})
+
+    # Include files written outside the worktree (already at permanent locations;
+    # listed in manifest for visibility but not re-copied since they're not transient).
+    outside_entries: list[dict] = []
+    queue_dir = os.path.join(state_dir, "queue")
+    outside_manifest = os.path.join(queue_dir, f"{spec_id}.changed-files")
+    if os.path.isfile(outside_manifest):
+        try:
+            with open(outside_manifest, encoding="utf-8") as cf:
+                for raw_line in cf:
+                    fpath = raw_line.strip()
+                    if not fpath:
+                        continue
+                    abs_wt = os.path.realpath(worktree_path)
+                    abs_fp = os.path.realpath(fpath) if os.path.isabs(fpath) else ""
+                    if abs_fp and not abs_fp.startswith(abs_wt):
+                        # File is outside the worktree — record it without copying.
+                        size = os.path.getsize(abs_fp) if os.path.isfile(abs_fp) else 0
+                        outside_entries.append(
+                            {"path": fpath, "action": "outside_worktree", "size": size}
+                        )
+        except Exception:
+            logger.warning(
+                "preserve_task_outputs: could not read outside-worktree files for %s", spec_id
+            )
+
+    # Update or create manifest.json (merge with any existing entries).
+    manifest_path = os.path.join(outputs_dir, "manifest.json")
+    existing_files: list[dict] = []
+    if os.path.isfile(manifest_path):
+        try:
+            with open(manifest_path, encoding="utf-8") as mf:
+                existing_files = json.load(mf).get("files", [])
+        except Exception:
+            pass
+
+    seen = {e["path"] for e in file_entries}
+    outside_seen = {e["path"] for e in outside_entries}
+    merged = (
+        file_entries
+        + outside_entries
+        + [e for e in existing_files if e["path"] not in seen and e["path"] not in outside_seen]
+    )
+    manifest = {
+        "queue_id": spec_id,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "files": merged,
+    }
+    tmp = manifest_path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as mf:
+            json.dump(manifest, mf, indent=2)
+            mf.write("\n")
+        os.rename(tmp, manifest_path)
+    except Exception as exc:
+        logger.warning("preserve_task_outputs: manifest write failed: %s", exc)
+
+    logger.info(
+        "preserve_task_outputs: preserved %d files for %s from %s",
+        len(file_entries), spec_id, worktree_path,
+    )
+
+
+def remove_task_worktree(main_repo: str, worktree_path: str, state_dir: Optional[str] = None) -> None:
     """Remove a task's worktree after completion.
 
+    Collects and preserves any outputs first so they are never destroyed.
     Uses --force because the worktree may have untracked changes.
     Logs errors but does not raise.
     """
     if not os.path.exists(worktree_path):
         logger.debug("Worktree already gone: %s", worktree_path)
+        return
+
+    # Preserve outputs before the worktree is deleted.
+    try:
+        preserve_task_outputs(worktree_path, state_dir=state_dir)
+    except Exception:
+        logger.exception(
+            "preserve_task_outputs failed for %s — skipping removal to avoid data loss",
+            worktree_path,
+        )
         return
 
     _force_remove_worktree(main_repo, worktree_path)
