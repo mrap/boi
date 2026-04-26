@@ -1289,38 +1289,41 @@ class TestWriteHeartbeat(DaemonTestCase):
     """Test Daemon.write_heartbeat()."""
 
     def test_writes_heartbeat_file(self) -> None:
-        """Heartbeat file is created with a valid timestamp."""
+        """Heartbeat file is created with valid JSON content."""
+        import json
         self.daemon.write_heartbeat()
 
-        hb_path = os.path.join(self.state_dir, "daemon-heartbeat")
+        hb_path = os.path.join(self.state_dir, "heartbeat.json")
         self.assertTrue(os.path.isfile(hb_path))
 
-        content = Path(hb_path).read_text(encoding="utf-8").strip()
-        # Should be a valid ISO timestamp ending with Z
-        self.assertTrue(content.endswith("Z"))
-        # Verify it parses
-        datetime.strptime(content, "%Y-%m-%dT%H:%M:%SZ")
+        data = json.loads(Path(hb_path).read_text(encoding="utf-8"))
+        self.assertIn("ts", data)
+        # Timestamp should be a valid ISO timestamp ending with Z
+        self.assertTrue(data["ts"].endswith("Z"))
+        datetime.strptime(data["ts"], "%Y-%m-%dT%H:%M:%SZ")
 
     def test_heartbeat_overwrites_previous(self) -> None:
         """Second write replaces the file (no append/corruption)."""
+        import json
         self.daemon.write_heartbeat()
-        hb_path = os.path.join(self.state_dir, "daemon-heartbeat")
+        hb_path = os.path.join(self.state_dir, "heartbeat.json")
 
         # Overwrite with junk, then write heartbeat again
-        Path(hb_path).write_text("corrupted\nextra\n")
+        Path(hb_path).write_text('{"corrupted": true, "extra": 1}')
         self.daemon.write_heartbeat()
 
-        # Should be a single clean line again
-        lines = Path(hb_path).read_text(encoding="utf-8").strip().split("\n")
-        self.assertEqual(len(lines), 1)
-        datetime.strptime(lines[0], "%Y-%m-%dT%H:%M:%SZ")
+        # Should be valid JSON with a fresh timestamp
+        data = json.loads(Path(hb_path).read_text(encoding="utf-8"))
+        self.assertIn("ts", data)
+        self.assertNotIn("corrupted", data)
+        datetime.strptime(data["ts"], "%Y-%m-%dT%H:%M:%SZ")
 
     def test_heartbeat_atomic_write(self) -> None:
         """No .tmp file remains after write."""
         self.daemon.write_heartbeat()
 
         tmp_path = os.path.join(
-            self.state_dir, "daemon-heartbeat.tmp"
+            self.state_dir, "heartbeat.json.tmp"
         )
         self.assertFalse(os.path.exists(tmp_path))
 
