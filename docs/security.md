@@ -58,7 +58,7 @@ A `Dockerfile` is included in the repository root. Build and run:
 
 ```bash
 docker build -t boi .
-docker run --rm -v $(pwd):/project boi dispatch --spec /project/spec.md
+docker run --rm -v $(pwd):/project boi dispatch --spec /project/spec.yaml
 docker run --rm boi status
 ```
 
@@ -67,7 +67,7 @@ docker run --rm boi status
 A `docker-compose.yml` is also provided:
 
 ```bash
-docker compose run boi dispatch --spec /project/spec.md
+docker compose run boi dispatch --spec /project/spec.yaml
 docker compose run boi status
 ```
 
@@ -77,22 +77,22 @@ For stricter isolation, you can:
 
 1. **Restrict network access:**
    ```bash
-   docker run --network none -v $(pwd):/project boi dispatch --spec /project/spec.md
+   docker run --network none -v $(pwd):/project boi dispatch --spec /project/spec.yaml
    ```
 
 2. **Run as a non-root user:**
    ```bash
-   docker run --user $(id -u):$(id -g) -v $(pwd):/project boi dispatch --spec /project/spec.md
+   docker run --user $(id -u):$(id -g) -v $(pwd):/project boi dispatch --spec /project/spec.yaml
    ```
 
 3. **Limit resources:**
    ```bash
-   docker run --memory=4g --cpus=2 -v $(pwd):/project boi dispatch --spec /project/spec.md
+   docker run --memory=4g --cpus=2 -v $(pwd):/project boi dispatch --spec /project/spec.yaml
    ```
 
 4. **Read-only root filesystem:**
    ```bash
-   docker run --read-only --tmpfs /tmp -v $(pwd):/project boi dispatch --spec /project/spec.md
+   docker run --read-only --tmpfs /tmp -v $(pwd):/project boi dispatch --spec /project/spec.yaml
    ```
 
 ## Input Validation

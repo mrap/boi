@@ -130,7 +130,7 @@ Create `~/.boi/critic/prompt.md` to completely replace the default critic prompt
 Three ways to skip critic validation:
 
 1. **Globally:** `boi critic disable`
-2. **Per-spec:** `boi dispatch --spec spec.md --no-critic`
+2. **Per-spec:** `boi dispatch --spec spec.yaml --no-critic`
 3. **Edit config:** Set `"enabled": false` in `~/.boi/critic/config.json`
 
 Re-enable with `boi critic enable`.

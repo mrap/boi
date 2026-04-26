@@ -60,7 +60,7 @@ Local file paths are read and injected. URLs are listed for the worker to fetch 
 If you set the `project` field when dispatching, context is injected automatically via Layers 1 and 3.
 
 ```bash
-boi dispatch --project my-project my-spec.md
+boi dispatch --project my-project my-spec.yaml
 ```
 
 The worker will receive:
@@ -98,7 +98,7 @@ Add a `## Context Sources` section to list additional files:
 +------------------------------------------------------------------+
 |                        boi dispatch                               |
 |                                                                   |
-|  1. Write spec to ~/.boi/queue/q-NNN.spec.md                    |
+|  1. Write spec to ~/.boi/queue/q-NNN.spec.yaml                    |
 |  2. Pre-flight context gather (Layer 3)                          |
 |     +-- Read {context_dir}/projects/{project}/context.md         |
 |     +-- Parse ## Context Sources from spec                       |

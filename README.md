@@ -340,7 +340,7 @@ BOI automatically preserves the work product of every completed spec so outputs 
 
 ```
 ~/.boi/outputs/<queue-id>/
-  ├── spec.md              # final spec file with all tasks DONE
+  ├── spec.yaml            # final spec file with all tasks DONE
   ├── manifest.json        # list of all files created/modified, with paths and sizes
   ├── files/               # copies of created/modified files (relative paths preserved)
   │   └── path/to/file.py

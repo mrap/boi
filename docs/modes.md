@@ -16,15 +16,14 @@ BOI has four execution modes that control what workers can do during each iterat
 Three ways, in order of precedence:
 
 1. **Spec header** (highest priority):
-   ```markdown
-   ## Mode
-   Discover
+   ```yaml
+   mode: discover
    ```
 
 2. **CLI flag**:
    ```bash
-   boi dispatch --spec spec.md --mode discover
-   boi dispatch --spec spec.md -m d
+   boi dispatch --spec spec.yaml --mode discover
+   boi dispatch --spec spec.yaml -m d
    ```
 
 3. **Default**: `execute` if nothing else is specified.
@@ -38,7 +37,7 @@ The strictest mode. Workers execute the current task exactly as specified. No ta
 **Use when:** Tasks are well-defined and straightforward. You know exactly what needs to be done and don't want the agent improvising.
 
 ```bash
-boi dispatch --spec spec.md -m e
+boi dispatch --spec spec.yaml -m e
 ```
 
 **Worker rules:**
@@ -54,7 +53,7 @@ Execute the task, but also flag concerns. Workers can write observations and ski
 **Use when:** You want a second pair of eyes on the approach. Good for code reviews, security audits, or when you're less confident about the plan.
 
 ```bash
-boi dispatch --spec spec.md -m c
+boi dispatch --spec spec.yaml -m c
 ```
 
 **Worker rules:**
@@ -80,7 +79,7 @@ Execute the task AND handle what you find. Workers can add new PENDING tasks whe
 **Use when:** Most real-world work. You have a plan but expect surprises. The agent adapts to what it finds in the codebase.
 
 ```bash
-boi dispatch --spec spec.md -m d
+boi dispatch --spec spec.yaml -m d
 ```
 
 **Worker rules:**
@@ -101,14 +100,15 @@ boi dispatch --spec spec.md -m d
 
 **Example:** A worker implementing an API endpoint discovers the database schema needs a migration. It adds:
 
-```markdown
-### t-7: Add database migration for email index
-PENDING
-
-**Spec:** The getUserByEmail query in t-3 does a full table scan. Add an index
-on the email column in the User table.
-
-**Verify:** Tests pass. Query plan shows index usage.
+```yaml
+- id: t-7
+  title: Add database migration for email index
+  status: PENDING
+  spec: |
+    The getUserByEmail query in t-3 does a full table scan. Add an index
+    on the email column in the User table.
+  verify: |
+    Tests pass. Query plan shows index usage.
 ```
 
 The daemon detects the new PENDING task and keeps iterating.
@@ -120,31 +120,28 @@ Full creative authority. Workers can add, modify, supersede tasks, and restructu
 **Use when:** The path to the goal is unclear. You know what you want but not how to get there. Good for exploratory work, prototypes, and greenfield features.
 
 ```bash
-boi dispatch --spec goal-spec.md -m g
+boi dispatch --spec goal-spec.yaml -m g
 ```
 
 ### Goal-Only Spec Format
 
 Generate mode specs define a goal and success criteria instead of tasks:
 
-```markdown
-# [Generate] Config Management CLI
+```yaml
+title: Config Management CLI
+mode: generate
+context: |
+  Build a CLI tool that reads, validates, and applies YAML configuration files
+  with schema validation, environment variable interpolation, and dry-run mode.
+  Python 3.10+, stdlib only. Must work on Linux and macOS.
 
-## Goal
-Build a CLI tool that reads, validates, and applies YAML configuration files
-with schema validation, environment variable interpolation, and dry-run mode.
-
-## Constraints
-- Python 3.10+, stdlib only
-- Must work on Linux and macOS
-
-## Success Criteria
-- [ ] CLI reads and parses YAML config files
-- [ ] Schema validation catches malformed configs
-- [ ] Environment variables are interpolated in config values
-- [ ] Dry-run mode shows what would change without applying
-- [ ] Help text is complete and accurate
-- [ ] Unit tests cover all core functions
+success_criteria:
+  - CLI reads and parses YAML config files
+  - Schema validation catches malformed configs
+  - Environment variables are interpolated in config values
+  - Dry-run mode shows what would change without applying
+  - Help text is complete and accurate
+  - Unit tests cover all core functions
 ```
 
 ### Three-Phase Lifecycle
@@ -167,14 +164,16 @@ Generate mode stops when:
 
 In Generate mode, workers can replace a PENDING task with a better alternative:
 
-```markdown
-### t-3: Parse config with regex
-SUPERSEDED by t-8
+```yaml
+- id: t-3
+  title: Parse config with regex
+  status: SUPERSEDED by t-8
 
-### t-8: Parse config with YAML stdlib module
-PENDING
-
-**Spec:** Replace the regex-based parser from t-3 with Python's yaml module...
+- id: t-8
+  title: Parse config with YAML stdlib module
+  status: PENDING
+  spec: |
+    Replace the regex-based parser from t-3 with Python's yaml module...
 ```
 
 ## Experiments
@@ -207,7 +206,7 @@ Experiments auto-reject after 24 hours if not reviewed (configurable via `experi
 ### Overriding the experiment budget
 
 ```bash
-boi dispatch --spec spec.md --mode discover --experiment-budget 10
+boi dispatch --spec spec.yaml --mode discover --experiment-budget 10
 ```
 
 ## Error Log

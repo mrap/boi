@@ -10,7 +10,7 @@ Self-evolving autonomous agent fleet. Workers iterate with fresh context per cyc
 ## How BOI Works
 
 1. User describes a task
-2. Claude decomposes it into a **spec.md** (a list of `### t-N:` tasks with `PENDING` status)
+2. Claude decomposes it into a **spec.yaml** (a YAML file with a `tasks:` array of objects with `status: PENDING`)
 3. User confirms ("fire it", "dispatch", "go")
 4. Claude runs `boi dispatch --spec <path>`
 5. BOI daemon assigns specs to workers (isolated git worktrees)
@@ -28,17 +28,17 @@ Self-evolving autonomous agent fleet. Workers iterate with fresh context per cyc
 1. If the user provides a spec file path, validate it exists, then dispatch directly.
 2. If the user describes a task without a spec file:
    a. Help decompose the task into discrete, ordered tasks
-   b. Write a spec.md file (see Spec Format below)
+   b. Write a spec.yaml file (see Spec Format below)
    c. Show the spec to the user for confirmation
    d. On confirmation ("fire it", "dispatch", "go", "yes"), dispatch it
 
 **Dispatch command:**
 ```bash
-boi dispatch --spec <path/to/spec.md> [--priority N] [--max-iter N] [--mode MODE]
+boi dispatch --spec <path/to/spec.yaml> [--priority N] [--max-iter N] [--mode MODE]
 ```
 
 Options:
-- `--spec FILE` — Path to spec.md file (required)
+- `--spec FILE` — Path to spec.yaml file (required)
 - `--priority N` — Queue priority, lower = higher priority (default: 100)
 - `--max-iter N` — Maximum iterations before marking failed (default: 30)
 - `--worktree PATH` — Pin to a specific worktree
@@ -70,43 +70,39 @@ boi project create|list|status|context|delete
 
 ## Spec Format
 
-```markdown
-# Spec Title
+A BOI spec is a YAML file. Each task has an `id`, `title`, `status`, `spec`, and `verify` field.
 
-**Pipeline:** execute → review        # optional — overrides default pipeline
-**Gates:** strict, +lint-pass         # optional — overrides guardrails
+```yaml
+title: "My Project Spec"
+mode: execute             # optional — execute (default), challenge, discover, generate
+pipeline: execute → critic  # optional — overrides default pipeline
 
-## Tasks
+tasks:
+  - id: t-1
+    title: "First task"
+    status: PENDING
+    spec: |
+      What the worker must do. Be concrete: file paths, function names, patterns.
+    verify: |
+      test -f output.txt
+      python3 -m pytest tests/ -x -q
 
-### t-1: First task
-PENDING
-
-**Spec:** What the worker must do. Be concrete: file paths, function names, patterns.
-
-**Verify:**
-```bash
-# Commands that prove the work is done. Non-zero exit = task incomplete.
-test -f output.txt
-python3 -m pytest tests/ -x -q
-```
-
-### t-2: Second task
-PENDING
-**Blocked by:** t-1
-
-**Spec:** Depends on t-1's output.
-
-**Verify:**
-```bash
-grep "expected" output.txt
-```
+  - id: t-2
+    title: "Second task"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Depends on t-1's output.
+    verify: |
+      grep "expected" output.txt
 ```
 
 **Rules:**
-- Headings must be `### t-N: Title` with status on the next line
-- `**Spec:**` and `**Verify:**` are required
-- `**Blocked by:** t-X` prevents a task from running until t-X is DONE
-- Workers add new `### t-N: ... PENDING` tasks to self-evolve the spec
+- `id` must be `t-N` (sequential numbers)
+- `status` must be `PENDING`, `DONE`, `SKIPPED`, or `FAILED`
+- `spec` and `verify` are required
+- `depends: [t-X]` prevents a task from running until t-X is DONE
+- Workers add new PENDING tasks to the `tasks:` array to self-evolve the spec
 - One task per worker iteration; daemon requeues until all tasks are DONE
 
 **Task-sizing guidelines:**
@@ -177,7 +173,7 @@ on_crash = "retry"
 post = ["no-secrets"]
 ```
 
-Use it: `**Pipeline:** execute → security-scan → review`
+Use it: `pipeline: execute → security-scan → review`
 
 ## Pipelines
 
@@ -188,12 +184,14 @@ An ordered list of phases a spec passes through. Configured globally in `~/.boi/
 default = ["execute", "critic"]
 ```
 
-Override per spec with a `**Pipeline:**` header:
+Override per spec with the `pipeline:` key:
 
-```markdown
-**Pipeline:** execute → review → critic
-**Pipeline:** decompose → execute → critic
-**Pipeline:** execute → security-scan
+```yaml
+pipeline: execute → review → critic
+```
+
+```yaml
+pipeline: decompose → execute → critic
 ```
 
 Arrows (`→` or `->`), commas, and spaces are all valid separators.
@@ -226,10 +224,10 @@ timeout = 60
 | `advisory` | Logs a warning; execution continues |
 | `permissive` | Silently skips; execution continues |
 
-**Per-spec gate overrides** (`**Gates:**` header):
+**Per-spec gate overrides** (`gates:` key):
 
-```markdown
-**Gates:** strict, +lint-pass, -no-secrets
+```yaml
+gates: strict, +lint-pass, -no-secrets
 ```
 
 - `strict` / `advisory` / `permissive` — override strictness

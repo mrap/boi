@@ -5,7 +5,7 @@ BOI is built on a simple principle: fresh context per iteration. Every worker se
 ## System Overview
 
 ```
-You → boi dispatch --spec spec.md → Spec Queue (priority-sorted)
+You → boi dispatch --spec spec.yaml → Spec Queue (priority-sorted)
                                           |
                                      +---------+
                                      | Daemon  |
@@ -61,7 +61,7 @@ Workers are isolated. Each runs in its own git worktree with its own tmux sessio
 ### Database (`lib/db.py`)
 
 All mutable state lives in a SQLite database at `~/.boi/boi.db` (WAL mode for concurrent reads). The `specs` table holds queue entries with fields including:
-- `spec_path`: Path to the spec.md file
+- `spec_path`: Path to the spec.yaml file
 - `status`: `queued`, `running`, `requeued`, `completed`, `failed`, `canceled`, `needs_review`, `assigning`
 - `priority`: Lower = higher priority
 - `iteration`: Current iteration count (incremented only for execute phases)
@@ -84,7 +84,7 @@ The database supports:
 
 ### Spec Parser (`lib/spec_parser.py`)
 
-Parses spec.md files to extract task counts, statuses, and metadata. Used by the daemon to decide whether to requeue, and by the CLI for status display.
+Parses spec.yaml files to extract task counts, statuses, and metadata. Used by the daemon to decide whether to requeue, and by the CLI for status display.
 
 ### Spec Validator (`lib/spec_validator.py`)
 
@@ -127,7 +127,7 @@ Computes quality scores across 18 signals in 4 categories (Code Quality, Test Qu
     queue.py                    # [DEPRECATED] JSON-file queue (kept for rollback)
     queue_compat.py             # Compatibility layer (routes to db.py or queue.py)
     conflict_detector.py        # File-level conflict detection between specs
-    spec_parser.py              # Parse spec.md for task statuses
+    spec_parser.py              # Parse spec.yaml for task statuses
     spec_validator.py           # Validate spec format
     spec_editor.py              # Add, skip, reorder, block tasks
     project.py                  # Project CRUD
@@ -162,7 +162,7 @@ Computes quality scores across 18 signals in 4 categories (Code Quality, Test Qu
   daemon.pid                    # Daemon process ID
   boi.db                        # SQLite database (WAL mode)
   queue/                        # Spec queue
-    q-001.spec.md               # Copy of spec file
+    q-001.spec.yaml               # Copy of spec file
     q-001.prompt.md             # Generated worker prompt
     q-001.run.sh                # Worker run script
   logs/
@@ -217,9 +217,9 @@ For specs dispatched without isolation, BOI parses `**Spec:**` and `**Files:**` 
 
 **Concurrency limit:** Max concurrent isolated worktrees is configurable (default 5) to prevent disk exhaustion.
 
-### Why Markdown specs?
+### Why YAML specs?
 
-Markdown is human-readable, version-controllable, and trivial to parse. Workers can edit specs with standard file I/O. Users can read and modify specs in any text editor. No databases, no APIs, no serialization formats.
+YAML is human-readable, version-controllable, and machine-parseable without fragile regex. Workers can edit specs with standard file I/O. Users can read and modify specs in any text editor. The schema-level structure means validation errors are typed and precise, not "missing blank line after heading". No databases, no APIs, no custom serialization.
 
 ### Why Python stdlib only?
 

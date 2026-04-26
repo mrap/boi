@@ -165,7 +165,7 @@ All transitions:
 
 | From | To | Trigger | Notes |
 |------|----|---------|-------|
-| *(new)* | **draft** | `boi dispatch spec.md --draft` | Spec is registered but not eligible for execution |
+| *(new)* | **draft** | `boi dispatch spec.yaml --draft` | Spec is registered but not eligible for execution |
 | **draft** | **queued** | `boi promote <queue-id>` | Explicit user action; deps are validated (targets must exist) |
 | **queued** | **draft** | `boi demote <queue-id>` | Only if status is `queued` (not `assigning` or later) |
 | **queued** | **assigning** | `pick_next_spec()` | Unchanged — daemon selects spec for a worker |
@@ -261,16 +261,16 @@ The `--after` flag declares dependencies at dispatch time, mapping directly to t
 **Syntax:**
 ```bash
 # Single dependency
-boi dispatch spec.md --after q-003
+boi dispatch spec.yaml --after q-003
 
 # Multiple dependencies (comma-separated, no spaces)
-boi dispatch spec.md --after q-003,q-005
+boi dispatch spec.yaml --after q-003,q-005
 
 # Combined with draft mode
-boi dispatch spec.md --draft --after q-003
+boi dispatch spec.yaml --draft --after q-003
 
 # Combined with priority
-boi dispatch spec.md --after q-003 --priority 50
+boi dispatch spec.yaml --after q-003 --priority 50
 ```
 
 **Why `--after` instead of `--blocked-by`?**
@@ -389,7 +389,7 @@ When both a CLI `--after` flag and a spec header `**Blocked-By:**` are present, 
 ```bash
 # Spec header contains: **Blocked-By:** q-003
 # CLI flag adds: --after q-005
-boi dispatch spec.md --after q-005
+boi dispatch spec.yaml --after q-005
 # Result: spec depends on BOTH q-003 AND q-005
 ```
 
@@ -520,7 +520,7 @@ All dependency operations (dispatch `--after`, spec header parsing, `boi dep add
 
 **Rule 1: Dependency target must exist.**
 ```
-$ boi dispatch spec.md --after q-999
+$ boi dispatch spec.yaml --after q-999
 Error: Dependency target 'q-999' does not exist.
 ```
 
@@ -623,7 +623,7 @@ This section provides concrete CLI command designs for every draft and dependenc
 
 **Syntax:**
 ```
-boi dispatch <spec.md> --draft [--priority N] [--after <queue-id>[,...]] [--project <name>] [--mode <mode>]
+boi dispatch <spec.yaml> --draft [--priority N] [--after <queue-id>[,...]] [--project <name>] [--mode <mode>]
 ```
 
 The `--draft` flag is a boolean flag. When present, the spec is enqueued with `status = 'draft'` instead of `'queued'`. All other dispatch flags work unchanged — priority, mode, project, after, max-iter, etc.
@@ -631,19 +631,19 @@ The `--draft` flag is a boolean flag. When present, the spec is enqueued with `s
 **Example usage:**
 ```bash
 # Basic draft dispatch
-boi dispatch feature-spec.md --draft
+boi dispatch feature-spec.yaml --draft
 
 # Draft with priority and dependencies
-boi dispatch feature-spec.md --draft --priority 50 --after q-003
+boi dispatch feature-spec.yaml --draft --priority 50 --after q-003
 
 # Draft with project association
-boi dispatch feature-spec.md --draft --project myapp
+boi dispatch feature-spec.yaml --draft --project myapp
 ```
 
 **Expected output (success):**
 ```
 boi: Dispatched as draft
-  Spec: feature-spec.md
+  Spec: feature-spec.yaml
   Queue ID: q-048
   Mode: execute
   Priority: 100
@@ -655,7 +655,7 @@ boi: Dispatched as draft
 **Expected output (success with deps):**
 ```
 boi: Dispatched as draft
-  Spec: feature-spec.md
+  Spec: feature-spec.yaml
   Queue ID: q-048
   Mode: execute
   Priority: 50
@@ -671,7 +671,7 @@ boi: Dispatched as draft
 Error: Spec file 'missing.md' does not exist.
 
 # Duplicate spec
-Error: Spec 'feature-spec.md' is already active as q-045 (running).
+Error: Spec 'feature-spec.yaml' is already active as q-045 (running).
 
 # Invalid dep target
 Error: Dependency target 'q-999' does not exist.
@@ -997,9 +997,9 @@ PYEOF
 Covered in section 5.1 above. The `--after` flag accepts comma-separated queue IDs:
 
 ```bash
-boi dispatch spec.md --after q-003
-boi dispatch spec.md --after q-003,q-005
-boi dispatch spec.md --draft --after q-003
+boi dispatch spec.yaml --after q-003
+boi dispatch spec.yaml --after q-003,q-005
+boi dispatch spec.yaml --draft --after q-003
 ```
 
 #### 5.5.2 Post-Dispatch: `boi dep add` / `boi dep remove`
@@ -1484,9 +1484,9 @@ Dispatch Flags (new):
 
 | Workflow | Command |
 |----------|---------|
-| Create a draft | `boi dispatch spec.md --draft` |
-| Create a draft with deps | `boi dispatch spec.md --draft --after q-003` |
-| Dispatch with deps (immediate) | `boi dispatch spec.md --after q-003` |
+| Create a draft | `boi dispatch spec.yaml --draft` |
+| Create a draft with deps | `boi dispatch spec.yaml --draft --after q-003` |
+| Dispatch with deps (immediate) | `boi dispatch spec.yaml --after q-003` |
 | List everything (incl. drafts) | `boi queue` |
 | Promote a draft | `boi promote q-008` |
 | Promote multiple drafts | `boi promote q-008 q-009` |
@@ -1554,8 +1554,8 @@ Among eligible specs, `pick_next_spec()` selects the one with the lowest priorit
 Drafts are assigned a priority at dispatch time (default 100, or via `--priority` flag):
 
 ```bash
-boi dispatch spec.md --draft                  # priority=100 (default)
-boi dispatch spec.md --draft --priority 10    # priority=10
+boi dispatch spec.yaml --draft                  # priority=100 (default)
+boi dispatch spec.yaml --draft --priority 10    # priority=10
 ```
 
 **While a spec is in `draft` status, its priority is stored but has no effect.** Drafts are never selected by `pick_next_spec()` because they don't match `status IN ('queued', 'requeued')`.
@@ -1671,7 +1671,7 @@ This section analyzes each edge case that arises from introducing draft specs an
 $ boi dep add q-003 --on q-005
 Error: Circular dependency detected: q-003 → q-005 → q-003
 
-$ boi dispatch spec.md --after q-007
+$ boi dispatch spec.yaml --after q-007
 Error: Circular dependency detected: q-012 → q-007 → q-009 → q-012
 ```
 
@@ -1760,7 +1760,7 @@ $ boi status
 **Expected behavior:** Reject immediately at dispatch time with a clear error.
 
 ```
-$ boi dispatch spec.md --after q-999
+$ boi dispatch spec.yaml --after q-999
 Error: Dependency target 'q-999' does not exist.
 
 $ boi dep add q-007 --on q-999
@@ -3169,16 +3169,16 @@ The recommended design uses an in-database `draft` status on the existing `specs
 
 ```
 # Create a draft (just copies file to drafts dir)
-boi draft spec.md
-# → Saved to ~/.boi/drafts/spec.md
+boi draft spec.yaml
+# → Saved to ~/.boi/drafts/spec.yaml
 
 # List drafts (reads filesystem)
 boi drafts
-# → spec.md   (modified: 2026-03-11 14:00)
+# → spec.yaml   (modified: 2026-03-11 14:00)
 # → other.md  (modified: 2026-03-10 09:30)
 
 # Promote to queue (moves file + enqueues)
-boi promote spec.md
+boi promote spec.yaml
 # → Dispatched as q-047 (status: queued)
 ```
 
@@ -3188,7 +3188,7 @@ boi promote spec.md
 |--------|-----|-----|
 | Simplicity | No schema changes needed; just file operations | Requires separate listing/management code for a parallel system |
 | Tracking | Files are easy to browse in a file manager | No queue ID until promotion — can't reference drafts in dependencies |
-| Dependencies | N/A | Cannot declare `--after draft-spec.md` because drafts have no ID in the DB |
+| Dependencies | N/A | Cannot declare `--after draft-spec.yaml` because drafts have no ID in the DB |
 | Integration | Familiar file-based workflow | Completely invisible to `boi queue` and `boi status` — two separate views |
 | Iteration | Edit files directly with any editor | No audit trail of changes, no status tracking |
 | Consistency | Filesystem is simple and reliable | Race conditions possible if daemon scans drafts dir; no transactional guarantees |
@@ -3213,7 +3213,7 @@ INSERT INTO specs (queue_id, status, tags) VALUES ('q-047', 'queued', '["#draft"
 
 ```
 # Create a draft via tag
-boi dispatch spec.md --tag draft
+boi dispatch spec.yaml --tag draft
 # → q-047 dispatched (queued, tags: #draft)
 
 # List tagged specs
@@ -3225,7 +3225,7 @@ boi tag remove q-047 draft
 # → q-047 is now a normal queued spec
 
 # Users could define custom tags
-boi dispatch spec.md --tag wip --tag needs-review
+boi dispatch spec.yaml --tag wip --tag needs-review
 ```
 
 **pick_next_spec() change:**
@@ -3279,7 +3279,7 @@ CREATE TABLE drafts (
 
 ```
 # Create a draft
-boi draft spec.md
+boi draft spec.yaml
 # → d-001 created (draft)
 
 # Promote to queue
@@ -3289,7 +3289,7 @@ boi promote d-001
 
 # List drafts
 boi drafts
-# → d-001  spec.md  (priority: 100, blocked-by: q-045)
+# → d-001  spec.yaml  (priority: 100, blocked-by: q-045)
 ```
 
 **Trade-offs:**
@@ -4058,7 +4058,7 @@ These tests verify end-to-end behavior through the CLI commands. They belong in 
 
 #### `test_dispatch_as_draft_cli`
 
-**Purpose:** `boi dispatch spec.md --draft` creates a draft in the database.
+**Purpose:** `boi dispatch spec.yaml --draft` creates a draft in the database.
 
 ```python
 class TestDraftDepsCLI(CrudTestCase):
@@ -4101,7 +4101,7 @@ class TestDraftDepsCLI(CrudTestCase):
 
 #### `test_dispatch_with_after_cli`
 
-**Purpose:** `boi dispatch spec.md --after q-NNN` creates a dependency.
+**Purpose:** `boi dispatch spec.yaml --after q-NNN` creates a dependency.
 
 ```python
     def test_dispatch_with_after_cli(self) -> None:

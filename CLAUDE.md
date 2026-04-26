@@ -18,7 +18,7 @@ boi.sh (CLI)
 
 ### Flow
 
-1. User dispatches a spec via `boi dispatch --spec spec.md`
+1. User dispatches a spec via `boi dispatch --spec spec.yaml`
 2. Spec is validated (`lib/spec_validator.py`), copied to `~/.boi/queue/`, and enqueued in SQLite
 3. Daemon polls every 5s: checks worker completions, dispatches queued specs to free workers
 4. Worker reads spec, generates prompt from template + mode rules, launches the configured runtime (`claude -p` by default, or `codex exec`) in a tmux session
@@ -35,7 +35,7 @@ boi.sh (CLI)
 | Worker | `worker.py` | Execute one iteration: read spec, generate prompt, launch tmux, post-process |
 | Database | `lib/db.py` | SQLite state store. Schema in `lib/schema.sql`. WAL for concurrent reads |
 | Daemon Ops | `lib/daemon_ops.py` | Post-iteration logic, next-spec selection, critic orchestration |
-| Spec Parser | `lib/spec_parser.py` | Parse `### t-N:` headings, status lines, task fields |
+| Spec Parser | `lib/spec_parser.py` | Parse YAML `tasks:` array, status fields, and task properties |
 | Spec Validator | `lib/spec_validator.py` | Pre-dispatch validation (structure, required fields) |
 | Critic | `lib/critic.py` | Quality gating: score >= 0.85 fast-approves, < 0.50 auto-rejects |
 | Evaluate | `lib/evaluate.py` | Convergence detection for Generate-mode specs |
@@ -63,28 +63,27 @@ All mutable state lives in `~/.boi/`:
 
 ## Spec Format
 
-A spec is a Markdown file with ordered tasks:
+A spec is a YAML file with an ordered `tasks:` array. Each task has an `id`, `title`, `status`, `spec`, and `verify` field:
 
-```markdown
-# Feature Name
+```yaml
+title: Feature Name
+mode: execute
 
-## Tasks
+tasks:
+  - id: t-1
+    title: First task
+    status: PENDING
+    spec: |
+      What to do. Be explicit about files, functions, patterns.
+    verify: "command to prove it worked"
 
-### t-1: First task
-PENDING
-
-**Spec:** What to do. Be explicit about files, functions, patterns.
-
-**Verify:** `command to prove it worked`
-
-### t-2: Second task
-PENDING
-
-**Blocked by:** t-1
-
-**Spec:** What to do next.
-
-**Verify:** How to verify.
+  - id: t-2
+    title: Second task
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      What to do next.
+    verify: "how to verify"
 ```
 
 ### Task Statuses
@@ -100,28 +99,28 @@ PENDING
 
 ### Task Fields
 
-- `**Spec:**` — What to do (required)
-- `**Verify:**` — How to prove it worked (required)
-- `**Blocked by:** t-N` — Dependency (optional)
-- `**Self-evolution:**` — What to do if unexpected work appears (optional)
-- `**Model:** opus|sonnet|haiku` — Per-task model override (optional)
+- `spec:` — What to do (required)
+- `verify:` — How to prove it worked (required)
+- `depends:` — List of task IDs that must be `DONE` first, e.g. `[t-1, t-2]` (optional)
+- `model:` — Per-task model override: `opus | sonnet | haiku` (optional)
 
 ### Generate Mode
 
 Goal-only format. A decomposition worker breaks it into tasks before execution:
 
-```markdown
-# [Generate] Feature Name
+```yaml
+title: Feature Name
+mode: generate
 
-## Goal
-What to build.
+goal: |
+  What to build.
 
-## Constraints
-- Python 3.10+, stdlib only
+constraints:
+  - Python 3.10+, stdlib only
 
-## Success Criteria
-- [ ] Criterion 1
-- [ ] Criterion 2
+success_criteria:
+  - Criterion 1
+  - Criterion 2
 ```
 
 ## Modes
@@ -161,8 +160,8 @@ Disable per-spec with `--no-critic`.
 
 ```bash
 # Dispatch
-boi dispatch --spec spec.md [--priority N] [--max-iter N] [--mode MODE]
-boi dispatch --spec spec.md --after q-001,q-002  # DAG dependencies
+boi dispatch --spec spec.yaml [--priority N] [--max-iter N] [--mode MODE]
+boi dispatch --spec spec.yaml --after q-001,q-002  # DAG dependencies
 
 # Monitor
 boi queue                    # Show spec queue with status
@@ -209,7 +208,7 @@ Tests use mock data only, no live API calls. The test suite includes:
 
 ## Runtime Abstraction
 
-BOI is runtime-agnostic. The execution backend is configured in `~/.boi/config.json` and can be overridden per-spec with `**Runtime:** codex`.
+BOI is runtime-agnostic. The execution backend is configured in `~/.boi/config.json` and can be overridden per-spec with `runtime: codex` in the spec YAML.
 
 - **`lib/runtime.py`** — `Runtime` ABC with `ClaudeRuntime` and `CodexRuntime` implementations. `get_runtime(name)` factory. `resolve_runtime(state_dir, spec_content)` applies priority: spec header > global config > default (`"claude"`).
 - **`worker.py`** — uses `self.runtime.build_exec_cmd()`, `model_id()`, `cost_per_token()` instead of hardcoded Claude values.

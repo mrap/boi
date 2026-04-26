@@ -1,52 +1,54 @@
 # Spec Format
 
-A BOI spec is a Markdown file that defines ordered tasks for autonomous execution. Each task is self-contained: a worker reads the spec, executes the next PENDING task, marks it DONE, and exits. The spec file on disk is the single source of truth.
+A BOI spec is a YAML file that defines ordered tasks for autonomous execution. Each task is self-contained: a worker reads the spec, executes the next PENDING task, marks it DONE, and exits. The spec file on disk is the single source of truth.
 
 ## Minimal Example
 
-```markdown
-# Feature Name
+```yaml
+title: Feature Name
+mode: execute
 
-## Tasks
+tasks:
+  - id: t-1
+    title: First task
+    status: PENDING
+    spec: What to do.
+    verify: How to prove it worked.
 
-### t-1: First task
-PENDING
-
-**Spec:** What to do.
-
-**Verify:** How to prove it worked.
-
-### t-2: Second task
-PENDING
-
-**Spec:** What to do next.
-
-**Verify:** How to verify.
+  - id: t-2
+    title: Second task
+    status: PENDING
+    spec: What to do next.
+    verify: How to verify.
 ```
 
 ## Task Structure
 
-Every task requires four parts:
+Every task requires five fields:
 
-### 1. Heading
+### 1. `id`
 
-```markdown
-### t-1: Descriptive task title
+```yaml
+id: t-1
 ```
 
 Rules:
-- Three hashes (`###`)
 - `t-` prefix followed by a sequential number
-- Colon and space before the title
+- Must be unique within the spec
 - Numbers must be sequential (t-1, t-2, t-3...)
 
-### 2. Status line
+### 2. `title`
 
-The status must appear on its own line immediately after the heading:
+```yaml
+title: Descriptive task title
+```
 
-```markdown
-### t-1: Set up data model
-PENDING
+A short human-readable description of what this task does.
+
+### 3. `status`
+
+```yaml
+status: PENDING
 ```
 
 Valid statuses:
@@ -57,15 +59,14 @@ Valid statuses:
 | `DONE` | Completed successfully. |
 | `SKIPPED` | Intentionally bypassed (with reason). |
 | `FAILED` | Attempted but could not complete. |
-| `EXPERIMENT_PROPOSED` | Worker proposed an alternative approach (awaiting review). |
-| `SUPERSEDED by t-N` | Replaced by a better task (Generate mode only). |
 
-### 3. Spec section
+### 4. `spec`
 
-```markdown
-**Spec:** Create a `UserPreferences` model with fields: user_id (int),
-theme (enum: light/dark), language (string), notifications_enabled (bool).
-Follow the existing model patterns in `src/models/`.
+```yaml
+spec: |
+  Create a `UserPreferences` model with fields: user_id (int),
+  theme (enum: light/dark), language (string), notifications_enabled (bool).
+  Follow the existing model patterns in `src/models/`.
 ```
 
 This tells the worker exactly what to do. Be concrete:
@@ -73,78 +74,81 @@ This tells the worker exactly what to do. Be concrete:
 - Reference earlier tasks if there are dependencies
 - Include enough context for a worker with zero prior knowledge
 
-### 4. Verify section
+### 5. `verify`
 
-```markdown
-**Verify:** `python3 -m pytest tests/test_models.py -v` passes.
-Schema migration runs without errors.
+```yaml
+verify: |
+  python3 -m pytest tests/test_models.py -v
+  Schema migration runs without errors.
 ```
 
 This proves the task is done. Use concrete commands when possible.
 
-## Optional Sections
+## Optional Fields
 
-### Self-evolution
+### `self_evolution`
 
-```markdown
-**Self-evolution:** If the database driver doesn't support the enum type,
-add a new task to implement a string-based fallback with validation.
+```yaml
+self_evolution: |
+  If the database driver doesn't support the enum type,
+  add a new task to implement a string-based fallback with validation.
 ```
 
 Guides what the worker should do if it discovers unexpected work. Only relevant in Discover and Generate modes.
 
-### Blocked by
+### `depends`
 
-```markdown
-**Blocked by:** t-3
+```yaml
+depends: [t-2, t-3]
 ```
 
-Workers skip this task until t-3 is DONE. Set via `boi spec <queue-id> block <t-id> --on <dep>`.
+Workers skip this task until all listed tasks are DONE. Supports multi-task dependencies (unlike the legacy `**Blocked by:**` field). Set via `boi spec <queue-id> block <t-id> --on <dep>`.
 
-## Spec Header
+## Top-Level Fields
 
-The spec can include a header section before the tasks with metadata:
+The spec file has several top-level fields before the tasks:
 
-```markdown
-# Config Management CLI
+```yaml
+title: Config Management CLI
+mode: discover
+context: |
+  Build a CLI tool for managing YAML configuration files.
+  Python 3.10+, stdlib only. Must work on Linux and macOS.
+workspace: /path/to/worktree    # optional: pin to a specific worktree
+blocked_by: [q-001]             # optional: wait for another spec
 
-Build a CLI tool for managing YAML configuration files.
+outcomes:
+  - description: "CLI reads config files"
+    verify: "python3 cli.py --config sample.yaml"
 
-## Constraints
-- Python 3.10+, stdlib only
-- Must work on Linux and macOS
-
-## Mode
-Discover
-
-## Tasks
-...
+tasks:
+  ...
 ```
 
-The `## Mode` header sets the execution mode (overrides the `--mode` CLI flag).
+The `mode` field sets the execution mode (overrides the `--mode` CLI flag).
 
 ## Generate Mode Specs
 
 Generate mode uses a goal-only format. No pre-defined tasks required:
 
-```markdown
-# [Generate] Config Management CLI
+```yaml
+title: Config Management CLI
+mode: generate
+context: |
+  Build a CLI tool that reads, validates, and applies YAML configuration files
+  with schema validation, environment variable interpolation, and dry-run mode.
 
-## Goal
-Build a CLI tool that reads, validates, and applies YAML configuration files
-with schema validation, environment variable interpolation, and dry-run mode.
+constraints:
+  - Python 3.10+, stdlib only
+  - Must work on Linux and macOS
 
-## Constraints
-- Python 3.10+, stdlib only
-- Must work on Linux and macOS
-
-## Success Criteria
-- [ ] CLI reads and parses YAML config files
-- [ ] Schema validation catches malformed configs
-- [ ] Environment variables are interpolated in config values
-- [ ] Dry-run mode shows what would change without applying
-- [ ] Help text is complete and accurate
-- [ ] Unit tests cover all core functions
+success_criteria:
+  - CLI reads and parses YAML config files
+  - Schema validation catches malformed configs
+  - Environment variables are interpolated in config values
+  - Dry-run mode shows what would change without applying
+  - Help text is complete and accurate
+  - Unit tests cover all core functions
 ```
 
 A decomposition worker breaks the goal into 5-15 concrete tasks before execution begins. See [modes.md](modes.md) for details.
@@ -154,9 +158,9 @@ A decomposition worker breaks the goal into 5-15 concrete tasks before execution
 BOI validates specs before dispatch. Invalid specs are rejected with clear error messages:
 
 ```bash
-$ boi dispatch --spec broken-spec.md
-Error: Task t-3 missing **Spec:** section
-Error: Task t-5 has no status line after heading
+$ boi dispatch --spec broken-spec.yaml
+Error: Task t-3 missing 'spec' field
+Error: Task t-5 missing 'status' field
 Spec validation failed: 2 errors
 ```
 
@@ -167,17 +171,23 @@ Spec validation failed: 2 errors
 Each task should take 10-30 minutes for Claude to complete. If a task would require multiple sessions, split it into smaller tasks.
 
 Bad:
-```markdown
-### t-1: Build the entire API
+```yaml
+- id: t-1
+  title: Build the entire API
 ```
 
 Good:
-```markdown
-### t-1: Set up the data model
-### t-2: Build the list endpoint
-### t-3: Build the create endpoint
-### t-4: Add input validation
-### t-5: Write tests
+```yaml
+- id: t-1
+  title: Set up the data model
+- id: t-2
+  title: Build the list endpoint
+- id: t-3
+  title: Build the create endpoint
+- id: t-4
+  title: Add input validation
+- id: t-5
+  title: Write tests
 ```
 
 ### Be explicit about context
@@ -185,46 +195,52 @@ Good:
 Workers start with zero context. They only read the spec. Include file paths, function names, and patterns to follow.
 
 Bad:
-```markdown
-**Spec:** Add error handling to the API.
+```yaml
+spec: Add error handling to the API.
 ```
 
 Good:
-```markdown
-**Spec:** Add error handling to `src/api/handlers.py`. Wrap the `create_user`
-function in a try/except. Catch `ValidationError` and return a 400 response.
-Catch `DatabaseError` and return a 500 response. Follow the pattern in
-`get_user` which already has error handling.
+```yaml
+spec: |
+  Add error handling to `src/api/handlers.py`. Wrap the `create_user`
+  function in a try/except. Catch `ValidationError` and return a 400 response.
+  Catch `DatabaseError` and return a 500 response. Follow the pattern in
+  `get_user` which already has error handling.
 ```
 
 ### Reference earlier tasks
 
 If task t-3 depends on output from t-1, say so explicitly:
 
-```markdown
-### t-3: Wire up the React component
-PENDING
-
-**Spec:** Create a `PreferencesPanel` component that calls the API mutation
-from t-2. Use the data model created in t-1 for TypeScript types.
+```yaml
+- id: t-3
+  title: Wire up the React component
+  status: PENDING
+  depends: [t-1, t-2]
+  spec: |
+    Create a `PreferencesPanel` component that calls the API mutation
+    from t-2. Use the data model created in t-1 for TypeScript types.
 ```
 
 ### Add concrete verification
 
 Give workers commands they can run to prove the task is done:
 
-```markdown
-**Verify:** `python3 -m pytest tests/ -v` passes. `python3 -m mypy src/` has
-no errors. The new endpoint returns 200 for valid input and 400 for invalid
-input (test with `curl`).
+```yaml
+verify: |
+  python3 -m pytest tests/ -v
+  python3 -m mypy src/
+  # Endpoint returns 200 for valid input:
+  curl -s -X POST http://localhost:8000/api/create -d '{"name":"test"}' | grep '"id"'
 ```
 
 ### Think about what could go wrong
 
-Use the self-evolution section to guide workers when unexpected situations arise:
+Use the self_evolution field to guide workers when unexpected situations arise:
 
-```markdown
-**Self-evolution:** If the existing database schema uses a different ORM than
-expected, add a new task to create an adapter layer before proceeding with
-the API implementation.
+```yaml
+self_evolution: |
+  If the existing database schema uses a different ORM than expected,
+  add a new task to create an adapter layer before proceeding with
+  the API implementation.
 ```

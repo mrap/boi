@@ -61,7 +61,7 @@ Checks all prerequisites and reports any issues.
 
 ### What is a spec?
 
-A Markdown file with ordered tasks. Each task has a heading (`### t-N: Title`), a status line (`PENDING`), a `**Spec:**` section (what to do), and a `**Verify:**` section (how to prove it's done). See [spec-format.md](spec-format.md).
+A YAML file with an ordered list of tasks. Each task has an `id`, `title`, `status` (`PENDING`/`DONE`), `spec` (what to do), and `verify` (how to prove it's done). See [spec-format.md](spec-format.md).
 
 ### How big should each task be?
 
@@ -154,7 +154,7 @@ After all tasks in a spec are done, the critic reviews the work. It checks spec 
 
 ```bash
 boi critic disable                              # Globally
-boi dispatch --spec spec.md --no-critic         # Per-spec
+boi dispatch --spec spec.yaml --no-critic         # Per-spec
 ```
 
 ### Can I add custom checks?

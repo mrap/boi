@@ -10,7 +10,7 @@ Self-evolving autonomous agent fleet. Workers iterate with fresh context per cyc
 ## How BOI Works
 
 1. User describes a task
-2. Claude decomposes it into a **spec.md** (a list of `### t-N:` tasks with `PENDING` status)
+2. Claude decomposes it into a **spec.yaml** (a YAML file with a `tasks:` array of objects with `status: PENDING`)
 3. User confirms ("fire it", "dispatch", "go")
 4. Claude runs `boi dispatch --spec <path>`
 5. BOI daemon assigns specs to workers (isolated git worktrees)
@@ -28,17 +28,17 @@ Self-evolving autonomous agent fleet. Workers iterate with fresh context per cyc
 1. If the user provides a spec file path, validate it exists, then dispatch directly.
 2. If the user describes a task without a spec file:
    a. Help decompose the task into discrete, ordered tasks (use `10x-engineer:brainstorming` if available)
-   b. Write a spec.md file (see Spec Format below)
+   b. Write a spec.yaml file (see Spec Format below)
    c. Show the spec to the user for confirmation
    d. On confirmation ("fire it", "dispatch", "go", "yes"), dispatch it
 
 **Dispatch command:**
 ```bash
-boi dispatch --spec <path/to/spec.md> [--priority N] [--max-iter N] [--mode MODE]
+boi dispatch --spec <path/to/spec.yaml> [--priority N] [--max-iter N] [--mode MODE]
 ```
 
 Options:
-- `--spec FILE` — Path to spec.md file (required)
+- `--spec FILE` — Path to spec.yaml file (required)
 - `--priority N` — Queue priority, lower = higher priority (default: 100)
 - `--max-iter N` — Maximum iterations before marking failed (default: 30)
 - `--worktree PATH` — Pin to a specific worktree
@@ -155,40 +155,40 @@ Creates `~/.boi/` state directory, sets up worker worktrees, writes config. Must
 
 ## Spec Format
 
-A BOI spec.md file is a Markdown document with task headings. Each task has a status line, a spec section, and a verify section.
+A BOI spec is a YAML file. Each task has an `id`, `title`, `status`, `spec`, and `verify` field.
 
-**Required format:**
+```yaml
+title: "My Project Spec"
+mode: execute             # optional — execute (default), challenge, discover, generate
+pipeline: execute → critic  # optional — overrides default pipeline
 
-```markdown
-# My Project Spec
+tasks:
+  - id: t-1
+    title: "First task title"
+    status: PENDING
+    spec: |
+      What the worker should do. Be specific: which files to read,
+      what to create, what patterns to follow.
+    verify: |
+      # Commands that prove the work is done. Non-zero exit = task incomplete.
+      test -f output.txt
+      python3 -m pytest tests/ -x -q
 
-## Tasks
-
-### t-1: First task title
-PENDING
-
-**Spec:** What the worker should do. Be specific: which files to read,
-what to create, what patterns to follow.
-
-**Verify:** How to verify the task is complete. Commands to run,
-assertions to check.
-
-**Self-evolution:** Optional. What to do if the task reveals new work.
-
-### t-2: Second task title
-PENDING
-
-**Spec:** Description of second task...
-
-**Verify:** Verification steps...
+  - id: t-2
+    title: "Second task title"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Description of second task...
+    verify: |
+      grep "expected" output.txt
 ```
 
 **Rules:**
-- Task headings must be `### t-N: Title` (three hashes, `t-` prefix, sequential numbers)
-- Status (`PENDING`, `DONE`, `SKIPPED`, `FAILED`, `EXPERIMENT_PROPOSED`, or `SUPERSEDED by t-N`) must be on its own line immediately after the heading
-- `**Spec:**` section is required. Tell the worker exactly what to do.
-- `**Verify:**` section is required. Give concrete verification commands.
-- `**Self-evolution:**` section is optional but recommended for complex tasks
+- `id` must be `t-N` (sequential numbers)
+- `status` must be `PENDING`, `DONE`, `SKIPPED`, or `FAILED`
+- `spec` and `verify` are required
+- `depends: [t-X]` prevents a task from running until t-X is DONE
 - Tasks are executed in ID order (lowest first)
 - Workers execute one task per iteration, then exit
 
@@ -197,10 +197,9 @@ PENDING
 - Include file paths, function names, and concrete references
 - Reference earlier tasks if later tasks depend on their output
 - Add verification commands that prove the work is done (test runs, lint checks, file existence)
-- Think about what could go wrong and add self-evolution guidance
 
 **What makes BOI specs special (self-evolution):**
-- During an iteration, a worker can ADD new `### t-N: ... PENDING` tasks to the spec
+- During an iteration, a worker can ADD new PENDING tasks to the `tasks:` array
 - This lets the system discover work it couldn't foresee at planning time
 - The daemon detects new PENDING tasks and requeues the spec automatically
 - Example: a worker implementing a feature discovers it needs a migration, so it adds a new task for the migration
@@ -250,7 +249,7 @@ boi project delete <name>                          # Delete a project (confirms 
 
 Dispatch a spec into a project:
 ```bash
-boi dispatch --spec spec.md --project my-project
+boi dispatch --spec spec.yaml --project my-project
 ```
 
 When a spec belongs to a project, workers automatically receive the project's `context.md` and `research.md` in their prompt. Workers can also append discoveries to `research.md` for future iterations.
@@ -310,16 +309,16 @@ BOI supports 4 execution modes that control what workers can do:
 
 Set the mode via CLI flag, spec header, or default:
 ```bash
-boi dispatch --spec spec.md --mode discover    # CLI flag
-boi dispatch --spec spec.md -m g              # Single-letter alias
+boi dispatch --spec spec.yaml --mode discover    # CLI flag
+boi dispatch --spec spec.yaml -m g              # Single-letter alias
 ```
 
-Or in the spec header:
-```markdown
-**Mode:** discover
+Or in the spec file:
+```yaml
+mode: discover
 ```
 
-Generate mode accepts goal-only specs (no pre-defined tasks) with `## Goal`, `## Constraints`, and `## Success Criteria` sections. The title must start with `# [Generate]`.
+Generate mode accepts goal-only specs (no pre-defined tasks) with `goal:`, `constraints:`, and `success_criteria:` top-level fields.
 
 ### `/boi critic` — Manage the critic system
 
@@ -340,7 +339,7 @@ The critic is configured via `~/.boi/critic/`:
 - **Config:** Edit `~/.boi/critic/config.json` to change `enabled`, `max_passes`, or restrict which default checks run.
 - **Custom checks:** Drop `.md` files into `~/.boi/critic/custom/` to add new checks. If a custom check has the same filename as a default check, the custom one replaces the default.
 - **Custom prompt:** Create `~/.boi/critic/prompt.md` to completely replace the default critic prompt template. Use `{{SPEC_CONTENT}}`, `{{CHECKS}}`, `{{QUEUE_ID}}`, `{{ITERATION}}` variables.
-- **Disable per-spec:** Use `boi dispatch --spec spec.md --no-critic` to skip critic validation for a single spec.
+- **Disable per-spec:** Use `boi dispatch --spec spec.yaml --no-critic` to skip critic validation for a single spec.
 
 ### Helping Users Create Custom Checks
 
@@ -391,7 +390,7 @@ Then confirms: `boi critic checks` shows `performance-review (custom)`.
 ## Constraints
 
 - `boi install` runs **outside Claude Code** in a terminal.
-- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. Configured globally in `~/.boi/config.json` or per-spec via `**Runtime:** codex` header.
+- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. Configured globally in `~/.boi/config.json` or per-spec via `runtime: codex` field.
 - Daemon polls every 5 seconds. Status may lag slightly.
 - Default 3 workers, max 5. Set during install.
 - Workers get fresh context each iteration. No memory of previous iterations.

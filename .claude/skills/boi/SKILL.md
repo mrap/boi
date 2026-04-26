@@ -20,13 +20,13 @@ That's it. BOI creates `~/.boi/` with worker worktrees, config, and a daemon tha
 ## How It Works
 
 1. You describe a task
-2. Claude decomposes it into a **spec.md** (a list of `### t-N:` tasks with `PENDING` status)
+2. Claude decomposes it into a **spec.yaml** (a `tasks:` array with `status: PENDING`)
 3. You confirm ("fire it", "dispatch", "go")
-4. `boi dispatch --spec spec.md` adds it to the queue
+4. `boi dispatch --spec spec.yaml` adds it to the queue
 5. BOI daemon assigns specs to workers (isolated git worktrees)
 6. Each worker gets a fresh session via the configured runtime CLI (default: `claude -p`; Codex: `codex exec`), reads the spec, executes the next PENDING task, marks it DONE, exits
 7. Daemon detects remaining PENDING tasks and requeues for the next iteration
-8. Workers can ADD new `### t-N: ... PENDING` tasks (self-evolution)
+8. Workers can ADD new PENDING tasks to the `tasks:` array (self-evolution)
 9. Spec completes when all tasks are DONE or SKIPPED
 
 ## Commands
@@ -36,13 +36,13 @@ That's it. BOI creates `~/.boi/` with worker worktrees, config, and a daemon tha
 Conversational flow: describe a task, Claude decomposes it into a spec, you confirm, it dispatches.
 
 ```bash
-boi dispatch spec.md                    # shorthand (positional arg)
-boi dispatch --spec <path/to/spec.md>   # explicit flag form
+boi dispatch spec.yaml                    # shorthand (positional arg)
+boi dispatch --spec <path/to/spec.yaml>   # explicit flag form
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--spec FILE` | Path to spec.md file (required) | - |
+| `--spec FILE` | Path to spec.yaml file (required) | - |
 | `--priority N` | Queue priority (lower = higher priority) | 100 |
 | `--max-iter N` | Max iterations before marking failed | 30 |
 | `--worktree PATH` | Pin to a specific worktree | auto |
@@ -57,9 +57,9 @@ boi dispatch --spec <path/to/spec.md>   # explicit flag form
 Chain specs so one starts only after another completes:
 
 ```bash
-boi dispatch --spec frontend.md                          # q-001
-boi dispatch --spec backend.md                           # q-002
-boi dispatch --spec integration-tests.md --after q-001,q-002  # q-003 waits for both
+boi dispatch --spec frontend.yaml                          # q-001
+boi dispatch --spec backend.yaml                           # q-002
+boi dispatch --spec integration-tests.yaml --after q-001,q-002  # q-003 waits for both
 ```
 
 Multiple dependencies (AND logic): all must complete before the dependent spec starts. If a dependency fails or is cancelled, dependent specs are automatically failed with a clear message.
@@ -121,7 +121,7 @@ boi do --dry-run "stop everything"
 
 ```bash
 boi project create my-app --description "App rewrite"
-boi dispatch --spec feature.md --project my-app
+boi dispatch --spec feature.yaml --project my-app
 boi project status my-app
 ```
 
@@ -146,34 +146,39 @@ For specs in `challenge`, `discover`, or `generate` mode, workers can propose ex
 
 ## Spec Format
 
-```markdown
-# My Project Spec
+A BOI spec is a YAML file. Each task has an `id`, `title`, `status`, `spec`, and `verify` field.
 
-## Tasks
+```yaml
+title: "My Project Spec"
+mode: execute             # optional — execute (default), challenge, discover, generate
 
-### t-1: First task title
-PENDING
+tasks:
+  - id: t-1
+    title: "First task title"
+    status: PENDING
+    spec: |
+      What the worker should do. Be specific.
+    verify: |
+      # Commands that prove the work is done. Non-zero exit = task incomplete.
+      test -f output.txt
 
-**Spec:** What the worker should do. Be specific.
-
-**Verify:** How to verify completion. Concrete commands.
-
-**Self-evolution:** What to do if this reveals new work.
-
-### t-2: Second task title
-PENDING
-
-**Spec:** Description...
-
-**Verify:** Verification steps...
+  - id: t-2
+    title: "Second task title"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Description...
+    verify: |
+      grep "expected" output.txt
 ```
 
 **Rules:**
-- Headings: `### t-N: Title` (three hashes, `t-` prefix, sequential numbers)
-- Status on its own line after heading: `PENDING`, `DONE`, `SKIPPED`, `FAILED`
-- `**Spec:**` and `**Verify:**` sections required
+- `id` must be `t-N` (sequential numbers)
+- `status` must be `PENDING`, `DONE`, `SKIPPED`, or `FAILED`
+- `spec` and `verify` are required
+- `depends: [t-X]` prevents a task from running until t-X is DONE
 - One task per iteration. Keep tasks completable in 10-30 min.
-- Workers can ADD new PENDING tasks (self-evolution)
+- Workers add new PENDING tasks to the `tasks:` array (self-evolution)
 
 ## Execution Modes
 
@@ -187,7 +192,7 @@ PENDING
 ## Constraints
 
 - `boi install` runs outside Claude Code (in tmux or terminal)
-- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. Configured globally in `~/.boi/config.json` or per-spec via `**Runtime:** codex` header.
+- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. Configured globally in `~/.boi/config.json` or per-spec via `runtime: codex` field.
 - Daemon polls every 5 seconds
 - Default 3 workers, max 5
 - Python stdlib only, no pip dependencies
