@@ -240,7 +240,7 @@ class MockClaude:
 
                 if PHASE == 'execute':
                     handle_execute()
-                elif PHASE == 'critic':
+                elif PHASE in ('critic', 'task-verify', 'code-review'):
                     handle_critic()
                 elif PHASE == 'evaluate':
                     handle_evaluate()

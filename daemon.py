@@ -858,9 +858,13 @@ class Daemon:
             try:
                 from pathlib import Path as _Path
                 from lib.spec_parser import parse_boi_spec as _parse_boi_spec
+                from lib.spec_parser import parse_deps_section as _parse_deps_section
                 content = _Path(spec_path).read_text(encoding="utf-8")
                 parsed_tasks = _parse_boi_spec(content)
-                if parsed_tasks:
+                if parsed_tasks and (
+                    _parse_deps_section(content) is not None
+                    or any(t.blocked_by for t in parsed_tasks)
+                ):
                     self.db.populate_tasks_from_spec(spec_id, parsed_tasks)
                     logger.info(
                         "Parallel spec %s: populated %d tasks, "

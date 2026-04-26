@@ -331,7 +331,7 @@ class TestPipelineOverride(unittest.TestCase):
     def test_load_guardrails_defaults_when_file_missing(self) -> None:
         """load_guardrails returns defaults when config file is missing."""
         config = load_guardrails("/nonexistent/guardrails.toml")
-        self.assertEqual(config.pipeline, ["execute", "critic"])
+        self.assertEqual(config.pipeline, ["execute", "task-verify"])
         self.assertEqual(config.strictness, "advisory")
 
 

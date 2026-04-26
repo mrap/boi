@@ -57,8 +57,18 @@ class TestOrphanedWorkerSelfHeal(IntegrationTestCase):
         self.db.set_running(spec_id, worker_id, "execute")
         self.db.assign_worker(worker_id, spec_id, pid=99999, phase="execute")
         self.db.complete(spec_id, tasks_done=3, tasks_total=3)
+        # db.complete() now atomically frees the worker. Re-assign the worker
+        # to the completed spec to simulate the orphaned state (e.g. after a
+        # crash where the worker assignment was written but free was skipped).
+        with self.db.lock:
+            self.db.conn.execute(
+                "UPDATE workers SET current_spec_id = ?, current_pid = 99999 "
+                "WHERE id = ?",
+                (spec_id, worker_id),
+            )
+            self.db.conn.commit()
 
-        # Worker is still marked busy even though spec is completed
+        # Worker is now marked busy even though spec is completed (orphaned)
         worker = self.db.get_worker(worker_id)
         self.assertEqual(worker["current_spec_id"], spec_id)
 

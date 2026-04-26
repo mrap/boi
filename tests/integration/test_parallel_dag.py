@@ -660,6 +660,12 @@ class TestConcurrentSpecUpdates(ParallelDAGTestBase):
             **Spec:** Do delta.
 
             **Verify:** true
+
+            ## Dependencies
+            t-1:
+            t-2:
+            t-3:
+            t-4:
         """)
 
         spec_path = self.create_dag_spec(spec_content)

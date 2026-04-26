@@ -1624,7 +1624,7 @@ class TestBugFixMaxIterAllTasksDone(DaemonOpsTestCase):
         self.db.set_running(entry["id"], "w-1")  # iteration becomes 1
 
         # Enable critic
-        critic_dir = os.path.join(self.boi_state, "critic")
+        critic_dir = os.path.join(self.boi_state, "task-verify")
         config_path = os.path.join(critic_dir, "config.json")
         Path(config_path).write_text(json.dumps({
             "enabled": True,
@@ -1714,7 +1714,7 @@ class DaemonOpsDBTestCase(unittest.TestCase):
         os.makedirs(self.hooks_dir)
 
         # Disable critic by default
-        critic_dir = os.path.join(self.boi_state, "critic")
+        critic_dir = os.path.join(self.boi_state, "task-verify")
         os.makedirs(critic_dir, exist_ok=True)
         os.makedirs(os.path.join(critic_dir, "custom"), exist_ok=True)
         config_path = os.path.join(critic_dir, "config.json")

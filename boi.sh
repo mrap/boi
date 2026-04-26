@@ -363,10 +363,14 @@ cmd_dispatch() {
                 exit 0
                 ;;
             *)
-                # Smart default: if first positional arg is a .md file, treat as --spec
-                if [[ -z "${spec_file}" ]] && [[ -z "${tasks_file}" ]] && [[ "$1" == *.md ]] && [[ -f "$1" ]]; then
-                    spec_file="$1"
-                    shift
+                # Smart default: positional arg is a spec file (.yaml, .yml, or legacy .md)
+                if [[ -z "${spec_file}" ]] && [[ -z "${tasks_file}" ]] && [[ -f "$1" ]]; then
+                    if [[ "$1" == *.yaml ]] || [[ "$1" == *.yml ]] || [[ "$1" == *.md ]]; then
+                        spec_file="$1"
+                        shift
+                    else
+                        die_usage "Unknown file type: $1. Use .yaml format."
+                    fi
                 else
                     die_usage "Unknown option: $1. Use 'boi dispatch --help' for usage."
                 fi
@@ -406,6 +410,11 @@ cmd_dispatch() {
 
     if [[ ! -f "${input_file}" ]]; then
         die "File not found: ${input_file}"
+    fi
+
+    # Block markdown spec dispatch
+    if [[ "${input_file}" == *.spec.md ]] || [[ "${input_file}" == *.md ]]; then
+        die "Markdown specs are no longer supported. Convert to YAML format.\nSee: boi help spec-format"
     fi
 
     mkdir -p "${QUEUE_DIR}" "${EVENTS_DIR}" "${LOG_DIR}"

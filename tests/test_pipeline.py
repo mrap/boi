@@ -58,7 +58,7 @@ class TestAdvancePipelineThreePhase(unittest.TestCase):
         # Write a guardrails.toml with 3-phase pipeline
         guardrails = os.path.join(self.state_dir, "guardrails.toml")
         with open(guardrails, "w") as f:
-            f.write('[pipeline]\ndefault = ["execute", "review", "critic"]\n')
+            f.write('[pipeline]\ndefault = ["execute", "review", "task-verify"]\n')
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -82,7 +82,7 @@ class TestAdvancePipelineThreePhase(unittest.TestCase):
 
     def test_critic_completes_spec(self):
         d = self._make()
-        d._advance_pipeline("q-1", "critic")
+        d._advance_pipeline("q-1", "task-verify")
         d.db.complete.assert_called_once_with("q-1", 2, 5)
         d.db.requeue.assert_not_called()
 
@@ -98,7 +98,7 @@ class TestReviewPhaseCompletion(unittest.TestCase):
         self.state_dir = self._tmp.name
         guardrails = os.path.join(self.state_dir, "guardrails.toml")
         with open(guardrails, "w") as f:
-            f.write('[pipeline]\ndefault = ["execute", "review", "critic"]\n')
+            f.write('[pipeline]\ndefault = ["execute", "review", "task-verify"]\n')
 
         # Spec file used by _handle_custom_phase_completion
         self.spec_path = os.path.join(self.state_dir, "spec.md")

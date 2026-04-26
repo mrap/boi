@@ -199,14 +199,18 @@ class TestFalseCompletion(IntegrationTestCase):
             "Expected empty-diff WARNING to be logged by boi.daemon_ops",
         )
 
-        # --- Assertion 1: spec is marked completed (false completion occurred) ---
+        # --- Assertion 1: spec is blocked by ship verify (needs_review) ---
+        # The daemon now runs **Verify:** commands in the ship phase. Because
+        # `test -f output.txt` fails (MockClaude never created the file), the
+        # daemon sets status='needs_review' instead of completing the spec.
         spec = self.db.get_spec(spec_id)
         self.assertIsNotNone(spec, "Spec must exist in database")
         self.assertEqual(
             spec["status"],
-            "completed",
-            f"Daemon should have completed the spec. Got status={spec['status']!r}. "
-            "This confirms the daemon does not verify work before completing.",
+            "needs_review",
+            f"Daemon ship verify should have blocked the false completion. "
+            f"Got status={spec['status']!r}. "
+            "Expected 'needs_review' because `test -f output.txt` fails.",
         )
 
         # --- Assertion 2: task in spec file is DONE ---

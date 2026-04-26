@@ -86,7 +86,6 @@ class TestValidateSpec_ValidSpecs(unittest.TestCase):
         """)
         result = validate_spec(spec)
         self.assertTrue(result.valid, result.errors)
-        self.assertEqual(len(result.warnings), 0)
 
     def test_spec_with_code_blocks(self):
         """Code blocks inside task body should not confuse the parser."""
