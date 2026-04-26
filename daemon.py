@@ -2867,12 +2867,27 @@ class Daemon:
     # ── Helpers ──────────────────────────────────────────────────────
 
     def write_heartbeat(self) -> None:
-        """Write current UTC timestamp to daemon-heartbeat file."""
-        heartbeat_path = os.path.join(self.state_dir, "daemon-heartbeat")
+        """Write JSON heartbeat to heartbeat.json (consumed by watchdog + fleet)."""
+        import json as _json
+        heartbeat_path = os.path.join(self.state_dir, "heartbeat.json")
         tmp = heartbeat_path + ".tmp"
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        workers_alive = sum(
+            1 for p in self.worker_procs.values() if p.poll() is None
+        )
+        try:
+            specs_active = self.db.conn.execute(
+                "SELECT COUNT(*) FROM specs WHERE status IN ('running', 'assigning')"
+            ).fetchone()[0]
+        except Exception:
+            specs_active = len(self.worker_procs)
+        heartbeat = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "pid": os.getpid(),
+            "specs_active": specs_active,
+            "workers_alive": workers_alive,
+        }
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(now + "\n")
+            _json.dump(heartbeat, f)
         os.replace(tmp, heartbeat_path)
 
 
