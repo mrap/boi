@@ -359,8 +359,7 @@ class TestValidateSpec_EdgeCases(unittest.TestCase):
             **Verify:** ok
         """)
         result = validate_spec(spec)
-        self.assertFalse(result.valid)
-        self.assertTrue(any("duplicate" in e.lower() for e in result.errors))
+        self.assertTrue(any("duplicate" in w.lower() for w in result.warnings))
 
     def test_mixed_valid_and_invalid_tasks(self):
         """One bad task shouldn't hide that the good tasks were found."""

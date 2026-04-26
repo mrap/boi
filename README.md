@@ -9,24 +9,21 @@ BOI is a self-evolving autonomous agent fleet for Claude Code. You write a spec 
 boi install [--workers N]
 
 # 2. Write a spec or let Claude write one for you
-cat > my-feature.spec.md << 'EOF'
-# My Feature
+cat > my-feature.yaml << 'EOF'
+title: My Feature
+mode: execute
 
-## Tasks
-
-### t-1: Implement the thing
-PENDING
-
-**Spec:** Add X to lib/foo.py following the existing pattern.
-
-**Verify:**
-```bash
-python3 -m pytest tests/test_foo.py -x -q
-```
+tasks:
+  - id: t-1
+    title: Implement the thing
+    status: PENDING
+    spec: |
+      Add X to lib/foo.py following the existing pattern.
+    verify: "python3 -m pytest tests/test_foo.py -x -q"
 EOF
 
 # 3. Dispatch
-boi dispatch --spec my-feature.spec.md
+boi dispatch my-feature.yaml
 
 # 4. Monitor
 boi status
@@ -35,47 +32,44 @@ boi log <queue-id>
 
 ## Spec Format
 
-A spec is a Markdown file. The daemon reads it on each iteration to find the next PENDING task.
+Specs are YAML files. The daemon reads the `tasks:` array on each iteration to find the next `PENDING` task.
 
-```markdown
-# Spec Title
+```yaml
+title: Spec Title
+mode: execute
+context: |
+  Optional context for why this work is needed.
 
-**Pipeline:** execute → review        # optional — overrides default pipeline
-**Gates:** strict, +lint-pass         # optional — overrides guardrails
+tasks:
+  - id: t-1
+    title: First task
+    status: PENDING
+    spec: |
+      What the worker must do. Be concrete: file paths, function names, patterns.
+    verify: "test -f output.txt && python3 -m pytest tests/ -x -q"
 
-## Tasks
-
-### t-1: First task
-PENDING
-
-**Spec:** What the worker must do. Be concrete: file paths, function names, patterns.
-
-**Verify:**
-```bash
-# Commands that prove the work is done. Non-zero exit = task incomplete.
-test -f output.txt
-python3 -m pytest tests/ -x -q
-```
-
-### t-2: Second task
-PENDING
-**Blocked by:** t-1
-
-**Spec:** Depends on t-1's output.
-
-**Verify:**
-```bash
-grep "expected" output.txt
-```
+  - id: t-2
+    title: Second task
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Depends on t-1's output.
+    verify: "grep 'expected' output.txt"
 ```
 
 **Task status values:** `PENDING` → `DONE` | `SKIPPED` | `FAILED`
 
+**Fields:**
+- `id` — unique task identifier (`t-1`, `t-2`, ...)
+- `title` — short description
+- `status` — `PENDING` until the worker marks it `DONE`
+- `spec` — what the worker must do (multiline string)
+- `verify` — shell command that proves the work is done; non-zero exit = task incomplete
+- `depends` — optional list of task IDs that must be `DONE` first
+
 **Rules:**
-- Headings must be `### t-N: Title` with status on the next line
-- `**Spec:**` and `**Verify:**` are required
-- `**Blocked by:** t-X` prevents a task from running until t-X is DONE
-- Workers add new `### t-N: ... PENDING` tasks to self-evolve the spec
+- Workers update `status: DONE` in the YAML file on success
+- Workers add new tasks to the `tasks:` array to self-evolve the spec
 - One task per worker iteration; daemon requeues until all tasks are DONE
 
 ## Phases
@@ -86,9 +80,11 @@ A **phase** is a named worker role defined by a `.phase.toml` file. The daemon l
 
 | Phase | Description | Model (alias) | Timeout |
 |-------|-------------|---------------|---------|
+| `plan-critique` | Evaluate spec quality before execution: catches non-executable verifies, unbounded scope, missing dependencies | sonnet | 300s |
 | `execute` | Execute tasks from the spec | sonnet | 600s |
+| `task-verify` | Review completed work for quality, correctness, and spec compliance | sonnet | 300s |
+| `code-review` | 4-persona code review: quality, testing, security, architecture (only runs when >50 lines changed) | sonnet | 300s |
 | `review` | Code review: correctness, security, spec compliance | sonnet | 300s |
-| `critic` | Quality gate: reviews completed work, adds [CRITIC] tasks on failure | sonnet | 300s |
 | `decompose` | Decompose a high-level spec into actionable tasks | opus | 600s |
 | `evaluate` | Evaluate spec completion and determine next steps | sonnet | 300s |
 
@@ -165,8 +161,6 @@ on_crash = "retry"
 post = ["no-secrets"]
 ```
 
-3. Use it in a spec: `**Pipeline:** execute → security-scan → review`
-
 The daemon hot-reloads phase files — no restart needed.
 
 ## Pipelines
@@ -179,26 +173,14 @@ Configured in `~/.boi/guardrails.toml`:
 
 ```toml
 [pipeline]
-default = ["execute", "critic"]
+default = ["plan-critique", "execute", "task-verify", "code-review"]
 ```
 
-### Per-Spec Override
+To use a shorter pipeline, edit `guardrails.toml`. For example, execute-only:
 
-Add a `**Pipeline:**` header to the spec:
-
-```markdown
-**Pipeline:** execute → review → critic
-```
-
-Arrows (`→` or `->`) and commas are all valid separators.
-
-### Example Pipelines
-
-```markdown
-**Pipeline:** execute                          # execute only
-**Pipeline:** decompose → execute → critic    # decompose first
-**Pipeline:** execute → review → critic       # full review cycle
-**Pipeline:** execute → security-scan         # custom phase
+```toml
+[pipeline]
+default = ["execute"]
 ```
 
 ## Guardrails
@@ -212,7 +194,7 @@ Guardrails define quality gates that run at phase transitions. Configured global
 strictness = "advisory"   # strict | advisory | permissive
 
 [pipeline]
-default = ["execute", "critic"]
+default = ["plan-critique", "execute", "task-verify", "code-review"]
 
 [hooks]
 post-execute = ["verify-commands-pass", "diff-is-non-empty"]
@@ -234,19 +216,6 @@ timeout = 120
 | `strict` | Blocks phase transition; appends a `[GATE-FAIL]` PENDING task to the spec |
 | `advisory` | Logs a warning; execution continues |
 | `permissive` | Silently skips; execution continues |
-
-### Per-Spec Gate Overrides
-
-Add a `**Gates:**` header to the spec:
-
-```markdown
-**Gates:** strict, +lint-pass, -no-secrets
-```
-
-Tokens:
-- `strict` / `advisory` / `permissive` — override strictness
-- `+gate-name` — add a gate to all hook points
-- `-gate-name` — remove a gate from all hook points
 
 ## Gates
 
@@ -308,10 +277,10 @@ Set in `~/.boi/config.json`:
 
 ### Per-Spec Override
 
-Add a `**Runtime:**` header to any spec:
+Add a `runtime:` field to any spec:
 
-```markdown
-**Runtime:** codex
+```yaml
+runtime: codex
 ```
 
 Spec-level override takes precedence over the global default.
@@ -333,7 +302,7 @@ Phase config accepts either full model IDs or aliases (`opus`, `sonnet`, `haiku`
 ## CLI Reference
 
 ```
-boi dispatch --spec <file.md> [options]   Submit a spec to the queue
+boi dispatch <file.yaml> [options]        Submit a spec to the queue
 boi status [--watch] [--json]             Show queue and worker status
 boi log <queue-id> [--full]              Tail worker output for a spec
 boi cancel <queue-id>                     Cancel a running or queued spec
@@ -359,7 +328,6 @@ boi project create|list|status|context|delete
 | `--mode MODE` | `execute` \| `challenge` \| `discover` \| `generate` (aliases: e/c/d/g) |
 | `--worktree-isolate` | Dedicated git worktree and branch for this spec |
 | `--after q-A,q-B` | Wait for listed specs to complete before starting |
-| `--no-critic` | Skip critic phase for this spec |
 | `--project NAME` | Associate with a project (injects project context) |
 
 ## Architecture

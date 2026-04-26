@@ -36,7 +36,7 @@ class DaemonOpsTestCase(unittest.TestCase):
         os.makedirs(self.hooks_dir)
 
         # Disable critic by default so existing tests aren't affected
-        critic_dir = os.path.join(self.boi_state, "critic")
+        critic_dir = os.path.join(self.boi_state, "task-verify")
         os.makedirs(critic_dir, exist_ok=True)
         os.makedirs(os.path.join(critic_dir, "custom"), exist_ok=True)
         config_path = os.path.join(critic_dir, "config.json")
@@ -742,8 +742,8 @@ class TestCriticIntegration(DaemonOpsTestCase):
 
     def setUp(self):
         super().setUp()
-        # Set up critic config directory
-        self.critic_dir = os.path.join(self.boi_state, "critic")
+        # Set up task-verify config directory (renamed from critic)
+        self.critic_dir = os.path.join(self.boi_state, "task-verify")
         self.custom_dir = os.path.join(self.critic_dir, "custom")
         os.makedirs(self.critic_dir, exist_ok=True)
         os.makedirs(self.custom_dir, exist_ok=True)
@@ -884,8 +884,8 @@ class TestProcessCriticCompletion(DaemonOpsTestCase):
 
     def setUp(self):
         super().setUp()
-        # Set up critic dirs
-        self.critic_dir = os.path.join(self.boi_state, "critic")
+        # Set up task-verify dirs (renamed from critic)
+        self.critic_dir = os.path.join(self.boi_state, "task-verify")
         os.makedirs(self.critic_dir, exist_ok=True)
         os.makedirs(os.path.join(self.critic_dir, "custom"), exist_ok=True)
 
@@ -1092,14 +1092,14 @@ class TestCriticHelpers(unittest.TestCase):
             state_dir = os.path.join(tmpdir, "state")
             boi_dir = os.path.join(tmpdir, "boi")
             checks_dir = os.path.join(boi_dir, "templates", "checks")
-            critic_dir = os.path.join(state_dir, "critic")
+            critic_dir = os.path.join(state_dir, "task-verify")
             custom_dir = os.path.join(critic_dir, "custom")
 
             os.makedirs(checks_dir)
             os.makedirs(custom_dir)
 
             # Write a simple critic prompt template
-            template_path = os.path.join(boi_dir, "templates", "critic-prompt.md")
+            template_path = os.path.join(boi_dir, "templates", "task-verify-prompt.md")
             Path(template_path).write_text(
                 "Spec: {{SPEC_CONTENT}}\nChecks: {{CHECKS}}\n"
                 "Queue: {{QUEUE_ID}}\nIter: {{ITERATION}}\n"
@@ -1148,8 +1148,8 @@ class TestCriticReviewDaemonIntegration(DaemonOpsTestCase):
 
     def setUp(self):
         super().setUp()
-        # Enable critic
-        self.critic_dir = os.path.join(self.boi_state, "critic")
+        # Enable critic (task-verify)
+        self.critic_dir = os.path.join(self.boi_state, "task-verify")
         os.makedirs(self.critic_dir, exist_ok=True)
         os.makedirs(os.path.join(self.critic_dir, "custom"), exist_ok=True)
         config = {

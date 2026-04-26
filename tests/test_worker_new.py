@@ -681,7 +681,7 @@ class TestMainArgparse(WorkerTestCase):
                 self.worktree,
                 self.spec_path,
                 "5",
-                "--phase", "critic",
+                "--phase", "task-verify",
                 "--timeout", "120",
                 "--mode", "challenge",
                 "--project", "myproject",
@@ -850,7 +850,7 @@ class TestWorkerHooks(WorkerTestCase):
         ), patch(
             "worker.MODES_DIR", modes_dir,
         ):
-            worker._generate_execute_prompt()
+            worker._generate_execute_prompt("")
 
         # Read the generated prompt
         with open(worker.prompt_file) as f:
@@ -905,7 +905,7 @@ class TestWorkerHooks(WorkerTestCase):
         ), patch(
             "worker.MODES_DIR", modes_dir,
         ):
-            worker._generate_execute_prompt()
+            worker._generate_execute_prompt("")
 
         with open(worker.prompt_file) as f:
             prompt_content = f.read()
@@ -953,7 +953,7 @@ class TestWorkerHooks(WorkerTestCase):
             "worker.MODES_DIR", modes_dir,
         ):
             # Should not raise
-            worker._generate_execute_prompt()
+            worker._generate_execute_prompt("")
 
         with open(worker.prompt_file) as f:
             prompt_content = f.read()

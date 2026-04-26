@@ -28,6 +28,7 @@ from lib.db import Database
 MINIMAL_SPEC = textwrap.dedent("""\
     # Test Spec
 
+    **Emergency:** true
     **Mode:** execute
 
     ## Tasks
@@ -43,6 +44,8 @@ MINIMAL_SPEC = textwrap.dedent("""\
 SPEC_A_CONTENT = textwrap.dedent("""\
     # Spec A
 
+    **Emergency:** true
+
     ## Tasks
 
     ### t-1: Foundation task
@@ -55,6 +58,8 @@ SPEC_A_CONTENT = textwrap.dedent("""\
 
 SPEC_B_CONTENT = textwrap.dedent("""\
     # Spec B
+
+    **Emergency:** true
 
     ## Tasks
 

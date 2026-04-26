@@ -19,7 +19,11 @@ import sys
 import time
 import uuid
 
+import pytest
+
 HEX_EVENTS_DIR = os.path.expanduser("~/.hex-events")
+_HEX_EVENTS_AVAILABLE = os.path.isdir(HEX_EVENTS_DIR) and os.path.isfile(os.path.join(HEX_EVENTS_DIR, "hex_eventd.py"))
+pytestmark = pytest.mark.skipif(not _HEX_EVENTS_AVAILABLE, reason="hex-events not installed")
 HEX_EMIT = os.path.join(HEX_EVENTS_DIR, "hex_emit.py")
 EVENTS_DB = os.path.join(HEX_EVENTS_DIR, "events.db")
 DIGEST_FILE = os.path.expanduser("~/.boi/ops-digest.md")

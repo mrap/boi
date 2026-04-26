@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS specs (
     worktree TEXT,
     priority INTEGER NOT NULL DEFAULT 100,
     status TEXT NOT NULL,                   -- queued|assigning|running|completed|failed|canceled|needs_review|requeued
-    phase TEXT DEFAULT 'execute',           -- execute|critic|evaluate|decompose
+    phase TEXT DEFAULT 'execute',           -- execute|task-verify|plan-critique|code-review|review|evaluate|decompose
     submitted_at TEXT NOT NULL,
     first_running_at TEXT,
     last_iteration_at TEXT,
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS specs (
     push TEXT DEFAULT 'false',
     commit_scope TEXT DEFAULT '',
     CHECK (status IN ('queued','assigning','running','completed','failed','canceled','needs_review','requeued')),
-    CHECK (phase IN ('execute','critic','evaluate','decompose'))
+    CHECK (phase IN ('execute','task-verify','plan-critique','code-review','review','evaluate','decompose'))
 );
 
 -- Task-level parallel execution: one row per task within a spec.

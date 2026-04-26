@@ -542,10 +542,10 @@ class TestProcessWorkerCompletionBranchLifecycle(BranchTestCase):
         mocks = self._run_pwc(phase="execute", after_status="completed")
         mocks["commit_push"].assert_not_called()
 
-    def test_no_target_repo_falls_back_to_commit_and_push(self):
-        """Without target_repo, completion falls back to _commit_and_push_output."""
+    def test_no_target_repo_skips_merge(self):
+        """Without target_repo, _merge_spec_branch is not called on completion."""
         mocks = self._run_pwc(phase="execute", after_status="completed", target_repo="")
-        mocks["commit_push"].assert_called_once()
+        mocks["merge"].assert_not_called()
 
     def test_failure_preserves_branch_no_merge(self):
         """On failure, _merge_spec_branch is NOT called."""

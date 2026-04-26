@@ -106,7 +106,7 @@ class TestVerifyInstructionInGeneratedPrompt:
             # generate_run_script writes {state_dir}/queue/{spec_id}.prompt.md
             # Stub out _generate_bash_run_script so we don't need tmux/claude
             with patch.object(worker, "_generate_bash_run_script"):
-                worker.generate_run_script()
+                worker.generate_run_script(MINIMAL_SPEC)
 
             prompt_path = os.path.join(tmpdir, "queue", "q-test.prompt.md")
             assert os.path.isfile(prompt_path), (

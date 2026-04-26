@@ -47,7 +47,7 @@ class DeadlockTestCase(unittest.TestCase):
         os.makedirs(self.specs_dir)
 
         # Disable critic by default
-        critic_dir = os.path.join(self.boi_state, "critic")
+        critic_dir = os.path.join(self.boi_state, "task-verify")
         os.makedirs(critic_dir, exist_ok=True)
         os.makedirs(os.path.join(critic_dir, "custom"), exist_ok=True)
         config_path = os.path.join(critic_dir, "config.json")
@@ -438,8 +438,8 @@ class TestCriticReviewHandled(DeadlockTestCase):
         qid = entry["id"]
         self._db_set_running(qid, "w-1")
 
-        # Enable critic
-        critic_dir = os.path.join(self.boi_state, "critic")
+        # Enable critic (task-verify)
+        critic_dir = os.path.join(self.boi_state, "task-verify")
         config_path = os.path.join(critic_dir, "config.json")
         Path(config_path).write_text(
             json.dumps({"enabled": True, "max_passes": 2}, indent=2) + "\n"

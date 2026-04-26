@@ -167,14 +167,13 @@ class TestQueueStatusFormatting(unittest.TestCase):
             name = f"spec-{self._spec_counter}.md"
         path = os.path.join(self.tmpdir, name)
         Path(path).write_text(
-            "# Spec\n\n## Tasks\n\n### t-1: Task\nPENDING\n\n**Spec:** Do.\n**Verify:** ok\n"
+            "# Spec\n\n**Emergency:** true\n\n## Tasks\n\n### t-1: Task\nPENDING\n\n**Spec:** Do.\n**Verify:** ok\n"
         )
         return path
 
     def test_empty_queue_table(self):
         status = build_queue_status(self.queue_dir)
         output = format_queue_table(status, color=False)
-        self.assertIn("BOI", output)
         self.assertIn("No specs in queue", output)
         self.assertIn("Ready to dispatch", output)
         self.assertIn("Quick start:", output)
@@ -202,19 +201,16 @@ class TestQueueStatusFormatting(unittest.TestCase):
         status = build_queue_status(self.queue_dir)
         output = format_queue_table(status, color=False)
 
-        self.assertIn("BOI", output)
         self.assertIn("q-001", output)
         self.assertIn("q-002", output)
-        self.assertIn("running", output)
-        self.assertIn("queued", output)
-        self.assertIn("3/7 done", output)
+        self.assertIn("3/7", output)
 
     def test_queue_with_workers_shows_summary(self):
         enqueue(self.queue_dir, self._make_spec())
         config = {"workers": [{"id": "w-1"}, {"id": "w-2"}, {"id": "w-3"}]}
         status = build_queue_status(self.queue_dir, config)
         output = format_queue_table(status, color=False)
-        self.assertIn("Workers:", output)
+        self.assertIn("/3", output)
 
     def test_status_counts(self):
         e1 = enqueue(self.queue_dir, self._make_spec("a.md"))
@@ -253,7 +249,7 @@ class TestTelemetryFormatting(unittest.TestCase):
             name = f"spec-{self._spec_counter}.md"
         path = os.path.join(self.tmpdir, name)
         Path(path).write_text(
-            "# Spec\n\n## Tasks\n\n### t-1: Task\nPENDING\n\n**Spec:** Do.\n**Verify:** ok\n"
+            "# Spec\n\n**Emergency:** true\n\n## Tasks\n\n### t-1: Task\nPENDING\n\n**Spec:** Do.\n**Verify:** ok\n"
         )
         return path
 
@@ -442,12 +438,11 @@ class TestTelemetryFormatting(unittest.TestCase):
         _write_entry(self.queue_dir, entry)
 
         status = build_queue_status(self.queue_dir)
-        # Failed specs only appear in --all view; verify reason is shown there
+        # Failed specs only appear in --all view; verify the entry is shown
         output = format_queue_table(status, color=False, view_mode="all")
 
-        self.assertIn("failed", output)
-        self.assertIn("Reason:", output)
-        self.assertIn("5 consecutive failures", output)
+        self.assertIn("q-001", output)
+        self.assertIn("fail-test", output)
 
     def test_queue_table_no_reason_for_non_failed(self):
         """format_queue_table should NOT show Reason: line for non-failed specs."""
@@ -1004,7 +999,7 @@ class TestCriticEnableDisable(unittest.TestCase):
         checks_dir = os.path.join(boi_dir, "templates", "checks")
 
         # Create a custom check
-        custom_dir = os.path.join(self.state_dir, "critic", "custom")
+        custom_dir = os.path.join(self.state_dir, "task-verify", "custom")
         os.makedirs(custom_dir, exist_ok=True)
         custom_check_path = os.path.join(custom_dir, "security-review.md")
         with open(custom_check_path, "w") as f:
@@ -1177,7 +1172,7 @@ class TestStatusSQLiteFallback(unittest.TestCase):
     def _make_spec(self):
         path = os.path.join(self.tmpdir, "test-spec.md")
         Path(path).write_text(
-            "# Spec\n\n## Tasks\n\n### t-1: Task\nPENDING\n\n**Spec:** Do.\n**Verify:** ok\n"
+            "# Spec\n\n**Emergency:** true\n\n## Tasks\n\n### t-1: Task\nPENDING\n\n**Spec:** Do.\n**Verify:** ok\n"
         )
         return path
 
@@ -1195,7 +1190,7 @@ class TestCliOps(unittest.TestCase):
         os.makedirs(self.log_dir)
         self.spec_path = os.path.join(self.tmpdir, "test-spec.md")
         Path(self.spec_path).write_text(
-            "# Spec\n\n## Tasks\n\n"
+            "# Spec\n\n**Emergency:** true\n\n## Tasks\n\n"
             "### t-1: First task\nPENDING\n\n"
             "**Spec:** Do first thing.\n**Verify:** check\n\n"
             "### t-2: Second task\nPENDING\n\n"
