@@ -508,6 +508,15 @@ def parse_boi_spec(source: str) -> BoiTaskList:
 _YAML_VALID_STATUSES = {"PENDING", "DONE", "FAILED", "SKIPPED"}
 _YAML_VALID_MODES = {"execute", "generate", "challenge", "discover"}
 
+# Near-miss top-level field names that indicate typos in BOI spec YAML files.
+# Keyed on the wrong name, valued with the correct name / helpful message.
+_YAML_SPEC_NEAR_MISS_FIELDS: dict[str, str] = {
+    "task": "tasks",
+    "outcome": "outcomes",
+    "krs": "tasks (note: 'key_results' belongs in initiative YAML, not BOI specs)",
+    "key_results": "tasks (note: 'key_results' belongs in initiative YAML, not BOI specs)",
+}
+
 
 def parse_yaml_spec(source: str) -> BoiTaskList:
     """Parse a YAML spec file into a BoiTaskList.
@@ -536,6 +545,14 @@ def parse_yaml_spec(source: str) -> BoiTaskList:
 
     if not isinstance(data, dict):
         raise ValueError("YAML spec must be a mapping (dict) at the top level")
+
+    for key in data:
+        if key in _YAML_SPEC_NEAR_MISS_FIELDS:
+            suggestion = _YAML_SPEC_NEAR_MISS_FIELDS[key]
+            raise ValueError(
+                f"Invalid field '{key}' in BOI spec YAML — did you mean '{suggestion}'? "
+                f"This typo would cause tasks/outcomes to be silently skipped."
+            )
 
     raw_tasks = data.get("tasks", []) or []
     raw_outcomes = data.get("outcomes", []) or []
