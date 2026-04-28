@@ -22,6 +22,7 @@ pub struct WorkerConfig {
     pub max_workers: u32,
     pub task_timeout_secs: u64,
     pub retry_count: u32,
+    pub cleanup_on_failure: bool,
 }
 
 impl Default for WorkerConfig {
@@ -30,6 +31,7 @@ impl Default for WorkerConfig {
             max_workers: 5,
             task_timeout_secs: 1800,
             retry_count: 3,
+            cleanup_on_failure: false,
         }
     }
 }
@@ -174,10 +176,12 @@ enum WorkerState {
     TaskRequeue { task_id: String, target_phase: String, attempts: usize },
     /// All tasks done — run post-task spec phases (critic, evaluate)
     PostTaskSpecPhase { phase_idx: usize },
-    /// Spec completed successfully
+    /// Spec completed successfully — update DB, fire hooks
     Complete,
-    /// Spec failed
+    /// Spec failed — update DB, fire hooks
     Failed { reason: String },
+    /// Terminal: clean up worktree (only state that touches worktree cleanup)
+    Cleanup { success: bool },
 }
 
 /// Execute all pending tasks using the phase pipeline with a custom PhaseRunner.
@@ -881,8 +885,7 @@ pub fn run_worker_with_phases(
                     "status": "completed",
                     "message": format!("spec {} completed", spec_id),
                 }));
-                let _ = crate::worktree::cleanup(spec_id);
-                break;
+                state = WorkerState::Cleanup { success: true };
             }
 
             WorkerState::Failed { ref reason } => {
@@ -895,7 +898,20 @@ pub fn run_worker_with_phases(
                     "status": "failed",
                     "message": format!("spec {} failed: {}", spec_id, reason_owned),
                 }));
+                if config.cleanup_on_failure {
+                    state = WorkerState::Cleanup { success: false };
+                } else {
+                    eprintln!("[boi] worktree preserved for inspection (cleanup_on_failure=false)");
+                    break;
+                }
+            }
+
+            WorkerState::Cleanup { success: _ } => {
                 let _ = crate::worktree::cleanup(spec_id);
+                let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
+                if tmp.exists() {
+                    let _ = std::fs::remove_dir_all(&tmp);
+                }
                 break;
             }
         }
@@ -975,6 +991,7 @@ pub fn run_daemon(queue_path: &str, hook_config: HookConfig, config: WorkerConfi
                                     max_workers: 1,
                                     task_timeout_secs: timeout,
                                     retry_count: retries,
+                                    cleanup_on_failure: false,
                                 };
                                 if let Err(e) =
                                     run_worker(&spec_id, &spec_path, &qpath, &hc, &wc, &tel)
@@ -1169,6 +1186,7 @@ tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it
             max_workers: 1,
             task_timeout_secs: 10,
             retry_count: 0,
+            cleanup_on_failure: false,
         };
 
         let tel = test_telemetry();
@@ -1202,6 +1220,7 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
             max_workers: 1,
             task_timeout_secs: 10,
             retry_count: 0,
+            cleanup_on_failure: false,
         };
 
         let tel = test_telemetry();
@@ -1234,6 +1253,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
             max_workers: 1,
             task_timeout_secs: 10,
             retry_count: 0,
+            cleanup_on_failure: false,
         };
 
         let tel = test_telemetry();
@@ -1282,6 +1302,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
             max_workers: 1,
             task_timeout_secs: 10,
             retry_count: 0,
+            cleanup_on_failure: false,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1318,6 +1339,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
             max_workers: 1,
             task_timeout_secs: 10,
             retry_count: 0,
+            cleanup_on_failure: false,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1353,6 +1375,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
             max_workers: 1,
             task_timeout_secs: 10,
             retry_count: 0,
+            cleanup_on_failure: false,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1388,6 +1411,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
             max_workers: 1,
             task_timeout_secs: 10,
             retry_count: 0,
+            cleanup_on_failure: false,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1422,6 +1446,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
             max_workers: 1,
             task_timeout_secs: 10,
             retry_count: 0,
+            cleanup_on_failure: false,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1460,6 +1485,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
             max_workers: 1,
             task_timeout_secs: 10,
             retry_count: 0,
+            cleanup_on_failure: false,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![

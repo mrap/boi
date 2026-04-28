@@ -15,6 +15,7 @@ pub struct Config {
     pub max_workers: Option<u32>,
     pub task_timeout_minutes: Option<u32>,
     pub retry_count: Option<u32>,
+    pub cleanup_on_failure: Option<bool>,
     pub hooks: Option<HashMap<String, HookEntry>>,
     pub paths: Option<Paths>,
 }
@@ -60,6 +61,10 @@ impl Config {
 
     pub fn retry_count(&self) -> u32 {
         self.retry_count.unwrap_or(3)
+    }
+
+    pub fn cleanup_on_failure(&self) -> bool {
+        self.cleanup_on_failure.unwrap_or(false)
     }
 
     pub fn db_path(&self) -> PathBuf {
