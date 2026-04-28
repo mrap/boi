@@ -365,8 +365,60 @@ pub struct PipelineConfig {
     pub task_phases: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PipelinesToml {
+    mode: HashMap<String, PipelineModeToml>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PipelineModeToml {
+    spec_phases: Vec<String>,
+    task_phases: Vec<String>,
+}
+
+/// Find the pipelines.toml file.
+/// Priority: BOI_PIPELINES_FILE env > ~/.boi/pipelines.toml > None
+fn find_pipelines_file() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("BOI_PIPELINES_FILE") {
+        let p = PathBuf::from(&path);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let user_path = PathBuf::from(&home).join(".boi").join("pipelines.toml");
+    if user_path.is_file() {
+        return Some(user_path);
+    }
+    None
+}
+
+fn load_pipeline_from_file(path: &Path, mode: &str) -> Option<PipelineConfig> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let parsed: PipelinesToml = toml::from_str(&content).ok()?;
+    let key = match mode {
+        "execute" | "" => "default",
+        other => other,
+    };
+    parsed.mode.get(key).map(|m| PipelineConfig {
+        spec_phases: m.spec_phases.clone(),
+        task_phases: m.task_phases.clone(),
+    })
+}
+
 /// Returns the default pipeline for a given spec mode.
+/// Loads from pipelines.toml (BOI_PIPELINES_FILE env > ~/.boi/pipelines.toml),
+/// falling back to hardcoded defaults if no file found.
 pub fn default_pipeline(mode: &str) -> PipelineConfig {
+    if let Some(path) = find_pipelines_file() {
+        if let Some(config) = load_pipeline_from_file(&path, mode) {
+            return config;
+        }
+    }
+    fallback_pipeline(mode)
+}
+
+fn fallback_pipeline(mode: &str) -> PipelineConfig {
     match mode {
         "execute" => PipelineConfig {
             spec_phases: vec!["critic".into()],
@@ -374,15 +426,15 @@ pub fn default_pipeline(mode: &str) -> PipelineConfig {
         },
         "challenge" => PipelineConfig {
             spec_phases: vec!["plan-critique".into(), "critic".into()],
-            task_phases: vec!["execute".into(), "code-review".into(), "task-verify".into()],
+            task_phases: vec!["execute".into(), "task-verify".into()],
         },
         "discover" => PipelineConfig {
-            spec_phases: vec!["plan-critique".into(), "critic".into(), "evaluate".into()],
+            spec_phases: vec!["critic".into(), "evaluate".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
         },
         "generate" => PipelineConfig {
             spec_phases: vec!["plan-critique".into(), "critic".into(), "evaluate".into()],
-            task_phases: vec!["decompose".into(), "execute".into(), "task-verify".into()],
+            task_phases: vec!["decompose".into(), "execute".into(), "code-review".into(), "task-verify".into()],
         },
         _ => PipelineConfig {
             spec_phases: vec![],
@@ -910,13 +962,13 @@ approve_signal = ""
     fn test_default_pipeline_challenge() {
         let p = default_pipeline("challenge");
         assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]);
-        assert_eq!(p.task_phases, vec!["execute", "code-review", "task-verify"]);
+        assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_discover() {
         let p = default_pipeline("discover");
-        assert_eq!(p.spec_phases, vec!["plan-critique", "critic", "evaluate"]);
+        assert_eq!(p.spec_phases, vec!["critic", "evaluate"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
@@ -924,7 +976,7 @@ approve_signal = ""
     fn test_default_pipeline_generate() {
         let p = default_pipeline("generate");
         assert_eq!(p.spec_phases, vec!["plan-critique", "critic", "evaluate"]);
-        assert_eq!(p.task_phases, vec!["decompose", "execute", "task-verify"]);
+        assert_eq!(p.task_phases, vec!["decompose", "execute", "code-review", "task-verify"]);
     }
 
     #[test]
