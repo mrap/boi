@@ -50,6 +50,8 @@ struct PhaseToml {
     completion: Option<CompletionSection>,
     #[serde(default)]
     trigger: Option<TriggerSection>,
+    #[serde(default)]
+    hooks: Option<HooksSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +112,14 @@ struct TriggerSection {
     min_lines_changed: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct HooksSection {
+    #[serde(default)]
+    pre: Option<Vec<String>>,
+    #[serde(default)]
+    post: Option<Vec<String>>,
+}
+
 impl PhaseConfig {
     fn from_toml(toml: PhaseToml) -> Option<Self> {
         let name = toml
@@ -130,15 +140,30 @@ impl PhaseConfig {
             .phase.as_ref().and_then(|p| p.timeout_minutes)
             .or_else(|| toml.worker.as_ref().and_then(|w| w.timeout.map(|t| t / 60)));
 
+        // Derive level from name: spec-level phases operate on the whole spec
+        let level = toml.phase.as_ref().and_then(|_| None).unwrap_or_else(|| {
+            derive_level(&name)
+        });
+
+        // Derive can_add_tasks: explicit [phase] setting wins, else derive from completion_handler
         let can_add_tasks = toml
             .phase.as_ref().and_then(|p| p.can_add_tasks)
-            .unwrap_or(false);
+            .unwrap_or_else(|| derive_can_add_tasks(&name, toml.completion_handler.as_deref()));
+
+        // Derive can_fail_spec: explicit [phase] setting wins, else derive from name
         let can_fail_spec = toml
             .phase.as_ref().and_then(|p| p.can_fail_spec)
-            .unwrap_or(false);
+            .unwrap_or_else(|| derive_can_fail_spec(&name));
+
+        // Derive requires_claude: explicit [phase] setting wins, else derive from worker.runtime
         let requires_claude = toml
             .phase.as_ref().and_then(|p| p.requires_claude)
-            .unwrap_or(true);
+            .unwrap_or_else(|| {
+                toml.worker.as_ref()
+                    .and_then(|w| w.runtime.as_deref())
+                    .map(|r| r == "claude")
+                    .unwrap_or(true)
+            });
 
         let completion = toml.completion.as_ref();
         let approve_signal = completion.and_then(|c| non_empty(&c.approve_signal));
@@ -150,7 +175,7 @@ impl PhaseConfig {
 
         Some(PhaseConfig {
             name,
-            level: PhaseLevel::default(),
+            level,
             description,
             prompt_template,
             timeout_minutes,
@@ -166,6 +191,30 @@ impl PhaseConfig {
             min_lines_changed,
         })
     }
+}
+
+/// Derive phase level from name. Spec-level phases: plan-critique, critic, evaluate, review.
+fn derive_level(name: &str) -> PhaseLevel {
+    match name {
+        "plan-critique" | "critic" | "evaluate" | "review" => PhaseLevel::Spec,
+        _ => PhaseLevel::Task,
+    }
+}
+
+/// Derive can_add_tasks from completion_handler or name.
+fn derive_can_add_tasks(name: &str, completion_handler: Option<&str>) -> bool {
+    if let Some(handler) = completion_handler {
+        if handler == "builtin:decompose" {
+            return true;
+        }
+    }
+    // Phases that structurally add tasks: critic, decompose, evaluate, plan-critique, code-review, review
+    matches!(name, "critic" | "decompose" | "evaluate" | "plan-critique" | "code-review" | "review")
+}
+
+/// Derive can_fail_spec from name.
+fn derive_can_fail_spec(name: &str) -> bool {
+    matches!(name, "plan-critique" | "critic")
 }
 
 fn non_empty(opt: &Option<String>) -> Option<String> {
@@ -187,8 +236,38 @@ impl Default for PhaseRegistry {
 
 impl PhaseRegistry {
     pub fn new() -> Self {
+        let phases = match core_phases_dir() {
+            Some(boi_dir) => {
+                let loaded = load_core_phases_from_dir(&boi_dir);
+                if loaded.is_empty() {
+                    fallback_core_phases()
+                } else {
+                    loaded
+                }
+            }
+            None => fallback_core_phases(),
+        };
+
         let mut core = HashMap::new();
-        for phase in core_phases() {
+        for phase in phases {
+            core.insert(phase.name.clone(), phase);
+        }
+        PhaseRegistry {
+            core,
+            user: HashMap::new(),
+        }
+    }
+
+    /// Create a registry loading core phases from a specific directory.
+    pub fn from_dir(boi_dir: &Path) -> Self {
+        let phases = load_core_phases_from_dir(boi_dir);
+        let phases = if phases.is_empty() {
+            fallback_core_phases()
+        } else {
+            phases
+        };
+        let mut core = HashMap::new();
+        for phase in phases {
             core.insert(phase.name.clone(), phase);
         }
         PhaseRegistry {
@@ -312,21 +391,131 @@ pub fn default_pipeline(mode: &str) -> PipelineConfig {
 }
 
 fn load_phase_file(path: &Path) -> Result<PhaseConfig, Box<dyn std::error::Error>> {
-    let content = std::fs::read_to_string(path)?;
-    let toml: PhaseToml = toml::from_str(&content)?;
-    PhaseConfig::from_toml(toml).ok_or_else(|| {
-        format!("phase file missing name: {}", path.display()).into()
-    })
+    load_phase_file_with_base(path, None)
 }
 
-fn core_phases() -> Vec<PhaseConfig> {
+/// Load a phase TOML file, optionally resolving prompt_template paths relative to base_dir.
+fn load_phase_file_with_base(path: &Path, base_dir: Option<&Path>) -> Result<PhaseConfig, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let toml_parsed: PhaseToml = toml::from_str(&content)?;
+    let mut phase = PhaseConfig::from_toml(toml_parsed).ok_or_else(|| {
+        format!("phase file missing name: {}", path.display())
+    })?;
+
+    // If prompt_template is a file path (not inline content), resolve and read it
+    if let Some(base) = base_dir {
+        if !phase.prompt_template.is_empty()
+            && !phase.prompt_template.contains('\n')
+            && phase.prompt_template.ends_with(".md")
+        {
+            let template_path = base.join(&phase.prompt_template);
+            if template_path.is_file() {
+                match std::fs::read_to_string(&template_path) {
+                    Ok(template_content) => {
+                        phase.prompt_template = template_content;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "WARN: failed to read prompt template {}: {}",
+                            template_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(phase)
+}
+
+/// Determine the core phases directory.
+///
+/// Priority:
+/// 1. `BOI_INSTALL_DIR` env var → `{BOI_INSTALL_DIR}/phases/`
+/// 2. Binary's parent directory → `{binary_dir}/phases/`
+/// 3. None (use fallback defaults)
+fn core_phases_dir() -> Option<PathBuf> {
+    // 1. Check BOI_INSTALL_DIR env var
+    if let Ok(install_dir) = std::env::var("BOI_INSTALL_DIR") {
+        let dir = PathBuf::from(&install_dir).join("phases");
+        if dir.is_dir() {
+            return Some(PathBuf::from(install_dir));
+        }
+    }
+
+    // 2. Check binary's parent directory
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            // Binary is typically in target/release or target/debug, but the phases
+            // dir lives at the repo root. Walk up to find it.
+            let mut dir = bin_dir.to_path_buf();
+            for _ in 0..5 {
+                let phases_dir = dir.join("phases");
+                if phases_dir.is_dir() {
+                    return Some(dir);
+                }
+                if !dir.pop() {
+                    break;
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Load core phases from TOML files in the phases/ directory.
+/// Returns empty vec if no directory found (caller should use fallback).
+fn load_core_phases_from_dir(boi_dir: &Path) -> Vec<PhaseConfig> {
+    let phases_dir = boi_dir.join("phases");
+    if !phases_dir.is_dir() {
+        return Vec::new();
+    }
+
+    let mut phases = Vec::new();
+    let patterns = [
+        phases_dir.join("*.phase.toml"),
+        phases_dir.join("*.toml"),
+    ];
+    let mut seen = std::collections::HashSet::new();
+
+    for pattern in &patterns {
+        let pat = pattern.to_string_lossy();
+        if let Ok(entries) = glob::glob(&pat) {
+            for entry in entries.flatten() {
+                if !seen.insert(entry.clone()) {
+                    continue;
+                }
+                match load_phase_file_with_base(&entry, Some(boi_dir)) {
+                    Ok(phase) => {
+                        phases.push(phase);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "WARN: failed to load core phase {}: {}",
+                            entry.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    phases
+}
+
+/// Minimal fallback phases when no TOML files are found (fresh install, tests).
+/// Just "execute" and "task-verify" — enough to work without files.
+fn fallback_core_phases() -> Vec<PhaseConfig> {
     vec![
         PhaseConfig {
             name: "execute".into(),
             level: PhaseLevel::Task,
-            description: "Execute the task specification via claude, verify with verify command".into(),
-            prompt_template: "You are a BOI worker. Execute exactly one task. Use your tools (Read, Write, Edit, Bash) to make the required changes. Do not just describe what to do — actually do it.".into(),
-            timeout_minutes: Some(30),
+            description: "Execute tasks from the spec".into(),
+            prompt_template: String::new(),
+            timeout_minutes: Some(10),
             retry_count: None,
             can_add_tasks: false,
             can_fail_spec: false,
@@ -339,144 +528,9 @@ fn core_phases() -> Vec<PhaseConfig> {
             min_lines_changed: None,
         },
         PhaseConfig {
-            name: "critic".into(),
-            level: PhaseLevel::Spec,
-            description: "Review completed spec for quality issues. Add [CRITIC] tasks if problems found.".into(),
-            prompt_template: concat!(
-                "You are a BOI critic reviewing completed work.\n\n",
-                "Review the spec and all completed tasks for:\n",
-                "1. Spec integrity — do the outcomes match what was built?\n",
-                "2. Weak verifications — are verify commands actually testing the right thing?\n",
-                "3. Incomplete work — any tasks that claim DONE but have gaps?\n",
-                "4. Quality issues — obvious bugs, missing error handling, dead code?\n\n",
-                "If all work is satisfactory, output: ## Critic Approved\n\n",
-                "If issues found, output lines starting with [CRITIC] describing each issue.\n",
-                "Each [CRITIC] line becomes a new remediation task.",
-            ).into(),
-            timeout_minutes: Some(15),
-            retry_count: None,
-            can_add_tasks: true,
-            can_fail_spec: true,
-            requires_claude: true,
-            approve_signal: Some("## Critic Approved".into()),
-            reject_signal: Some("[CRITIC]".into()),
-            on_approve: Some("next".into()),
-            on_reject: Some("requeue:execute".into()),
-            on_crash: Some("retry".into()),
-            min_lines_changed: None,
-        },
-        PhaseConfig {
-            name: "decompose".into(),
-            level: PhaseLevel::Task,
-            description: "Break large tasks into subtasks before execution.".into(),
-            prompt_template: concat!(
-                "You are a BOI decomposer. Break this task into smaller subtasks.\n\n",
-                "For each subtask, output a YAML block:\n",
-                "```yaml\n",
-                "- id: t-N-sub-M\n",
-                "  title: \"Subtask title\"\n",
-                "  status: PENDING\n",
-                "  spec: |\n",
-                "    What to do.\n",
-                "  verify: \"command that returns 0 on success\"\n",
-                "```\n\n",
-                "Only decompose if the task genuinely has independent sub-steps.\n",
-                "If the task is already atomic, output: ## No Decomposition Needed",
-            ).into(),
-            timeout_minutes: Some(10),
-            retry_count: None,
-            can_add_tasks: true,
-            can_fail_spec: false,
-            requires_claude: true,
-            approve_signal: None,
-            reject_signal: None,
-            on_approve: None,
-            on_reject: None,
-            on_crash: None,
-            min_lines_changed: None,
-        },
-        PhaseConfig {
-            name: "evaluate".into(),
-            level: PhaseLevel::Spec,
-            description: "Check if generate-mode spec has converged. Add tasks if not.".into(),
-            prompt_template: concat!(
-                "You are a BOI evaluator checking if this spec has converged.\n\n",
-                "Review all completed tasks and outcomes. Determine:\n",
-                "1. Are all outcomes satisfied?\n",
-                "2. Is the work complete and coherent?\n",
-                "3. Are there obvious gaps or missing pieces?\n\n",
-                "If converged, output: ## Evaluation Complete\n\n",
-                "If not converged, output new tasks as YAML blocks to close the gaps.",
-            ).into(),
-            timeout_minutes: Some(15),
-            retry_count: None,
-            can_add_tasks: true,
-            can_fail_spec: false,
-            requires_claude: true,
-            approve_signal: Some("## Evaluation Complete".into()),
-            reject_signal: None,
-            on_approve: Some("next".into()),
-            on_reject: None,
-            on_crash: Some("retry".into()),
-            min_lines_changed: None,
-        },
-        PhaseConfig {
-            name: "plan-critique".into(),
-            level: PhaseLevel::Spec,
-            description: "Review spec plan before execution begins. Challenge assumptions and identify risks.".into(),
-            prompt_template: concat!(
-                "You are a BOI plan critic. Review this spec BEFORE execution begins.\n\n",
-                "Evaluate:\n",
-                "1. Are tasks well-scoped and independently verifiable?\n",
-                "2. Are dependencies correct and complete?\n",
-                "3. Are there missing tasks or unrealistic assumptions?\n",
-                "4. Do verify commands actually test meaningful outcomes?\n\n",
-                "If the plan is sound, output: ## Plan Approved\n\n",
-                "If issues found, output lines starting with [PLAN] describing each issue.\n",
-                "Each [PLAN] line becomes a new task or modification.",
-            ).into(),
-            timeout_minutes: Some(10),
-            retry_count: None,
-            can_add_tasks: true,
-            can_fail_spec: false,
-            requires_claude: true,
-            approve_signal: Some("## Plan Approved".into()),
-            reject_signal: Some("[PLAN]".into()),
-            on_approve: Some("next".into()),
-            on_reject: Some("requeue:plan-critique".into()),
-            on_crash: Some("retry".into()),
-            min_lines_changed: None,
-        },
-        PhaseConfig {
-            name: "code-review".into(),
-            level: PhaseLevel::Task,
-            description: "Review code changes after task execution. Flag quality issues.".into(),
-            prompt_template: concat!(
-                "You are a BOI code reviewer. Review the code changes made for this task.\n\n",
-                "Check for:\n",
-                "1. Correctness — does the code do what the task spec requires?\n",
-                "2. Quality — error handling, edge cases, dead code?\n",
-                "3. Style — consistent with the codebase?\n",
-                "4. Security — any obvious vulnerabilities?\n\n",
-                "If code is acceptable, output: ## Code Review Approved\n\n",
-                "If issues found, output lines starting with [CODE-REVIEW] describing each issue.",
-            ).into(),
-            timeout_minutes: Some(15),
-            retry_count: None,
-            can_add_tasks: true,
-            can_fail_spec: false,
-            requires_claude: true,
-            approve_signal: Some("## Code Review Approved".into()),
-            reject_signal: Some("[CODE-REVIEW]".into()),
-            on_approve: Some("next".into()),
-            on_reject: Some("requeue:execute".into()),
-            on_crash: Some("retry".into()),
-            min_lines_changed: Some(10),
-        },
-        PhaseConfig {
             name: "task-verify".into(),
             level: PhaseLevel::Task,
-            description: "Run verification commands for a task without spawning claude.".into(),
+            description: "Run verification commands for a task".into(),
             prompt_template: String::new(),
             timeout_minutes: Some(5),
             retry_count: None,
@@ -611,9 +665,33 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Find the BOI repo root directory for tests.
+    /// Uses CARGO_MANIFEST_DIR which points to the crate root during `cargo test`.
+    fn repo_root() -> PathBuf {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        if manifest.join("phases").is_dir() {
+            return manifest;
+        }
+        let mut dir = manifest.clone();
+        for _ in 0..5 {
+            if dir.join("phases").is_dir() {
+                return dir;
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+        manifest
+    }
+
+    /// Build a PhaseRegistry from the repo's TOML phase files.
+    fn test_registry() -> PhaseRegistry {
+        PhaseRegistry::from_dir(&repo_root())
+    }
+
     #[test]
     fn test_core_phases_exist() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         assert!(registry.get("execute").is_some());
         assert!(registry.get("critic").is_some());
         assert!(registry.get("decompose").is_some());
@@ -789,7 +867,7 @@ approve_signal = ""
     fn test_core_and_user_names() {
         let registry = PhaseRegistry::new();
         let core = registry.core_names();
-        assert_eq!(core.len(), 7);
+        assert_eq!(core.len(), 8);
         assert!(core.contains(&"execute"));
         assert!(core.contains(&"plan-critique"));
         assert!(core.contains(&"code-review"));
@@ -803,7 +881,7 @@ approve_signal = ""
     fn test_load_nonexistent_dir() {
         let mut registry = PhaseRegistry::new();
         registry.load_user_phases(Path::new("/tmp/boi-nonexistent-dir-xyz"));
-        assert_eq!(registry.list().len(), 7);
+        assert_eq!(registry.list().len(), 8);
     }
 
     // --- Step 1: PhaseLevel tests ---
@@ -874,10 +952,10 @@ approve_signal = ""
         let pc = registry.get("plan-critique").unwrap();
         assert_eq!(pc.level, PhaseLevel::Spec);
         assert!(pc.can_add_tasks);
-        assert!(!pc.can_fail_spec);
+        assert!(pc.can_fail_spec);
         assert!(pc.requires_claude);
         assert_eq!(pc.approve_signal.as_deref(), Some("## Plan Approved"));
-        assert_eq!(pc.reject_signal.as_deref(), Some("[PLAN]"));
+        assert_eq!(pc.reject_signal.as_deref(), Some("[PLAN-CRITIQUE]"));
     }
 
     #[test]
@@ -889,7 +967,7 @@ approve_signal = ""
         assert!(!cr.can_fail_spec);
         assert!(cr.requires_claude);
         assert_eq!(cr.approve_signal.as_deref(), Some("## Code Review Approved"));
-        assert_eq!(cr.min_lines_changed, Some(10));
+        assert_eq!(cr.min_lines_changed, Some(50));
     }
 
     #[test]
@@ -897,7 +975,7 @@ approve_signal = ""
         let registry = PhaseRegistry::new();
         let tv = registry.get("task-verify").unwrap();
         assert_eq!(tv.level, PhaseLevel::Task);
-        assert!(!tv.requires_claude);
+        assert!(tv.requires_claude);
         assert!(!tv.can_add_tasks);
         assert!(!tv.can_fail_spec);
     }
@@ -1077,13 +1155,13 @@ approve_signal = ""
     fn test_parse_phase_output_plan_critique_rejected() {
         let registry = PhaseRegistry::new();
         let pc = registry.get("plan-critique").unwrap();
-        let outcome = parse_phase_output(pc, "[PLAN] Task t-3 has unrealistic dependency");
-        assert_eq!(
-            outcome,
-            PhaseOutcome::Requeue {
-                phase: "plan-critique".into()
+        let outcome = parse_phase_output(pc, "[PLAN-CRITIQUE] Task t-3 has unrealistic dependency");
+        match outcome {
+            PhaseOutcome::Failed { reason } => {
+                assert!(reason.contains("[PLAN-CRITIQUE]"));
             }
-        );
+            other => panic!("Expected Failed, got {:?}", other),
+        }
     }
 
     #[test]

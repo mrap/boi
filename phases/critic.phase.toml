@@ -1,0 +1,20 @@
+name = "critic"
+description = "Review completed spec for quality issues. Add [CRITIC] tasks if problems found."
+
+[worker]
+runtime = "claude"
+model = "claude-sonnet-4-6"
+prompt_template = "templates/critic-prompt.md"
+effort = "high"
+timeout = 900
+
+[completion]
+approve_signal = "## Critic Approved"
+reject_signal = "[CRITIC]"
+on_approve = "next"
+on_reject = "requeue:execute"
+on_crash = "retry"
+
+[hooks]
+pre = []
+post = []
