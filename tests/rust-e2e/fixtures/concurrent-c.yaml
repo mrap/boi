@@ -1,0 +1,8 @@
+title: "E2E Test — Concurrent C"
+mode: execute
+tasks:
+  - id: t-1
+    title: "Write marker C"
+    status: PENDING
+    spec: "Create /tmp/boi-concurrent-c.txt"
+    verify: "touch /tmp/boi-concurrent-c.txt"

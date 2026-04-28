@@ -132,14 +132,21 @@ pub fn run_worker_with_phases(
     queue.update_spec(spec_id, "running")?;
     let _ = hooks::fire(hook_config, ON_WORKER_START, &json!({ "spec_id": spec_id }));
 
-    let repo_path = std::env::var("BOI_REPO").unwrap_or_else(|_| {
-        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
-    });
-    let worktree_dir = crate::worktree::create(spec_id, &repo_path)?;
-    let worktree_path = worktree_dir.to_str().unwrap_or("/tmp").to_string();
-
     let spec_content = std::fs::read_to_string(spec_path)?;
     let boi_spec = spec::parse_unchecked(&spec_content)?;
+
+    let worktree_path = match &boi_spec.workspace {
+        Some(ws) if !ws.is_empty() => {
+            let worktree_dir = crate::worktree::create(spec_id, ws)?;
+            worktree_dir.to_str().unwrap_or("/tmp").to_string()
+        }
+        _ => {
+            let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
+            std::fs::create_dir_all(&tmp)?;
+            eprintln!("[boi] no workspace set — running in temp dir: {}", tmp.display());
+            tmp.to_str().unwrap_or("/tmp").to_string()
+        }
+    };
 
     let order = match spec::topological_sort(&boi_spec) {
         Ok(o) => o,
@@ -660,7 +667,8 @@ mod tests {
         let script = mock_claude(0, "worker_ok");
         let repo = setup_test_repo("worker_ok");
         let spec_yaml =
-            "title: \"Worker Test\"\ntasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it\"\n";
+            "title: \"Worker Test\"
+tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it\"\n";
         let (queue, spec_id, db_path) = setup_test_db("worker_ok", spec_yaml);
         let spec_file = std::env::temp_dir().join("boi_test_spec_worker_ok.yaml");
         let config = WorkerConfig {
@@ -690,7 +698,8 @@ mod tests {
         let script = mock_claude(1, "worker_fail");
         let repo = setup_test_repo("worker_fail");
         let spec_yaml =
-            "title: \"Fail Test\"\ntasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
+            "title: \"Fail Test\"
+tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
         let (queue, spec_id, db_path) = setup_test_db("worker_fail", spec_yaml);
         let spec_file = std::env::temp_dir().join("boi_test_spec_worker_fail.yaml");
         let config = WorkerConfig {
@@ -719,7 +728,8 @@ mod tests {
         let script = mock_claude(0, "worker_skip");
         let repo = setup_test_repo("worker_skip");
         // t-1 is already DONE in YAML; only t-2 should be executed
-        let spec_yaml = "title: \"Skip Test\"\ntasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    title: \"Pending\"\n    status: PENDING\n    depends: [t-1]\n";
+        let spec_yaml = "title: \"Skip Test\"
+tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    title: \"Pending\"\n    status: PENDING\n    depends: [t-1]\n";
         let (queue, spec_id, db_path) = setup_test_db("worker_skip", spec_yaml);
         let spec_file = std::env::temp_dir().join("boi_test_spec_worker_skip.yaml");
         let config = WorkerConfig {

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub struct BoiSpec {
     pub title: String,
     pub mode: Option<String>,
+    pub workspace: Option<String>,
     pub initiative: Option<String>,
     pub context: Option<String>,
     pub outcomes: Option<Vec<Outcome>>,
@@ -37,6 +38,12 @@ pub enum TaskStatus {
     Skipped,
 }
 
+impl Default for TaskStatus {
+    fn default() -> Self {
+        TaskStatus::Pending
+    }
+}
+
 impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -53,6 +60,7 @@ impl std::fmt::Display for TaskStatus {
 pub struct BoiTask {
     pub id: String,
     pub title: String,
+    #[serde(default)]
     pub status: TaskStatus,
     pub depends: Option<Vec<String>>,
     pub spec: Option<String>,
@@ -449,6 +457,22 @@ tasks:
         let ready = ready_tasks(&spec);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, "t-2");
+    }
+
+    #[test]
+    fn test_task_status_defaults_to_pending() {
+        let yaml = r#"
+title: "Default Status"
+tasks:
+  - id: t-1
+    title: "No status field"
+  - id: t-2
+    title: "Explicit pending"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(spec.tasks[0].status, TaskStatus::Pending);
+        assert_eq!(spec.tasks[1].status, TaskStatus::Pending);
     }
 
     // --- Step 4: spec_phases / task_phases / phases field tests ---

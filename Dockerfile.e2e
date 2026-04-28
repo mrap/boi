@@ -44,6 +44,7 @@ RUN git config --global user.email "test@boi.test" \
     && git init && echo "test" > README.md && git add . && git commit -m "init"
 
 ENV BOI_HOME=$HOME/.boi
+ENV BOI_REPO=$HOME/test-repo
 ENV CLAUDE_BIN=claude
 WORKDIR $HOME
 ENTRYPOINT ["bash", "tests/run-e2e.sh"]

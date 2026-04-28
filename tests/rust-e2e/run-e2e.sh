@@ -298,6 +298,113 @@ fi
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════════
+bold "17. Concurrent spec execution"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Clean any stale state from prior daemon runs
+rm -f /tmp/boi-concurrent-a.txt /tmp/boi-concurrent-b.txt /tmp/boi-concurrent-c.txt
+$BOI stop 2>/dev/null || true
+rm -f ~/.boi/daemon.pid ~/.boi/daemon.heartbeat
+
+# Dispatch 3 specs simultaneously
+out_a=$($BOI dispatch "$FIXTURES/concurrent-a.yaml" 2>&1); rc_a=$?
+out_b=$($BOI dispatch "$FIXTURES/concurrent-b.yaml" 2>&1); rc_b=$?
+out_c=$($BOI dispatch "$FIXTURES/concurrent-c.yaml" 2>&1); rc_c=$?
+
+assert_exit 0 $rc_a "concurrent dispatch A exits 0"
+assert_exit 0 $rc_b "concurrent dispatch B exits 0"
+assert_exit 0 $rc_c "concurrent dispatch C exits 0"
+
+CONC_A=$(echo "$out_a" | grep -o 'q-[0-9]*')
+CONC_B=$(echo "$out_b" | grep -o 'q-[0-9]*')
+CONC_C=$(echo "$out_c" | grep -o 'q-[0-9]*')
+
+if [ -n "$CONC_A" ] && [ -n "$CONC_B" ] && [ -n "$CONC_C" ]; then
+  assert_pass "all 3 concurrent specs got IDs: $CONC_A, $CONC_B, $CONC_C"
+else
+  assert_fail "concurrent dispatch did not return 3 IDs"
+fi
+
+# Verify all 3 are queued
+out=$($BOI status 2>&1)
+assert_contains "$out" "Concurrent A" "status shows concurrent spec A"
+assert_contains "$out" "Concurrent B" "status shows concurrent spec B"
+assert_contains "$out" "Concurrent C" "status shows concurrent spec C"
+
+# Start daemon in background, wait for specs to complete
+$BOI daemon &
+DAEMON_PID=$!
+sleep 1
+
+# Poll for completion of our 3 concurrent specs (max 60s)
+WAITED=0
+while [ $WAITED -lt 60 ]; do
+  conc_done=0
+  for cid in "$CONC_A" "$CONC_B" "$CONC_C"; do
+    s=$($BOI status "$cid" 2>&1)
+    echo "$s" | grep -q "completed" && conc_done=$((conc_done + 1))
+  done
+  if [ "$conc_done" -ge 3 ]; then
+    break
+  fi
+  sleep 2
+  WAITED=$((WAITED + 2))
+done
+
+# Stop daemon
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+
+# Assert all 3 completed (check each by ID)
+for label_id in "A:$CONC_A" "B:$CONC_B" "C:$CONC_C"; do
+  label="${label_id%%:*}"
+  sid="${label_id#*:}"
+  s=$($BOI status "$sid" 2>&1)
+  if echo "$s" | grep -q "completed"; then
+    assert_pass "concurrent spec $label ($sid) completed"
+  else
+    assert_fail "concurrent spec $label ($sid) did not complete — status: $(echo "$s" | head -3)"
+  fi
+done
+
+# Assert marker files exist
+if [ -f /tmp/boi-concurrent-a.txt ]; then
+  assert_pass "marker file A exists"
+else
+  assert_fail "marker file A missing"
+fi
+if [ -f /tmp/boi-concurrent-b.txt ]; then
+  assert_pass "marker file B exists"
+else
+  assert_fail "marker file B missing"
+fi
+if [ -f /tmp/boi-concurrent-c.txt ]; then
+  assert_pass "marker file C exists"
+else
+  assert_fail "marker file C missing"
+fi
+
+# Assert no double-dispatch: each spec appears exactly once in the specs table
+DB_CONC=$(find ~/.boi -name "boi-rust.db" -o -name "boi.db" -not -path "*/worktrees/*" 2>/dev/null | head -1)
+if [ -n "$DB_CONC" ] && [ -n "$CONC_A" ]; then
+  for label_id in "A:$CONC_A" "B:$CONC_B" "C:$CONC_C"; do
+    label="${label_id%%:*}"
+    sid="${label_id#*:}"
+    count=$(sqlite3 "$DB_CONC" "SELECT COUNT(*) FROM specs WHERE id = '$sid';" 2>/dev/null)
+    status=$(sqlite3 "$DB_CONC" "SELECT status FROM specs WHERE id = '$sid';" 2>/dev/null)
+    if [ "$count" -eq 1 ] && [ "$status" = "completed" ]; then
+      assert_pass "spec $label ($sid) has exactly 1 DB row, status=completed (no double-dispatch)"
+    else
+      assert_fail "spec $label ($sid) has $count rows, status=$status (expected 1 row, completed)"
+    fi
+  done
+else
+  assert_fail "could not verify DB state (DB or IDs missing)"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ══════════════════════════════════════════════════════════════════════════════
 

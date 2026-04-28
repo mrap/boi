@@ -7,7 +7,6 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>, cfg: &config::Config) 
             println!("task_timeout_minutes: {}", cfg.task_timeout_secs() / 60);
             println!("retry_count:          {}", cfg.retry_count());
             println!("db_path:              {}", cfg.db_path().display());
-            println!("telemetry_path:       {}", cfg.telemetry_path().display());
             println!("worktrees_dir:        {}", cfg.worktrees_dir().display());
             println!("logs_dir:             {}", cfg.logs_dir().display());
             let config_path = config::default_config_path();
@@ -25,7 +24,6 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>, cfg: &config::Config) 
                 "task_timeout_minutes" => (cfg.task_timeout_secs() / 60).to_string(),
                 "retry_count" => cfg.retry_count().to_string(),
                 "db_path" => cfg.db_path().display().to_string(),
-                "telemetry_path" => cfg.telemetry_path().display().to_string(),
                 "worktrees_dir" => cfg.worktrees_dir().display().to_string(),
                 "logs_dir" => cfg.logs_dir().display().to_string(),
                 _ => {

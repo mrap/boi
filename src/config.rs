@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Paths {
     pub db: Option<String>,
-    pub telemetry: Option<String>,
     pub worktrees: Option<String>,
     pub logs: Option<String>,
 }
@@ -72,18 +71,6 @@ impl Config {
         }
     }
 
-    pub fn telemetry_path(&self) -> PathBuf {
-        if let Some(p) = self.paths.as_ref().and_then(|p| p.telemetry.as_ref()) {
-            PathBuf::from(p)
-        } else {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home)
-                .join(".boi")
-                .join("telemetry")
-                .join("boi.jsonl")
-        }
-    }
-
     pub fn worktrees_dir(&self) -> PathBuf {
         if let Some(p) = self.paths.as_ref().and_then(|p| p.worktrees.as_ref()) {
             PathBuf::from(p)
@@ -142,7 +129,6 @@ mod tests {
     fn test_default_paths() {
         let cfg = Config::default();
         assert!(cfg.db_path().to_str().unwrap().contains("boi-rust.db"));
-        assert!(cfg.telemetry_path().to_str().unwrap().ends_with("boi.jsonl"));
         assert!(cfg.worktrees_dir().to_str().unwrap().ends_with("worktrees"));
         assert!(cfg.logs_dir().to_str().unwrap().ends_with("logs"));
     }
@@ -153,13 +139,12 @@ mod tests {
             "/tmp/boi-test-config-paths-{}.yaml",
             std::process::id()
         ));
-        let yaml = "paths:\n  db: /custom/boi.db\n  telemetry: /custom/t.jsonl\n";
+        let yaml = "paths:\n  db: /custom/boi.db\n";
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(yaml.as_bytes()).unwrap();
 
         let cfg = Config::load_from(&path);
         assert_eq!(cfg.db_path(), PathBuf::from("/custom/boi.db"));
-        assert_eq!(cfg.telemetry_path(), PathBuf::from("/custom/t.jsonl"));
 
         let _ = fs::remove_file(&path);
     }

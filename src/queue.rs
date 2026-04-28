@@ -839,6 +839,7 @@ mod tests {
         BoiSpec {
             title: title.to_string(),
             mode: Some("execute".to_string()),
+            workspace: None,
             initiative: None,
             context: None,
             outcomes: None,

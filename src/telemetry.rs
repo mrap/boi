@@ -1,97 +1,211 @@
 use chrono::Utc;
-use serde_json::{json, Value};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use rusqlite::{params, Connection, Result};
+use serde_json::Value;
 use std::path::PathBuf;
 
 pub struct Telemetry {
-    pub path: PathBuf,
+    pub db_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct TelemetryEvent {
+    pub seq: i64,
+    pub timestamp: String,
+    pub spec_id: Option<String>,
+    pub event_type: String,
+    pub message: Option<String>,
+    pub data: Option<String>,
+    pub level: String,
 }
 
 impl Telemetry {
-    pub fn new(path: PathBuf) -> Self {
-        Telemetry { path }
+    pub fn new(db_path: PathBuf) -> Self {
+        Telemetry { db_path }
     }
 
-    /// Append-only JSONL entry: {ts, event, detail}
-    pub fn record(&self, event: &str, detail: &Value) {
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let entry = json!({
-            "ts": Utc::now().to_rfc3339(),
-            "event": event,
-            "detail": detail,
-        });
-        let mut line = serde_json::to_string(&entry).unwrap_or_default();
-        line.push('\n');
-
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            let _ = file.write_all(line.as_bytes());
-        }
+    fn open_conn(&self) -> Result<Connection> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                spec_id TEXT,
+                event_type TEXT NOT NULL,
+                message TEXT,
+                data TEXT,
+                level TEXT DEFAULT 'info'
+            );",
+        )?;
+        Ok(conn)
     }
 
-    pub fn default_path() -> PathBuf {
+    pub fn emit(&self, event_type: &str, detail: &Value) {
+        let conn = match self.open_conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let now = Utc::now().to_rfc3339();
+        let spec_id = detail.get("spec_id").and_then(|v| v.as_str());
+        let data_str = serde_json::to_string(detail).ok();
+        let _ = conn.execute(
+            "INSERT INTO events (timestamp, spec_id, event_type, message, data, level)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'info')",
+            params![now, spec_id, event_type, event_type, data_str],
+        );
+    }
+
+    pub fn recent(&self, limit: usize) -> Vec<TelemetryEvent> {
+        let conn = match self.open_conn() {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT seq, timestamp, spec_id, event_type, message, data, level
+             FROM events ORDER BY seq DESC LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![limit as i64], row_to_event)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn by_spec(&self, spec_id: &str) -> Vec<TelemetryEvent> {
+        let conn = match self.open_conn() {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT seq, timestamp, spec_id, event_type, message, data, level
+             FROM events WHERE spec_id = ?1 ORDER BY seq DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![spec_id], row_to_event)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn by_type(&self, event_type: &str) -> Vec<TelemetryEvent> {
+        let conn = match self.open_conn() {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT seq, timestamp, spec_id, event_type, message, data, level
+             FROM events WHERE event_type = ?1 ORDER BY seq DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![event_type], row_to_event)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn default_db_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home)
-            .join(".boi")
-            .join("telemetry")
-            .join("boi.jsonl")
+        PathBuf::from(home).join(".boi").join("boi-rust.db")
     }
 }
 
 impl Default for Telemetry {
     fn default() -> Self {
-        Telemetry::new(Self::default_path())
+        Telemetry::new(Self::default_db_path())
     }
+}
+
+fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TelemetryEvent> {
+    Ok(TelemetryEvent {
+        seq: row.get(0)?,
+        timestamp: row.get(1)?,
+        spec_id: row.get(2)?,
+        event_type: row.get(3)?,
+        message: row.get(4)?,
+        data: row.get(5)?,
+        level: row.get(6)?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db(name: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        PathBuf::from(format!(
+            "/tmp/boi-test-telemetry-{}-{}-{}.db",
+            std::process::id(),
+            name,
+            n
+        ))
+    }
 
     #[test]
     fn test_new() {
-        let t = Telemetry::new(PathBuf::from("/tmp/test.jsonl"));
-        assert_eq!(t.path, PathBuf::from("/tmp/test.jsonl"));
+        let db = temp_db("new");
+        let t = Telemetry::new(db.clone());
+        assert_eq!(t.db_path, db);
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]
-    fn test_record_appends_jsonl() {
-        let path = PathBuf::from(format!("/tmp/boi-test-telemetry-{}.jsonl", std::process::id()));
-        let _ = fs::remove_file(&path);
+    fn test_emit_and_recent() {
+        let db = temp_db("emit");
+        let _ = std::fs::remove_file(&db);
 
-        let t = Telemetry::new(path.clone());
-        t.record("boi.spec.dispatched", &json!({"spec_id": "q-001"}));
-        t.record("boi.task.completed", &json!({"spec_id": "q-001", "task_id": "t-1"}));
+        let t = Telemetry::new(db.clone());
+        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-001"}));
+        t.emit(
+            "boi.task.completed",
+            &json!({"spec_id": "q-001", "task_id": "t-1"}),
+        );
 
-        let content = fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2);
+        let events = t.recent(10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "boi.task.completed");
+        assert_eq!(events[1].event_type, "boi.spec.dispatched");
 
-        let entry: Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(entry["event"], "boi.spec.dispatched");
-        assert!(entry["ts"].is_string());
-        assert_eq!(entry["detail"]["spec_id"], "q-001");
-
-        let _ = fs::remove_file(&path);
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]
-    fn test_record_creates_parent_dirs() {
-        let path = PathBuf::from(format!(
-            "/tmp/boi-test-{}/nested/boi.jsonl",
-            std::process::id()
-        ));
-        let t = Telemetry::new(path.clone());
-        t.record("boi.worker.started", &json!({}));
-        assert!(path.exists());
-        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    fn test_by_spec() {
+        let db = temp_db("spec");
+        let _ = std::fs::remove_file(&db);
+
+        let t = Telemetry::new(db.clone());
+        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-001"}));
+        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-002"}));
+        t.emit("boi.task.completed", &json!({"spec_id": "q-001"}));
+
+        let events = t.by_spec("q-001");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.spec_id.as_deref() == Some("q-001")));
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn test_by_type() {
+        let db = temp_db("type");
+        let _ = std::fs::remove_file(&db);
+
+        let t = Telemetry::new(db.clone());
+        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-001"}));
+        t.emit("boi.worker.started", &json!({}));
+        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-002"}));
+
+        let events = t.by_type("boi.spec.dispatched");
+        assert_eq!(events.len(), 2);
+
+        let _ = std::fs::remove_file(&db);
     }
 }
