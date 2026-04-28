@@ -68,6 +68,7 @@ pub fn spawn_claude(
     let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
     let mut child = Command::new(&claude_bin)
         .args(["-p", prompt, "--output-format", "json", "--dangerously-skip-permissions"])
+        .current_dir(worktree_path)
         .env("AGENT_DIR", worktree_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -390,8 +391,10 @@ pub fn run_worker_with_phases(
         );
 
         let mut task_success = false;
+        let mut requeue_count: usize = 0;
+        let mut requeue_to: Option<String> = None;
 
-        // Run each task phase in sequence
+        // Run each task phase in sequence, with requeue support
         'phases: for phase_name in &task_phases {
             let phase = match registry.get(phase_name) {
                 Some(p) => p,
@@ -484,11 +487,17 @@ pub fn run_worker_with_phases(
                     let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
                     // Continue to next phase (tasks would be injected into the spec in production)
                 }
-                PhaseOutcome::Requeue { phase: target } => {
-                    eprintln!("[boi] phase '{}' requests requeue to '{}' for task {}", phase_name, target, task.id);
-                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                    // Mark task failed — it needs re-execution
-                    task_success = false;
+                PhaseOutcome::Requeue { phase: ref target } => {
+                    requeue_count += 1;
+                    if requeue_count > config.retry_count as usize {
+                        eprintln!("[boi] phase '{}' requeue limit ({}) exceeded for task {}", phase_name, config.retry_count, task.id);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        task_success = false;
+                        break 'phases;
+                    }
+                    eprintln!("[boi] phase '{}' requests requeue to '{}' for task {} (attempt {}/{})", phase_name, target, task.id, requeue_count, config.retry_count);
+                    // Restart from the target phase
+                    requeue_to = Some(target.clone());
                     break 'phases;
                 }
                 PhaseOutcome::Failed { reason } => {
@@ -507,6 +516,47 @@ pub fn run_worker_with_phases(
 
             // If we made it through all phases, task succeeded
             task_success = true;
+        }
+
+        // Handle requeue: re-run phases from the target phase
+        if let Some(ref _target) = requeue_to {
+            if requeue_count <= config.retry_count as usize {
+                requeue_to = None;
+                task_success = false;
+                // Re-run the phase loop — the 'phases loop will restart
+                // We need to re-enter the phase iteration
+                // For now: re-run ALL task phases (simpler than finding the target)
+                let task_phases_retry = phases::resolve_task_phases(
+                    &pipeline,
+                    task.phases.as_deref(),
+                );
+                'retry_phases: for phase_name in &task_phases_retry {
+                    let phase = match registry.get(phase_name) {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    let phase_started_at = Utc::now().to_rfc3339();
+                    let phase_start = Instant::now();
+                    let phase_outcome = runner.run_phase(
+                        phase,
+                        &spec_content,
+                        Some(task),
+                        &worktree_path,
+                        config.task_timeout_secs,
+                    );
+                    let elapsed_ms = phase_start.elapsed().as_millis() as i64;
+                    record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &phase_outcome, &phase_started_at, elapsed_ms);
+                    match &phase_outcome {
+                        PhaseOutcome::Approved | PhaseOutcome::Skipped | PhaseOutcome::AddedTasks(_) => {
+                            task_success = true;
+                        }
+                        _ => {
+                            task_success = false;
+                            break 'retry_phases;
+                        }
+                    }
+                }
+            }
         }
 
         if task_success {
