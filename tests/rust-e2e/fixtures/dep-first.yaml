@@ -1,0 +1,8 @@
+title: "E2E Test — Dep First"
+mode: execute
+tasks:
+  - id: t-1
+    title: "Write first-done marker"
+    status: PENDING
+    spec: "Create /tmp/boi-first-done.txt"
+    verify: "touch /tmp/boi-first-done.txt"

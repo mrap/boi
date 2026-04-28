@@ -1,0 +1,8 @@
+title: "E2E Test — Dep Second"
+mode: execute
+tasks:
+  - id: t-1
+    title: "Read first-done and write second-done marker"
+    status: PENDING
+    spec: "Read /tmp/boi-first-done.txt, then create /tmp/boi-second-done.txt"
+    verify: "test -f /tmp/boi-first-done.txt && touch /tmp/boi-second-done.txt"

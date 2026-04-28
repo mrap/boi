@@ -1,0 +1,20 @@
+title: "E2E Test — Mutation Skip Task"
+mode: execute
+tasks:
+  - id: t-1
+    title: "Write skip marker 1"
+    status: PENDING
+    spec: "Create /tmp/boi-mut-skip-1.txt"
+    verify: "touch /tmp/boi-mut-skip-1.txt"
+  - id: t-2
+    title: "Should be skipped"
+    status: PENDING
+    depends: [t-1]
+    spec: "Create /tmp/boi-mut-skip-2.txt"
+    verify: "touch /tmp/boi-mut-skip-2.txt"
+  - id: t-3
+    title: "Write skip marker 3"
+    status: PENDING
+    depends: [t-2]
+    spec: "Create /tmp/boi-mut-skip-3.txt"
+    verify: "touch /tmp/boi-mut-skip-3.txt"

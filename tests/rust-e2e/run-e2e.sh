@@ -512,6 +512,287 @@ fi
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════════
+bold "19. In-flight mutation — add task to queued spec"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Clean state
+rm -f /tmp/boi-mut-add-1.txt /tmp/boi-mut-add-2.txt /tmp/boi-mut-add-3.txt
+$BOI stop 2>/dev/null || true
+rm -f ~/.boi/daemon.pid ~/.boi/daemon.heartbeat
+
+# Dispatch a 2-task spec
+out=$($BOI dispatch "$FIXTURES/mutation-add.yaml" 2>&1); rc=$?
+assert_exit 0 $rc "dispatch mutation-add spec exits 0"
+ADD_ID=$(echo "$out" | grep -o 'q-[0-9]*')
+if [ -n "$ADD_ID" ]; then
+  assert_pass "mutation-add got ID: $ADD_ID"
+else
+  assert_fail "mutation-add did not return ID"
+  ADD_ID="q-999"
+fi
+
+# Before starting daemon, add a 3rd task
+out=$($BOI spec "$ADD_ID" add "Write marker 3" --spec "Create /tmp/boi-mut-add-3.txt" --verify "touch /tmp/boi-mut-add-3.txt" 2>&1); rc=$?
+assert_exit 0 $rc "spec add task exits 0"
+assert_contains "$out" "added" "spec add confirms addition"
+
+# Verify spec shows 3 tasks
+out=$($BOI spec "$ADD_ID" 2>&1); rc=$?
+assert_exit 0 $rc "spec view after add exits 0"
+task_count=$(echo "$out" | grep -c "t-[0-9]")
+if [ "$task_count" -ge 3 ]; then
+  assert_pass "spec shows 3 tasks after add (found $task_count)"
+else
+  assert_fail "spec should show 3 tasks after add (found $task_count)"
+fi
+
+# Verify total_tasks updated in DB
+DB_MUT=$(find ~/.boi -name "boi-rust.db" -o -name "boi.db" -not -path "*/worktrees/*" 2>/dev/null | head -1)
+if [ -n "$DB_MUT" ]; then
+  total=$(sqlite3 "$DB_MUT" "SELECT total_tasks FROM specs WHERE id = '$ADD_ID';" 2>/dev/null)
+  if [ "$total" -eq 3 ]; then
+    assert_pass "DB total_tasks = 3 after add"
+  else
+    assert_fail "DB total_tasks expected 3, got $total"
+  fi
+fi
+
+# Start daemon, let it complete
+$BOI daemon &
+DAEMON_PID=$!
+sleep 1
+
+WAITED=0
+while [ $WAITED -lt 60 ]; do
+  s=$($BOI status "$ADD_ID" 2>&1)
+  echo "$s" | grep -q "completed" && break
+  sleep 2
+  WAITED=$((WAITED + 2))
+done
+
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+
+# Assert spec completed
+s=$($BOI status "$ADD_ID" 2>&1)
+if echo "$s" | grep -q "completed"; then
+  assert_pass "mutation-add spec completed"
+else
+  assert_fail "mutation-add spec did not complete — status: $(echo "$s" | head -3)"
+fi
+
+# Assert original marker files exist (tasks from YAML)
+if [ -f /tmp/boi-mut-add-1.txt ]; then
+  assert_pass "add test: marker 1 exists"
+else
+  assert_fail "add test: marker 1 missing"
+fi
+if [ -f /tmp/boi-mut-add-2.txt ]; then
+  assert_pass "add test: marker 2 exists"
+else
+  assert_fail "add test: marker 2 missing"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "20. In-flight mutation — skip task in queued spec"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Clean state
+rm -f /tmp/boi-mut-skip-1.txt /tmp/boi-mut-skip-2.txt /tmp/boi-mut-skip-3.txt
+$BOI stop 2>/dev/null || true
+rm -f ~/.boi/daemon.pid ~/.boi/daemon.heartbeat
+
+# Dispatch a 3-task chain (t-1 → t-2 → t-3)
+out=$($BOI dispatch "$FIXTURES/mutation-skip.yaml" 2>&1); rc=$?
+assert_exit 0 $rc "dispatch mutation-skip spec exits 0"
+SKIP_ID=$(echo "$out" | grep -o 'q-[0-9]*')
+if [ -n "$SKIP_ID" ]; then
+  assert_pass "mutation-skip got ID: $SKIP_ID"
+else
+  assert_fail "mutation-skip did not return ID"
+  SKIP_ID="q-999"
+fi
+
+# Skip t-2 before daemon starts
+out=$($BOI spec "$SKIP_ID" skip t-2 2>&1); rc=$?
+assert_exit 0 $rc "spec skip t-2 exits 0"
+assert_contains "$out" "skipped" "spec skip confirms skip"
+
+# Verify t-2 shows SKIPPED in spec view
+out=$($BOI spec "$SKIP_ID" 2>&1); rc=$?
+assert_exit 0 $rc "spec view after skip exits 0"
+if echo "$out" | grep -i "t-2" | grep -iq "skip"; then
+  assert_pass "spec view shows t-2 as SKIPPED"
+else
+  assert_fail "spec view does not show t-2 as SKIPPED"
+fi
+
+# Verify DB state: t-2 is SKIPPED, completed_tasks incremented
+DB_SKIP=$(find ~/.boi -name "boi-rust.db" -o -name "boi.db" -not -path "*/worktrees/*" 2>/dev/null | head -1)
+if [ -n "$DB_SKIP" ]; then
+  t2_status=$(sqlite3 "$DB_SKIP" "SELECT status FROM tasks WHERE spec_id = '$SKIP_ID' AND id = 't-2';" 2>/dev/null)
+  if [ "$t2_status" = "SKIPPED" ]; then
+    assert_pass "DB shows t-2 status = SKIPPED"
+  else
+    assert_fail "DB t-2 status expected SKIPPED, got '$t2_status'"
+  fi
+
+  completed=$(sqlite3 "$DB_SKIP" "SELECT completed_tasks FROM specs WHERE id = '$SKIP_ID';" 2>/dev/null)
+  if [ "$completed" -ge 1 ]; then
+    assert_pass "DB completed_tasks >= 1 after skip (got $completed)"
+  else
+    assert_fail "DB completed_tasks expected >= 1, got $completed"
+  fi
+fi
+
+# Start daemon, let it complete
+$BOI daemon &
+DAEMON_PID=$!
+sleep 1
+
+WAITED=0
+while [ $WAITED -lt 60 ]; do
+  s=$($BOI status "$SKIP_ID" 2>&1)
+  echo "$s" | grep -q "completed" && break
+  sleep 2
+  WAITED=$((WAITED + 2))
+done
+
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+
+# Assert spec completed
+s=$($BOI status "$SKIP_ID" 2>&1)
+if echo "$s" | grep -q "completed"; then
+  assert_pass "mutation-skip spec completed"
+else
+  assert_fail "mutation-skip spec did not complete — status: $(echo "$s" | head -3)"
+fi
+
+# Assert t-1 ran (marker exists)
+if [ -f /tmp/boi-mut-skip-1.txt ]; then
+  assert_pass "skip test: marker 1 exists (t-1 ran)"
+else
+  assert_fail "skip test: marker 1 missing (t-1 did not run)"
+fi
+
+# Assert t-2 did NOT run (marker should not exist — it was skipped)
+if [ ! -f /tmp/boi-mut-skip-2.txt ]; then
+  assert_pass "skip test: marker 2 absent (t-2 correctly skipped)"
+else
+  assert_fail "skip test: marker 2 exists (t-2 ran despite skip)"
+fi
+
+# Verify final DB state: t-1 DONE, t-2 SKIPPED
+if [ -n "$DB_SKIP" ]; then
+  t1_status=$(sqlite3 "$DB_SKIP" "SELECT status FROM tasks WHERE spec_id = '$SKIP_ID' AND id = 't-1';" 2>/dev/null)
+  t2_final=$(sqlite3 "$DB_SKIP" "SELECT status FROM tasks WHERE spec_id = '$SKIP_ID' AND id = 't-2';" 2>/dev/null)
+  if [ "$t1_status" = "DONE" ]; then
+    assert_pass "skip test DB: t-1 = DONE"
+  else
+    assert_fail "skip test DB: t-1 expected DONE, got '$t1_status'"
+  fi
+  if [ "$t2_final" = "SKIPPED" ]; then
+    assert_pass "skip test DB: t-2 = SKIPPED (preserved)"
+  else
+    assert_fail "skip test DB: t-2 expected SKIPPED, got '$t2_final'"
+  fi
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "21. In-flight mutation — block task on dependency"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Clean state
+rm -f /tmp/boi-mut-block-1.txt /tmp/boi-mut-block-2.txt
+$BOI stop 2>/dev/null || true
+rm -f ~/.boi/daemon.pid ~/.boi/daemon.heartbeat
+
+# Dispatch a 2-task spec with NO deps between them
+out=$($BOI dispatch "$FIXTURES/mutation-block.yaml" 2>&1); rc=$?
+assert_exit 0 $rc "dispatch mutation-block spec exits 0"
+BLOCK_ID=$(echo "$out" | grep -o 'q-[0-9]*')
+if [ -n "$BLOCK_ID" ]; then
+  assert_pass "mutation-block got ID: $BLOCK_ID"
+else
+  assert_fail "mutation-block did not return ID"
+  BLOCK_ID="q-999"
+fi
+
+# Block t-2 on t-1
+out=$($BOI spec "$BLOCK_ID" block t-2 --on t-1 2>&1); rc=$?
+assert_exit 0 $rc "spec block t-2 --on t-1 exits 0"
+assert_contains "$out" "blocked" "spec block confirms blocking"
+
+# Verify DB shows the dependency
+DB_BLOCK=$(find ~/.boi -name "boi-rust.db" -o -name "boi.db" -not -path "*/worktrees/*" 2>/dev/null | head -1)
+if [ -n "$DB_BLOCK" ]; then
+  deps=$(sqlite3 "$DB_BLOCK" "SELECT depends FROM tasks WHERE spec_id = '$BLOCK_ID' AND id = 't-2';" 2>/dev/null)
+  if echo "$deps" | grep -q "t-1"; then
+    assert_pass "DB shows t-2 depends on t-1 after block"
+  else
+    assert_fail "DB t-2 depends expected to contain t-1, got '$deps'"
+  fi
+fi
+
+# Start daemon, let it complete
+$BOI daemon &
+DAEMON_PID=$!
+sleep 1
+
+WAITED=0
+while [ $WAITED -lt 60 ]; do
+  s=$($BOI status "$BLOCK_ID" 2>&1)
+  echo "$s" | grep -q "completed" && break
+  sleep 2
+  WAITED=$((WAITED + 2))
+done
+
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+
+# Assert spec completed
+s=$($BOI status "$BLOCK_ID" 2>&1)
+if echo "$s" | grep -q "completed"; then
+  assert_pass "mutation-block spec completed"
+else
+  assert_fail "mutation-block spec did not complete — status: $(echo "$s" | head -3)"
+fi
+
+# Assert both markers exist (both tasks ran)
+if [ -f /tmp/boi-mut-block-1.txt ]; then
+  assert_pass "block test: marker 1 exists (t-1 ran)"
+else
+  assert_fail "block test: marker 1 missing"
+fi
+if [ -f /tmp/boi-mut-block-2.txt ]; then
+  assert_pass "block test: marker 2 exists (t-2 ran)"
+else
+  assert_fail "block test: marker 2 missing"
+fi
+
+# Verify ordering via DB timestamps: t-1 started before t-2
+if [ -n "$DB_BLOCK" ]; then
+  t1_start=$(sqlite3 "$DB_BLOCK" "SELECT started_at FROM tasks WHERE spec_id = '$BLOCK_ID' AND id = 't-1';" 2>/dev/null)
+  t2_start=$(sqlite3 "$DB_BLOCK" "SELECT started_at FROM tasks WHERE spec_id = '$BLOCK_ID' AND id = 't-2';" 2>/dev/null)
+  if [ -n "$t1_start" ] && [ -n "$t2_start" ]; then
+    if [[ "$t1_start" < "$t2_start" || "$t1_start" == "$t2_start" ]]; then
+      assert_pass "block test: t-1 started ($t1_start) <= t-2 started ($t2_start)"
+    else
+      assert_fail "block test: t-1 started ($t1_start) AFTER t-2 ($t2_start) — block violated"
+    fi
+  else
+    assert_fail "block test: could not read timestamps (t1='$t1_start', t2='$t2_start')"
+  fi
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ══════════════════════════════════════════════════════════════════════════════
 

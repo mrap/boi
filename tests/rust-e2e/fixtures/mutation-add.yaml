@@ -1,0 +1,13 @@
+title: "E2E Test — Mutation Add Task"
+mode: execute
+tasks:
+  - id: t-1
+    title: "Write marker 1"
+    status: PENDING
+    spec: "Create /tmp/boi-mut-add-1.txt"
+    verify: "touch /tmp/boi-mut-add-1.txt"
+  - id: t-2
+    title: "Write marker 2"
+    status: PENDING
+    spec: "Create /tmp/boi-mut-add-2.txt"
+    verify: "touch /tmp/boi-mut-add-2.txt"
