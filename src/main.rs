@@ -200,7 +200,10 @@ fn main() {
         Commands::Outputs { spec_id } => {
             cmd_outputs(&spec_id, &cfg);
         }
-        Commands::Daemon { foreground: _ } => {
+        Commands::Daemon { foreground } => {
+            if !foreground {
+                eprintln!("[boi] note: daemon always runs in foreground (use LaunchAgent/systemd for background)");
+            }
             cmd_daemon(db_str, hook_cfg, &cfg);
         }
         Commands::Config { key, value } => {
@@ -235,7 +238,7 @@ fn cmd_dispatch(
     priority: i64,
     mode: Option<SpecMode>,
     max_iter: i64,
-    _timeout: u32,
+    timeout: u32,
     _no_critic: bool,
     project: Option<&str>,
     dry_run: bool,
@@ -282,31 +285,27 @@ fn cmd_dispatch(
         }
     };
 
-    // Apply CLI overrides
+    // Apply CLI overrides via single queue connection
     let mode_str = mode.map(|m| m.to_string());
+    let timeout_secs = if timeout != 30 {
+        Some(timeout as i64 * 60)
+    } else {
+        None
+    };
     let _ = q.set_spec_fields(
         &spec_id,
         mode_str.as_deref(),
         if max_iter != 30 { Some(max_iter) } else { None },
         project,
+        timeout_secs,
     );
 
     if priority != 100 {
-        if let Ok(conn) = rusqlite::Connection::open(db_str) {
-            let _ = conn.execute(
-                "UPDATE specs SET priority = ?1 WHERE id = ?2",
-                rusqlite::params![priority, spec_id],
-            );
-        }
+        let _ = q.set_priority(&spec_id, priority);
     }
 
     if let Some(dep) = after {
-        if let Ok(conn) = rusqlite::Connection::open(db_str) {
-            let _ = conn.execute(
-                "UPDATE specs SET depends_on = ?1 WHERE id = ?2",
-                rusqlite::params![dep, spec_id],
-            );
-        }
+        let _ = q.set_depends_on(&spec_id, dep);
     }
 
     let payload = json!({
@@ -906,12 +905,37 @@ fn daemon_heartbeat_path() -> PathBuf {
     PathBuf::from(home).join(".boi").join("daemon.heartbeat")
 }
 
+fn check_existing_daemon(pid_path: &std::path::Path) -> bool {
+    if let Ok(content) = std::fs::read_to_string(pid_path) {
+        if let Ok(pid) = content.trim().parse::<i32>() {
+            unsafe { libc::kill(pid, 0) == 0 }
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
 fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Config) {
     ensure_db_dir(db_str);
 
+    // Singleton guard: check if a daemon is already running
+    let pid_path = daemon_pid_path();
+    if check_existing_daemon(&pid_path) {
+        if let Ok(content) = std::fs::read_to_string(&pid_path) {
+            eprintln!(
+                "[boi daemon] error: daemon already running (pid {})",
+                content.trim()
+            );
+        } else {
+            eprintln!("[boi daemon] error: daemon already running");
+        }
+        std::process::exit(1);
+    }
+
     // Write PID file
     let pid = std::process::id();
-    let pid_path = daemon_pid_path();
     if let Some(parent) = pid_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -944,6 +968,15 @@ fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Config) {
         retry_count: cfg.retry_count(),
     };
 
+    // Crash recovery: reset any specs stuck in 'running' or 'assigning' back to 'queued'
+    if let Ok(q) = queue::Queue::open(db_str) {
+        match q.recover_stuck_specs() {
+            Ok(0) => {}
+            Ok(n) => eprintln!("[boi daemon] recovered {} stuck spec(s) back to queued", n),
+            Err(e) => eprintln!("[boi daemon] warning: crash recovery failed: {}", e),
+        }
+    }
+
     eprintln!("[boi daemon] started (pid {}), max_workers={}", pid, wc.max_workers);
 
     let active: std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
@@ -963,17 +996,35 @@ fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Config) {
                     Ok(queue) => match queue.dequeue() {
                         Ok(Some(rec)) => {
                             let spec_id = rec.id.clone();
-                            let spec_path = rec.spec_path.clone().unwrap_or_default();
+                            let spec_path = match rec.spec_path.as_deref() {
+                                Some(p) if !p.is_empty() => p.to_string(),
+                                _ => {
+                                    eprintln!(
+                                        "[boi daemon] spec {} has no spec_path — marking failed",
+                                        spec_id
+                                    );
+                                    if let Ok(q2) = queue::Queue::open(db_str) {
+                                        let _ = q2.update_spec(&spec_id, "failed");
+                                    }
+                                    continue;
+                                }
+                            };
                             let qpath = db_str.to_string();
                             let hc = hook_cfg.clone();
                             let timeout = wc.task_timeout_secs;
                             let retries = wc.retry_count;
 
+                            // Use per-spec timeout if set, otherwise default
+                            let spec_timeout = rec
+                                .worker_timeout_seconds
+                                .map(|t| t as u64)
+                                .unwrap_or(timeout);
+
                             eprintln!("[boi daemon] starting worker for {}", spec_id);
                             let handle = std::thread::spawn(move || {
                                 let wc = worker::WorkerConfig {
                                     max_workers: 1,
-                                    task_timeout_secs: timeout,
+                                    task_timeout_secs: spec_timeout,
                                     retry_count: retries,
                                 };
                                 if let Err(e) =
@@ -1512,10 +1563,12 @@ fn ensure_db_dir(db_str: &str) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max - 1])
+        let truncated: String = chars[..max - 1].iter().collect();
+        format!("{}…", truncated)
     }
 }
 

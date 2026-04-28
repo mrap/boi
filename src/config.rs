@@ -34,7 +34,18 @@ impl Config {
     pub fn load_from(path: &Path) -> Self {
         if path.exists() {
             let content = std::fs::read_to_string(path).unwrap_or_default();
-            serde_yaml::from_str(&content).unwrap_or_default()
+            match serde_yaml::from_str::<Config>(&content) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!(
+                        "ERROR: config parse failed at {}: {}",
+                        path.display(),
+                        e
+                    );
+                    eprintln!("Using defaults. Fix the config file or delete it.");
+                    Config::default()
+                }
+            }
         } else {
             Config::default()
         }
@@ -57,8 +68,7 @@ impl Config {
             PathBuf::from(p)
         } else {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            // Use a separate path from the legacy Python boi.db to avoid schema conflicts.
-            PathBuf::from(home).join(".boi").join("rust").join("boi.db")
+            PathBuf::from(home).join(".boi").join("boi.db")
         }
     }
 

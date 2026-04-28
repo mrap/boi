@@ -29,11 +29,6 @@ impl Default for WorkerConfig {
     }
 }
 
-fn worktrees_base() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    format!("{}/.boi/worktrees", home)
-}
-
 pub fn build_prompt(spec_content: &str, task: &spec::BoiTask) -> String {
     let task_spec = task.spec.as_deref().unwrap_or("(no spec provided)");
     let task_verify = task.verify.as_deref().unwrap_or("(no verify command)");
@@ -83,7 +78,8 @@ pub fn spawn_claude(
                     let _ = child.wait();
                     return Ok((false, "timeout".to_string()));
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                // Claude sessions run for minutes; 2s poll is responsive enough
+                std::thread::sleep(Duration::from_secs(2));
             }
         }
     }
@@ -108,8 +104,11 @@ pub fn run_worker(
     queue.update_spec(spec_id, "running")?;
     let _ = hooks::fire(hook_config, ON_WORKER_START, &json!({ "spec_id": spec_id }));
 
-    let worktree_path = format!("{}/{}", worktrees_base(), spec_id);
-    std::fs::create_dir_all(&worktree_path)?;
+    let repo_path = std::env::var("BOI_REPO").unwrap_or_else(|_| {
+        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
+    });
+    let worktree_dir = crate::worktree::create(spec_id, &repo_path)?;
+    let worktree_path = worktree_dir.to_str().unwrap_or("/tmp").to_string();
 
     let spec_content = std::fs::read_to_string(spec_path)?;
     let boi_spec = spec::parse_unchecked(&spec_content)?;
@@ -212,7 +211,7 @@ pub fn run_worker(
         let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
     }
 
-    let _ = std::fs::remove_dir_all(&worktree_path);
+    let _ = crate::worktree::cleanup(spec_id);
 
     Ok(())
 }
@@ -279,7 +278,7 @@ mod tests {
     use crate::{hooks::HookConfig, queue::Queue, spec};
     use std::sync::Mutex;
 
-    // Serializes tests that mutate CLAUDE_BIN to avoid env var races.
+    // Serializes tests that mutate env vars to avoid races.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Run `f` with CLAUDE_BIN set to `bin_path`, holding ENV_LOCK.
@@ -294,6 +293,49 @@ mod tests {
                 None => std::env::remove_var("CLAUDE_BIN"),
             }
         }
+    }
+
+    /// Run `f` with CLAUDE_BIN and BOI_REPO set, holding ENV_LOCK.
+    fn with_test_env<F: FnOnce()>(bin_path: &str, repo_path: &str, f: F) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let old_bin = std::env::var("CLAUDE_BIN").ok();
+        let old_repo = std::env::var("BOI_REPO").ok();
+        unsafe {
+            std::env::set_var("CLAUDE_BIN", bin_path);
+            std::env::set_var("BOI_REPO", repo_path);
+        }
+        f();
+        unsafe {
+            match old_bin {
+                Some(v) => std::env::set_var("CLAUDE_BIN", v),
+                None => std::env::remove_var("CLAUDE_BIN"),
+            }
+            match old_repo {
+                Some(v) => std::env::set_var("BOI_REPO", v),
+                None => std::env::remove_var("BOI_REPO"),
+            }
+        }
+    }
+
+    /// Create a temporary git repo for worktree testing.
+    fn setup_test_repo(suffix: &str) -> std::path::PathBuf {
+        use std::process::Command;
+        let repo_dir = std::env::temp_dir().join(format!("boi_test_repo_{}", suffix));
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        Command::new("git").args(["init"]).current_dir(&repo_dir).output().unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@boi.test"])
+            .current_dir(&repo_dir).output().unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "BOI Test"])
+            .current_dir(&repo_dir).output().unwrap();
+        std::fs::write(repo_dir.join("README.md"), "test").unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&repo_dir).output().unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&repo_dir).output().unwrap();
+        repo_dir
     }
 
     fn mock_claude(exit_code: u8, suffix: &str) -> std::path::PathBuf {
@@ -378,6 +420,7 @@ mod tests {
     #[test]
     fn test_run_worker_completes_on_success() {
         let script = mock_claude(0, "worker_ok");
+        let repo = setup_test_repo("worker_ok");
         let spec_yaml =
             "title: \"Worker Test\"\ntasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it\"\n";
         let (queue, spec_id, db_path) = setup_test_db("worker_ok", spec_yaml);
@@ -388,7 +431,7 @@ mod tests {
             retry_count: 0,
         };
 
-        with_claude_bin(script.to_str().unwrap(), || {
+        with_test_env(script.to_str().unwrap(), repo.to_str().unwrap(), || {
             run_worker(
                 &spec_id,
                 spec_file.to_str().unwrap(),
@@ -407,6 +450,7 @@ mod tests {
     #[test]
     fn test_run_worker_fails_on_task_failure() {
         let script = mock_claude(1, "worker_fail");
+        let repo = setup_test_repo("worker_fail");
         let spec_yaml =
             "title: \"Fail Test\"\ntasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
         let (queue, spec_id, db_path) = setup_test_db("worker_fail", spec_yaml);
@@ -417,7 +461,7 @@ mod tests {
             retry_count: 0,
         };
 
-        with_claude_bin(script.to_str().unwrap(), || {
+        with_test_env(script.to_str().unwrap(), repo.to_str().unwrap(), || {
             let _ = run_worker(
                 &spec_id,
                 spec_file.to_str().unwrap(),
@@ -435,6 +479,7 @@ mod tests {
     #[test]
     fn test_run_worker_skips_done_tasks() {
         let script = mock_claude(0, "worker_skip");
+        let repo = setup_test_repo("worker_skip");
         // t-1 is already DONE in YAML; only t-2 should be executed
         let spec_yaml = "title: \"Skip Test\"\ntasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    title: \"Pending\"\n    status: PENDING\n    depends: [t-1]\n";
         let (queue, spec_id, db_path) = setup_test_db("worker_skip", spec_yaml);
@@ -445,7 +490,7 @@ mod tests {
             retry_count: 0,
         };
 
-        with_claude_bin(script.to_str().unwrap(), || {
+        with_test_env(script.to_str().unwrap(), repo.to_str().unwrap(), || {
             run_worker(
                 &spec_id,
                 spec_file.to_str().unwrap(),

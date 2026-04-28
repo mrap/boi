@@ -25,6 +25,7 @@ pub struct SpecRecord {
     pub iteration: i64,
     pub project: Option<String>,
     pub phase: String,
+    pub worker_timeout_seconds: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -182,6 +183,7 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "iteration", "INTEGER DEFAULT 0");
         Self::ensure_column(&conn, "specs", "project", "TEXT");
         Self::ensure_column(&conn, "specs", "phase", "TEXT DEFAULT 'execute'");
+        Self::ensure_column(&conn, "specs", "worker_timeout_seconds", "INTEGER");
 
         Ok(Queue { conn })
     }
@@ -205,9 +207,14 @@ impl Queue {
         }
     }
 
-    fn next_id(&self) -> Result<String> {
-        let max_n: Option<i64> = self
-            .conn
+    pub fn enqueue(
+        &self,
+        spec: &crate::spec::BoiSpec,
+        spec_path: Option<&str>,
+    ) -> Result<String> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let max_n: Option<i64> = tx
             .query_row(
                 "SELECT MAX(CAST(SUBSTR(id, 3) AS INTEGER)) FROM specs WHERE id LIKE 'q-%'",
                 [],
@@ -215,20 +222,13 @@ impl Queue {
             )
             .unwrap_or(None);
         let n = max_n.map(|n| n + 1).unwrap_or(1);
-        Ok(format!("q-{}", n))
-    }
+        let id = format!("q-{}", n);
 
-    pub fn enqueue(
-        &self,
-        spec: &crate::spec::BoiSpec,
-        spec_path: Option<&str>,
-    ) -> Result<String> {
-        let id = self.next_id()?;
         let now = Utc::now().to_rfc3339();
         let mode = spec.mode.as_deref().unwrap_or("execute");
         let total = spec.tasks.len() as i64;
 
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at)
              VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6)",
             params![id, spec.title, mode, spec_path, total, now],
@@ -237,36 +237,61 @@ impl Queue {
         for task in &spec.tasks {
             let depends_json = serde_json::to_string(task.depends.as_deref().unwrap_or(&[]))
                 .unwrap_or_else(|_| "[]".to_string());
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO tasks (id, spec_id, title, status, depends)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![task.id, id, task.title, task.status.to_string(), depends_json],
             )?;
         }
 
+        tx.commit()?;
         Ok(id)
     }
 
     /// Returns the highest-priority queued spec whose depends_on (if any) is completed.
+    /// Atomically sets the spec status to 'assigning' to prevent double-dispatch.
     pub fn dequeue(&self) -> Result<Option<SpecRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, title, mode, status, spec_path, total_tasks, completed_tasks,
-                    priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
-                    max_iterations, iteration, project, phase
-             FROM specs
-             WHERE status = 'queued'
-               AND (depends_on IS NULL OR depends_on = ''
-                    OR EXISTS (SELECT 1 FROM specs s2
-                               WHERE s2.id = specs.depends_on AND s2.status = 'completed'))
-             ORDER BY priority ASC, queued_at ASC
-             LIMIT 1",
+        let tx = self.conn.unchecked_transaction()?;
+
+        let maybe_id: Option<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM specs
+                 WHERE status = 'queued'
+                   AND (depends_on IS NULL OR depends_on = ''
+                        OR EXISTS (SELECT 1 FROM specs s2
+                                   WHERE s2.id = specs.depends_on AND s2.status = 'completed'))
+                 ORDER BY priority ASC, queued_at ASC
+                 LIMIT 1",
+            )?;
+            match stmt.query_row([], |row| row.get::<_, String>(0)) {
+                Ok(id) => Some(id),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e),
+            }
+        };
+
+        let id = match maybe_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        tx.execute(
+            "UPDATE specs SET status = 'assigning' WHERE id = ?1",
+            params![id],
         )?;
 
-        match stmt.query_row([], row_to_spec) {
-            Ok(s) => Ok(Some(s)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
+        let rec = {
+            let mut stmt = tx.prepare(
+                "SELECT id, title, mode, status, spec_path, total_tasks, completed_tasks,
+                        priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
+                        max_iterations, iteration, project, phase, worker_timeout_seconds
+                 FROM specs WHERE id = ?1",
+            )?;
+            stmt.query_row(params![id], row_to_spec)?
+        };
+
+        tx.commit()?;
+        Ok(Some(rec))
     }
 
     pub fn update_task(&self, spec_id: &str, task_id: &str, status: &str) -> Result<()> {
@@ -329,7 +354,7 @@ impl Queue {
         let spec = match self.conn.query_row(
             "SELECT id, title, mode, status, spec_path, total_tasks, completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
-                    max_iterations, iteration, project, phase
+                    max_iterations, iteration, project, phase, worker_timeout_seconds
              FROM specs WHERE id = ?1",
             params![spec_id],
             row_to_spec,
@@ -355,7 +380,7 @@ impl Queue {
         let mut stmt = self.conn.prepare(
             "SELECT id, title, mode, status, spec_path, total_tasks, completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
-                    max_iterations, iteration, project, phase
+                    max_iterations, iteration, project, phase, worker_timeout_seconds
              FROM specs
              ORDER BY
                CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
@@ -378,6 +403,7 @@ impl Queue {
         mode: Option<&str>,
         max_iterations: Option<i64>,
         project: Option<&str>,
+        worker_timeout_seconds: Option<i64>,
     ) -> Result<()> {
         if let Some(m) = mode {
             self.conn.execute(
@@ -397,6 +423,28 @@ impl Queue {
                 params![p, spec_id],
             )?;
         }
+        if let Some(t) = worker_timeout_seconds {
+            self.conn.execute(
+                "UPDATE specs SET worker_timeout_seconds = ?1 WHERE id = ?2",
+                params![t, spec_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn set_priority(&self, spec_id: &str, priority: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE specs SET priority = ?1 WHERE id = ?2",
+            params![priority, spec_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_depends_on(&self, spec_id: &str, depends_on: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE specs SET depends_on = ?1 WHERE id = ?2",
+            params![depends_on, spec_id],
+        )?;
         Ok(())
     }
 
@@ -637,6 +685,15 @@ impl Queue {
         Ok(())
     }
 
+    /// Reset any specs stuck in 'running' or 'assigning' back to 'queued'.
+    /// Called on daemon startup to recover from crashes.
+    pub fn recover_stuck_specs(&self) -> Result<usize> {
+        self.conn.execute(
+            "UPDATE specs SET status = 'queued' WHERE status IN ('running', 'assigning')",
+            [],
+        )
+    }
+
     /// Get the last updated timestamp across all specs (for heartbeat detection)
     pub fn last_spec_update(&self) -> Result<Option<String>> {
         let result: Option<String> = self
@@ -672,6 +729,7 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
         iteration: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
         project: row.get(16)?,
         phase: row.get::<_, Option<String>>(17)?.unwrap_or_else(|| "execute".to_string()),
+        worker_timeout_seconds: row.get(18)?,
     })
 }
 
@@ -756,7 +814,7 @@ mod tests {
         let id = q.enqueue(&spec, None).unwrap();
         let dequeued = q.dequeue().unwrap().expect("should find a spec");
         assert_eq!(dequeued.id, id);
-        assert_eq!(dequeued.status, "queued");
+        assert_eq!(dequeued.status, "assigning");
     }
 
     #[test]

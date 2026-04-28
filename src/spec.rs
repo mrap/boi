@@ -21,6 +21,8 @@ pub struct Outcome {
 pub enum TaskStatus {
     #[serde(rename = "PENDING")]
     Pending,
+    #[serde(rename = "RUNNING")]
+    Running,
     #[serde(rename = "DONE")]
     Done,
     #[serde(rename = "FAILED")]
@@ -33,6 +35,7 @@ impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TaskStatus::Pending => write!(f, "PENDING"),
+            TaskStatus::Running => write!(f, "RUNNING"),
             TaskStatus::Done => write!(f, "DONE"),
             TaskStatus::Failed => write!(f, "FAILED"),
             TaskStatus::Skipped => write!(f, "SKIPPED"),
