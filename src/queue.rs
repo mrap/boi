@@ -842,6 +842,8 @@ mod tests {
             initiative: None,
             context: None,
             outcomes: None,
+            spec_phases: None,
+            task_phases: None,
             tasks,
         }
     }
@@ -854,6 +856,7 @@ mod tests {
             depends: None,
             spec: None,
             verify: None,
+            phases: None,
         }
     }
 

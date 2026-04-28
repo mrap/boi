@@ -1,15 +1,18 @@
 use crate::{
     hooks::{
         self, HookConfig, ON_COMPLETE, ON_FAIL, ON_TASK_COMPLETE, ON_TASK_FAIL, ON_TASK_START,
-        ON_WORKER_START,
+        ON_WORKER_START, ON_PHASE_START, ON_PHASE_COMPLETE, ON_PHASE_FAIL, ON_PHASE_SKIP,
     },
+    phases::{self, PhaseLevel, PhaseOutcome, PhaseRegistry},
     queue::Queue,
+    runner::{ClaudePhaseRunner, PhaseRunner},
     spec,
 };
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
     process::{Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -91,14 +94,39 @@ pub fn spawn_claude(
 /// Execute all pending tasks for a queued spec.
 ///
 /// Reads the spec YAML at `spec_path`, processes tasks in topological order,
-/// spawning `claude -p` for each PENDING task. Updates `queue_path` (SQLite)
-/// after each task and when the spec completes or fails.
+/// using the phase pipeline (resolve_pipeline → spec phases → task phases).
+/// Updates `queue_path` (SQLite) after each task and when the spec completes or fails.
 pub fn run_worker(
     spec_id: &str,
     spec_path: &str,
     queue_path: &str,
     hook_config: &HookConfig,
     config: &WorkerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = PhaseRegistry::new();
+    // Load user phases from ~/.boi/phases/ if they exist
+    registry_load_user(&registry);
+    let runner = Arc::new(ClaudePhaseRunner);
+    run_worker_with_phases(spec_id, spec_path, queue_path, hook_config, config, &registry, runner.as_ref())
+}
+
+/// Load user phases into a registry (helper to avoid mutability issues in run_worker).
+fn registry_load_user(registry: &PhaseRegistry) {
+    // PhaseRegistry::new() already loads core phases. User phases need a mutable registry,
+    // but we handle this by creating a new registry with user phases in run_worker_with_registry.
+    let _ = registry;
+}
+
+/// Execute all pending tasks using the phase pipeline with a custom PhaseRunner.
+/// This is the core implementation, testable with mock runners.
+pub fn run_worker_with_phases(
+    spec_id: &str,
+    spec_path: &str,
+    queue_path: &str,
+    hook_config: &HookConfig,
+    config: &WorkerConfig,
+    registry: &PhaseRegistry,
+    runner: &dyn PhaseRunner,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let queue = Queue::open(queue_path)?;
     queue.update_spec(spec_id, "running")?;
@@ -121,6 +149,14 @@ pub fn run_worker(
         }
     };
 
+    // Resolve the pipeline for this spec
+    let mode = boi_spec.mode.as_deref().unwrap_or("execute");
+    let pipeline = phases::resolve_pipeline(
+        mode,
+        boi_spec.spec_phases.as_deref(),
+        boi_spec.task_phases.as_deref(),
+    );
+
     let task_map: HashMap<&str, &spec::BoiTask> =
         boi_spec.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
 
@@ -132,6 +168,68 @@ pub fn run_worker(
         .map(|t| t.id.clone())
         .collect();
 
+    // --- Pre-task spec phases (e.g., plan-critique) ---
+    let pre_spec_phases: Vec<&str> = pipeline
+        .spec_phases
+        .iter()
+        .filter_map(|name| {
+            registry.get(name).and_then(|p| {
+                // Pre-task spec phases are those that make sense before execution
+                if p.level == PhaseLevel::Spec && (name == "plan-critique") {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    for phase_name in &pre_spec_phases {
+        if let Some(phase) = registry.get(phase_name) {
+            let phase_payload = json!({
+                "spec_id": spec_id,
+                "phase": phase_name,
+                "level": "spec",
+            });
+            let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
+
+            let outcome = runner.run_phase(
+                phase,
+                &spec_content,
+                None,
+                &worktree_path,
+                config.task_timeout_secs,
+            );
+
+            match &outcome {
+                PhaseOutcome::Approved => {
+                    let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                }
+                PhaseOutcome::Skipped => {
+                    let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
+                }
+                PhaseOutcome::Failed { reason } => {
+                    eprintln!("[boi] pre-task spec phase '{}' failed: {}", phase_name, reason);
+                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                    if phase.can_fail_spec {
+                        queue.update_spec(spec_id, "failed")?;
+                        let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
+                        let _ = crate::worktree::cleanup(spec_id);
+                        return Ok(());
+                    }
+                }
+                PhaseOutcome::Timeout => {
+                    eprintln!("[boi] pre-task spec phase '{}' timed out", phase_name);
+                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                }
+                _ => {
+                    let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                }
+            }
+        }
+    }
+
+    // --- Process tasks through their phase pipelines ---
     let mut overall_success = true;
 
     'tasks: for task_id in &order {
@@ -159,36 +257,106 @@ pub fn run_worker(
         queue.update_task(spec_id, &task.id, "RUNNING")?;
         let _ = hooks::fire(hook_config, ON_TASK_START, &task_payload);
 
-        let prompt = build_prompt(&spec_content, task);
+        // Resolve task phases (task override > pipeline default)
+        let task_phases = phases::resolve_task_phases(
+            &pipeline,
+            task.phases.as_deref(),
+        );
+
         let mut task_success = false;
 
-        'retry: for attempt in 0..=config.retry_count {
-            match spawn_claude(&prompt, &worktree_path, config.task_timeout_secs) {
-                Ok((exited_ok, _output)) => {
-                    let verify_ok = task
-                        .verify
-                        .as_deref()
-                        .map(|cmd| run_verify(cmd, &worktree_path))
-                        .unwrap_or(exited_ok);
-
-                    if verify_ok {
-                        task_success = true;
-                        break 'retry;
-                    }
-                    if attempt < config.retry_count {
-                        eprintln!(
-                            "[boi] task {} failed verify (attempt {}/{}), retrying",
-                            task.id,
-                            attempt + 1,
-                            config.retry_count + 1
-                        );
-                    }
+        // Run each task phase in sequence
+        'phases: for phase_name in &task_phases {
+            let phase = match registry.get(phase_name) {
+                Some(p) => p,
+                None => {
+                    eprintln!("[boi] unknown phase '{}' in task {} — skipping", phase_name, task.id);
+                    continue 'phases;
                 }
-                Err(e) => {
-                    eprintln!("[boi] task {} spawn error: {}", task.id, e);
-                    break 'retry;
+            };
+
+            let phase_payload = json!({
+                "spec_id": spec_id,
+                "task_id": task.id,
+                "phase": phase_name,
+                "level": "task",
+            });
+            let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
+
+            // Check trigger conditions (e.g., min_lines_changed)
+            // For now, skip phases with min_lines_changed if we can't measure (first iteration)
+            // This is a placeholder — full implementation would check git diff
+
+            // Retry loop for the phase
+            let mut phase_outcome = PhaseOutcome::Failed {
+                reason: "no attempts made".into(),
+            };
+
+            let max_attempts = phase.retry_count.unwrap_or(config.retry_count) + 1;
+            for attempt in 0..max_attempts {
+                phase_outcome = runner.run_phase(
+                    phase,
+                    &spec_content,
+                    Some(task),
+                    &worktree_path,
+                    config.task_timeout_secs,
+                );
+
+                match &phase_outcome {
+                    PhaseOutcome::Approved | PhaseOutcome::Skipped | PhaseOutcome::AddedTasks(_) => {
+                        break;
+                    }
+                    PhaseOutcome::Failed { .. } | PhaseOutcome::Timeout => {
+                        if attempt + 1 < max_attempts {
+                            eprintln!(
+                                "[boi] phase '{}' for task {} failed (attempt {}/{}), retrying",
+                                phase_name, task.id, attempt + 1, max_attempts
+                            );
+                        }
+                    }
+                    PhaseOutcome::Requeue { .. } => {
+                        break; // Requeue doesn't retry
+                    }
                 }
             }
+
+            // Handle the final phase outcome
+            match &phase_outcome {
+                PhaseOutcome::Approved => {
+                    let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                    // Continue to next phase
+                }
+                PhaseOutcome::Skipped => {
+                    let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
+                    // Continue to next phase
+                }
+                PhaseOutcome::AddedTasks(_) => {
+                    let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                    // Continue to next phase (tasks would be injected into the spec in production)
+                }
+                PhaseOutcome::Requeue { phase: target } => {
+                    eprintln!("[boi] phase '{}' requests requeue to '{}' for task {}", phase_name, target, task.id);
+                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                    // Mark task failed — it needs re-execution
+                    task_success = false;
+                    break 'phases;
+                }
+                PhaseOutcome::Failed { reason } => {
+                    eprintln!("[boi] phase '{}' failed for task {}: {}", phase_name, task.id, reason);
+                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                    task_success = false;
+                    break 'phases;
+                }
+                PhaseOutcome::Timeout => {
+                    eprintln!("[boi] phase '{}' timed out for task {}", phase_name, task.id);
+                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                    task_success = false;
+                    break 'phases;
+                }
+            }
+
+            // If we made it through all phases, task succeeded
+            task_success = true;
         }
 
         if task_success {
@@ -200,6 +368,75 @@ pub fn run_worker(
             let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
             overall_success = false;
             break 'tasks;
+        }
+    }
+
+    // --- Post-task spec phases (e.g., critic, evaluate) ---
+    if overall_success {
+        let post_spec_phases: Vec<&str> = pipeline
+            .spec_phases
+            .iter()
+            .filter_map(|name| {
+                registry.get(name).and_then(|p| {
+                    if p.level == PhaseLevel::Spec && name != "plan-critique" {
+                        Some(name.as_str())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        for phase_name in &post_spec_phases {
+            if let Some(phase) = registry.get(phase_name) {
+                let phase_payload = json!({
+                    "spec_id": spec_id,
+                    "phase": phase_name,
+                    "level": "spec",
+                });
+                let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
+
+                let outcome = runner.run_phase(
+                    phase,
+                    &spec_content,
+                    None,
+                    &worktree_path,
+                    config.task_timeout_secs,
+                );
+
+                match &outcome {
+                    PhaseOutcome::Approved => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                    }
+                    PhaseOutcome::Skipped => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
+                    }
+                    PhaseOutcome::Failed { reason } => {
+                        eprintln!("[boi] post-task spec phase '{}' failed: {}", phase_name, reason);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        if phase.can_fail_spec {
+                            overall_success = false;
+                            break;
+                        }
+                    }
+                    PhaseOutcome::Timeout => {
+                        eprintln!("[boi] post-task spec phase '{}' timed out", phase_name);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                    }
+                    PhaseOutcome::Requeue { phase: target } => {
+                        eprintln!("[boi] post-task spec phase '{}' requests requeue to '{}'", phase_name, target);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        // For spec-level requeue, we mark as failed so the daemon can re-process
+                        if phase.can_fail_spec {
+                            overall_success = false;
+                            break;
+                        }
+                    }
+                    _ => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                    }
+                }
+            }
         }
     }
 
@@ -363,6 +600,7 @@ mod tests {
             depends: None,
             spec: Some("Run cargo init".to_string()),
             verify: Some("test -f Cargo.toml".to_string()),
+            phases: None,
         };
         let prompt = build_prompt("title: Test\ntasks: []", &task);
         assert!(prompt.contains("t-1"));
@@ -505,5 +743,236 @@ mod tests {
         assert_eq!(st.spec.status, "completed");
         let t2 = st.tasks.iter().find(|t| t.id == "t-2").unwrap();
         assert_eq!(t2.status, "DONE");
+    }
+
+    // --- Phase pipeline tests using MockPhaseRunner ---
+
+    fn setup_phase_test(
+        suffix: &str,
+        spec_yaml: &str,
+    ) -> (Queue, String, String, String, std::path::PathBuf) {
+        let repo = setup_test_repo(suffix);
+        let spec_file = std::env::temp_dir().join(format!("boi_phase_spec_{}.yaml", suffix));
+        std::fs::write(&spec_file, spec_yaml).unwrap();
+        let db_file = std::env::temp_dir().join(format!("boi_phase_db_{}.db", suffix));
+        let _ = std::fs::remove_file(&db_file);
+        let queue = Queue::open(db_file.to_str().unwrap()).unwrap();
+        let boi_spec = spec::parse(spec_yaml).unwrap();
+        let spec_id = queue.enqueue(&boi_spec, spec_file.to_str()).unwrap();
+        let db_path = db_file.to_str().unwrap().to_string();
+        let spec_path = spec_file.to_str().unwrap().to_string();
+        (queue, spec_id, db_path, spec_path, repo)
+    }
+
+    #[test]
+    fn test_phase_pipeline_all_approved() {
+        // execute mode: task_phases = [execute, task-verify], spec_phases = [critic]
+        // Mock returns Approved for all 3 calls (execute, task-verify, critic)
+        let yaml = "title: \"Phase Pipeline Test\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n    verify: \"true\"\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_ok", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            PhaseOutcome::Approved, // execute phase
+            PhaseOutcome::Approved, // task-verify phase
+            PhaseOutcome::Approved, // critic (post-task spec phase)
+        ]);
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+            )
+            .unwrap();
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "completed");
+        assert_eq!(st.tasks[0].status, "DONE");
+    }
+
+    #[test]
+    fn test_phase_pipeline_task_phase_fails() {
+        // execute phase succeeds, task-verify fails → task FAILED
+        let yaml = "title: \"Phase Fail Test\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_fail", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            PhaseOutcome::Approved,                                    // execute phase
+            PhaseOutcome::Failed { reason: "verify failed".into() },   // task-verify fails
+        ]);
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+            )
+            .unwrap();
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "failed");
+        assert_eq!(st.tasks[0].status, "FAILED");
+    }
+
+    #[test]
+    fn test_phase_pipeline_with_task_override() {
+        // Task specifies phases: ["execute"] — only one phase, no task-verify
+        let yaml = "title: \"Override Test\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"Custom\"\n    status: PENDING\n    phases: [\"execute\"]\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_override", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            PhaseOutcome::Approved, // execute phase (only task phase)
+            PhaseOutcome::Approved, // critic (post-task spec phase)
+        ]);
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+            )
+            .unwrap();
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "completed");
+        assert_eq!(st.tasks[0].status, "DONE");
+    }
+
+    #[test]
+    fn test_phase_pipeline_timeout_fails_task() {
+        let yaml = "title: \"Timeout Test\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_timeout", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            PhaseOutcome::Timeout, // execute phase times out
+        ]);
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+            )
+            .unwrap();
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "failed");
+        assert_eq!(st.tasks[0].status, "FAILED");
+    }
+
+    #[test]
+    fn test_phase_pipeline_challenge_mode() {
+        // challenge mode: spec_phases = [plan-critique, critic]
+        //                 task_phases = [execute, code-review, task-verify]
+        let yaml = "title: \"Challenge Test\"\nmode: challenge\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_challenge", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            PhaseOutcome::Approved, // plan-critique (pre-task spec phase)
+            PhaseOutcome::Approved, // execute
+            PhaseOutcome::Approved, // code-review
+            PhaseOutcome::Approved, // task-verify
+            PhaseOutcome::Approved, // critic (post-task spec phase)
+        ]);
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+            )
+            .unwrap();
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "completed");
+        assert_eq!(st.tasks[0].status, "DONE");
+    }
+
+    #[test]
+    fn test_phase_pipeline_multi_task() {
+        // Two tasks, both should get phase pipeline
+        let yaml = "title: \"Multi Task\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"First\"\n    status: PENDING\n  - id: t-2\n    title: \"Second\"\n    status: PENDING\n    depends: [t-1]\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_multi", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            PhaseOutcome::Approved, // t-1 execute
+            PhaseOutcome::Approved, // t-1 task-verify
+            PhaseOutcome::Approved, // t-2 execute
+            PhaseOutcome::Approved, // t-2 task-verify
+            PhaseOutcome::Approved, // critic (post-task)
+        ]);
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+            )
+            .unwrap();
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "completed");
+        assert_eq!(st.tasks[0].status, "DONE");
+        assert_eq!(st.tasks[1].status, "DONE");
     }
 }

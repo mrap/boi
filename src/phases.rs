@@ -2,9 +2,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Whether a phase operates at the whole-spec level or per-task level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseLevel {
+    /// Runs once for the entire spec (e.g., plan-critique, critic, evaluate)
+    Spec,
+    /// Runs once per task (e.g., execute, code-review, task-verify)
+    #[default]
+    Task,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseConfig {
     pub name: String,
+    pub level: PhaseLevel,
     pub description: String,
     pub prompt_template: String,
     pub timeout_minutes: Option<u32>,
@@ -138,6 +150,7 @@ impl PhaseConfig {
 
         Some(PhaseConfig {
             name,
+            level: PhaseLevel::default(),
             description,
             prompt_template,
             timeout_minutes,
@@ -164,6 +177,12 @@ fn non_empty(opt: &Option<String>) -> Option<String> {
 pub struct PhaseRegistry {
     core: HashMap<String, PhaseConfig>,
     user: HashMap<String, PhaseConfig>,
+}
+
+impl Default for PhaseRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PhaseRegistry {
@@ -257,6 +276,41 @@ pub fn default_phases(mode: &str) -> Vec<String> {
     .collect()
 }
 
+/// Pipeline configuration separating spec-level and task-level phases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineConfig {
+    /// Phases that run once for the whole spec (before/after all tasks)
+    pub spec_phases: Vec<String>,
+    /// Phases that run for each individual task
+    pub task_phases: Vec<String>,
+}
+
+/// Returns the default pipeline for a given spec mode.
+pub fn default_pipeline(mode: &str) -> PipelineConfig {
+    match mode {
+        "execute" => PipelineConfig {
+            spec_phases: vec!["critic".into()],
+            task_phases: vec!["execute".into(), "task-verify".into()],
+        },
+        "challenge" => PipelineConfig {
+            spec_phases: vec!["plan-critique".into(), "critic".into()],
+            task_phases: vec!["execute".into(), "code-review".into(), "task-verify".into()],
+        },
+        "discover" => PipelineConfig {
+            spec_phases: vec!["plan-critique".into(), "critic".into(), "evaluate".into()],
+            task_phases: vec!["execute".into(), "task-verify".into()],
+        },
+        "generate" => PipelineConfig {
+            spec_phases: vec!["plan-critique".into(), "critic".into(), "evaluate".into()],
+            task_phases: vec!["decompose".into(), "execute".into(), "task-verify".into()],
+        },
+        _ => PipelineConfig {
+            spec_phases: vec![],
+            task_phases: vec!["execute".into()],
+        },
+    }
+}
+
 fn load_phase_file(path: &Path) -> Result<PhaseConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
     let toml: PhaseToml = toml::from_str(&content)?;
@@ -269,6 +323,7 @@ fn core_phases() -> Vec<PhaseConfig> {
     vec![
         PhaseConfig {
             name: "execute".into(),
+            level: PhaseLevel::Task,
             description: "Execute the task specification via claude, verify with verify command".into(),
             prompt_template: String::new(),
             timeout_minutes: Some(30),
@@ -285,6 +340,7 @@ fn core_phases() -> Vec<PhaseConfig> {
         },
         PhaseConfig {
             name: "critic".into(),
+            level: PhaseLevel::Spec,
             description: "Review completed spec for quality issues. Add [CRITIC] tasks if problems found.".into(),
             prompt_template: concat!(
                 "You are a BOI critic reviewing completed work.\n\n",
@@ -311,6 +367,7 @@ fn core_phases() -> Vec<PhaseConfig> {
         },
         PhaseConfig {
             name: "decompose".into(),
+            level: PhaseLevel::Task,
             description: "Break large tasks into subtasks before execution.".into(),
             prompt_template: concat!(
                 "You are a BOI decomposer. Break this task into smaller subtasks.\n\n",
@@ -340,6 +397,7 @@ fn core_phases() -> Vec<PhaseConfig> {
         },
         PhaseConfig {
             name: "evaluate".into(),
+            level: PhaseLevel::Spec,
             description: "Check if generate-mode spec has converged. Add tasks if not.".into(),
             prompt_template: concat!(
                 "You are a BOI evaluator checking if this spec has converged.\n\n",
@@ -362,12 +420,190 @@ fn core_phases() -> Vec<PhaseConfig> {
             on_crash: Some("retry".into()),
             min_lines_changed: None,
         },
+        PhaseConfig {
+            name: "plan-critique".into(),
+            level: PhaseLevel::Spec,
+            description: "Review spec plan before execution begins. Challenge assumptions and identify risks.".into(),
+            prompt_template: concat!(
+                "You are a BOI plan critic. Review this spec BEFORE execution begins.\n\n",
+                "Evaluate:\n",
+                "1. Are tasks well-scoped and independently verifiable?\n",
+                "2. Are dependencies correct and complete?\n",
+                "3. Are there missing tasks or unrealistic assumptions?\n",
+                "4. Do verify commands actually test meaningful outcomes?\n\n",
+                "If the plan is sound, output: ## Plan Approved\n\n",
+                "If issues found, output lines starting with [PLAN] describing each issue.\n",
+                "Each [PLAN] line becomes a new task or modification.",
+            ).into(),
+            timeout_minutes: Some(10),
+            retry_count: None,
+            can_add_tasks: true,
+            can_fail_spec: false,
+            requires_claude: true,
+            approve_signal: Some("## Plan Approved".into()),
+            reject_signal: Some("[PLAN]".into()),
+            on_approve: Some("next".into()),
+            on_reject: Some("requeue:plan-critique".into()),
+            on_crash: Some("retry".into()),
+            min_lines_changed: None,
+        },
+        PhaseConfig {
+            name: "code-review".into(),
+            level: PhaseLevel::Task,
+            description: "Review code changes after task execution. Flag quality issues.".into(),
+            prompt_template: concat!(
+                "You are a BOI code reviewer. Review the code changes made for this task.\n\n",
+                "Check for:\n",
+                "1. Correctness — does the code do what the task spec requires?\n",
+                "2. Quality — error handling, edge cases, dead code?\n",
+                "3. Style — consistent with the codebase?\n",
+                "4. Security — any obvious vulnerabilities?\n\n",
+                "If code is acceptable, output: ## Code Review Approved\n\n",
+                "If issues found, output lines starting with [CODE-REVIEW] describing each issue.",
+            ).into(),
+            timeout_minutes: Some(15),
+            retry_count: None,
+            can_add_tasks: true,
+            can_fail_spec: false,
+            requires_claude: true,
+            approve_signal: Some("## Code Review Approved".into()),
+            reject_signal: Some("[CODE-REVIEW]".into()),
+            on_approve: Some("next".into()),
+            on_reject: Some("requeue:execute".into()),
+            on_crash: Some("retry".into()),
+            min_lines_changed: Some(10),
+        },
+        PhaseConfig {
+            name: "task-verify".into(),
+            level: PhaseLevel::Task,
+            description: "Run verification commands for a task without spawning claude.".into(),
+            prompt_template: String::new(),
+            timeout_minutes: Some(5),
+            retry_count: None,
+            can_add_tasks: false,
+            can_fail_spec: false,
+            requires_claude: false,
+            approve_signal: None,
+            reject_signal: None,
+            on_approve: Some("next".into()),
+            on_reject: Some("requeue:execute".into()),
+            on_crash: None,
+            min_lines_changed: None,
+        },
     ]
 }
 
 pub fn user_phases_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".boi").join("phases")
+}
+
+/// Resolve the full pipeline for a spec, considering spec-level overrides.
+///
+/// Priority:
+/// 1. If the spec provides `spec_phases` / `task_phases`, use those.
+/// 2. Otherwise, use default_pipeline(mode).
+pub fn resolve_pipeline(
+    mode: &str,
+    spec_phases: Option<&[String]>,
+    task_phases: Option<&[String]>,
+) -> PipelineConfig {
+    let defaults = default_pipeline(mode);
+    PipelineConfig {
+        spec_phases: spec_phases
+            .map(|v| v.to_vec())
+            .unwrap_or(defaults.spec_phases),
+        task_phases: task_phases
+            .map(|v| v.to_vec())
+            .unwrap_or(defaults.task_phases),
+    }
+}
+
+/// Resolve the task-level phases for a specific task.
+///
+/// Priority:
+/// 1. If the task has its own `phases` override, use those.
+/// 2. Otherwise, use the pipeline's task_phases.
+pub fn resolve_task_phases(
+    pipeline: &PipelineConfig,
+    task_phases_override: Option<&[String]>,
+) -> Vec<String> {
+    task_phases_override
+        .map(|v| v.to_vec())
+        .unwrap_or_else(|| pipeline.task_phases.clone())
+}
+
+/// Outcome of running a single phase.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PhaseOutcome {
+    /// Phase approved the work — proceed to next phase.
+    Approved,
+    /// Phase generated new tasks to add to the spec.
+    AddedTasks(Vec<crate::spec::BoiTask>),
+    /// Phase requests requeue back to a specific phase.
+    Requeue { phase: String },
+    /// Phase failed and cannot continue.
+    Failed { reason: String },
+    /// Phase was skipped (e.g., no changes to review, trigger not met).
+    Skipped,
+    /// Phase timed out.
+    Timeout,
+}
+
+/// Build a prompt for a spec-level phase.
+pub fn build_phase_prompt(
+    phase: &PhaseConfig,
+    spec_content: &str,
+    task_context: Option<&str>,
+) -> String {
+    if phase.prompt_template.is_empty() {
+        return format!(
+            "Phase: {}\n\nSPEC:\n{}\n{}",
+            phase.name,
+            spec_content,
+            task_context.map(|c| format!("\nTASK CONTEXT:\n{}", c)).unwrap_or_default()
+        );
+    }
+
+    let mut prompt = phase.prompt_template.clone();
+    prompt.push_str("\n\n--- SPEC ---\n");
+    prompt.push_str(spec_content);
+    if let Some(ctx) = task_context {
+        prompt.push_str("\n\n--- TASK ---\n");
+        prompt.push_str(ctx);
+    }
+    prompt
+}
+
+/// Parse phase output to determine the outcome.
+pub fn parse_phase_output(phase: &PhaseConfig, output: &str) -> PhaseOutcome {
+    // Check for approve signal first
+    if let Some(ref signal) = phase.approve_signal {
+        if output.contains(signal) {
+            return PhaseOutcome::Approved;
+        }
+    }
+
+    // Check for reject signal
+    if let Some(ref signal) = phase.reject_signal {
+        if output.contains(signal) {
+            // Determine action from on_reject
+            if let Some(ref action) = phase.on_reject {
+                if action.starts_with("requeue:") {
+                    let target_phase = action.strip_prefix("requeue:").unwrap_or("execute");
+                    return PhaseOutcome::Requeue {
+                        phase: target_phase.to_string(),
+                    };
+                }
+            }
+            return PhaseOutcome::Failed {
+                reason: format!("Phase {} rejected: found '{}'", phase.name, signal),
+            };
+        }
+    }
+
+    // No explicit signals — treat as approved (permissive default)
+    PhaseOutcome::Approved
 }
 
 #[cfg(test)]
@@ -468,19 +704,19 @@ template = "Custom prompt for execute"
         fs::create_dir_all(&dir).unwrap();
 
         let toml_content = r###"
-name = "code-review"
-description = "4-persona code review"
+name = "custom-lint"
+description = "Custom lint phase"
 
 [phase]
-name = "code-review"
-description = "4-persona code review"
+name = "custom-lint"
+description = "Custom lint phase"
 can_add_tasks = false
 can_fail_spec = true
 requires_claude = true
 
 [completion]
-approve_signal = "## Code Review Approved"
-reject_signal = "[CODE-REVIEW]"
+approve_signal = "## Lint Passed"
+reject_signal = "[LINT]"
 on_approve = "next"
 on_reject = "requeue:execute"
 
@@ -488,19 +724,19 @@ on_reject = "requeue:execute"
 min_lines_changed = 50
 
 [prompt]
-template = "Review the code changes."
+template = "Lint the code changes."
 "###;
-        fs::write(dir.join("code-review.phase.toml"), toml_content).unwrap();
+        fs::write(dir.join("custom-lint.phase.toml"), toml_content).unwrap();
 
         let mut registry = PhaseRegistry::new();
         registry.load_user_phases(&dir);
 
-        let cr = registry.get("code-review").unwrap();
-        assert_eq!(cr.description, "4-persona code review");
+        let cr = registry.get("custom-lint").unwrap();
+        assert_eq!(cr.description, "Custom lint phase");
         assert!(cr.can_fail_spec);
-        assert_eq!(cr.reject_signal.as_deref(), Some("[CODE-REVIEW]"));
+        assert_eq!(cr.reject_signal.as_deref(), Some("[LINT]"));
         assert_eq!(cr.min_lines_changed, Some(50));
-        assert!(!registry.is_user_override("code-review"));
+        assert!(!registry.is_user_override("custom-lint"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -553,8 +789,11 @@ approve_signal = ""
     fn test_core_and_user_names() {
         let registry = PhaseRegistry::new();
         let core = registry.core_names();
-        assert_eq!(core.len(), 4);
+        assert_eq!(core.len(), 7);
         assert!(core.contains(&"execute"));
+        assert!(core.contains(&"plan-critique"));
+        assert!(core.contains(&"code-review"));
+        assert!(core.contains(&"task-verify"));
 
         let user = registry.user_names();
         assert!(user.is_empty());
@@ -564,6 +803,314 @@ approve_signal = ""
     fn test_load_nonexistent_dir() {
         let mut registry = PhaseRegistry::new();
         registry.load_user_phases(Path::new("/tmp/boi-nonexistent-dir-xyz"));
-        assert_eq!(registry.list().len(), 4);
+        assert_eq!(registry.list().len(), 7);
+    }
+
+    // --- Step 1: PhaseLevel tests ---
+
+    #[test]
+    fn test_phase_level_defaults_to_task() {
+        assert_eq!(PhaseLevel::default(), PhaseLevel::Task);
+    }
+
+    #[test]
+    fn test_core_phases_have_correct_levels() {
+        let registry = PhaseRegistry::new();
+
+        // Spec-level phases
+        assert_eq!(registry.get("critic").unwrap().level, PhaseLevel::Spec);
+        assert_eq!(registry.get("evaluate").unwrap().level, PhaseLevel::Spec);
+        assert_eq!(registry.get("plan-critique").unwrap().level, PhaseLevel::Spec);
+
+        // Task-level phases
+        assert_eq!(registry.get("execute").unwrap().level, PhaseLevel::Task);
+        assert_eq!(registry.get("decompose").unwrap().level, PhaseLevel::Task);
+        assert_eq!(registry.get("code-review").unwrap().level, PhaseLevel::Task);
+        assert_eq!(registry.get("task-verify").unwrap().level, PhaseLevel::Task);
+    }
+
+    // --- Step 2: PipelineConfig tests ---
+
+    #[test]
+    fn test_default_pipeline_execute() {
+        let p = default_pipeline("execute");
+        assert_eq!(p.spec_phases, vec!["critic"]);
+        assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
+    }
+
+    #[test]
+    fn test_default_pipeline_challenge() {
+        let p = default_pipeline("challenge");
+        assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]);
+        assert_eq!(p.task_phases, vec!["execute", "code-review", "task-verify"]);
+    }
+
+    #[test]
+    fn test_default_pipeline_discover() {
+        let p = default_pipeline("discover");
+        assert_eq!(p.spec_phases, vec!["plan-critique", "critic", "evaluate"]);
+        assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
+    }
+
+    #[test]
+    fn test_default_pipeline_generate() {
+        let p = default_pipeline("generate");
+        assert_eq!(p.spec_phases, vec!["plan-critique", "critic", "evaluate"]);
+        assert_eq!(p.task_phases, vec!["decompose", "execute", "task-verify"]);
+    }
+
+    #[test]
+    fn test_default_pipeline_unknown_mode() {
+        let p = default_pipeline("unknown");
+        assert!(p.spec_phases.is_empty());
+        assert_eq!(p.task_phases, vec!["execute"]);
+    }
+
+    // --- Step 3: New core phases tests ---
+
+    #[test]
+    fn test_plan_critique_phase() {
+        let registry = PhaseRegistry::new();
+        let pc = registry.get("plan-critique").unwrap();
+        assert_eq!(pc.level, PhaseLevel::Spec);
+        assert!(pc.can_add_tasks);
+        assert!(!pc.can_fail_spec);
+        assert!(pc.requires_claude);
+        assert_eq!(pc.approve_signal.as_deref(), Some("## Plan Approved"));
+        assert_eq!(pc.reject_signal.as_deref(), Some("[PLAN]"));
+    }
+
+    #[test]
+    fn test_code_review_phase() {
+        let registry = PhaseRegistry::new();
+        let cr = registry.get("code-review").unwrap();
+        assert_eq!(cr.level, PhaseLevel::Task);
+        assert!(cr.can_add_tasks);
+        assert!(!cr.can_fail_spec);
+        assert!(cr.requires_claude);
+        assert_eq!(cr.approve_signal.as_deref(), Some("## Code Review Approved"));
+        assert_eq!(cr.min_lines_changed, Some(10));
+    }
+
+    #[test]
+    fn test_task_verify_phase() {
+        let registry = PhaseRegistry::new();
+        let tv = registry.get("task-verify").unwrap();
+        assert_eq!(tv.level, PhaseLevel::Task);
+        assert!(!tv.requires_claude);
+        assert!(!tv.can_add_tasks);
+        assert!(!tv.can_fail_spec);
+    }
+
+    // --- Step 5: resolve_pipeline / resolve_task_phases tests ---
+
+    #[test]
+    fn test_resolve_pipeline_uses_defaults() {
+        let p = resolve_pipeline("execute", None, None);
+        assert_eq!(p.spec_phases, vec!["critic"]);
+        assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
+    }
+
+    #[test]
+    fn test_resolve_pipeline_spec_override() {
+        let spec_override = vec!["plan-critique".to_string(), "critic".to_string()];
+        let p = resolve_pipeline("execute", Some(&spec_override), None);
+        assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]);
+        assert_eq!(p.task_phases, vec!["execute", "task-verify"]); // unchanged
+    }
+
+    #[test]
+    fn test_resolve_pipeline_task_override() {
+        let task_override = vec!["execute".to_string()];
+        let p = resolve_pipeline("challenge", None, Some(&task_override));
+        assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]); // unchanged
+        assert_eq!(p.task_phases, vec!["execute"]); // overridden
+    }
+
+    #[test]
+    fn test_resolve_pipeline_both_override() {
+        let sp = vec!["evaluate".to_string()];
+        let tp = vec!["execute".to_string(), "code-review".to_string()];
+        let p = resolve_pipeline("execute", Some(&sp), Some(&tp));
+        assert_eq!(p.spec_phases, vec!["evaluate"]);
+        assert_eq!(p.task_phases, vec!["execute", "code-review"]);
+    }
+
+    #[test]
+    fn test_resolve_task_phases_no_override() {
+        let pipeline = default_pipeline("execute");
+        let phases = resolve_task_phases(&pipeline, None);
+        assert_eq!(phases, vec!["execute", "task-verify"]);
+    }
+
+    #[test]
+    fn test_resolve_task_phases_with_override() {
+        let pipeline = default_pipeline("execute");
+        let override_phases = vec!["execute".to_string()];
+        let phases = resolve_task_phases(&pipeline, Some(&override_phases));
+        assert_eq!(phases, vec!["execute"]);
+    }
+
+    // --- Step 6: PhaseOutcome + build_phase_prompt + parse_phase_output tests ---
+
+    #[test]
+    fn test_build_phase_prompt_with_template() {
+        let phase = PhaseConfig {
+            name: "critic".into(),
+            level: PhaseLevel::Spec,
+            description: "Test".into(),
+            prompt_template: "Review this spec carefully.".into(),
+            timeout_minutes: None,
+            retry_count: None,
+            can_add_tasks: false,
+            can_fail_spec: false,
+            requires_claude: true,
+            approve_signal: None,
+            reject_signal: None,
+            on_approve: None,
+            on_reject: None,
+            on_crash: None,
+            min_lines_changed: None,
+        };
+        let prompt = build_phase_prompt(&phase, "title: Test\ntasks: []", None);
+        assert!(prompt.contains("Review this spec carefully."));
+        assert!(prompt.contains("--- SPEC ---"));
+        assert!(prompt.contains("title: Test"));
+    }
+
+    #[test]
+    fn test_build_phase_prompt_with_task_context() {
+        let phase = PhaseConfig {
+            name: "code-review".into(),
+            level: PhaseLevel::Task,
+            description: "".into(),
+            prompt_template: "Review code.".into(),
+            timeout_minutes: None,
+            retry_count: None,
+            can_add_tasks: false,
+            can_fail_spec: false,
+            requires_claude: true,
+            approve_signal: None,
+            reject_signal: None,
+            on_approve: None,
+            on_reject: None,
+            on_crash: None,
+            min_lines_changed: None,
+        };
+        let prompt = build_phase_prompt(&phase, "spec content", Some("task t-1 details"));
+        assert!(prompt.contains("--- TASK ---"));
+        assert!(prompt.contains("task t-1 details"));
+    }
+
+    #[test]
+    fn test_build_phase_prompt_empty_template() {
+        let phase = PhaseConfig {
+            name: "task-verify".into(),
+            level: PhaseLevel::Task,
+            description: "".into(),
+            prompt_template: String::new(),
+            timeout_minutes: None,
+            retry_count: None,
+            can_add_tasks: false,
+            can_fail_spec: false,
+            requires_claude: false,
+            approve_signal: None,
+            reject_signal: None,
+            on_approve: None,
+            on_reject: None,
+            on_crash: None,
+            min_lines_changed: None,
+        };
+        let prompt = build_phase_prompt(&phase, "spec", None);
+        assert!(prompt.contains("Phase: task-verify"));
+        assert!(prompt.contains("spec"));
+    }
+
+    #[test]
+    fn test_parse_phase_output_approved() {
+        let registry = PhaseRegistry::new();
+        let critic = registry.get("critic").unwrap();
+        let outcome = parse_phase_output(critic, "Everything looks good.\n\n## Critic Approved\n");
+        assert_eq!(outcome, PhaseOutcome::Approved);
+    }
+
+    #[test]
+    fn test_parse_phase_output_rejected_with_requeue() {
+        let registry = PhaseRegistry::new();
+        let critic = registry.get("critic").unwrap();
+        let outcome = parse_phase_output(
+            critic,
+            "[CRITIC] Missing error handling in parse_spec()\n[CRITIC] Dead code in worker.rs",
+        );
+        assert_eq!(
+            outcome,
+            PhaseOutcome::Requeue {
+                phase: "execute".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_phase_output_no_signals() {
+        let phase = PhaseConfig {
+            name: "execute".into(),
+            level: PhaseLevel::Task,
+            description: "".into(),
+            prompt_template: String::new(),
+            timeout_minutes: None,
+            retry_count: None,
+            can_add_tasks: false,
+            can_fail_spec: false,
+            requires_claude: true,
+            approve_signal: None,
+            reject_signal: None,
+            on_approve: None,
+            on_reject: None,
+            on_crash: None,
+            min_lines_changed: None,
+        };
+        let outcome = parse_phase_output(&phase, "Task completed successfully.");
+        assert_eq!(outcome, PhaseOutcome::Approved);
+    }
+
+    #[test]
+    fn test_parse_phase_output_plan_critique_rejected() {
+        let registry = PhaseRegistry::new();
+        let pc = registry.get("plan-critique").unwrap();
+        let outcome = parse_phase_output(pc, "[PLAN] Task t-3 has unrealistic dependency");
+        assert_eq!(
+            outcome,
+            PhaseOutcome::Requeue {
+                phase: "plan-critique".into()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_phase_output_reject_without_requeue_action() {
+        let phase = PhaseConfig {
+            name: "custom".into(),
+            level: PhaseLevel::Task,
+            description: "".into(),
+            prompt_template: String::new(),
+            timeout_minutes: None,
+            retry_count: None,
+            can_add_tasks: false,
+            can_fail_spec: true,
+            requires_claude: true,
+            approve_signal: Some("## OK".into()),
+            reject_signal: Some("[FAIL]".into()),
+            on_approve: None,
+            on_reject: None, // no requeue action
+            on_crash: None,
+            min_lines_changed: None,
+        };
+        let outcome = parse_phase_output(&phase, "Found issue: [FAIL] bad code");
+        match outcome {
+            PhaseOutcome::Failed { reason } => {
+                assert!(reason.contains("[FAIL]"));
+            }
+            other => panic!("Expected Failed, got {:?}", other),
+        }
     }
 }

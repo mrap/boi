@@ -5,6 +5,7 @@ use boi::cli::dispatch::cmd_dispatch;
 use boi::cli::doctor::cmd_doctor;
 use boi::cli::log::cmd_log;
 use boi::cli::outputs::cmd_outputs;
+use boi::cli::phases_cmd::{cmd_phases_list, cmd_phases_show};
 use boi::cli::spec_mgmt::{cmd_spec, SpecActionData};
 use boi::cli::status::{cmd_status, cmd_status_json, cmd_status_watch};
 use boi::cli::telemetry_cmd::cmd_telemetry;
@@ -119,6 +120,11 @@ enum Commands {
         queue_id: String,
         #[command(subcommand)]
         action: Option<SpecAction>,
+    },
+    /// List or inspect phases
+    Phases {
+        /// Phase name to show details for (omit to list all)
+        name: Option<String>,
     },
     /// Health check
     Doctor,
@@ -239,6 +245,12 @@ fn main() {
                 Some(SpecAction::Block { task_id, on }) => SpecActionData::Block { task_id, on },
             };
             cmd_spec(&queue_id, action_data, db_str);
+        }
+        Commands::Phases { name } => {
+            match name {
+                Some(n) => cmd_phases_show(&n),
+                None => cmd_phases_list(),
+            }
         }
         Commands::Doctor => {
             cmd_doctor(db_str, &cfg);

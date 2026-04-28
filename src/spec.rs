@@ -8,6 +8,12 @@ pub struct BoiSpec {
     pub initiative: Option<String>,
     pub context: Option<String>,
     pub outcomes: Option<Vec<Outcome>>,
+    /// Override spec-level phases (replaces default_pipeline().spec_phases)
+    #[serde(default)]
+    pub spec_phases: Option<Vec<String>>,
+    /// Override task-level phases (replaces default_pipeline().task_phases)
+    #[serde(default)]
+    pub task_phases: Option<Vec<String>>,
     pub tasks: Vec<BoiTask>,
 }
 
@@ -43,7 +49,7 @@ impl std::fmt::Display for TaskStatus {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct BoiTask {
     pub id: String,
     pub title: String,
@@ -51,6 +57,9 @@ pub struct BoiTask {
     pub depends: Option<Vec<String>>,
     pub spec: Option<String>,
     pub verify: Option<String>,
+    /// Override task-level phases for this specific task
+    #[serde(default)]
+    pub phases: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -440,5 +449,62 @@ tasks:
         let ready = ready_tasks(&spec);
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].id, "t-2");
+    }
+
+    // --- Step 4: spec_phases / task_phases / phases field tests ---
+
+    #[test]
+    fn test_parse_spec_with_phase_overrides() {
+        let yaml = r#"
+title: "Phase Override Spec"
+mode: challenge
+spec_phases: ["plan-critique", "critic", "evaluate"]
+task_phases: ["execute", "code-review"]
+tasks:
+  - id: t-1
+    title: "Task one"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(
+            spec.spec_phases,
+            Some(vec!["plan-critique".to_string(), "critic".to_string(), "evaluate".to_string()])
+        );
+        assert_eq!(
+            spec.task_phases,
+            Some(vec!["execute".to_string(), "code-review".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_parse_spec_without_phase_overrides() {
+        let yaml = r#"
+title: "No Override"
+tasks:
+  - id: t-1
+    title: "Task"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(spec.spec_phases, None);
+        assert_eq!(spec.task_phases, None);
+    }
+
+    #[test]
+    fn test_parse_task_with_phases_override() {
+        let yaml = r#"
+title: "Task Phases"
+tasks:
+  - id: t-1
+    title: "Custom phases task"
+    status: PENDING
+    phases: ["execute"]
+  - id: t-2
+    title: "Default phases task"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(spec.tasks[0].phases, Some(vec!["execute".to_string()]));
+        assert_eq!(spec.tasks[1].phases, None);
     }
 }

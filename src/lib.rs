@@ -4,6 +4,7 @@ pub mod fmt;
 pub mod hooks;
 pub mod phases;
 pub mod queue;
+pub mod runner;
 pub mod spec;
 pub mod telemetry;
 pub mod worker;
