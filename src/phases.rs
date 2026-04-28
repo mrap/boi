@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn test_core_phase_properties() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
 
         let exec = registry.get("execute").unwrap();
         assert!(!exec.can_add_tasks);
@@ -738,7 +738,7 @@ mod tests {
 
     #[test]
     fn test_unknown_phase_returns_none() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         assert!(registry.get("nonexistent").is_none());
     }
 
@@ -764,7 +764,7 @@ template = "Custom prompt for execute"
 "#;
         fs::write(dir.join("execute.phase.toml"), toml_content).unwrap();
 
-        let mut registry = PhaseRegistry::new();
+        let mut registry = test_registry();
         registry.load_user_phases(&dir);
 
         let exec = registry.get("execute").unwrap();
@@ -806,7 +806,7 @@ template = "Lint the code changes."
 "###;
         fs::write(dir.join("custom-lint.phase.toml"), toml_content).unwrap();
 
-        let mut registry = PhaseRegistry::new();
+        let mut registry = test_registry();
         registry.load_user_phases(&dir);
 
         let cr = registry.get("custom-lint").unwrap();
@@ -841,7 +841,7 @@ approve_signal = ""
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("execute.phase.toml"), toml_content).unwrap();
 
-        let mut registry = PhaseRegistry::new();
+        let mut registry = test_registry();
         registry.load_user_phases(&dir);
 
         let exec = registry.get("execute").unwrap();
@@ -853,7 +853,7 @@ approve_signal = ""
 
     #[test]
     fn test_list_returns_merged() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         let list = registry.list();
         assert!(list.len() >= 4);
         let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
@@ -865,7 +865,7 @@ approve_signal = ""
 
     #[test]
     fn test_core_and_user_names() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         let core = registry.core_names();
         assert_eq!(core.len(), 8);
         assert!(core.contains(&"execute"));
@@ -879,7 +879,7 @@ approve_signal = ""
 
     #[test]
     fn test_load_nonexistent_dir() {
-        let mut registry = PhaseRegistry::new();
+        let mut registry = test_registry();
         registry.load_user_phases(Path::new("/tmp/boi-nonexistent-dir-xyz"));
         assert_eq!(registry.list().len(), 8);
     }
@@ -893,7 +893,7 @@ approve_signal = ""
 
     #[test]
     fn test_core_phases_have_correct_levels() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
 
         // Spec-level phases
         assert_eq!(registry.get("critic").unwrap().level, PhaseLevel::Spec);
@@ -948,7 +948,7 @@ approve_signal = ""
 
     #[test]
     fn test_plan_critique_phase() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         let pc = registry.get("plan-critique").unwrap();
         assert_eq!(pc.level, PhaseLevel::Spec);
         assert!(pc.can_add_tasks);
@@ -960,7 +960,7 @@ approve_signal = ""
 
     #[test]
     fn test_code_review_phase() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         let cr = registry.get("code-review").unwrap();
         assert_eq!(cr.level, PhaseLevel::Task);
         assert!(cr.can_add_tasks);
@@ -972,7 +972,7 @@ approve_signal = ""
 
     #[test]
     fn test_task_verify_phase() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         let tv = registry.get("task-verify").unwrap();
         assert_eq!(tv.level, PhaseLevel::Task);
         assert!(tv.requires_claude);
@@ -1106,7 +1106,7 @@ approve_signal = ""
 
     #[test]
     fn test_parse_phase_output_approved() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         let critic = registry.get("critic").unwrap();
         let outcome = parse_phase_output(critic, "Everything looks good.\n\n## Critic Approved\n");
         assert_eq!(outcome, PhaseOutcome::Approved);
@@ -1114,7 +1114,7 @@ approve_signal = ""
 
     #[test]
     fn test_parse_phase_output_rejected_with_requeue() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         let critic = registry.get("critic").unwrap();
         let outcome = parse_phase_output(
             critic,
@@ -1153,7 +1153,7 @@ approve_signal = ""
 
     #[test]
     fn test_parse_phase_output_plan_critique_rejected() {
-        let registry = PhaseRegistry::new();
+        let registry = test_registry();
         let pc = registry.get("plan-critique").unwrap();
         let outcome = parse_phase_output(pc, "[PLAN-CRITIQUE] Task t-3 has unrealistic dependency");
         match outcome {
