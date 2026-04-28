@@ -237,8 +237,8 @@ impl Default for PhaseRegistry {
 impl PhaseRegistry {
     pub fn new() -> Self {
         let phases = match core_phases_dir() {
-            Some(boi_dir) => {
-                let loaded = load_core_phases_from_dir(&boi_dir);
+            Some(phases_dir) => {
+                let loaded = load_phases_from_dir(&phases_dir);
                 if loaded.is_empty() {
                     fallback_core_phases()
                 } else {
@@ -258,9 +258,10 @@ impl PhaseRegistry {
         }
     }
 
-    /// Create a registry loading core phases from a specific directory.
-    pub fn from_dir(boi_dir: &Path) -> Self {
-        let phases = load_core_phases_from_dir(boi_dir);
+    /// Create a registry loading phases from a specific directory.
+    /// The directory should contain *.phase.toml files directly.
+    pub fn from_dir(phases_dir: &Path) -> Self {
+        let phases = load_phases_from_dir(phases_dir);
         let phases = if phases.is_empty() {
             fallback_core_phases()
         } else {
@@ -436,30 +437,20 @@ fn load_phase_file_with_base(path: &Path, base_dir: Option<&Path>) -> Result<Pha
 /// 2. Binary's parent directory → `{binary_dir}/phases/`
 /// 3. None (use fallback defaults)
 fn core_phases_dir() -> Option<PathBuf> {
-    // 1. Check BOI_INSTALL_DIR env var
-    if let Ok(install_dir) = std::env::var("BOI_INSTALL_DIR") {
-        let dir = PathBuf::from(&install_dir).join("phases");
-        if dir.is_dir() {
-            return Some(PathBuf::from(install_dir));
+    // 1. Explicit override via env var (tests, development)
+    if let Ok(dir) = std::env::var("BOI_PHASES_DIR") {
+        let path = PathBuf::from(&dir);
+        if path.is_dir() {
+            return Some(path);
         }
     }
 
-    // 2. Check binary's parent directory
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin_dir) = exe.parent() {
-            // Binary is typically in target/release or target/debug, but the phases
-            // dir lives at the repo root. Walk up to find it.
-            let mut dir = bin_dir.to_path_buf();
-            for _ in 0..5 {
-                let phases_dir = dir.join("phases");
-                if phases_dir.is_dir() {
-                    return Some(dir);
-                }
-                if !dir.pop() {
-                    break;
-                }
-            }
-        }
+    // 2. Well-known location: ~/.boi/phases/
+    // This is where install.sh copies the phase configs.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let boi_phases = PathBuf::from(&home).join(".boi").join("phases");
+    if boi_phases.is_dir() {
+        return Some(boi_phases);
     }
 
     None
@@ -467,8 +458,7 @@ fn core_phases_dir() -> Option<PathBuf> {
 
 /// Load core phases from TOML files in the phases/ directory.
 /// Returns empty vec if no directory found (caller should use fallback).
-fn load_core_phases_from_dir(boi_dir: &Path) -> Vec<PhaseConfig> {
-    let phases_dir = boi_dir.join("phases");
+fn load_phases_from_dir(phases_dir: &Path) -> Vec<PhaseConfig> {
     if !phases_dir.is_dir() {
         return Vec::new();
     }
@@ -487,7 +477,7 @@ fn load_core_phases_from_dir(boi_dir: &Path) -> Vec<PhaseConfig> {
                 if !seen.insert(entry.clone()) {
                     continue;
                 }
-                match load_phase_file_with_base(&entry, Some(boi_dir)) {
+                match load_phase_file_with_base(&entry, phases_dir.parent()) {
                     Ok(phase) => {
                         phases.push(phase);
                     }
@@ -686,7 +676,7 @@ mod tests {
 
     /// Build a PhaseRegistry from the repo's TOML phase files.
     fn test_registry() -> PhaseRegistry {
-        PhaseRegistry::from_dir(&repo_root())
+        PhaseRegistry::from_dir(&repo_root().join("phases"))
     }
 
     #[test]
