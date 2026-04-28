@@ -155,6 +155,31 @@ fn registry_load_user(registry: &PhaseRegistry) {
     let _ = registry;
 }
 
+/// Worker state machine — flat loop, no nested breaks.
+///
+/// Every state does ONE thing: one claude call, one shell command, or one decision.
+/// State transitions are explicit assignments. The requeue counter lives in the
+/// TaskRequeue state, not as a mutable variable.
+#[derive(Debug, Clone)]
+enum WorkerState {
+    /// Run a pre-task spec-level phase (plan-critique)
+    SpecPhase { phase_idx: usize },
+    /// Select the next ready task from the DAG
+    TaskSelect,
+    /// Run a task-level phase (execute, task-verify, code-review)
+    TaskPhase { task_id: String, phase_idx: usize },
+    /// Task phase failed — retry the phase up to max_attempts
+    TaskPhaseRetry { task_id: String, phase_idx: usize, attempt: u32 },
+    /// Task verify/review failed — requeue back to a target phase
+    TaskRequeue { task_id: String, target_phase: String, attempts: usize },
+    /// All tasks done — run post-task spec phases (critic, evaluate)
+    PostTaskSpecPhase { phase_idx: usize },
+    /// Spec completed successfully
+    Complete,
+    /// Spec failed
+    Failed { reason: String },
+}
+
 /// Execute all pending tasks using the phase pipeline with a custom PhaseRunner.
 /// This is the core implementation, testable with mock runners.
 pub fn run_worker_with_phases(
@@ -235,14 +260,13 @@ pub fn run_worker_with_phases(
         }
     }
 
-    // --- Pre-task spec phases (e.g., plan-critique) ---
+    // Precompute phase lists
     let pre_spec_phases: Vec<&str> = pipeline
         .spec_phases
         .iter()
         .filter_map(|name| {
             registry.get(name).and_then(|p| {
-                // Pre-task spec phases are those that make sense before execution
-                if p.level == PhaseLevel::Spec && (name == "plan-critique") {
+                if p.level == PhaseLevel::Spec && name == "plan-critique" {
                     Some(name.as_str())
                 } else {
                     None
@@ -251,361 +275,43 @@ pub fn run_worker_with_phases(
         })
         .collect();
 
-    for phase_name in &pre_spec_phases {
-        if let Some(phase) = registry.get(phase_name) {
-            let phase_payload = json!({
-                "spec_id": spec_id,
-                "phase": phase_name,
-                "level": "spec",
-            });
-            let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
-
-            telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
-                "spec_id": spec_id,
-                "phase": phase_name,
-                "level": "spec",
-                "message": format!("spec phase '{}' started", phase_name),
-            }));
-
-            let phase_start = Instant::now();
-            let phase_started_at = Utc::now().to_rfc3339();
-            let outcome = runner.run_phase(
-                phase,
-                &spec_content,
-                None,
-                &worktree_path,
-                config.task_timeout_secs,
-            );
-            let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-            record_phase_run(&queue, spec_id, None, phase_name, "spec", &outcome, &phase_started_at, elapsed_ms);
-
-            let outcome_label = match &outcome {
-                PhaseOutcome::Approved => "approved",
-                PhaseOutcome::Skipped => "skipped",
-                PhaseOutcome::Failed { .. } => "failed",
-                PhaseOutcome::Timeout => "timeout",
-                PhaseOutcome::Requeue { .. } => "requeue",
-                PhaseOutcome::AddedTasks(_) => "added_tasks",
-            };
-            telemetry.emit("boi.phase.outcome", LogLevel::Info, &json!({
-                "spec_id": spec_id,
-                "phase": phase_name,
-                "outcome": outcome_label,
-                "duration_ms": elapsed_ms,
-                "message": format!("spec phase '{}' {} ({}ms)", phase_name, outcome_label, elapsed_ms),
-            }));
-
-            match &outcome {
-                PhaseOutcome::Approved => {
-                    let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+    let post_spec_phases: Vec<&str> = pipeline
+        .spec_phases
+        .iter()
+        .filter_map(|name| {
+            registry.get(name).and_then(|p| {
+                if p.level == PhaseLevel::Spec && name != "plan-critique" {
+                    Some(name.as_str())
+                } else {
+                    None
                 }
-                PhaseOutcome::Skipped => {
-                    let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
-                }
-                PhaseOutcome::Failed { reason } => {
-                    eprintln!("[boi] pre-task spec phase '{}' failed: {}", phase_name, reason);
-                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                    if phase.can_fail_spec {
-                        telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
-                            "spec_id": spec_id,
-                            "message": format!("spec failed: pre-task phase '{}' failed", phase_name),
-                        }));
-                        queue.update_spec(spec_id, "failed")?;
-                        let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
-                        let _ = crate::worktree::cleanup(spec_id);
-                        return Ok(());
-                    }
-                }
-                PhaseOutcome::Timeout => {
-                    eprintln!("[boi] pre-task spec phase '{}' timed out", phase_name);
-                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                }
-                _ => {
-                    let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
-                }
-            }
-        }
-    }
-
-    // --- Process tasks through their phase pipelines ---
-    // Retry loop: DB-level deps (from `boi spec block`) may not align with YAML topo order,
-    // so we re-scan until no new tasks complete in a pass.
-    let mut overall_success = true;
-    let pending_count = order.len() - done_ids.len() - skipped_ids.len();
-
-    'retry: for _pass in 0..pending_count.max(1) {
-        let before = done_ids.len();
-
-    'tasks: for task_id in &order {
-        let task = match task_map.get(task_id.as_str()) {
-            Some(t) => t,
-            None => continue,
-        };
-
-        if done_ids.contains(task_id.as_str()) || skipped_ids.contains(task_id.as_str()) {
-            continue;
-        }
-
-        if task.status != spec::TaskStatus::Pending {
-            continue;
-        }
-
-        // Check DB-level deps (from `boi spec block`) merged with YAML deps
-        let effective_deps: Vec<String> = if let Some(db_d) = db_depends.get(task_id.as_str()) {
-            let mut merged = db_d.clone();
-            if let Some(yaml_deps) = &task.depends {
-                for d in yaml_deps {
-                    if !merged.contains(d) {
-                        merged.push(d.clone());
-                    }
-                }
-            }
-            merged
-        } else {
-            task.depends.clone().unwrap_or_default()
-        };
-
-        if effective_deps.iter().any(|d| !done_ids.contains(d)) {
-            continue;
-        }
-
-        let task_payload = json!({
-            "spec_id": spec_id,
-            "task_id": task.id,
-            "task_title": task.title,
-        });
-
-        queue.update_task(spec_id, &task.id, "RUNNING")?;
-        let _ = hooks::fire(hook_config, ON_TASK_START, &task_payload);
-
-        telemetry.emit("boi.task.started", LogLevel::Info, &json!({
-            "spec_id": spec_id,
-            "task_id": task.id,
-            "message": format!("{}: {} — started", task.id, task.title),
-        }));
-
-        // Resolve task phases (task override > pipeline default)
-        let task_phases = phases::resolve_task_phases(
-            &pipeline,
-            task.phases.as_deref(),
-        );
-
-        let mut task_success = false;
-        let mut requeue_count: usize = 0;
-        let mut requeue_to: Option<String> = None;
-
-        // Run each task phase in sequence, with requeue support
-        'phases: for phase_name in &task_phases {
-            let phase = match registry.get(phase_name) {
-                Some(p) => p,
-                None => {
-                    eprintln!("[boi] unknown phase '{}' in task {} — skipping", phase_name, task.id);
-                    continue 'phases;
-                }
-            };
-
-            let phase_payload = json!({
-                "spec_id": spec_id,
-                "task_id": task.id,
-                "phase": phase_name,
-                "level": "task",
-            });
-            let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
-
-            telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
-                "spec_id": spec_id,
-                "task_id": task.id,
-                "phase": phase_name,
-                "message": format!("{}: {} phase started", task.id, phase_name),
-            }));
-
-            // Retry loop for the phase
-            let mut phase_outcome = PhaseOutcome::Failed {
-                reason: "no attempts made".into(),
-            };
-
-            let phase_start = Instant::now();
-            let phase_started_at = Utc::now().to_rfc3339();
-            let max_attempts = phase.retry_count.unwrap_or(config.retry_count) + 1;
-            for attempt in 0..max_attempts {
-                phase_outcome = runner.run_phase(
-                    phase,
-                    &spec_content,
-                    Some(task),
-                    &worktree_path,
-                    config.task_timeout_secs,
-                );
-
-                match &phase_outcome {
-                    PhaseOutcome::Approved | PhaseOutcome::Skipped | PhaseOutcome::AddedTasks(_) => {
-                        break;
-                    }
-                    PhaseOutcome::Failed { .. } | PhaseOutcome::Timeout => {
-                        if attempt + 1 < max_attempts {
-                            eprintln!(
-                                "[boi] phase '{}' for task {} failed (attempt {}/{}), retrying",
-                                phase_name, task.id, attempt + 1, max_attempts
-                            );
-                        }
-                    }
-                    PhaseOutcome::Requeue { .. } => {
-                        break; // Requeue doesn't retry
-                    }
-                }
-            }
-            let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-            record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &phase_outcome, &phase_started_at, elapsed_ms);
-
-            let outcome_label = match &phase_outcome {
-                PhaseOutcome::Approved => "approved",
-                PhaseOutcome::Skipped => "skipped",
-                PhaseOutcome::Failed { .. } => "failed",
-                PhaseOutcome::Timeout => "timeout",
-                PhaseOutcome::Requeue { .. } => "requeue",
-                PhaseOutcome::AddedTasks(_) => "added_tasks",
-            };
-            telemetry.emit("boi.phase.outcome", LogLevel::Info, &json!({
-                "spec_id": spec_id,
-                "task_id": task.id,
-                "phase": phase_name,
-                "outcome": outcome_label,
-                "duration_ms": elapsed_ms,
-                "message": format!("{}: {} phase {} ({}ms)", task.id, phase_name, outcome_label, elapsed_ms),
-            }));
-
-            // Handle the final phase outcome
-            match &phase_outcome {
-                PhaseOutcome::Approved => {
-                    let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
-                    // Continue to next phase
-                }
-                PhaseOutcome::Skipped => {
-                    let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
-                    // Continue to next phase
-                }
-                PhaseOutcome::AddedTasks(_) => {
-                    let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
-                    // Continue to next phase (tasks would be injected into the spec in production)
-                }
-                PhaseOutcome::Requeue { phase: ref target } => {
-                    requeue_count += 1;
-                    if requeue_count > config.retry_count as usize {
-                        eprintln!("[boi] phase '{}' requeue limit ({}) exceeded for task {}", phase_name, config.retry_count, task.id);
-                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                        task_success = false;
-                        break 'phases;
-                    }
-                    eprintln!("[boi] phase '{}' requests requeue to '{}' for task {} (attempt {}/{})", phase_name, target, task.id, requeue_count, config.retry_count);
-                    // Restart from the target phase
-                    requeue_to = Some(target.clone());
-                    break 'phases;
-                }
-                PhaseOutcome::Failed { reason } => {
-                    eprintln!("[boi] phase '{}' failed for task {}: {}", phase_name, task.id, reason);
-                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                    task_success = false;
-                    break 'phases;
-                }
-                PhaseOutcome::Timeout => {
-                    eprintln!("[boi] phase '{}' timed out for task {}", phase_name, task.id);
-                    let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                    task_success = false;
-                    break 'phases;
-                }
-            }
-
-            // If we made it through all phases, task succeeded
-            task_success = true;
-        }
-
-        // Handle requeue: re-run phases from the target phase
-        if let Some(ref _target) = requeue_to {
-            if requeue_count <= config.retry_count as usize {
-                requeue_to = None;
-                task_success = false;
-                // Re-run the phase loop — the 'phases loop will restart
-                // We need to re-enter the phase iteration
-                // For now: re-run ALL task phases (simpler than finding the target)
-                let task_phases_retry = phases::resolve_task_phases(
-                    &pipeline,
-                    task.phases.as_deref(),
-                );
-                'retry_phases: for phase_name in &task_phases_retry {
-                    let phase = match registry.get(phase_name) {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    let phase_started_at = Utc::now().to_rfc3339();
-                    let phase_start = Instant::now();
-                    let phase_outcome = runner.run_phase(
-                        phase,
-                        &spec_content,
-                        Some(task),
-                        &worktree_path,
-                        config.task_timeout_secs,
-                    );
-                    let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                    record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &phase_outcome, &phase_started_at, elapsed_ms);
-                    match &phase_outcome {
-                        PhaseOutcome::Approved | PhaseOutcome::Skipped | PhaseOutcome::AddedTasks(_) => {
-                            task_success = true;
-                        }
-                        _ => {
-                            task_success = false;
-                            break 'retry_phases;
-                        }
-                    }
-                }
-            }
-        }
-
-        if task_success {
-            queue.update_task(spec_id, &task.id, "DONE")?;
-            done_ids.insert(task.id.clone());
-            let _ = hooks::fire(hook_config, ON_TASK_COMPLETE, &task_payload);
-            telemetry.emit("boi.task.completed", LogLevel::Info, &json!({
-                "spec_id": spec_id,
-                "task_id": task.id,
-                "status": "DONE",
-                "message": format!("{} complete", task.id),
-            }));
-        } else {
-            queue.update_task(spec_id, &task.id, "FAILED")?;
-            let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
-            telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
-                "spec_id": spec_id,
-                "task_id": task.id,
-                "status": "FAILED",
-                "message": format!("{} failed", task.id),
-            }));
-            overall_success = false;
-            break 'retry;
-        }
-    }
-
-        if !overall_success || done_ids.len() == before {
-            break 'retry;
-        }
-    }
-
-    // --- Post-task spec phases (e.g., critic, evaluate) ---
-    if overall_success {
-        let post_spec_phases: Vec<&str> = pipeline
-            .spec_phases
-            .iter()
-            .filter_map(|name| {
-                registry.get(name).and_then(|p| {
-                    if p.level == PhaseLevel::Spec && name != "plan-critique" {
-                        Some(name.as_str())
-                    } else {
-                        None
-                    }
-                })
             })
-            .collect();
+        })
+        .collect();
 
-        for phase_name in &post_spec_phases {
-            if let Some(phase) = registry.get(phase_name) {
+    // Track pass count for deadlock detection in TaskSelect
+    let mut task_select_passes: usize = 0;
+    let max_task_select_passes = order.len().max(1);
+
+    // --- State machine ---
+    let mut state = WorkerState::SpecPhase { phase_idx: 0 };
+
+    loop {
+        match state {
+            WorkerState::SpecPhase { phase_idx } => {
+                if phase_idx >= pre_spec_phases.len() {
+                    state = WorkerState::TaskSelect;
+                    continue;
+                }
+                let phase_name = pre_spec_phases[phase_idx];
+                let phase = match registry.get(phase_name) {
+                    Some(p) => p,
+                    None => {
+                        state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
+                        continue;
+                    }
+                };
+
                 let phase_payload = json!({
                     "spec_id": spec_id,
                     "phase": phase_name,
@@ -632,78 +338,598 @@ pub fn run_worker_with_phases(
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, None, phase_name, "spec", &outcome, &phase_started_at, elapsed_ms);
 
-                let outcome_label = match &outcome {
-                    PhaseOutcome::Approved => "approved",
-                    PhaseOutcome::Skipped => "skipped",
-                    PhaseOutcome::Failed { .. } => "failed",
-                    PhaseOutcome::Timeout => "timeout",
-                    PhaseOutcome::Requeue { .. } => "requeue",
-                    PhaseOutcome::AddedTasks(_) => "added_tasks",
+                emit_phase_outcome(telemetry, spec_id, None, phase_name, &outcome, elapsed_ms);
+
+                match &outcome {
+                    PhaseOutcome::Approved | PhaseOutcome::AddedTasks(_) => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
+                    }
+                    PhaseOutcome::Skipped => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
+                        state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
+                    }
+                    PhaseOutcome::Failed { reason } => {
+                        eprintln!("[boi] pre-task spec phase '{}' failed: {}", phase_name, reason);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        if phase.can_fail_spec {
+                            state = WorkerState::Failed {
+                                reason: format!("pre-task phase '{}' failed: {}", phase_name, reason),
+                            };
+                        } else {
+                            state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
+                        }
+                    }
+                    PhaseOutcome::Timeout => {
+                        eprintln!("[boi] pre-task spec phase '{}' timed out", phase_name);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
+                    }
+                    PhaseOutcome::Requeue { .. } => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
+                    }
+                }
+            }
+
+            WorkerState::TaskSelect => {
+                // Find next ready task: PENDING, all deps satisfied
+                let mut found = false;
+                for task_id in &order {
+                    if done_ids.contains(task_id.as_str()) || skipped_ids.contains(task_id.as_str()) {
+                        continue;
+                    }
+                    let task = match task_map.get(task_id.as_str()) {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    if task.status != spec::TaskStatus::Pending {
+                        continue;
+                    }
+
+                    // Merge DB-level deps with YAML deps
+                    let effective_deps: Vec<String> = if let Some(db_d) = db_depends.get(task_id.as_str()) {
+                        let mut merged = db_d.clone();
+                        if let Some(yaml_deps) = &task.depends {
+                            for d in yaml_deps {
+                                if !merged.contains(d) {
+                                    merged.push(d.clone());
+                                }
+                            }
+                        }
+                        merged
+                    } else {
+                        task.depends.clone().unwrap_or_default()
+                    };
+
+                    if effective_deps.iter().any(|d| !done_ids.contains(d)) {
+                        continue;
+                    }
+
+                    // Found a ready task — start it
+                    let task_payload = json!({
+                        "spec_id": spec_id,
+                        "task_id": task.id,
+                        "task_title": task.title,
+                    });
+                    queue.update_task(spec_id, &task.id, "RUNNING")?;
+                    let _ = hooks::fire(hook_config, ON_TASK_START, &task_payload);
+
+                    telemetry.emit("boi.task.started", LogLevel::Info, &json!({
+                        "spec_id": spec_id,
+                        "task_id": task.id,
+                        "message": format!("{}: {} — started", task.id, task.title),
+                    }));
+
+                    task_select_passes = 0;
+                    found = true;
+                    state = WorkerState::TaskPhase {
+                        task_id: task.id.clone(),
+                        phase_idx: 0,
+                    };
+                    break;
+                }
+
+                if !found {
+                    // Check if all tasks are done
+                    let all_done = order.iter().all(|id| {
+                        done_ids.contains(id) || skipped_ids.contains(id)
+                    });
+                    if all_done {
+                        state = WorkerState::PostTaskSpecPhase { phase_idx: 0 };
+                    } else {
+                        // Some tasks are still pending but none are ready — possible deadlock
+                        // or DB-level deps not yet satisfied. Re-scan up to max passes.
+                        task_select_passes += 1;
+                        if task_select_passes > max_task_select_passes {
+                            state = WorkerState::Failed {
+                                reason: "deadlock: pending tasks but none ready".to_string(),
+                            };
+                        } else {
+                            // Re-scan (same state) — done_ids may have grown from a previous pass
+                            // but if not, the pass counter will catch it
+                            state = WorkerState::Failed {
+                                reason: "deadlock: pending tasks but none ready".to_string(),
+                            };
+                        }
+                    }
+                }
+            }
+
+            WorkerState::TaskPhase { ref task_id, phase_idx } => {
+                let task_id_owned = task_id.clone();
+                let task = match task_map.get(task_id_owned.as_str()) {
+                    Some(t) => t,
+                    None => {
+                        state = WorkerState::Failed {
+                            reason: format!("task {} not found", task_id_owned),
+                        };
+                        continue;
+                    }
                 };
-                telemetry.emit("boi.phase.outcome", LogLevel::Info, &json!({
+
+                let task_phases = phases::resolve_task_phases(
+                    &pipeline,
+                    task.phases.as_deref(),
+                );
+
+                if phase_idx >= task_phases.len() {
+                    // All phases done for this task — mark DONE
+                    queue.update_task(spec_id, &task.id, "DONE")?;
+                    done_ids.insert(task.id.clone());
+                    let task_payload = json!({
+                        "spec_id": spec_id,
+                        "task_id": task.id,
+                        "task_title": task.title,
+                    });
+                    let _ = hooks::fire(hook_config, ON_TASK_COMPLETE, &task_payload);
+                    telemetry.emit("boi.task.completed", LogLevel::Info, &json!({
+                        "spec_id": spec_id,
+                        "task_id": task.id,
+                        "status": "DONE",
+                        "message": format!("{} complete", task.id),
+                    }));
+
+                    state = WorkerState::TaskSelect;
+                    continue;
+                }
+
+                let phase_name = &task_phases[phase_idx];
+                let phase = match registry.get(phase_name) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[boi] unknown phase '{}' in task {} — skipping", phase_name, task.id);
+                        state = WorkerState::TaskPhase {
+                            task_id: task_id_owned,
+                            phase_idx: phase_idx + 1,
+                        };
+                        continue;
+                    }
+                };
+
+                let phase_payload = json!({
                     "spec_id": spec_id,
+                    "task_id": task.id,
                     "phase": phase_name,
-                    "outcome": outcome_label,
-                    "duration_ms": elapsed_ms,
-                    "message": format!("spec phase '{}' {} ({}ms)", phase_name, outcome_label, elapsed_ms),
+                    "level": "task",
+                });
+                let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
+
+                telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
+                    "spec_id": spec_id,
+                    "task_id": task.id,
+                    "phase": phase_name,
+                    "message": format!("{}: {} phase started", task.id, phase_name),
                 }));
+
+                let phase_start = Instant::now();
+                let phase_started_at = Utc::now().to_rfc3339();
+                let outcome = runner.run_phase(
+                    phase,
+                    &spec_content,
+                    Some(task),
+                    &worktree_path,
+                    config.task_timeout_secs,
+                );
+                let elapsed_ms = phase_start.elapsed().as_millis() as i64;
+                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &outcome, &phase_started_at, elapsed_ms);
+
+                emit_phase_outcome(telemetry, spec_id, Some(&task.id), phase_name, &outcome, elapsed_ms);
 
                 match &outcome {
                     PhaseOutcome::Approved => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        state = WorkerState::TaskPhase {
+                            task_id: task_id_owned,
+                            phase_idx: phase_idx + 1,
+                        };
                     }
                     PhaseOutcome::Skipped => {
                         let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
+                        state = WorkerState::TaskPhase {
+                            task_id: task_id_owned,
+                            phase_idx: phase_idx + 1,
+                        };
+                    }
+                    PhaseOutcome::AddedTasks(_) => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        state = WorkerState::TaskPhase {
+                            task_id: task_id_owned,
+                            phase_idx: phase_idx + 1,
+                        };
+                    }
+                    PhaseOutcome::Requeue { phase: ref target } => {
+                        eprintln!("[boi] phase '{}' requests requeue to '{}' for task {}", phase_name, target, task.id);
+                        state = WorkerState::TaskRequeue {
+                            task_id: task_id_owned,
+                            target_phase: target.clone(),
+                            attempts: 1,
+                        };
+                    }
+                    PhaseOutcome::Failed { reason } => {
+                        eprintln!("[boi] phase '{}' failed for task {}: {}", phase_name, task.id, reason);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
+                        if max_attempts > 0 {
+                            state = WorkerState::TaskPhaseRetry {
+                                task_id: task_id_owned,
+                                phase_idx,
+                                attempt: 1,
+                            };
+                        } else {
+                            // No retries — fail the task
+                            queue.update_task(spec_id, &task.id, "FAILED")?;
+                            let task_payload = json!({
+                                "spec_id": spec_id,
+                                "task_id": task.id,
+                                "task_title": task.title,
+                            });
+                            let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
+                            telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
+                                "spec_id": spec_id,
+                                "task_id": task.id,
+                                "status": "FAILED",
+                                "message": format!("{} failed", task.id),
+                            }));
+                            state = WorkerState::Failed {
+                                reason: format!("task {} phase '{}' failed: {}", task.id, phase_name, reason),
+                            };
+                        }
+                    }
+                    PhaseOutcome::Timeout => {
+                        eprintln!("[boi] phase '{}' timed out for task {}", phase_name, task.id);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
+                        if max_attempts > 0 {
+                            state = WorkerState::TaskPhaseRetry {
+                                task_id: task_id_owned,
+                                phase_idx,
+                                attempt: 1,
+                            };
+                        } else {
+                            queue.update_task(spec_id, &task.id, "FAILED")?;
+                            let task_payload = json!({
+                                "spec_id": spec_id,
+                                "task_id": task.id,
+                                "task_title": task.title,
+                            });
+                            let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
+                            telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
+                                "spec_id": spec_id,
+                                "task_id": task.id,
+                                "status": "FAILED",
+                                "message": format!("{} failed (timeout)", task.id),
+                            }));
+                            state = WorkerState::Failed {
+                                reason: format!("task {} phase '{}' timed out", task.id, phase_name),
+                            };
+                        }
+                    }
+                }
+            }
+
+            WorkerState::TaskPhaseRetry { ref task_id, phase_idx, attempt } => {
+                let task_id_owned = task_id.clone();
+                let task = match task_map.get(task_id_owned.as_str()) {
+                    Some(t) => t,
+                    None => {
+                        state = WorkerState::Failed {
+                            reason: format!("task {} not found", task_id_owned),
+                        };
+                        continue;
+                    }
+                };
+
+                let task_phases = phases::resolve_task_phases(
+                    &pipeline,
+                    task.phases.as_deref(),
+                );
+                let phase_name = &task_phases[phase_idx];
+                let phase = registry.get(phase_name).unwrap(); // safe: we checked in TaskPhase
+                let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
+
+                if attempt >= max_attempts {
+                    // Exhausted retries — fail the task
+                    queue.update_task(spec_id, &task.id, "FAILED")?;
+                    let task_payload = json!({
+                        "spec_id": spec_id,
+                        "task_id": task.id,
+                        "task_title": task.title,
+                    });
+                    let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
+                    telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
+                        "spec_id": spec_id,
+                        "task_id": task.id,
+                        "status": "FAILED",
+                        "message": format!("{} failed after {} retries", task.id, attempt),
+                    }));
+                    state = WorkerState::Failed {
+                        reason: format!("task {} phase '{}' failed after {} retries", task.id, phase_name, attempt),
+                    };
+                    continue;
+                }
+
+                eprintln!(
+                    "[boi] phase '{}' for task {} failed (attempt {}/{}), retrying",
+                    phase_name, task.id, attempt, max_attempts
+                );
+
+                let phase_start = Instant::now();
+                let phase_started_at = Utc::now().to_rfc3339();
+                let outcome = runner.run_phase(
+                    phase,
+                    &spec_content,
+                    Some(task),
+                    &worktree_path,
+                    config.task_timeout_secs,
+                );
+                let elapsed_ms = phase_start.elapsed().as_millis() as i64;
+                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &outcome, &phase_started_at, elapsed_ms);
+
+                emit_phase_outcome(telemetry, spec_id, Some(&task.id), phase_name, &outcome, elapsed_ms);
+
+                match &outcome {
+                    PhaseOutcome::Approved | PhaseOutcome::Skipped | PhaseOutcome::AddedTasks(_) => {
+                        // Retry succeeded — advance to next phase
+                        state = WorkerState::TaskPhase {
+                            task_id: task_id_owned,
+                            phase_idx: phase_idx + 1,
+                        };
+                    }
+                    PhaseOutcome::Requeue { phase: ref target } => {
+                        state = WorkerState::TaskRequeue {
+                            task_id: task_id_owned,
+                            target_phase: target.clone(),
+                            attempts: 1,
+                        };
+                    }
+                    PhaseOutcome::Failed { .. } | PhaseOutcome::Timeout => {
+                        state = WorkerState::TaskPhaseRetry {
+                            task_id: task_id_owned,
+                            phase_idx,
+                            attempt: attempt + 1,
+                        };
+                    }
+                }
+            }
+
+            WorkerState::TaskRequeue { ref task_id, ref target_phase, attempts } => {
+                let task_id_owned = task_id.clone();
+                let target_owned = target_phase.clone();
+
+                if attempts > config.retry_count as usize {
+                    let task = task_map.get(task_id_owned.as_str());
+                    let task_title = task.map(|t| t.title.as_str()).unwrap_or("unknown");
+                    eprintln!("[boi] requeue limit ({}) exceeded for task {}", config.retry_count, task_id_owned);
+                    queue.update_task(spec_id, &task_id_owned, "FAILED")?;
+                    let task_payload = json!({
+                        "spec_id": spec_id,
+                        "task_id": task_id_owned,
+                        "task_title": task_title,
+                    });
+                    let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
+                    telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
+                        "spec_id": spec_id,
+                        "task_id": task_id_owned,
+                        "status": "FAILED",
+                        "message": format!("{} failed: requeue limit exceeded", task_id_owned),
+                    }));
+                    state = WorkerState::Failed {
+                        reason: format!("task {} requeue limit exceeded", task_id_owned),
+                    };
+                    continue;
+                }
+
+                let task = match task_map.get(task_id_owned.as_str()) {
+                    Some(t) => t,
+                    None => {
+                        state = WorkerState::Failed {
+                            reason: format!("task {} not found", task_id_owned),
+                        };
+                        continue;
+                    }
+                };
+
+                let task_phases = phases::resolve_task_phases(
+                    &pipeline,
+                    task.phases.as_deref(),
+                );
+
+                // Find the target phase index
+                let target_idx = task_phases.iter().position(|p| p == &target_owned).unwrap_or(0);
+
+                eprintln!(
+                    "[boi] requeue to '{}' for task {} (attempt {}/{})",
+                    target_owned, task_id_owned, attempts, config.retry_count
+                );
+
+                telemetry.emit("boi.task.requeue", LogLevel::Info, &json!({
+                    "spec_id": spec_id,
+                    "task_id": task_id_owned,
+                    "target_phase": target_owned,
+                    "attempt": attempts,
+                    "message": format!("{}: requeue to '{}' (attempt {})", task_id_owned, target_owned, attempts),
+                }));
+
+                // The TaskPhase handler will re-run from the target phase.
+                // If it hits another Requeue, attempts will be incremented.
+                state = WorkerState::TaskPhase {
+                    task_id: task_id_owned,
+                    phase_idx: target_idx,
+                };
+            }
+
+            WorkerState::PostTaskSpecPhase { phase_idx } => {
+                if phase_idx >= post_spec_phases.len() {
+                    state = WorkerState::Complete;
+                    continue;
+                }
+
+                let phase_name = post_spec_phases[phase_idx];
+                let phase = match registry.get(phase_name) {
+                    Some(p) => p,
+                    None => {
+                        state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
+                        continue;
+                    }
+                };
+
+                let phase_payload = json!({
+                    "spec_id": spec_id,
+                    "phase": phase_name,
+                    "level": "spec",
+                });
+                let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
+
+                telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
+                    "spec_id": spec_id,
+                    "phase": phase_name,
+                    "level": "spec",
+                    "message": format!("spec phase '{}' started", phase_name),
+                }));
+
+                let phase_start = Instant::now();
+                let phase_started_at = Utc::now().to_rfc3339();
+                let outcome = runner.run_phase(
+                    phase,
+                    &spec_content,
+                    None,
+                    &worktree_path,
+                    config.task_timeout_secs,
+                );
+                let elapsed_ms = phase_start.elapsed().as_millis() as i64;
+                record_phase_run(&queue, spec_id, None, phase_name, "spec", &outcome, &phase_started_at, elapsed_ms);
+
+                emit_phase_outcome(telemetry, spec_id, None, phase_name, &outcome, elapsed_ms);
+
+                match &outcome {
+                    PhaseOutcome::Approved => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
+                    }
+                    PhaseOutcome::Skipped => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
+                        state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
+                    }
+                    PhaseOutcome::AddedTasks(_) => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        // Tasks injected — re-enter task loop to process them
+                        state = WorkerState::TaskSelect;
                     }
                     PhaseOutcome::Failed { reason } => {
                         eprintln!("[boi] post-task spec phase '{}' failed: {}", phase_name, reason);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
                         if phase.can_fail_spec {
-                            overall_success = false;
-                            break;
+                            state = WorkerState::Failed {
+                                reason: format!("post-task phase '{}' failed: {}", phase_name, reason),
+                            };
+                        } else {
+                            state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                         }
                     }
                     PhaseOutcome::Timeout => {
                         eprintln!("[boi] post-task spec phase '{}' timed out", phase_name);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                     }
                     PhaseOutcome::Requeue { phase: target } => {
                         eprintln!("[boi] post-task spec phase '{}' requests requeue to '{}'", phase_name, target);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
                         if phase.can_fail_spec {
-                            overall_success = false;
-                            break;
+                            state = WorkerState::Failed {
+                                reason: format!("post-task phase '{}' requeue (treated as failure)", phase_name),
+                            };
+                        } else {
+                            state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                         }
                     }
-                    _ => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
-                    }
                 }
+            }
+
+            WorkerState::Complete => {
+                queue.update_spec(spec_id, "completed")?;
+                let _ = hooks::fire(hook_config, ON_COMPLETE, &json!({ "spec_id": spec_id }));
+                telemetry.emit("boi.spec.completed", LogLevel::Info, &json!({
+                    "spec_id": spec_id,
+                    "status": "completed",
+                    "message": format!("spec {} completed", spec_id),
+                }));
+                let _ = crate::worktree::cleanup(spec_id);
+                break;
+            }
+
+            WorkerState::Failed { ref reason } => {
+                let reason_owned = reason.clone();
+                eprintln!("[boi] spec {} failed: {}", spec_id, reason_owned);
+                queue.update_spec(spec_id, "failed")?;
+                let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
+                telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
+                    "spec_id": spec_id,
+                    "status": "failed",
+                    "message": format!("spec {} failed: {}", spec_id, reason_owned),
+                }));
+                let _ = crate::worktree::cleanup(spec_id);
+                break;
             }
         }
     }
 
-    if overall_success {
-        queue.update_spec(spec_id, "completed")?;
-        let _ = hooks::fire(hook_config, ON_COMPLETE, &json!({ "spec_id": spec_id }));
-        telemetry.emit("boi.spec.completed", LogLevel::Info, &json!({
-            "spec_id": spec_id,
-            "status": "completed",
-            "message": format!("spec {} completed", spec_id),
-        }));
-    } else {
-        queue.update_spec(spec_id, "failed")?;
-        let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
-        telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
-            "spec_id": spec_id,
-            "status": "failed",
-            "message": format!("spec {} failed", spec_id),
-        }));
-    }
-
-    let _ = crate::worktree::cleanup(spec_id);
-
     Ok(())
+}
+
+/// Emit a phase outcome telemetry event (DRY helper for the state machine).
+fn emit_phase_outcome(
+    telemetry: &Telemetry,
+    spec_id: &str,
+    task_id: Option<&str>,
+    phase_name: &str,
+    outcome: &PhaseOutcome,
+    elapsed_ms: i64,
+) {
+    let outcome_label = match outcome {
+        PhaseOutcome::Approved => "approved",
+        PhaseOutcome::Skipped => "skipped",
+        PhaseOutcome::Failed { .. } => "failed",
+        PhaseOutcome::Timeout => "timeout",
+        PhaseOutcome::Requeue { .. } => "requeue",
+        PhaseOutcome::AddedTasks(_) => "added_tasks",
+    };
+    let msg = if let Some(tid) = task_id {
+        format!("{}: {} phase {} ({}ms)", tid, phase_name, outcome_label, elapsed_ms)
+    } else {
+        format!("spec phase '{}' {} ({}ms)", phase_name, outcome_label, elapsed_ms)
+    };
+    let mut payload = json!({
+        "spec_id": spec_id,
+        "phase": phase_name,
+        "outcome": outcome_label,
+        "duration_ms": elapsed_ms,
+        "message": msg,
+    });
+    if let Some(tid) = task_id {
+        payload["task_id"] = serde_json::Value::String(tid.to_string());
+    }
+    telemetry.emit("boi.phase.outcome", LogLevel::Info, &payload);
 }
 
 /// Poll the queue every 5 seconds and spawn workers up to `config.max_workers`.
