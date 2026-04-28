@@ -382,6 +382,17 @@ fn elapsed_since(ts: &str) -> String {
     }
 }
 
+fn term_width() -> usize {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            ws.ws_col as usize
+        } else {
+            110
+        }
+    }
+}
+
 // ─── rich status ─────────────────────────────────────────────────────────────
 
 fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
@@ -404,6 +415,7 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
         return "queue is empty".to_string();
     }
 
+    let width = term_width();
     let mut out = String::new();
 
     // Partition by status
@@ -424,57 +436,57 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
         })
         .collect();
 
+    // Layout constants (display column widths, not byte widths)
+    // "▸ q-NNN  " = icon(1) + space(1) + id-field(5) + gap(2) = 9 display cols before title
+    let prefix_dcols: usize = 9; // icon(1) + space(1) + id-padded(5) + gap(2)
+
     // Running section
     if !running.is_empty() {
         out.push_str(&format!("{}{}RUNNING{}\n", BOLD, YELLOW, RESET));
         for s in &running {
             let total = s.total_tasks.unwrap_or(0);
-            let outcomes = if let Ok(Some(st)) = q.status(&s.id) {
-                st.tasks
-                    .iter()
-                    .filter(|t| t.status == "DONE")
-                    .count()
-            } else {
-                0
-            };
+            let outcomes = q.outcome_count(&s.id);
             let elapsed = s
                 .started_at
                 .as_deref()
                 .map(elapsed_since)
                 .unwrap_or_else(|| "?".to_string());
 
+            // Build right-side stats string
+            let right = if outcomes > 0 {
+                format!("{}/{} \u{b7} {} outcomes  {}", s.completed_tasks, total, outcomes, elapsed)
+            } else {
+                format!("{}/{}  {}", s.completed_tasks, total, elapsed)
+            };
+            let right_dcols = display_width(&right);
+
+            // Title fills the space between prefix+gap and right stats
+            let title_budget = width.saturating_sub(prefix_dcols + right_dcols);
+            let title_str = truncate(&s.title, title_budget);
+            let title_dcols = display_width(&title_str);
+            let spaces = width.saturating_sub(prefix_dcols + title_dcols + right_dcols);
+
             out.push_str(&format!(
-                "{}▸ {:8}{}  {:<40}  {}/{} · {} outcomes  {}\n",
-                YELLOW,
-                s.id,
-                RESET,
-                truncate(&s.title, 40),
-                s.completed_tasks,
-                total,
-                outcomes,
-                elapsed,
+                "{}\u{25b8} {:<5}{}  {}{}{}\n",
+                YELLOW, s.id, RESET,
+                title_str, " ".repeat(spaces), right,
             ));
 
             // Show current task
             if let Ok(Some(st)) = q.status(&s.id) {
                 if let Some(running_task) = st.tasks.iter().find(|t| t.status == "RUNNING") {
                     out.push_str(&format!(
-                        "         {}→ {}: {}{}\n",
+                        "         {}\u{2192} {}: {}{}\n",
                         DIM, running_task.id, running_task.title, RESET
                     ));
                 }
             }
 
-            // Progress bar
-            let pct = if total > 0 {
-                (s.completed_tasks as f64 / total as f64 * 100.0) as u32
-            } else {
-                0
-            };
+            // Progress bar — spans from column 9 to terminal width
+            let bar_width = width.saturating_sub(9);
             out.push_str(&format!(
-                "         {}  {}%\n",
-                progress_bar(s.completed_tasks, total, 25),
-                pct
+                "         {}\n",
+                progress_bar(s.completed_tasks, total, bar_width),
             ));
         }
         out.push('\n');
@@ -488,16 +500,25 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
             let dep_str = s
                 .depends_on
                 .as_deref()
-                .map(|d| format!(" {}(after {}){}", DIM, d, RESET))
+                .map(|d| format!("(after {})", d))
                 .unwrap_or_default();
+
+            let right = if dep_str.is_empty() {
+                format!("0/{}", total)
+            } else {
+                format!("0/{}  {}", total, dep_str)
+            };
+            let right_dcols = display_width(&right);
+
+            let title_budget = width.saturating_sub(prefix_dcols + right_dcols);
+            let title_str = truncate(&s.title, title_budget);
+            let title_dcols = display_width(&title_str);
+            let spaces = width.saturating_sub(prefix_dcols + title_dcols + right_dcols);
+
             out.push_str(&format!(
-                "{}◦ {:8}{}  {:<40}  0/{}{}\n",
-                CYAN,
-                s.id,
-                RESET,
-                truncate(&s.title, 40),
-                total,
-                dep_str,
+                "{}\u{25e6} {:<5}{}  {}{}{}\n",
+                CYAN, s.id, RESET,
+                title_str, " ".repeat(spaces), right,
             ));
         }
         out.push('\n');
@@ -515,44 +536,52 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
                 .unwrap_or_else(|| "?".to_string());
 
             let (icon, color) = match s.status.as_str() {
-                "completed" => ("✓", GREEN),
-                "failed" => ("✗", RED),
-                "cancelled" => ("⊘", DIM),
+                "completed" => ("\u{2713}", GREEN),
+                "failed" => ("\u{2717}", RED),
+                "cancelled" => ("\u{2298}", DIM),
                 _ => ("?", RESET),
             };
 
+            let outcomes = q.outcome_count(&s.id);
+            let right = if outcomes > 0 {
+                format!("{}/{} \u{b7} {} outcomes  {}", s.completed_tasks, total, outcomes, ago)
+            } else {
+                format!("{}/{}  {}", s.completed_tasks, total, ago)
+            };
+            let right_dcols = display_width(&right);
+
+            let title_budget = width.saturating_sub(prefix_dcols + right_dcols);
+            let title_str = truncate(&s.title, title_budget);
+            let title_dcols = display_width(&title_str);
+            let spaces = width.saturating_sub(prefix_dcols + title_dcols + right_dcols);
+
             out.push_str(&format!(
-                "{}{} {:8}{}  {:<40}  {}/{}  {}\n",
-                color,
-                icon,
-                s.id,
-                RESET,
-                truncate(&s.title, 40),
-                s.completed_tasks,
-                total,
-                ago,
+                "{}{} {:<5}{}  {}{}{}\n",
+                color, icon, s.id, RESET,
+                title_str, " ".repeat(spaces), right,
             ));
         }
         out.push('\n');
     }
 
-    // Summary line
+    // Summary line — lifetime totals from DB, worker slots from config
     let busy = running.len();
-    let failed_count = specs.iter().filter(|s| s.status == "failed").count();
-    let completed_count = specs.iter().filter(|s| s.status == "completed").count();
+    let cfg = crate::config::load();
+    let max_workers = cfg.max_workers() as usize;
+    let (lifetime_failed, lifetime_completed) = q.lifetime_counts().unwrap_or((0, 0));
     let total_shown = running.len() + queued.len() + finished.len();
 
     out.push_str(&format!(
-        "{}{}/{} busy{} | {}{}✗{}  {}{}✓{}\n",
+        "{}{}/{} busy{} | {}{}\u{2717}{}  {}{}\u{2713}{}\n",
         BOLD,
         busy,
-        specs.iter().filter(|s| s.status != "cancelled").count(),
+        max_workers,
         RESET,
         RED,
-        failed_count,
+        lifetime_failed,
         RESET,
         GREEN,
-        completed_count,
+        lifetime_completed,
         RESET,
     ));
 
@@ -566,47 +595,49 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
         ));
     }
 
-    // Daemon heartbeat detection
-    if let Ok(last_update) = q.last_spec_update() {
-        if let Some(ts) = last_update {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&ts) {
-                let age = chrono::Utc::now()
-                    .signed_duration_since(dt.with_timezone(&chrono::Utc))
-                    .num_seconds();
-                if age > 3600 {
-                    out.push_str(&format!(
-                        "\n{}{}⚠  Daemon may be stuck — no spec updated in {}{}{}",
-                        BOLD, YELLOW, time_ago(&ts), RESET, "\n"
-                    ));
-                }
-            }
-        }
-    }
-
-    // Also check pidfile-based heartbeat
+    // Daemon heartbeat — check pidfile-based heartbeat first, then spec updates
     let heartbeat_path = daemon_heartbeat_path();
+    let mut heartbeat_warned = false;
     if heartbeat_path.exists() {
         if let Ok(ts_str) = std::fs::read_to_string(&heartbeat_path) {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str.trim()) {
+            let ts_trimmed = ts_str.trim();
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_trimmed) {
                 let age = chrono::Utc::now()
                     .signed_duration_since(dt.with_timezone(&chrono::Utc))
                     .num_seconds();
                 if age > 3600 {
                     out.push_str(&format!(
-                        "{}{}⚠  Daemon heartbeat stale ({} old){}\n",
-                        BOLD,
-                        YELLOW,
-                        time_ago(ts_str.trim()),
-                        RESET,
+                        "\n{}{}Warning: Daemon may be stuck. Heartbeat is stale (last: {}).{}\n",
+                        BOLD, YELLOW, ts_trimmed, RESET,
                     ));
+                    heartbeat_warned = true;
                 }
             }
         }
     } else if !running.is_empty() {
         out.push_str(&format!(
-            "{}{}⚠  No daemon heartbeat file found — daemon may not be running{}\n",
+            "\n{}{}Warning: No daemon heartbeat file found — daemon may not be running.{}\n",
             BOLD, YELLOW, RESET,
         ));
+        heartbeat_warned = true;
+    }
+
+    if !heartbeat_warned {
+        if let Ok(last_update) = q.last_spec_update() {
+            if let Some(ts) = last_update {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&ts) {
+                    let age = chrono::Utc::now()
+                        .signed_duration_since(dt.with_timezone(&chrono::Utc))
+                        .num_seconds();
+                    if age > 3600 {
+                        out.push_str(&format!(
+                            "\n{}{}Warning: Daemon may be stuck. No spec updated in {}.{}\n",
+                            BOLD, YELLOW, time_ago(&ts), RESET,
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     out
@@ -1587,13 +1618,22 @@ fn ensure_db_dir(db_str: &str) {
 }
 
 fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max {
         s.to_string()
     } else {
-        let truncated: String = chars[..max - 1].iter().collect();
+        let truncated: String = chars[..max.saturating_sub(1)].iter().collect();
         format!("{}…", truncated)
     }
+}
+
+/// Count display width of a string (each char = 1 column, ignoring ANSI escapes).
+/// This is a simple approximation that works for ASCII + common Unicode symbols.
+fn display_width(s: &str) -> usize {
+    s.chars().count()
 }
 
 fn is_pid_alive(pid: u32) -> bool {

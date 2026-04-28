@@ -694,6 +694,78 @@ impl Queue {
         )
     }
 
+    /// Get lifetime totals for failed and completed specs across all history
+    pub fn lifetime_stats(&self) -> Result<(i64, i64)> {
+        let failed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM specs WHERE status = 'failed'",
+            [],
+            |r| r.get(0),
+        )?;
+        let completed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM specs WHERE status = 'completed'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((failed, completed))
+    }
+
+    /// Get lifetime counts of failed and completed specs (across entire DB history)
+    pub fn lifetime_counts(&self) -> Result<(i64, i64)> {
+        let failed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM specs WHERE status = 'failed'",
+            [],
+            |r| r.get(0),
+        )?;
+        let completed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM specs WHERE status = 'completed'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((failed, completed))
+    }
+
+    /// Get outcome count for a spec by reading the YAML spec file
+    pub fn outcome_count(&self, spec_id: &str) -> i64 {
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT spec_path FROM specs WHERE id = ?1",
+                rusqlite::params![spec_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(None);
+        if let Some(p) = path {
+            if let Ok(content) = std::fs::read_to_string(&p) {
+                // Count "- description:" lines under outcomes
+                let mut in_outcomes = false;
+                let mut count: i64 = 0;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed == "outcomes:" {
+                        in_outcomes = true;
+                        continue;
+                    }
+                    if in_outcomes {
+                        if trimmed.starts_with("- description:") {
+                            count += 1;
+                        } else if !trimmed.is_empty()
+                            && !trimmed.starts_with("- ")
+                            && !trimmed.starts_with("verify:")
+                        {
+                            // Left the outcomes section
+                            break;
+                        }
+                    }
+                }
+                count
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    }
+
     /// Get the last updated timestamp across all specs (for heartbeat detection)
     pub fn last_spec_update(&self) -> Result<Option<String>> {
         let result: Option<String> = self

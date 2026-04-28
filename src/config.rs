@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn test_default_paths() {
         let cfg = Config::default();
-        assert!(cfg.db_path().to_str().unwrap().contains("boi.db"));
+        assert!(cfg.db_path().to_str().unwrap().contains("boi-rust.db"));
         assert!(cfg.telemetry_path().to_str().unwrap().ends_with("boi.jsonl"));
         assert!(cfg.worktrees_dir().to_str().unwrap().ends_with("worktrees"));
         assert!(cfg.logs_dir().to_str().unwrap().ends_with("logs"));
