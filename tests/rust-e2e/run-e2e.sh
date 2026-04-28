@@ -275,7 +275,7 @@ echo ""
 bold "16. SQLite database integrity"
 # ══════════════════════════════════════════════════════════════════════════════
 
-DB_PATH=$(find ~/.boi -name "boi.db" -not -path "*/worktrees/*" 2>/dev/null | head -1)
+DB_PATH=$(find ~/.boi -name "boi-rust.db" -o -name "boi.db" -not -path "*/worktrees/*" 2>/dev/null | head -1)
 if [ -n "$DB_PATH" ]; then
   tables=$(sqlite3 "$DB_PATH" ".tables" 2>/dev/null)
   assert_contains "$tables" "specs" "DB has specs table"
