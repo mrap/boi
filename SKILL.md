@@ -12,7 +12,7 @@ Self-evolving autonomous agent fleet. Workers iterate with fresh context per cyc
 1. User describes a task
 2. Claude decomposes it into a **spec.yaml** (a YAML file with a `tasks:` array of objects with `status: PENDING`)
 3. User confirms ("fire it", "dispatch", "go")
-4. Claude runs `boi dispatch --spec <path>`
+4. Claude runs `boi dispatch <path>`
 5. BOI daemon assigns specs to workers (isolated git worktrees)
 6. Each worker gets a fresh runtime session (default: `claude -p`; Codex: `codex exec`), reads the spec, executes the next PENDING task, marks it DONE, exits
 7. Daemon detects remaining PENDING tasks and requeues the spec for the next iteration
@@ -34,11 +34,11 @@ Self-evolving autonomous agent fleet. Workers iterate with fresh context per cyc
 
 **Dispatch command:**
 ```bash
-boi dispatch --spec <path/to/spec.yaml> [--priority N] [--max-iter N] [--mode MODE]
+boi dispatch <path/to/spec.yaml> [--priority N] [--max-iter N] [--mode MODE]
 ```
 
 Options:
-- `--spec FILE` — Path to spec.yaml file (required)
+- `<SPEC_PATH>` — Path to spec.yaml file (required, positional)
 - `--priority N` — Queue priority, lower = higher priority (default: 100)
 - `--max-iter N` — Maximum iterations before marking failed (default: 30)
 - `--worktree PATH` — Pin to a specific worktree

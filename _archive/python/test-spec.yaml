@@ -1,0 +1,9 @@
+title: "E2E Test Spec"
+mode: execute
+tasks:
+  - id: t-1
+    title: "Verify step"
+    status: PENDING
+    spec: |
+      Placeholder task for E2E testing.
+    verify: "echo done"

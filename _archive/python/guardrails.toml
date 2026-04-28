@@ -1,0 +1,2 @@
+[pipeline]
+default = ["plan-critique", "execute", "task-verify", "code-review"]
