@@ -1,3 +1,4 @@
+// BOI formatting utilities
 // ─── ANSI constants ───────────────────────────────────────────────────────────
 
 pub const RESET: &str = "\x1b[0m";

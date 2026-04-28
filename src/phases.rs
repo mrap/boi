@@ -325,7 +325,7 @@ fn core_phases() -> Vec<PhaseConfig> {
             name: "execute".into(),
             level: PhaseLevel::Task,
             description: "Execute the task specification via claude, verify with verify command".into(),
-            prompt_template: String::new(),
+            prompt_template: "You are a BOI worker. Execute exactly one task. Use your tools (Read, Write, Edit, Bash) to make the required changes. Do not just describe what to do — actually do it.".into(),
             timeout_minutes: Some(30),
             retry_count: None,
             can_add_tasks: false,
