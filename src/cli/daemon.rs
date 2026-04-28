@@ -82,6 +82,16 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
             Ok(n) => eprintln!("[boi daemon] recovered {} stuck spec(s) back to queued", n),
             Err(e) => eprintln!("[boi daemon] warning: crash recovery failed: {}", e),
         }
+        match q.prune_events(30) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("[boi daemon] pruned {} event(s) older than 30 days", n),
+            Err(e) => eprintln!("[boi daemon] warning: event prune failed: {}", e),
+        }
+        match q.prune_phase_runs(90) {
+            Ok(0) => {}
+            Ok(n) => eprintln!("[boi daemon] pruned {} phase_run(s) older than 90 days", n),
+            Err(e) => eprintln!("[boi daemon] warning: phase_run prune failed: {}", e),
+        }
     }
 
     eprintln!("[boi daemon] started (pid {}), max_workers={}", pid, wc.max_workers);

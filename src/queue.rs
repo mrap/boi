@@ -789,6 +789,22 @@ impl Queue {
         )
     }
 
+    pub fn prune_events(&self, days: u32) -> Result<usize> {
+        let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+        self.conn.execute(
+            "DELETE FROM events WHERE timestamp < ?1",
+            params![cutoff.to_rfc3339()],
+        )
+    }
+
+    pub fn prune_phase_runs(&self, days: u32) -> Result<usize> {
+        let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+        self.conn.execute(
+            "DELETE FROM phase_runs WHERE started_at < ?1",
+            params![cutoff.to_rfc3339()],
+        )
+    }
+
     /// Get lifetime totals for failed and completed specs across all history
     pub fn lifetime_stats(&self) -> Result<(i64, i64)> {
         let failed: i64 = self.conn.query_row(
