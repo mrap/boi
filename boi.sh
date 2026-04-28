@@ -1,6 +1,10 @@
 #!/bin/bash
 # boi.sh — CLI entry point for BOI (Beginning of Infinity).
 
+if [ -x "$HOME/.boi/bin/boi" ]; then
+    exec "$HOME/.boi/bin/boi" "$@"
+fi
+
 # Use Python 3.12+ if available (lib/ uses 3.10+ syntax)
 if command -v /opt/homebrew/bin/python3.12 &>/dev/null; then
     alias python3=/opt/homebrew/bin/python3.12
@@ -621,6 +625,76 @@ PYEOF
 
     if [[ -n "${blocked_by_ids}" ]]; then
         info "  blocked by: ${blocked_by_ids} (will not run until dependencies complete)"
+    fi
+
+    # no-critic warn: emit warning and log to audit when critic is skipped
+    if [[ "${no_critic}" == "true" ]]; then
+        warn "Critic disabled for this spec. Quality review skipped."
+        python3 - "${HOME}/.hex/audit/critic-skips.jsonl" "${queue_id}" "${QUEUE_DIR}" <<'PYEOF_CRITIC'
+import sys, os, json, datetime
+
+# skip-critic audit: record each dispatch where critic review was bypassed
+critic_skip_log = sys.argv[1]
+queue_id = sys.argv[2]
+queue_dir = sys.argv[3]
+
+os.makedirs(os.path.dirname(os.path.abspath(critic_skip_log)), exist_ok=True)
+
+entry = {
+    "ts": datetime.datetime.utcnow().isoformat() + "Z",
+    "queue_id": queue_id,
+    "reason": "no-critic flag used at dispatch",
+}
+
+# Atomic append: read existing content, append new entry, write to tmp, rename
+existing = ""
+if os.path.isfile(critic_skip_log):
+    with open(critic_skip_log, "r") as f:
+        existing = f.read()
+new_content = existing + json.dumps(entry) + "\n"
+tmp = critic_skip_log + ".tmp"
+with open(tmp, "w") as f:
+    f.write(new_content)
+os.replace(tmp, critic_skip_log)
+
+# If >30% of recent specs used --no-critic, emit hex.quality.critic.overused
+try:
+    skip_entries = []
+    with open(critic_skip_log, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    skip_entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    recent_skips = len(skip_entries)
+    recent_total = recent_skips
+    if os.path.isdir(queue_dir):
+        spec_count = len([f for f in os.listdir(queue_dir) if f.endswith(".spec.md")])
+        if spec_count > 0:
+            recent_total = spec_count
+
+    ratio = recent_skips / recent_total if recent_total > 0 else 0
+    if ratio > 0.30 and recent_skips >= 3:
+        hex_emit = os.path.join(os.environ.get("HOME", ""), ".hex-events", "hex_emit.py")
+        if os.path.isfile(hex_emit):
+            import subprocess
+            subprocess.run(
+                [
+                    "python3", hex_emit, "hex.quality.critic.overused",
+                    json.dumps({
+                        "no_critic_ratio": round(ratio, 2),
+                        "no_critic_count": recent_skips,
+                        "total_specs": recent_total,
+                    }),
+                ],
+                capture_output=True,
+            )
+except Exception:
+    pass
+PYEOF_CRITIC
     fi
 
     # Emit boi.spec.dispatched event to hex-events (if installed)

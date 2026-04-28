@@ -22,3 +22,6 @@ __pycache__/
 *.pyc
 .boi/
 *.log
+
+# Rust build artifacts
+target/

@@ -385,6 +385,31 @@ ENDJSON
     log_info "Config written."
 }
 
+install_hook_config() {
+    local yaml_config="${BOI_STATE_DIR}/config.yaml"
+    local template="${SCRIPT_DIR}/templates/boi-config.yaml"
+
+    if [[ -f "${yaml_config}" ]]; then
+        log_info "Hook config already exists at ${yaml_config}, skipping."
+        return 0
+    fi
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        log_info "[dry-run] Would copy ${template} -> ${yaml_config}"
+        return 0
+    fi
+
+    if [[ ! -f "${template}" ]]; then
+        log_warn "Template not found: ${template}. Skipping hook config install."
+        return 0
+    fi
+
+    local tmp="${yaml_config}.tmp"
+    cp "${template}" "${tmp}"
+    mv "${tmp}" "${yaml_config}"
+    log_info "Hook config written to ${yaml_config}."
+}
+
 setup_alias() {
     log_step "Setting up boi command"
 
@@ -569,6 +594,9 @@ main() {
     echo ""
 
     write_config
+    echo ""
+
+    install_hook_config
     echo ""
 
     setup_alias
