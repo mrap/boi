@@ -4,10 +4,11 @@ use crate::{
         ON_WORKER_START, ON_PHASE_START, ON_PHASE_COMPLETE, ON_PHASE_FAIL, ON_PHASE_SKIP,
     },
     phases::{self, PhaseLevel, PhaseOutcome, PhaseRegistry},
-    queue::Queue,
+    queue::{PhaseRunRecord, Queue},
     runner::{ClaudePhaseRunner, PhaseRunner},
     spec,
 };
+use chrono::Utc;
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
@@ -89,6 +90,41 @@ pub fn spawn_claude(
     let output = child.wait_with_output()?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     Ok((output.status.success(), stdout))
+}
+
+fn record_phase_run(
+    queue: &Queue,
+    spec_id: &str,
+    task_id: Option<&str>,
+    phase_name: &str,
+    level: &str,
+    outcome: &PhaseOutcome,
+    started_at: &str,
+    elapsed_ms: i64,
+) {
+    let outcome_str = match outcome {
+        PhaseOutcome::Approved => "approved",
+        PhaseOutcome::Skipped => "skipped",
+        PhaseOutcome::Failed { .. } => "failed",
+        PhaseOutcome::Timeout => "timeout",
+        PhaseOutcome::Requeue { .. } => "requeue",
+        PhaseOutcome::AddedTasks(_) => "added_tasks",
+    };
+    let completed_at = Utc::now().to_rfc3339();
+    let rec = PhaseRunRecord {
+        spec_id: spec_id.to_string(),
+        task_id: task_id.map(|s| s.to_string()),
+        phase: phase_name.to_string(),
+        level: level.to_string(),
+        outcome: outcome_str.to_string(),
+        duration_ms: Some(elapsed_ms),
+        cost_usd: None,
+        input_tokens: None,
+        output_tokens: None,
+        started_at: started_at.to_string(),
+        completed_at: Some(completed_at),
+    };
+    let _ = queue.insert_phase_run(&rec);
 }
 
 /// Execute all pending tasks for a queued spec.
@@ -200,6 +236,8 @@ pub fn run_worker_with_phases(
             });
             let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
 
+            let phase_start = Instant::now();
+            let phase_started_at = Utc::now().to_rfc3339();
             let outcome = runner.run_phase(
                 phase,
                 &spec_content,
@@ -207,6 +245,8 @@ pub fn run_worker_with_phases(
                 &worktree_path,
                 config.task_timeout_secs,
             );
+            let elapsed_ms = phase_start.elapsed().as_millis() as i64;
+            record_phase_run(&queue, spec_id, None, phase_name, "spec", &outcome, &phase_started_at, elapsed_ms);
 
             match &outcome {
                 PhaseOutcome::Approved => {
@@ -290,15 +330,13 @@ pub fn run_worker_with_phases(
             });
             let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
 
-            // Check trigger conditions (e.g., min_lines_changed)
-            // For now, skip phases with min_lines_changed if we can't measure (first iteration)
-            // This is a placeholder — full implementation would check git diff
-
             // Retry loop for the phase
             let mut phase_outcome = PhaseOutcome::Failed {
                 reason: "no attempts made".into(),
             };
 
+            let phase_start = Instant::now();
+            let phase_started_at = Utc::now().to_rfc3339();
             let max_attempts = phase.retry_count.unwrap_or(config.retry_count) + 1;
             for attempt in 0..max_attempts {
                 phase_outcome = runner.run_phase(
@@ -326,6 +364,8 @@ pub fn run_worker_with_phases(
                     }
                 }
             }
+            let elapsed_ms = phase_start.elapsed().as_millis() as i64;
+            record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &phase_outcome, &phase_started_at, elapsed_ms);
 
             // Handle the final phase outcome
             match &phase_outcome {
@@ -403,6 +443,8 @@ pub fn run_worker_with_phases(
                 });
                 let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
 
+                let phase_start = Instant::now();
+                let phase_started_at = Utc::now().to_rfc3339();
                 let outcome = runner.run_phase(
                     phase,
                     &spec_content,
@@ -410,6 +452,8 @@ pub fn run_worker_with_phases(
                     &worktree_path,
                     config.task_timeout_secs,
                 );
+                let elapsed_ms = phase_start.elapsed().as_millis() as i64;
+                record_phase_run(&queue, spec_id, None, phase_name, "spec", &outcome, &phase_started_at, elapsed_ms);
 
                 match &outcome {
                     PhaseOutcome::Approved => {
@@ -433,7 +477,6 @@ pub fn run_worker_with_phases(
                     PhaseOutcome::Requeue { phase: target } => {
                         eprintln!("[boi] post-task spec phase '{}' requests requeue to '{}'", phase_name, target);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                        // For spec-level requeue, we mark as failed so the daemon can re-process
                         if phase.can_fail_spec {
                             overall_success = false;
                             break;

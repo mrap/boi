@@ -1,8 +1,8 @@
-use crate::cli::daemon::daemon_heartbeat_path;
+use crate::cli::daemon::{daemon_heartbeat_path, daemon_pid_path};
 use crate::config;
 use crate::fmt::{
-    display_width, elapsed_since, ensure_db_dir, progress_bar, term_width, time_ago, truncate,
-    BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW,
+    display_width, elapsed_since, ensure_db_dir, is_pid_alive, progress_bar, term_width, time_ago,
+    truncate, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW,
 };
 use crate::queue;
 use serde_json::json;
@@ -62,6 +62,33 @@ pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
 
 fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
     ensure_db_dir(db_str);
+
+    // Check daemon status FIRST — loud banner if not running
+    let daemon_running = {
+        let pid_path = daemon_pid_path();
+        if pid_path.exists() {
+            std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .map(|pid| is_pid_alive(pid))
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    };
+
+    let mut out = String::new();
+    if !daemon_running {
+        out.push_str(&format!(
+            "{}{}⚠  DAEMON NOT RUNNING — queued specs will not execute.{}\n",
+            BOLD, RED, RESET
+        ));
+        out.push_str(&format!(
+            "{}   Start with: boi daemon --foreground{}\n\n",
+            DIM, RESET
+        ));
+    }
+
     let q = match queue::Queue::open(db_str) {
         Ok(q) => q,
         Err(e) => return format!("error: cannot open queue: {}", e),
@@ -77,7 +104,8 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
     };
 
     if specs.is_empty() {
-        return "queue is empty".to_string();
+        out.push_str("queue is empty");
+        return out;
     }
 
     let width = term_width();
@@ -279,9 +307,9 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
                 }
             }
         }
-    } else if !running.is_empty() {
+    } else if !running.is_empty() && daemon_running {
         out.push_str(&format!(
-            "\n{}{}Warning: No daemon heartbeat file found — daemon may not be running.{}\n",
+            "\n{}{}⚠  No heartbeat file — daemon may be stuck.{}\n",
             BOLD, YELLOW, RESET,
         ));
         heartbeat_warned = true;

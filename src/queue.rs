@@ -77,6 +77,29 @@ pub struct ProcessRecord {
 }
 
 #[derive(Debug)]
+pub struct PhaseRunRecord {
+    pub spec_id: String,
+    pub task_id: Option<String>,
+    pub phase: String,
+    pub level: String,
+    pub outcome: String,
+    pub duration_ms: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PhaseCostSummary {
+    pub phase: String,
+    pub total_cost: f64,
+    pub total_duration_ms: i64,
+    pub count: i64,
+}
+
+#[derive(Debug)]
 pub struct TaskRecord {
     pub id: String,
     pub spec_id: String,
@@ -177,7 +200,24 @@ impl Queue {
                 started_at TEXT,
                 ended_at TEXT,
                 exit_code INTEGER
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS phase_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                spec_id TEXT NOT NULL,
+                task_id TEXT,
+                phase TEXT NOT NULL,
+                level TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                duration_ms INTEGER,
+                cost_usd REAL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                started_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_phase_runs_spec ON phase_runs(spec_id);
+            CREATE INDEX IF NOT EXISTS idx_phase_runs_phase ON phase_runs(phase);",
         )?;
 
         // Migrate existing specs tables that lack new columns
@@ -627,6 +667,61 @@ impl Queue {
             ],
         )?;
         Ok(())
+    }
+
+    // --- Phase run records ---
+
+    pub fn insert_phase_run(&self, rec: &PhaseRunRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO phase_runs (spec_id, task_id, phase, level, outcome,
+             duration_ms, cost_usd, input_tokens, output_tokens, started_at, completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                rec.spec_id,
+                rec.task_id,
+                rec.phase,
+                rec.level,
+                rec.outcome,
+                rec.duration_ms,
+                rec.cost_usd,
+                rec.input_tokens,
+                rec.output_tokens,
+                rec.started_at,
+                rec.completed_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn phase_cost_summary(&self, spec_id: &str) -> Result<Vec<PhaseCostSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT phase,
+                    COALESCE(SUM(cost_usd), 0.0),
+                    COALESCE(SUM(duration_ms), 0),
+                    COUNT(*)
+             FROM phase_runs WHERE spec_id = ?1
+             GROUP BY phase ORDER BY phase",
+        )?;
+        let rows = stmt
+            .query_map(params![spec_id], |row| {
+                Ok(PhaseCostSummary {
+                    phase: row.get(0)?,
+                    total_cost: row.get(1)?,
+                    total_duration_ms: row.get(2)?,
+                    count: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn phase_cost_total(&self, spec_id: &str) -> Result<f64> {
+        let total: f64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM phase_runs WHERE spec_id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        )?;
+        Ok(total)
     }
 
     // --- Task management ---
