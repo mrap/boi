@@ -62,7 +62,7 @@ pub fn spawn_claude(
 ) -> Result<(bool, String), Box<dyn std::error::Error>> {
     let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
     let mut child = Command::new(&claude_bin)
-        .args(["-p", prompt, "--output-format", "json"])
+        .args(["-p", prompt, "--output-format", "json", "--dangerously-skip-permissions"])
         .env("AGENT_DIR", worktree_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

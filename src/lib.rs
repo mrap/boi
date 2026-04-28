@@ -1,5 +1,8 @@
+pub mod cli;
 pub mod config;
+pub mod fmt;
 pub mod hooks;
+pub mod phases;
 pub mod queue;
 pub mod spec;
 pub mod telemetry;
