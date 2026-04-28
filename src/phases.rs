@@ -629,21 +629,17 @@ pub fn resolve_task_phases(
         .unwrap_or_else(|| pipeline.task_phases.clone())
 }
 
-/// Outcome of running a single phase.
+/// The control flow decision from a phase. Metadata/findings go into telemetry separately.
 #[derive(Debug, Clone, PartialEq)]
-pub enum PhaseOutcome {
-    /// Phase approved the work — proceed to next phase.
-    Approved,
-    /// Phase generated new tasks to add to the spec.
-    AddedTasks(Vec<crate::spec::BoiTask>),
-    /// Phase requests requeue back to a specific phase.
-    Requeue { phase: String },
-    /// Phase failed and cannot continue.
-    Failed { reason: String },
-    /// Phase was skipped (e.g., no changes to review, trigger not met).
-    Skipped,
-    /// Phase timed out.
-    Timeout,
+pub enum Verdict {
+    /// Move to next phase or next task
+    Proceed,
+    /// Go back to TaskSelect. Optional new tasks to add first.
+    Redo { tasks: Vec<crate::spec::BoiTask> },
+    /// Pause spec, wait for human input via `boi decide <id>`
+    Pause { prompt: String },
+    /// End the spec
+    Done { success: bool, reason: String },
 }
 
 /// Build a prompt for a spec-level phase.
@@ -671,12 +667,12 @@ pub fn build_phase_prompt(
     prompt
 }
 
-/// Parse phase output to determine the outcome.
-pub fn parse_phase_output(phase: &PhaseConfig, output: &str) -> PhaseOutcome {
+/// Parse phase output to determine the verdict.
+pub fn parse_phase_output(phase: &PhaseConfig, output: &str) -> Verdict {
     // Check for approve signal first
     if let Some(ref signal) = phase.approve_signal {
         if output.contains(signal) {
-            return PhaseOutcome::Approved;
+            return Verdict::Proceed;
         }
     }
 
@@ -686,20 +682,18 @@ pub fn parse_phase_output(phase: &PhaseConfig, output: &str) -> PhaseOutcome {
             // Determine action from on_reject
             if let Some(ref action) = phase.on_reject {
                 if action.starts_with("requeue:") {
-                    let target_phase = action.strip_prefix("requeue:").unwrap_or("execute");
-                    return PhaseOutcome::Requeue {
-                        phase: target_phase.to_string(),
-                    };
+                    return Verdict::Redo { tasks: vec![] };
                 }
             }
-            return PhaseOutcome::Failed {
+            return Verdict::Done {
+                success: false,
                 reason: format!("Phase {} rejected: found '{}'", phase.name, signal),
             };
         }
     }
 
-    // No explicit signals — treat as approved (permissive default)
-    PhaseOutcome::Approved
+    // No explicit signals — treat as proceed (permissive default)
+    Verdict::Proceed
 }
 
 #[cfg(test)]
@@ -1071,7 +1065,7 @@ approve_signal = ""
         assert_eq!(phases, vec!["execute"]);
     }
 
-    // --- Step 6: PhaseOutcome + build_phase_prompt + parse_phase_output tests ---
+    // --- Step 6: Verdict + build_phase_prompt + parse_phase_output tests ---
 
     #[test]
     fn test_build_phase_prompt_with_template() {
@@ -1151,7 +1145,7 @@ approve_signal = ""
         let registry = test_registry();
         let critic = registry.get("critic").unwrap();
         let outcome = parse_phase_output(critic, "Everything looks good.\n\n## Critic Approved\n");
-        assert_eq!(outcome, PhaseOutcome::Approved);
+        assert_eq!(outcome, Verdict::Proceed);
     }
 
     #[test]
@@ -1164,9 +1158,7 @@ approve_signal = ""
         );
         assert_eq!(
             outcome,
-            PhaseOutcome::Requeue {
-                phase: "execute".into()
-            }
+            Verdict::Redo { tasks: vec![] }
         );
     }
 
@@ -1190,7 +1182,7 @@ approve_signal = ""
             min_lines_changed: None,
         };
         let outcome = parse_phase_output(&phase, "Task completed successfully.");
-        assert_eq!(outcome, PhaseOutcome::Approved);
+        assert_eq!(outcome, Verdict::Proceed);
     }
 
     #[test]
@@ -1199,10 +1191,11 @@ approve_signal = ""
         let pc = registry.get("plan-critique").unwrap();
         let outcome = parse_phase_output(pc, "[PLAN-CRITIQUE] Task t-3 has unrealistic dependency");
         match outcome {
-            PhaseOutcome::Failed { reason } => {
+            Verdict::Done { success, reason } => {
+                assert!(!success);
                 assert!(reason.contains("[PLAN-CRITIQUE]"));
             }
-            other => panic!("Expected Failed, got {:?}", other),
+            other => panic!("Expected Done with success=false, got {:?}", other),
         }
     }
 
@@ -1227,10 +1220,11 @@ approve_signal = ""
         };
         let outcome = parse_phase_output(&phase, "Found issue: [FAIL] bad code");
         match outcome {
-            PhaseOutcome::Failed { reason } => {
+            Verdict::Done { success, reason } => {
+                assert!(!success);
                 assert!(reason.contains("[FAIL]"));
             }
-            other => panic!("Expected Failed, got {:?}", other),
+            other => panic!("Expected Done with success=false, got {:?}", other),
         }
     }
 }

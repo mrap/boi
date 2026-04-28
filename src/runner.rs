@@ -1,4 +1,4 @@
-use crate::phases::{PhaseConfig, PhaseOutcome};
+use crate::phases::{PhaseConfig, Verdict};
 use crate::spec::BoiTask;
 use crate::telemetry::{LogLevel, Telemetry};
 use crate::worker;
@@ -21,7 +21,7 @@ pub trait PhaseRunner: Send + Sync {
         task: Option<&BoiTask>,
         worktree_path: &str,
         timeout_secs: u64,
-    ) -> PhaseOutcome;
+    ) -> Verdict;
 }
 
 /// Production phase runner that spawns claude for requires_claude phases
@@ -44,7 +44,7 @@ impl PhaseRunner for ClaudePhaseRunner {
         task: Option<&BoiTask>,
         worktree_path: &str,
         timeout_secs: u64,
-    ) -> PhaseOutcome {
+    ) -> Verdict {
         if !phase.requires_claude {
             // Non-claude phase: run verify command directly
             return self.run_verify_phase(phase, task, worktree_path);
@@ -105,13 +105,18 @@ impl PhaseRunner for ClaudePhaseRunner {
                     "message": format!("claude exit non-zero, output: {} chars ({}ms)", output.len(), duration_ms),
                 }));
                 if output == "timeout" {
-                    PhaseOutcome::Timeout
+                    Verdict::Done {
+                        success: false,
+                        reason: "timeout".into(),
+                    }
                 } else if phase.on_crash.as_deref() == Some("retry") {
-                    PhaseOutcome::Failed {
+                    Verdict::Done {
+                        success: false,
                         reason: format!("Phase {} claude exited non-zero", phase.name),
                     }
                 } else {
-                    PhaseOutcome::Failed {
+                    Verdict::Done {
+                        success: false,
                         reason: format!("Phase {} failed: {}", phase.name, output),
                     }
                 }
@@ -124,7 +129,8 @@ impl PhaseRunner for ClaudePhaseRunner {
                     "duration_ms": duration_ms,
                     "message": format!("claude spawn error: {}", e),
                 }));
-                PhaseOutcome::Failed {
+                Verdict::Done {
+                    success: false,
                     reason: format!("Phase {} spawn error: {}", phase.name, e),
                 }
             }
@@ -138,15 +144,15 @@ impl ClaudePhaseRunner {
         _phase: &PhaseConfig,
         task: Option<&BoiTask>,
         worktree_path: &str,
-    ) -> PhaseOutcome {
+    ) -> Verdict {
         let task = match task {
             Some(t) => t,
-            None => return PhaseOutcome::Skipped,
+            None => return Verdict::Proceed,
         };
 
         let verify_cmd = match task.verify.as_deref() {
             Some(cmd) if !cmd.is_empty() => cmd,
-            _ => return PhaseOutcome::Approved,
+            _ => return Verdict::Proceed,
         };
 
         self.telemetry.emit("boi.verify.run", LogLevel::Debug, &json!({
@@ -168,27 +174,25 @@ impl ClaudePhaseRunner {
         }));
 
         if passed {
-            PhaseOutcome::Approved
+            Verdict::Proceed
         } else {
-            PhaseOutcome::Requeue {
-                phase: "execute".to_string(),
-            }
+            Verdict::Redo { tasks: vec![] }
         }
     }
 }
 
-/// Mock phase runner for testing — returns configurable outcomes.
+/// Mock phase runner for testing — returns configurable verdicts.
 #[cfg(test)]
 pub struct MockPhaseRunner {
-    /// Outcomes to return, indexed by call order.
-    pub outcomes: std::sync::Mutex<Vec<PhaseOutcome>>,
+    /// Verdicts to return, indexed by call order.
+    pub verdicts: std::sync::Mutex<Vec<Verdict>>,
 }
 
 #[cfg(test)]
 impl MockPhaseRunner {
-    pub fn new(outcomes: Vec<PhaseOutcome>) -> Self {
+    pub fn new(verdicts: Vec<Verdict>) -> Self {
         MockPhaseRunner {
-            outcomes: std::sync::Mutex::new(outcomes),
+            verdicts: std::sync::Mutex::new(verdicts),
         }
     }
 }
@@ -202,12 +206,12 @@ impl PhaseRunner for MockPhaseRunner {
         _task: Option<&BoiTask>,
         _worktree_path: &str,
         _timeout_secs: u64,
-    ) -> PhaseOutcome {
-        let mut outcomes = self.outcomes.lock().unwrap();
-        if outcomes.is_empty() {
-            PhaseOutcome::Approved
+    ) -> Verdict {
+        let mut verdicts = self.verdicts.lock().unwrap();
+        if verdicts.is_empty() {
+            Verdict::Proceed
         } else {
-            outcomes.remove(0)
+            verdicts.remove(0)
         }
     }
 }
@@ -215,7 +219,7 @@ impl PhaseRunner for MockPhaseRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::phases::{PhaseConfig, PhaseLevel, PhaseOutcome};
+    use crate::phases::{PhaseConfig, PhaseLevel, Verdict};
     use crate::spec::{BoiTask, TaskStatus};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -269,7 +273,7 @@ mod tests {
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("true");
         let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10);
-        assert_eq!(outcome, PhaseOutcome::Approved);
+        assert_eq!(outcome, Verdict::Proceed);
     }
 
     #[test]
@@ -280,9 +284,7 @@ mod tests {
         let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10);
         assert_eq!(
             outcome,
-            PhaseOutcome::Requeue {
-                phase: "execute".into()
-            }
+            Verdict::Redo { tasks: vec![] }
         );
     }
 
@@ -300,43 +302,43 @@ mod tests {
             phases: None,
         };
         let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10);
-        assert_eq!(outcome, PhaseOutcome::Approved);
+        assert_eq!(outcome, Verdict::Proceed);
     }
 
     #[test]
-    fn test_claude_runner_spec_level_no_claude_skips() {
+    fn test_claude_runner_spec_level_no_claude_proceeds() {
         let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("no-op", false);
-        // Spec-level phase with no task → skipped
+        // Spec-level phase with no task → proceed (skip is just proceed)
         let outcome = runner.run_phase(&phase, "", None, "/tmp", 10);
-        assert_eq!(outcome, PhaseOutcome::Skipped);
+        assert_eq!(outcome, Verdict::Proceed);
     }
 
     #[test]
-    fn test_mock_runner_returns_configured_outcomes() {
+    fn test_mock_runner_returns_configured_verdicts() {
         let runner = MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved,
-            PhaseOutcome::Timeout,
-            PhaseOutcome::Failed { reason: "bad".into() },
+            Verdict::Proceed,
+            Verdict::Done { success: false, reason: "timeout".into() },
+            Verdict::Done { success: false, reason: "bad".into() },
         ]);
         let phase = make_phase("test", true);
 
         assert_eq!(
             runner.run_phase(&phase, "", None, "/tmp", 10),
-            PhaseOutcome::Approved
+            Verdict::Proceed
         );
         assert_eq!(
             runner.run_phase(&phase, "", None, "/tmp", 10),
-            PhaseOutcome::Timeout
+            Verdict::Done { success: false, reason: "timeout".into() }
         );
         assert_eq!(
             runner.run_phase(&phase, "", None, "/tmp", 10),
-            PhaseOutcome::Failed { reason: "bad".into() }
+            Verdict::Done { success: false, reason: "bad".into() }
         );
-        // Exhausted outcomes → default to Approved
+        // Exhausted verdicts → default to Proceed
         assert_eq!(
             runner.run_phase(&phase, "", None, "/tmp", 10),
-            PhaseOutcome::Approved
+            Verdict::Proceed
         );
     }
 }

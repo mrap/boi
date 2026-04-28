@@ -379,7 +379,7 @@ impl Queue {
                     params![status, now, spec_id],
                 )?;
             }
-            "completed" | "failed" | "cancelled" => {
+            "completed" | "failed" | "cancelled" | "paused" => {
                 self.conn.execute(
                     "UPDATE specs SET status = ?1, completed_at = ?2 WHERE id = ?3",
                     params![status, now, spec_id],
@@ -440,6 +440,15 @@ impl Queue {
 
     pub fn cancel(&self, spec_id: &str) -> Result<()> {
         self.update_spec(spec_id, "cancelled")
+    }
+
+    /// Resume a paused spec by resetting its status to "queued".
+    pub fn resume_spec(&self, spec_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE specs SET status = 'queued' WHERE id = ?1 AND status = 'paused'",
+            params![spec_id],
+        )?;
+        Ok(())
     }
 
     pub fn set_spec_fields(

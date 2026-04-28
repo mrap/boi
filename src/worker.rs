@@ -1,9 +1,9 @@
 use crate::{
     hooks::{
         self, HookConfig, ON_COMPLETE, ON_FAIL, ON_TASK_COMPLETE, ON_TASK_FAIL, ON_TASK_START,
-        ON_WORKER_START, ON_PHASE_START, ON_PHASE_COMPLETE, ON_PHASE_FAIL, ON_PHASE_SKIP,
+        ON_WORKER_START, ON_PHASE_START, ON_PHASE_COMPLETE, ON_PHASE_FAIL,
     },
-    phases::{self, PhaseLevel, PhaseOutcome, PhaseRegistry},
+    phases::{self, PhaseLevel, PhaseRegistry, Verdict},
     queue::{PhaseRunRecord, Queue},
     runner::{ClaudePhaseRunner, PhaseRunner},
     spec,
@@ -102,17 +102,16 @@ fn record_phase_run(
     task_id: Option<&str>,
     phase_name: &str,
     level: &str,
-    outcome: &PhaseOutcome,
+    verdict: &Verdict,
     started_at: &str,
     elapsed_ms: i64,
 ) {
-    let outcome_str = match outcome {
-        PhaseOutcome::Approved => "approved",
-        PhaseOutcome::Skipped => "skipped",
-        PhaseOutcome::Failed { .. } => "failed",
-        PhaseOutcome::Timeout => "timeout",
-        PhaseOutcome::Requeue { .. } => "requeue",
-        PhaseOutcome::AddedTasks(_) => "added_tasks",
+    let outcome_str = match verdict {
+        Verdict::Proceed => "proceed",
+        Verdict::Redo { .. } => "redo",
+        Verdict::Pause { .. } => "pause",
+        Verdict::Done { success: true, .. } => "done",
+        Verdict::Done { success: false, .. } => "failed",
     };
     let completed_at = Utc::now().to_rfc3339();
     let rec = PhaseRunRecord {
@@ -176,6 +175,8 @@ enum WorkerState {
     TaskRequeue { task_id: String, target_phase: String, attempts: usize },
     /// All tasks done — run post-task spec phases (critic, evaluate)
     PostTaskSpecPhase { phase_idx: usize },
+    /// Spec paused — waiting for human input via `boi decide <id>`
+    Paused { prompt: String },
     /// Spec completed successfully — update DB, fire hooks
     Complete,
     /// Spec failed — update DB, fire hooks
@@ -332,7 +333,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let outcome = runner.run_phase(
+                let verdict = runner.run_phase(
                     phase,
                     &spec_content,
                     None,
@@ -340,20 +341,36 @@ pub fn run_worker_with_phases(
                     config.task_timeout_secs,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, None, phase_name, "spec", &outcome, &phase_started_at, elapsed_ms);
+                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms);
 
-                emit_phase_outcome(telemetry, spec_id, None, phase_name, &outcome, elapsed_ms);
+                emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
 
-                match &outcome {
-                    PhaseOutcome::Approved | PhaseOutcome::AddedTasks(_) => {
+                match &verdict {
+                    Verdict::Proceed => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
                         state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
                     }
-                    PhaseOutcome::Skipped => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
-                        state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
+                    Verdict::Redo { tasks } => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        // Inject tasks if any, then go to TaskSelect
+                        if !tasks.is_empty() {
+                            for t in tasks {
+                                let _ = queue.add_task(
+                                    spec_id,
+                                    &t.id,
+                                    &t.title,
+                                    t.spec.as_deref(),
+                                    t.verify.as_deref(),
+                                    t.depends.as_deref().unwrap_or(&[]),
+                                );
+                            }
+                        }
+                        state = WorkerState::TaskSelect;
                     }
-                    PhaseOutcome::Failed { reason } => {
+                    Verdict::Pause { prompt } => {
+                        state = WorkerState::Paused { prompt: prompt.clone() };
+                    }
+                    Verdict::Done { success: false, reason } => {
                         eprintln!("[boi] pre-task spec phase '{}' failed: {}", phase_name, reason);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
                         if phase.can_fail_spec {
@@ -364,13 +381,9 @@ pub fn run_worker_with_phases(
                             state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
                         }
                     }
-                    PhaseOutcome::Timeout => {
-                        eprintln!("[boi] pre-task spec phase '{}' timed out", phase_name);
-                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                        state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
-                    }
-                    PhaseOutcome::Requeue { .. } => {
+                    Verdict::Done { success: true, reason } => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        eprintln!("[boi] pre-task spec phase '{}' done: {}", phase_name, reason);
                         state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
                     }
                 }
@@ -530,7 +543,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let outcome = runner.run_phase(
+                let verdict = runner.run_phase(
                     phase,
                     &spec_content,
                     Some(task),
@@ -538,12 +551,12 @@ pub fn run_worker_with_phases(
                     config.task_timeout_secs,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &outcome, &phase_started_at, elapsed_ms);
+                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &verdict, &phase_started_at, elapsed_ms);
 
-                emit_phase_outcome(telemetry, spec_id, Some(&task.id), phase_name, &outcome, elapsed_ms);
+                emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &verdict, elapsed_ms);
 
-                match &outcome {
-                    PhaseOutcome::Approved => {
+                match &verdict {
+                    Verdict::Proceed => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
@@ -551,31 +564,35 @@ pub fn run_worker_with_phases(
                             requeue_attempts,
                         };
                     }
-                    PhaseOutcome::Skipped => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
-                        state = WorkerState::TaskPhase {
-                            task_id: task_id_owned,
-                            phase_idx: phase_idx + 1,
-                            requeue_attempts,
-                        };
+                    Verdict::Redo { tasks } => {
+                        if tasks.is_empty() {
+                            // Redo with no new tasks = requeue back to execute
+                            eprintln!("[boi] phase '{}' requests redo for task {}", phase_name, task.id);
+                            state = WorkerState::TaskRequeue {
+                                task_id: task_id_owned,
+                                target_phase: "execute".to_string(),
+                                attempts: requeue_attempts + 1,
+                            };
+                        } else {
+                            // Inject tasks and go to TaskSelect
+                            let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                            for t in tasks {
+                                let _ = queue.add_task(
+                                    spec_id,
+                                    &t.id,
+                                    &t.title,
+                                    t.spec.as_deref(),
+                                    t.verify.as_deref(),
+                                    t.depends.as_deref().unwrap_or(&[]),
+                                );
+                            }
+                            state = WorkerState::TaskSelect;
+                        }
                     }
-                    PhaseOutcome::AddedTasks(_) => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
-                        state = WorkerState::TaskPhase {
-                            task_id: task_id_owned,
-                            phase_idx: phase_idx + 1,
-                            requeue_attempts,
-                        };
+                    Verdict::Pause { prompt } => {
+                        state = WorkerState::Paused { prompt: prompt.clone() };
                     }
-                    PhaseOutcome::Requeue { phase: ref target } => {
-                        eprintln!("[boi] phase '{}' requests requeue to '{}' for task {}", phase_name, target, task.id);
-                        state = WorkerState::TaskRequeue {
-                            task_id: task_id_owned,
-                            target_phase: target.clone(),
-                            attempts: requeue_attempts + 1,
-                        };
-                    }
-                    PhaseOutcome::Failed { reason } => {
+                    Verdict::Done { success: false, reason } => {
                         eprintln!("[boi] phase '{}' failed for task {}: {}", phase_name, task.id, reason);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
                         let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
@@ -598,41 +615,21 @@ pub fn run_worker_with_phases(
                                 "spec_id": spec_id,
                                 "task_id": task.id,
                                 "status": "FAILED",
-                                "message": format!("{} failed", task.id),
+                                "message": format!("{} failed: {}", task.id, reason),
                             }));
                             state = WorkerState::Failed {
                                 reason: format!("task {} phase '{}' failed: {}", task.id, phase_name, reason),
                             };
                         }
                     }
-                    PhaseOutcome::Timeout => {
-                        eprintln!("[boi] phase '{}' timed out for task {}", phase_name, task.id);
-                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                        let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
-                        if max_attempts > 0 {
-                            state = WorkerState::TaskPhaseRetry {
-                                task_id: task_id_owned,
-                                phase_idx,
-                                attempt: 1,
-                            };
-                        } else {
-                            queue.update_task(spec_id, &task.id, "FAILED")?;
-                            let task_payload = json!({
-                                "spec_id": spec_id,
-                                "task_id": task.id,
-                                "task_title": task.title,
-                            });
-                            let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
-                            telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
-                                "spec_id": spec_id,
-                                "task_id": task.id,
-                                "status": "FAILED",
-                                "message": format!("{} failed (timeout)", task.id),
-                            }));
-                            state = WorkerState::Failed {
-                                reason: format!("task {} phase '{}' timed out", task.id, phase_name),
-                            };
-                        }
+                    Verdict::Done { success: true, reason } => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        eprintln!("[boi] phase '{}' done for task {}: {}", phase_name, task.id, reason);
+                        state = WorkerState::TaskPhase {
+                            task_id: task_id_owned,
+                            phase_idx: phase_idx + 1,
+                            requeue_attempts,
+                        };
                     }
                 }
             }
@@ -685,7 +682,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let outcome = runner.run_phase(
+                let retry_verdict = runner.run_phase(
                     phase,
                     &spec_content,
                     Some(task),
@@ -693,12 +690,12 @@ pub fn run_worker_with_phases(
                     config.task_timeout_secs,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &outcome, &phase_started_at, elapsed_ms);
+                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &retry_verdict, &phase_started_at, elapsed_ms);
 
-                emit_phase_outcome(telemetry, spec_id, Some(&task.id), phase_name, &outcome, elapsed_ms);
+                emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &retry_verdict, elapsed_ms);
 
-                match &outcome {
-                    PhaseOutcome::Approved | PhaseOutcome::Skipped | PhaseOutcome::AddedTasks(_) => {
+                match &retry_verdict {
+                    Verdict::Proceed => {
                         // Retry succeeded — advance to next phase
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
@@ -706,18 +703,29 @@ pub fn run_worker_with_phases(
                             requeue_attempts: 0,
                         };
                     }
-                    PhaseOutcome::Requeue { phase: ref target } => {
+                    Verdict::Redo { .. } => {
                         state = WorkerState::TaskRequeue {
                             task_id: task_id_owned,
-                            target_phase: target.clone(),
+                            target_phase: "execute".to_string(),
                             attempts: 1,
                         };
                     }
-                    PhaseOutcome::Failed { .. } | PhaseOutcome::Timeout => {
+                    Verdict::Pause { prompt } => {
+                        state = WorkerState::Paused { prompt: prompt.clone() };
+                    }
+                    Verdict::Done { success: false, .. } => {
                         state = WorkerState::TaskPhaseRetry {
                             task_id: task_id_owned,
                             phase_idx,
                             attempt: attempt + 1,
+                        };
+                    }
+                    Verdict::Done { success: true, .. } => {
+                        // Retry succeeded — advance to next phase
+                        state = WorkerState::TaskPhase {
+                            task_id: task_id_owned,
+                            phase_idx: phase_idx + 1,
+                            requeue_attempts: 0,
                         };
                     }
                 }
@@ -821,7 +829,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let outcome = runner.run_phase(
+                let verdict = runner.run_phase(
                     phase,
                     &spec_content,
                     None,
@@ -829,25 +837,37 @@ pub fn run_worker_with_phases(
                     config.task_timeout_secs,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, None, phase_name, "spec", &outcome, &phase_started_at, elapsed_ms);
+                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms);
 
-                emit_phase_outcome(telemetry, spec_id, None, phase_name, &outcome, elapsed_ms);
+                emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
 
-                match &outcome {
-                    PhaseOutcome::Approved => {
+                match &verdict {
+                    Verdict::Proceed => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
                         state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                     }
-                    PhaseOutcome::Skipped => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_SKIP, &phase_payload);
-                        state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
-                    }
-                    PhaseOutcome::AddedTasks(_) => {
+                    Verdict::Redo { tasks } => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
-                        // Tasks injected — re-enter task loop to process them
+                        // Inject tasks if any, then re-enter task loop
+                        if !tasks.is_empty() {
+                            for t in tasks {
+                                let _ = queue.add_task(
+                                    spec_id,
+                                    &t.id,
+                                    &t.title,
+                                    t.spec.as_deref(),
+                                    t.verify.as_deref(),
+                                    t.depends.as_deref().unwrap_or(&[]),
+                                );
+                            }
+                        }
+                        // Re-enter task loop (iterative quality loop)
                         state = WorkerState::TaskSelect;
                     }
-                    PhaseOutcome::Failed { reason } => {
+                    Verdict::Pause { prompt } => {
+                        state = WorkerState::Paused { prompt: prompt.clone() };
+                    }
+                    Verdict::Done { success: false, reason } => {
                         eprintln!("[boi] post-task spec phase '{}' failed: {}", phase_name, reason);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
                         if phase.can_fail_spec {
@@ -858,23 +878,31 @@ pub fn run_worker_with_phases(
                             state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                         }
                     }
-                    PhaseOutcome::Timeout => {
-                        eprintln!("[boi] post-task spec phase '{}' timed out", phase_name);
-                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                    Verdict::Done { success: true, reason } => {
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        eprintln!("[boi] post-task spec phase '{}' done: {}", phase_name, reason);
                         state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                     }
-                    PhaseOutcome::Requeue { phase: target } => {
-                        eprintln!("[boi] post-task spec phase '{}' requests requeue to '{}'", phase_name, target);
-                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
-                        if phase.can_fail_spec {
-                            state = WorkerState::Failed {
-                                reason: format!("post-task phase '{}' requeue (treated as failure)", phase_name),
-                            };
-                        } else {
-                            state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
-                        }
-                    }
                 }
+            }
+
+            WorkerState::Paused { ref prompt } => {
+                let prompt_owned = prompt.clone();
+                eprintln!("[boi] spec {} paused: {}", spec_id, prompt_owned);
+                queue.update_spec(spec_id, "paused")?;
+                let _ = hooks::fire(hook_config, hooks::ON_SPEC_PAUSED, &json!({
+                    "spec_id": spec_id,
+                    "prompt": prompt_owned,
+                }));
+                telemetry.emit("boi.spec.paused", LogLevel::Info, &json!({
+                    "spec_id": spec_id,
+                    "status": "paused",
+                    "prompt": prompt_owned,
+                    "message": format!("spec {} paused: {}", spec_id, prompt_owned),
+                }));
+                // Worker exits; spec stays in "paused" status.
+                // `boi decide <id>` would reset status to "queued" to resume.
+                break;
             }
 
             WorkerState::Complete => {
@@ -920,22 +948,21 @@ pub fn run_worker_with_phases(
     Ok(())
 }
 
-/// Emit a phase outcome telemetry event (DRY helper for the state machine).
-fn emit_phase_outcome(
+/// Emit a phase verdict telemetry event (DRY helper for the state machine).
+fn emit_phase_verdict(
     telemetry: &Telemetry,
     spec_id: &str,
     task_id: Option<&str>,
     phase_name: &str,
-    outcome: &PhaseOutcome,
+    verdict: &Verdict,
     elapsed_ms: i64,
 ) {
-    let outcome_label = match outcome {
-        PhaseOutcome::Approved => "approved",
-        PhaseOutcome::Skipped => "skipped",
-        PhaseOutcome::Failed { .. } => "failed",
-        PhaseOutcome::Timeout => "timeout",
-        PhaseOutcome::Requeue { .. } => "requeue",
-        PhaseOutcome::AddedTasks(_) => "added_tasks",
+    let outcome_label = match verdict {
+        Verdict::Proceed => "proceed",
+        Verdict::Redo { .. } => "redo",
+        Verdict::Pause { .. } => "pause",
+        Verdict::Done { success: true, .. } => "done",
+        Verdict::Done { success: false, .. } => "failed",
     };
     let msg = if let Some(tid) = task_id {
         format!("{}: {} phase {} ({}ms)", tid, phase_name, outcome_label, elapsed_ms)
@@ -1306,9 +1333,9 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
+            Verdict::Proceed,
+            Verdict::Proceed,
+            Verdict::Proceed,
         ]);
         let tel = test_telemetry();
 
@@ -1343,8 +1370,8 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved,
-            PhaseOutcome::Failed { reason: "verify failed".into() },
+            Verdict::Proceed,
+            Verdict::Done { success: false, reason: "verify failed".into() },
         ]);
         let tel = test_telemetry();
 
@@ -1379,8 +1406,8 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
+            Verdict::Proceed,
+            Verdict::Proceed,
         ]);
         let tel = test_telemetry();
 
@@ -1415,7 +1442,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Timeout,
+            Verdict::Done { success: false, reason: "timeout".into() },
         ]);
         let tel = test_telemetry();
 
@@ -1450,11 +1477,11 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
+            Verdict::Proceed,
+            Verdict::Proceed,
+            Verdict::Proceed,
+            Verdict::Proceed,
+            Verdict::Proceed,
         ]);
         let tel = test_telemetry();
 
@@ -1489,11 +1516,11 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
-            PhaseOutcome::Approved,
+            Verdict::Proceed,
+            Verdict::Proceed,
+            Verdict::Proceed,
+            Verdict::Proceed,
+            Verdict::Proceed,
         ]);
         let tel = test_telemetry();
 

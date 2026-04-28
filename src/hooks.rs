@@ -30,6 +30,7 @@ pub const ON_COMPLETE: &str = "on_complete";
 pub const ON_FAIL: &str = "on_fail";
 pub const ON_CANCEL: &str = "on_cancel";
 pub const ON_STALL: &str = "on_stall";
+pub const ON_SPEC_PAUSED: &str = "on_spec_paused";
 
 /// Fire a lifecycle hook for the given event. Never panics — errors are logged to stderr.
 pub fn fire(
