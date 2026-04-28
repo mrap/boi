@@ -1,0 +1,8 @@
+title: "E2E Test — Simple Spec"
+mode: execute
+tasks:
+  - id: t-1
+    title: "Create a file"
+    status: PENDING
+    spec: "Create /tmp/boi-e2e-marker.txt"
+    verify: "test -f /tmp/boi-e2e-marker.txt"

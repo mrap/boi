@@ -1,0 +1,20 @@
+title: "E2E Test — Chained Tasks"
+mode: execute
+tasks:
+  - id: t-1
+    title: "First step"
+    status: PENDING
+    spec: "Do step 1"
+    verify: "true"
+  - id: t-2
+    title: "Second step"
+    status: PENDING
+    depends: [t-1]
+    spec: "Do step 2"
+    verify: "true"
+  - id: t-3
+    title: "Third step"
+    status: PENDING
+    depends: [t-2]
+    spec: "Do step 3"
+    verify: "true"

@@ -1,0 +1,29 @@
+# BOI configuration
+# Hooks connect BOI lifecycle events to hex (or any other system).
+# BOI itself has zero knowledge of hex — these hooks are the interface.
+
+max_workers: 5
+task_timeout_minutes: 30
+retry_count: 3
+
+hooks:
+  on_dispatch:
+    command: "python3 ~/.hex-events/hex_emit.py boi.spec.dispatched"
+    blocking: false
+    timeout: 10
+  on_task_complete:
+    command: "python3 ~/.hex-events/hex_emit.py boi.task.completed"
+    blocking: false
+    timeout: 10
+  on_complete:
+    command: "python3 ~/.hex-events/hex_emit.py boi.spec.completed"
+    blocking: false
+    timeout: 10
+  on_fail:
+    command: "python3 ~/.hex-events/hex_emit.py boi.spec.failed"
+    blocking: false
+    timeout: 10
+  on_cancel:
+    command: "python3 ~/.hex-events/hex_emit.py boi.spec.cancelled"
+    blocking: false
+    timeout: 10

@@ -1,0 +1,49 @@
+FROM rust:latest AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+RUN cargo build --release 2>&1
+
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash git python3 sqlite3 procps \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV HOME=/home/testuser
+RUN useradd -m -s /bin/bash testuser
+
+# Install binary
+COPY --from=builder /build/target/release/boi /usr/local/bin/boi
+RUN chmod +x /usr/local/bin/boi
+
+# Set up test environment as root before switching users
+RUN mkdir -p $HOME/.boi/worktrees $HOME/.boi/logs $HOME/.boi/telemetry \
+    && chown -R testuser:testuser $HOME
+
+# Copy test fixtures and mock claude
+COPY tests/rust-e2e/ $HOME/tests/
+RUN chmod +x $HOME/tests/*.sh 2>/dev/null || true
+
+# Create mock claude binary
+RUN printf '#!/bin/sh\necho "{}"\nexit 0\n' > /usr/local/bin/claude \
+    && chmod +x /usr/local/bin/claude
+
+# Set up a git repo for worktree testing
+USER testuser
+RUN git config --global user.email "test@boi.test" \
+    && git config --global user.name "BOI Test" \
+    && git config --global init.defaultBranch main \
+    && mkdir -p $HOME/test-repo \
+    && cd $HOME/test-repo \
+    && git init && echo "test" > README.md && git add . && git commit -m "init"
+
+ENV BOI_HOME=$HOME/.boi
+ENV CLAUDE_BIN=claude
+WORKDIR $HOME
+ENTRYPOINT ["bash", "tests/run-e2e.sh"]

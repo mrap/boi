@@ -1,0 +1,13 @@
+title: "Invalid — circular dependency"
+mode: execute
+tasks:
+  - id: t-1
+    title: "Task A"
+    status: PENDING
+    depends: [t-2]
+    spec: "Do A"
+  - id: t-2
+    title: "Task B"
+    status: PENDING
+    depends: [t-1]
+    spec: "Do B"
