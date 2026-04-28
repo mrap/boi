@@ -1116,12 +1116,33 @@ fn cmd_config(key: Option<&str>, value: Option<&str>, cfg: &config::Config) {
             };
             println!("{}", val);
         }
-        (Some(_k), Some(_v)) => {
-            eprintln!(
-                "note: config set is not yet persisted — edit {} directly",
-                config::default_config_path().display()
-            );
-            std::process::exit(1);
+        (Some(k), Some(v)) => {
+            // Validate key
+            match k {
+                "max_workers" | "task_timeout_minutes" | "retry_count" => {}
+                _ => {
+                    eprintln!("unknown config key: {} (supported: max_workers, task_timeout_minutes, retry_count)", k);
+                    std::process::exit(1);
+                }
+            }
+            let config_path = config::default_config_path();
+            let mut cfg_map: serde_yml::Value = if config_path.exists() {
+                let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+                serde_yml::from_str(&content).unwrap_or(serde_yml::Value::Mapping(Default::default()))
+            } else {
+                serde_yml::Value::Mapping(Default::default())
+            };
+            if let serde_yml::Value::Mapping(ref mut map) = cfg_map {
+                map.insert(
+                    serde_yml::Value::String(k.to_string()),
+                    serde_yml::Value::String(v.to_string()),
+                );
+            }
+            if let Some(parent) = config_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&config_path, serde_yml::to_string(&cfg_map).unwrap()).unwrap();
+            println!("set {} = {}", k, v);
         }
     }
 }
@@ -1358,13 +1379,16 @@ fn cmd_spec(queue_id: &str, action: Option<SpecAction>, db_str: &str) {
             verify,
             depends,
         }) => {
-            // Generate a task ID
+            // Generate a task ID using max existing ID to avoid collisions
             let existing = q.status(queue_id);
-            let task_num = match &existing {
-                Ok(Some(st)) => st.tasks.len() + 1,
-                _ => 1,
+            let max_id: i64 = match &existing {
+                Ok(Some(st)) => st.tasks.iter()
+                    .filter_map(|t| t.id.strip_prefix("t-").and_then(|n| n.parse::<i64>().ok()))
+                    .max()
+                    .unwrap_or(0),
+                _ => 0,
             };
-            let task_id = format!("t-{}", task_num);
+            let task_id = format!("t-{}", max_id + 1);
 
             match q.add_task(
                 queue_id,
@@ -1527,7 +1551,7 @@ fn cmd_doctor(db_str: &str, cfg: &config::Config) {
     let config_path = config::default_config_path();
     if config_path.exists() {
         match std::fs::read_to_string(&config_path) {
-            Ok(content) => match serde_yaml::from_str::<config::Config>(&content) {
+            Ok(content) => match serde_yml::from_str::<config::Config>(&content) {
                 Ok(_) => println!("  {}✓{} Config valid ({})", GREEN, RESET, config_path.display()),
                 Err(e) => {
                     println!(

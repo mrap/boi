@@ -82,14 +82,14 @@ impl std::error::Error for ValidationError {}
 
 /// Parse and validate a BOI spec from YAML content.
 pub fn parse(content: &str) -> Result<BoiSpec, Box<dyn std::error::Error>> {
-    let spec: BoiSpec = serde_yaml::from_str(content)?;
+    let spec: BoiSpec = serde_yml::from_str(content)?;
     validate(&spec)?;
     Ok(spec)
 }
 
 /// Parse without validation — useful for reading in-progress specs.
 pub fn parse_unchecked(content: &str) -> Result<BoiSpec, Box<dyn std::error::Error>> {
-    let spec: BoiSpec = serde_yaml::from_str(content)?;
+    let spec: BoiSpec = serde_yml::from_str(content)?;
     Ok(spec)
 }
 

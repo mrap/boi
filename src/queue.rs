@@ -129,6 +129,8 @@ impl Queue {
                 started_at TEXT,
                 completed_at TEXT,
                 error TEXT,
+                spec_content TEXT,
+                verify_content TEXT,
                 PRIMARY KEY (spec_id, id)
             );
 
@@ -184,6 +186,8 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "project", "TEXT");
         Self::ensure_column(&conn, "specs", "phase", "TEXT DEFAULT 'execute'");
         Self::ensure_column(&conn, "specs", "worker_timeout_seconds", "INTEGER");
+        Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
+        Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
 
         Ok(Queue { conn })
     }
@@ -237,10 +241,11 @@ impl Queue {
         for task in &spec.tasks {
             let depends_json = serde_json::to_string(task.depends.as_deref().unwrap_or(&[]))
                 .unwrap_or_else(|_| "[]".to_string());
+            let status_str = task.status.to_string();
             tx.execute(
-                "INSERT INTO tasks (id, spec_id, title, status, depends)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![task.id, id, task.title, task.status.to_string(), depends_json],
+                "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![task.id, id, task.title, status_str, depends_json, task.spec, task.verify],
             )?;
         }
 
@@ -637,26 +642,21 @@ impl Queue {
     ) -> Result<()> {
         let depends_json = serde_json::to_string(depends).unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
-            "INSERT INTO tasks (id, spec_id, title, status, depends)
-             VALUES (?1, ?2, ?3, 'PENDING', ?4)",
-            params![task_id, spec_id, title, depends_json],
+            "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)
+             VALUES (?1, ?2, ?3, 'PENDING', ?4, ?5, ?6)",
+            params![task_id, spec_id, title, depends_json, spec_text, verify],
         )?;
         // Update total_tasks count
         self.conn.execute(
             "UPDATE specs SET total_tasks = (SELECT COUNT(*) FROM tasks WHERE spec_id = ?1) WHERE id = ?1",
             params![spec_id],
         )?;
-        // Store spec and verify in a pragmatic way -- we don't have columns for these in tasks,
-        // but we insert an event to record the addition
-        let data = serde_json::json!({
-            "spec": spec_text,
-            "verify": verify,
-        });
+        // Also log the addition as an event for audit trail
         let _ = self.insert_event(
             Some(spec_id),
             "task.added",
             Some(&format!("Added task {} to {}", task_id, spec_id)),
-            Some(&data.to_string()),
+            None,
             "info",
         );
         Ok(())

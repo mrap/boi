@@ -34,7 +34,7 @@ impl Config {
     pub fn load_from(path: &Path) -> Self {
         if path.exists() {
             let content = std::fs::read_to_string(path).unwrap_or_default();
-            match serde_yaml::from_str::<Config>(&content) {
+            match serde_yml::from_str::<Config>(&content) {
                 Ok(cfg) => cfg,
                 Err(e) => {
                     eprintln!(

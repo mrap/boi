@@ -89,7 +89,7 @@ pub fn fire(
     }
 
     if blocking {
-        match wait_with_timeout(child, Duration::from_secs(timeout_secs)) {
+        match wait_with_timeout(child, Duration::from_secs(timeout_secs), event) {
             Ok(status) if !status.success() => {
                 eprintln!("[BOI] hook '{}' exited with status: {}", event, status);
             }
@@ -109,21 +109,32 @@ pub fn fire(
 }
 
 fn wait_with_timeout(
-    mut child: std::process::Child,
+    child: std::process::Child,
     timeout: Duration,
+    event: &str,
 ) -> Result<std::process::ExitStatus, Box<dyn std::error::Error>> {
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
     let (tx, rx) = mpsc::channel();
+    let child_arc = Arc::new(Mutex::new(child));
+    let child_thread = Arc::clone(&child_arc);
 
     std::thread::spawn(move || {
-        let result = child.wait();
+        let result = child_thread.lock().unwrap().wait();
         let _ = tx.send(result);
     });
 
     match rx.recv_timeout(timeout) {
         Ok(Ok(status)) => Ok(status),
         Ok(Err(e)) => Err(Box::new(e)),
-        Err(_) => Err("hook timed out".into()),
+        Err(_) => {
+            // Timeout — kill the child process to prevent zombie
+            if let Ok(mut child_guard) = child_arc.lock() {
+                let _ = child_guard.kill();
+                let _ = child_guard.wait(); // reap
+            }
+            eprintln!("[boi hooks] {} timed out after {:?}", event, timeout);
+            Err("hook timed out".into())
+        }
     }
 }
 
