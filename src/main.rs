@@ -92,6 +92,9 @@ enum Commands {
         spec_id: String,
         #[arg(long)]
         full: bool,
+        /// Show debug-level events (claude output, verify results)
+        #[arg(long)]
+        debug: bool,
     },
     /// Cancel a queued or running spec
     Cancel { spec_id: String },
@@ -208,8 +211,8 @@ fn main() {
                 cmd_status(spec_id.as_deref(), all, db_str);
             }
         }
-        Commands::Log { spec_id, full } => {
-            cmd_log(&spec_id, full, &cfg);
+        Commands::Log { spec_id, full, debug } => {
+            cmd_log(&spec_id, full, debug, db_str);
         }
         Commands::Cancel { spec_id } => {
             cmd_cancel(&spec_id, db_str, &hook_cfg);

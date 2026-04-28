@@ -1,6 +1,9 @@
 use crate::phases::{PhaseConfig, PhaseOutcome};
 use crate::spec::BoiTask;
+use crate::telemetry::{LogLevel, Telemetry};
 use crate::worker;
+use serde_json::json;
+use std::time::Instant;
 
 /// Trait for running a single phase. Allows mocking in tests.
 pub trait PhaseRunner: Send + Sync {
@@ -23,7 +26,15 @@ pub trait PhaseRunner: Send + Sync {
 
 /// Production phase runner that spawns claude for requires_claude phases
 /// and runs verify commands for non-claude phases.
-pub struct ClaudePhaseRunner;
+pub struct ClaudePhaseRunner {
+    pub telemetry: Telemetry,
+}
+
+impl ClaudePhaseRunner {
+    pub fn new(telemetry: Telemetry) -> Self {
+        ClaudePhaseRunner { telemetry }
+    }
+}
 
 impl PhaseRunner for ClaudePhaseRunner {
     fn run_phase(
@@ -38,6 +49,9 @@ impl PhaseRunner for ClaudePhaseRunner {
             // Non-claude phase: run verify command directly
             return self.run_verify_phase(phase, task, worktree_path);
         }
+
+        let task_id = task.map(|t| t.id.as_str());
+        let spec_id_hint = "";
 
         // Build the prompt
         let task_context = task.map(|t| {
@@ -55,36 +69,70 @@ impl PhaseRunner for ClaudePhaseRunner {
             task_context.as_deref(),
         );
 
-        // Spawn claude
-        match worker::spawn_claude(&prompt, worktree_path, timeout_secs) {
-            Ok((true, output)) => {
-                crate::phases::parse_phase_output(phase, &output)
+        self.telemetry.emit("boi.claude.spawn", LogLevel::Debug, &json!({
+            "spec_id": spec_id_hint,
+            "task_id": task_id,
+            "phase": phase.name,
+            "prompt_length": prompt.len(),
+            "message": format!("spawning claude for phase '{}'", phase.name),
+        }));
+
+        let start = Instant::now();
+        let result = worker::spawn_claude(&prompt, worktree_path, timeout_secs);
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        match result {
+            Ok((true, ref output)) => {
+                self.telemetry.emit("boi.claude.exit", LogLevel::Debug, &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "phase": phase.name,
+                    "exit_code": 0,
+                    "output_length": output.len(),
+                    "duration_ms": duration_ms,
+                    "message": format!("claude exit 0, output: {} chars ({}ms)", output.len(), duration_ms),
+                }));
+                crate::phases::parse_phase_output(phase, output)
             }
-            Ok((false, output)) => {
+            Ok((false, ref output)) => {
+                self.telemetry.emit("boi.claude.exit", LogLevel::Debug, &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "phase": phase.name,
+                    "exit_code": 1,
+                    "output_length": output.len(),
+                    "duration_ms": duration_ms,
+                    "message": format!("claude exit non-zero, output: {} chars ({}ms)", output.len(), duration_ms),
+                }));
                 if output == "timeout" {
                     PhaseOutcome::Timeout
+                } else if phase.on_crash.as_deref() == Some("retry") {
+                    PhaseOutcome::Failed {
+                        reason: format!("Phase {} claude exited non-zero", phase.name),
+                    }
                 } else {
-                    // Claude exited non-zero — check if on_crash says retry
-                    if phase.on_crash.as_deref() == Some("retry") {
-                        PhaseOutcome::Failed {
-                            reason: format!("Phase {} claude exited non-zero", phase.name),
-                        }
-                    } else {
-                        PhaseOutcome::Failed {
-                            reason: format!("Phase {} failed: {}", phase.name, output),
-                        }
+                    PhaseOutcome::Failed {
+                        reason: format!("Phase {} failed: {}", phase.name, output),
                     }
                 }
             }
-            Err(e) => PhaseOutcome::Failed {
-                reason: format!("Phase {} spawn error: {}", phase.name, e),
-            },
+            Err(e) => {
+                self.telemetry.emit("boi.claude.error", LogLevel::Error, &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "phase": phase.name,
+                    "duration_ms": duration_ms,
+                    "message": format!("claude spawn error: {}", e),
+                }));
+                PhaseOutcome::Failed {
+                    reason: format!("Phase {} spawn error: {}", phase.name, e),
+                }
+            }
         }
     }
 }
 
 impl ClaudePhaseRunner {
-    /// Run a non-claude phase (e.g., task-verify). Executes the task's verify command.
     fn run_verify_phase(
         &self,
         _phase: &PhaseConfig,
@@ -93,15 +141,33 @@ impl ClaudePhaseRunner {
     ) -> PhaseOutcome {
         let task = match task {
             Some(t) => t,
-            None => return PhaseOutcome::Skipped, // Spec-level non-claude phase: nothing to run
+            None => return PhaseOutcome::Skipped,
         };
 
         let verify_cmd = match task.verify.as_deref() {
             Some(cmd) if !cmd.is_empty() => cmd,
-            _ => return PhaseOutcome::Approved, // No verify command = pass
+            _ => return PhaseOutcome::Approved,
         };
 
-        if worker::run_verify(verify_cmd, worktree_path) {
+        self.telemetry.emit("boi.verify.run", LogLevel::Debug, &json!({
+            "task_id": task.id,
+            "verify_cmd": verify_cmd,
+            "message": format!("cmd: {}", verify_cmd),
+        }));
+
+        let start = Instant::now();
+        let passed = worker::run_verify(verify_cmd, worktree_path);
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        self.telemetry.emit("boi.verify.result", LogLevel::Debug, &json!({
+            "task_id": task.id,
+            "verify_cmd": verify_cmd,
+            "passed": passed,
+            "duration_ms": duration_ms,
+            "message": format!("exit {} ({})", if passed { "0 (passed)" } else { "non-zero (failed)" }, duration_ms),
+        }));
+
+        if passed {
             PhaseOutcome::Approved
         } else {
             PhaseOutcome::Requeue {
@@ -151,6 +217,19 @@ mod tests {
     use super::*;
     use crate::phases::{PhaseConfig, PhaseLevel, PhaseOutcome};
     use crate::spec::{BoiTask, TaskStatus};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_telemetry() -> Telemetry {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let db = std::path::PathBuf::from(format!(
+            "/tmp/boi-test-runner-{}-{}.db",
+            std::process::id(), n
+        ));
+        let _ = std::fs::remove_file(&db);
+        Telemetry::new(db)
+    }
 
     fn make_phase(name: &str, requires_claude: bool) -> PhaseConfig {
         PhaseConfig {
@@ -186,7 +265,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_verify_phase_success() {
-        let runner = ClaudePhaseRunner;
+        let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("true");
         let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10);
@@ -195,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_verify_phase_failure() {
-        let runner = ClaudePhaseRunner;
+        let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("false");
         let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10);
@@ -209,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_verify_phase_no_verify_cmd() {
-        let runner = ClaudePhaseRunner;
+        let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("task-verify", false);
         let task = BoiTask {
             id: "t-1".into(),
@@ -226,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_spec_level_no_claude_skips() {
-        let runner = ClaudePhaseRunner;
+        let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("no-op", false);
         // Spec-level phase with no task → skipped
         let outcome = runner.run_phase(&phase, "", None, "/tmp", 10);

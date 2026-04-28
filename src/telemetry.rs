@@ -3,8 +3,47 @@ use rusqlite::{params, Connection, Result};
 use serde_json::Value;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "debug" => LogLevel::Debug,
+            "warn" | "warning" => LogLevel::Warn,
+            "error" => LogLevel::Error,
+            _ => LogLevel::Info,
+        }
+    }
+
+    fn prefix(&self) -> &'static str {
+        match self {
+            LogLevel::Debug => "[debug]",
+            LogLevel::Info => "[info]",
+            LogLevel::Warn => "[warn]",
+            LogLevel::Error => "[ERROR]",
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Telemetry {
     pub db_path: PathBuf,
+    stderr_level: LogLevel,
 }
 
 #[derive(Debug)]
@@ -20,7 +59,11 @@ pub struct TelemetryEvent {
 
 impl Telemetry {
     pub fn new(db_path: PathBuf) -> Self {
-        Telemetry { db_path }
+        let stderr_level = match std::env::var("BOI_LOG_LEVEL") {
+            Ok(val) => LogLevel::from_str(&val),
+            Err(_) => LogLevel::Error,
+        };
+        Telemetry { db_path, stderr_level }
     }
 
     fn open_conn(&self) -> Result<Connection> {
@@ -40,19 +83,29 @@ impl Telemetry {
         Ok(conn)
     }
 
-    pub fn emit(&self, event_type: &str, detail: &Value) {
+    pub fn emit(&self, event_type: &str, level: LogLevel, detail: &Value) {
         let conn = match self.open_conn() {
             Ok(c) => c,
             Err(_) => return,
         };
         let now = Utc::now().to_rfc3339();
         let spec_id = detail.get("spec_id").and_then(|v| v.as_str());
+        let message = detail.get("message").and_then(|v| v.as_str());
         let data_str = serde_json::to_string(detail).ok();
+        let level_str = level.as_str();
+
         let _ = conn.execute(
             "INSERT INTO events (timestamp, spec_id, event_type, message, data, level)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'info')",
-            params![now, spec_id, event_type, event_type, data_str],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![now, spec_id, event_type, message, data_str, level_str],
         );
+
+        if level >= self.stderr_level {
+            let msg = message
+                .or_else(|| detail.get("task_id").and_then(|v| v.as_str()))
+                .unwrap_or(event_type);
+            eprintln!("[boi] {} {}: {}", level.prefix(), event_type, msg);
+        }
     }
 
     pub fn recent(&self, limit: usize) -> Vec<TelemetryEvent> {
@@ -79,12 +132,29 @@ impl Telemetry {
         };
         let mut stmt = match conn.prepare(
             "SELECT seq, timestamp, spec_id, event_type, message, data, level
-             FROM events WHERE spec_id = ?1 ORDER BY seq DESC",
+             FROM events WHERE spec_id = ?1 ORDER BY seq ASC",
         ) {
             Ok(s) => s,
             Err(_) => return vec![],
         };
         stmt.query_map(params![spec_id], row_to_event)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn by_level(&self, level: LogLevel) -> Vec<TelemetryEvent> {
+        let conn = match self.open_conn() {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT seq, timestamp, spec_id, event_type, message, data, level
+             FROM events WHERE level = ?1 ORDER BY seq DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![level.as_str()], row_to_event)
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
     }
@@ -162,9 +232,10 @@ mod tests {
         let _ = std::fs::remove_file(&db);
 
         let t = Telemetry::new(db.clone());
-        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-001"}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-001"}));
         t.emit(
             "boi.task.completed",
+            LogLevel::Info,
             &json!({"spec_id": "q-001", "task_id": "t-1"}),
         );
 
@@ -182,9 +253,9 @@ mod tests {
         let _ = std::fs::remove_file(&db);
 
         let t = Telemetry::new(db.clone());
-        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-001"}));
-        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-002"}));
-        t.emit("boi.task.completed", &json!({"spec_id": "q-001"}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-001"}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-002"}));
+        t.emit("boi.task.completed", LogLevel::Info, &json!({"spec_id": "q-001"}));
 
         let events = t.by_spec("q-001");
         assert_eq!(events.len(), 2);
@@ -199,12 +270,68 @@ mod tests {
         let _ = std::fs::remove_file(&db);
 
         let t = Telemetry::new(db.clone());
-        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-001"}));
-        t.emit("boi.worker.started", &json!({}));
-        t.emit("boi.spec.dispatched", &json!({"spec_id": "q-002"}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-001"}));
+        t.emit("boi.worker.started", LogLevel::Info, &json!({}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-002"}));
 
         let events = t.by_type("boi.spec.dispatched");
         assert_eq!(events.len(), 2);
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn test_by_level() {
+        let db = temp_db("level");
+        let _ = std::fs::remove_file(&db);
+
+        let t = Telemetry::new(db.clone());
+        t.emit("boi.phase.start", LogLevel::Debug, &json!({"spec_id": "q-001"}));
+        t.emit("boi.task.done", LogLevel::Info, &json!({"spec_id": "q-001"}));
+        t.emit("boi.verify.fail", LogLevel::Error, &json!({"spec_id": "q-001"}));
+
+        let debug_events = t.by_level(LogLevel::Debug);
+        assert_eq!(debug_events.len(), 1);
+        assert_eq!(debug_events[0].level, "debug");
+
+        let error_events = t.by_level(LogLevel::Error);
+        assert_eq!(error_events.len(), 1);
+        assert_eq!(error_events[0].level, "error");
+
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn test_log_level_from_str() {
+        assert_eq!(LogLevel::from_str("debug"), LogLevel::Debug);
+        assert_eq!(LogLevel::from_str("info"), LogLevel::Info);
+        assert_eq!(LogLevel::from_str("warn"), LogLevel::Warn);
+        assert_eq!(LogLevel::from_str("warning"), LogLevel::Warn);
+        assert_eq!(LogLevel::from_str("error"), LogLevel::Error);
+        assert_eq!(LogLevel::from_str("DEBUG"), LogLevel::Debug);
+        assert_eq!(LogLevel::from_str("unknown"), LogLevel::Info);
+    }
+
+    #[test]
+    fn test_log_level_ordering() {
+        assert!(LogLevel::Debug < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Warn);
+        assert!(LogLevel::Warn < LogLevel::Error);
+    }
+
+    #[test]
+    fn test_emit_stores_level() {
+        let db = temp_db("stores_level");
+        let _ = std::fs::remove_file(&db);
+
+        let t = Telemetry::new(db.clone());
+        t.emit("boi.debug.event", LogLevel::Debug, &json!({"spec_id": "q-001"}));
+        t.emit("boi.error.event", LogLevel::Error, &json!({"spec_id": "q-001"}));
+
+        let events = t.recent(10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].level, "error");
+        assert_eq!(events[1].level, "debug");
 
         let _ = std::fs::remove_file(&db);
     }

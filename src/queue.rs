@@ -780,6 +780,18 @@ impl Queue {
         Ok(())
     }
 
+    pub fn get_tasks(&self, spec_id: &str) -> Result<Vec<TaskRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, spec_id, title, status, depends, started_at, completed_at, error FROM tasks WHERE spec_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![spec_id], row_to_task)?;
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row?);
+        }
+        Ok(tasks)
+    }
+
     /// Reset any specs stuck in 'running' or 'assigning' back to 'queued'.
     /// Called on daemon startup to recover from crashes.
     pub fn recover_stuck_specs(&self) -> Result<usize> {

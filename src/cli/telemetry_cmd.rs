@@ -64,17 +64,26 @@ pub fn cmd_telemetry(spec_id: &str, db_str: &str) {
 
     if !phase_costs.is_empty() {
         println!(
-            "\n{}{}Phase Cost Breakdown{}\n",
+            "\n{}{}Phase breakdown{}\n",
             BOLD, CYAN, RESET
         );
-        println!("  {:>14}  {:>6}  {:>10}  {:>8}", "PHASE", "RUNS", "DURATION", "COST");
-        println!("  {}", "-".repeat(46));
+        println!("  {:>14}  {:>6}  {:>12}  {:>8}", "PHASE", "RUNS", "AVG DURATION", "COST");
+        println!("  {}", "-".repeat(50));
 
         for summary in &phase_costs {
-            let duration = if summary.total_duration_ms < 60_000 {
-                format!("{:.1}s", summary.total_duration_ms as f64 / 1000.0)
+            let avg_ms = if summary.count > 0 {
+                summary.total_duration_ms / summary.count
             } else {
-                format!("{:.1}m", summary.total_duration_ms as f64 / 60_000.0)
+                0
+            };
+            let avg_duration = if avg_ms < 1000 {
+                format!("{}ms", avg_ms)
+            } else if avg_ms < 60_000 {
+                format!("{:.0}s", avg_ms as f64 / 1000.0)
+            } else {
+                let mins = avg_ms as f64 / 60_000.0;
+                let secs = (avg_ms % 60_000) as f64 / 1000.0;
+                format!("{}m {:.0}s", mins as i64, secs)
             };
             let cost = if summary.total_cost > 0.0 {
                 format!("${:.4}", summary.total_cost)
@@ -82,8 +91,8 @@ pub fn cmd_telemetry(spec_id: &str, db_str: &str) {
                 format!("{}—{}", DIM, RESET)
             };
             println!(
-                "  {:>14}  {:>6}  {:>10}  {:>8}",
-                summary.phase, summary.count, duration, cost
+                "  {:>14}  {:>6}  {:>12}  {:>8}",
+                summary.phase, summary.count, avg_duration, cost
             );
         }
 

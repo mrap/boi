@@ -7,6 +7,7 @@ use crate::{
     queue::{PhaseRunRecord, Queue},
     runner::{ClaudePhaseRunner, PhaseRunner},
     spec,
+    telemetry::{LogLevel, Telemetry},
 };
 use chrono::Utc;
 use serde_json::json;
@@ -138,12 +139,12 @@ pub fn run_worker(
     queue_path: &str,
     hook_config: &HookConfig,
     config: &WorkerConfig,
+    telemetry: &Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = PhaseRegistry::new();
-    // Load user phases from ~/.boi/phases/ if they exist
     registry_load_user(&registry);
-    let runner = Arc::new(ClaudePhaseRunner);
-    run_worker_with_phases(spec_id, spec_path, queue_path, hook_config, config, &registry, runner.as_ref())
+    let runner = Arc::new(ClaudePhaseRunner::new(telemetry.clone()));
+    run_worker_with_phases(spec_id, spec_path, queue_path, hook_config, config, &registry, runner.as_ref(), telemetry)
 }
 
 /// Load user phases into a registry (helper to avoid mutability issues in run_worker).
@@ -163,10 +164,16 @@ pub fn run_worker_with_phases(
     config: &WorkerConfig,
     registry: &PhaseRegistry,
     runner: &dyn PhaseRunner,
+    telemetry: &Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let queue = Queue::open(queue_path)?;
     queue.update_spec(spec_id, "running")?;
     let _ = hooks::fire(hook_config, ON_WORKER_START, &json!({ "spec_id": spec_id }));
+
+    telemetry.emit("boi.worker.started", LogLevel::Info, &json!({
+        "spec_id": spec_id,
+        "message": format!("worker started for {}", spec_id),
+    }));
 
     let spec_content = std::fs::read_to_string(spec_path)?;
     let boi_spec = spec::parse_unchecked(&spec_content)?;
@@ -211,6 +218,22 @@ pub fn run_worker_with_phases(
         .map(|t| t.id.clone())
         .collect();
 
+    // Overlay DB state: tasks may have been SKIPPED or had deps added via `boi spec` mutations
+    let mut skipped_ids: HashSet<String> = HashSet::new();
+    let mut db_depends: HashMap<String, Vec<String>> = HashMap::new();
+    if let Ok(db_tasks) = queue.get_tasks(spec_id) {
+        for dt in &db_tasks {
+            if dt.status == "SKIPPED" {
+                skipped_ids.insert(dt.id.clone());
+                done_ids.insert(dt.id.clone());
+            }
+            let deps: Vec<String> = serde_json::from_str(&dt.depends).unwrap_or_default();
+            if !deps.is_empty() {
+                db_depends.insert(dt.id.clone(), deps);
+            }
+        }
+    }
+
     // --- Pre-task spec phases (e.g., plan-critique) ---
     let pre_spec_phases: Vec<&str> = pipeline
         .spec_phases
@@ -236,6 +259,13 @@ pub fn run_worker_with_phases(
             });
             let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
 
+            telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
+                "spec_id": spec_id,
+                "phase": phase_name,
+                "level": "spec",
+                "message": format!("spec phase '{}' started", phase_name),
+            }));
+
             let phase_start = Instant::now();
             let phase_started_at = Utc::now().to_rfc3339();
             let outcome = runner.run_phase(
@@ -248,6 +278,22 @@ pub fn run_worker_with_phases(
             let elapsed_ms = phase_start.elapsed().as_millis() as i64;
             record_phase_run(&queue, spec_id, None, phase_name, "spec", &outcome, &phase_started_at, elapsed_ms);
 
+            let outcome_label = match &outcome {
+                PhaseOutcome::Approved => "approved",
+                PhaseOutcome::Skipped => "skipped",
+                PhaseOutcome::Failed { .. } => "failed",
+                PhaseOutcome::Timeout => "timeout",
+                PhaseOutcome::Requeue { .. } => "requeue",
+                PhaseOutcome::AddedTasks(_) => "added_tasks",
+            };
+            telemetry.emit("boi.phase.outcome", LogLevel::Info, &json!({
+                "spec_id": spec_id,
+                "phase": phase_name,
+                "outcome": outcome_label,
+                "duration_ms": elapsed_ms,
+                "message": format!("spec phase '{}' {} ({}ms)", phase_name, outcome_label, elapsed_ms),
+            }));
+
             match &outcome {
                 PhaseOutcome::Approved => {
                     let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
@@ -259,6 +305,10 @@ pub fn run_worker_with_phases(
                     eprintln!("[boi] pre-task spec phase '{}' failed: {}", phase_name, reason);
                     let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
                     if phase.can_fail_spec {
+                        telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
+                            "spec_id": spec_id,
+                            "message": format!("spec failed: pre-task phase '{}' failed", phase_name),
+                        }));
                         queue.update_spec(spec_id, "failed")?;
                         let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
                         let _ = crate::worktree::cleanup(spec_id);
@@ -277,7 +327,13 @@ pub fn run_worker_with_phases(
     }
 
     // --- Process tasks through their phase pipelines ---
+    // Retry loop: DB-level deps (from `boi spec block`) may not align with YAML topo order,
+    // so we re-scan until no new tasks complete in a pass.
     let mut overall_success = true;
+    let pending_count = order.len() - done_ids.len() - skipped_ids.len();
+
+    'retry: for _pass in 0..pending_count.max(1) {
+        let before = done_ids.len();
 
     'tasks: for task_id in &order {
         let task = match task_map.get(task_id.as_str()) {
@@ -285,14 +341,31 @@ pub fn run_worker_with_phases(
             None => continue,
         };
 
+        if done_ids.contains(task_id.as_str()) || skipped_ids.contains(task_id.as_str()) {
+            continue;
+        }
+
         if task.status != spec::TaskStatus::Pending {
             continue;
         }
 
-        if let Some(deps) = &task.depends {
-            if deps.iter().any(|d| !done_ids.contains(d)) {
-                continue;
+        // Check DB-level deps (from `boi spec block`) merged with YAML deps
+        let effective_deps: Vec<String> = if let Some(db_d) = db_depends.get(task_id.as_str()) {
+            let mut merged = db_d.clone();
+            if let Some(yaml_deps) = &task.depends {
+                for d in yaml_deps {
+                    if !merged.contains(d) {
+                        merged.push(d.clone());
+                    }
+                }
             }
+            merged
+        } else {
+            task.depends.clone().unwrap_or_default()
+        };
+
+        if effective_deps.iter().any(|d| !done_ids.contains(d)) {
+            continue;
         }
 
         let task_payload = json!({
@@ -303,6 +376,12 @@ pub fn run_worker_with_phases(
 
         queue.update_task(spec_id, &task.id, "RUNNING")?;
         let _ = hooks::fire(hook_config, ON_TASK_START, &task_payload);
+
+        telemetry.emit("boi.task.started", LogLevel::Info, &json!({
+            "spec_id": spec_id,
+            "task_id": task.id,
+            "message": format!("{}: {} — started", task.id, task.title),
+        }));
 
         // Resolve task phases (task override > pipeline default)
         let task_phases = phases::resolve_task_phases(
@@ -329,6 +408,13 @@ pub fn run_worker_with_phases(
                 "level": "task",
             });
             let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
+
+            telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
+                "spec_id": spec_id,
+                "task_id": task.id,
+                "phase": phase_name,
+                "message": format!("{}: {} phase started", task.id, phase_name),
+            }));
 
             // Retry loop for the phase
             let mut phase_outcome = PhaseOutcome::Failed {
@@ -366,6 +452,23 @@ pub fn run_worker_with_phases(
             }
             let elapsed_ms = phase_start.elapsed().as_millis() as i64;
             record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &phase_outcome, &phase_started_at, elapsed_ms);
+
+            let outcome_label = match &phase_outcome {
+                PhaseOutcome::Approved => "approved",
+                PhaseOutcome::Skipped => "skipped",
+                PhaseOutcome::Failed { .. } => "failed",
+                PhaseOutcome::Timeout => "timeout",
+                PhaseOutcome::Requeue { .. } => "requeue",
+                PhaseOutcome::AddedTasks(_) => "added_tasks",
+            };
+            telemetry.emit("boi.phase.outcome", LogLevel::Info, &json!({
+                "spec_id": spec_id,
+                "task_id": task.id,
+                "phase": phase_name,
+                "outcome": outcome_label,
+                "duration_ms": elapsed_ms,
+                "message": format!("{}: {} phase {} ({}ms)", task.id, phase_name, outcome_label, elapsed_ms),
+            }));
 
             // Handle the final phase outcome
             match &phase_outcome {
@@ -410,11 +513,28 @@ pub fn run_worker_with_phases(
             queue.update_task(spec_id, &task.id, "DONE")?;
             done_ids.insert(task.id.clone());
             let _ = hooks::fire(hook_config, ON_TASK_COMPLETE, &task_payload);
+            telemetry.emit("boi.task.completed", LogLevel::Info, &json!({
+                "spec_id": spec_id,
+                "task_id": task.id,
+                "status": "DONE",
+                "message": format!("{} complete", task.id),
+            }));
         } else {
             queue.update_task(spec_id, &task.id, "FAILED")?;
             let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
+            telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
+                "spec_id": spec_id,
+                "task_id": task.id,
+                "status": "FAILED",
+                "message": format!("{} failed", task.id),
+            }));
             overall_success = false;
-            break 'tasks;
+            break 'retry;
+        }
+    }
+
+        if !overall_success || done_ids.len() == before {
+            break 'retry;
         }
     }
 
@@ -443,6 +563,13 @@ pub fn run_worker_with_phases(
                 });
                 let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
 
+                telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
+                    "spec_id": spec_id,
+                    "phase": phase_name,
+                    "level": "spec",
+                    "message": format!("spec phase '{}' started", phase_name),
+                }));
+
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let outcome = runner.run_phase(
@@ -454,6 +581,22 @@ pub fn run_worker_with_phases(
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, None, phase_name, "spec", &outcome, &phase_started_at, elapsed_ms);
+
+                let outcome_label = match &outcome {
+                    PhaseOutcome::Approved => "approved",
+                    PhaseOutcome::Skipped => "skipped",
+                    PhaseOutcome::Failed { .. } => "failed",
+                    PhaseOutcome::Timeout => "timeout",
+                    PhaseOutcome::Requeue { .. } => "requeue",
+                    PhaseOutcome::AddedTasks(_) => "added_tasks",
+                };
+                telemetry.emit("boi.phase.outcome", LogLevel::Info, &json!({
+                    "spec_id": spec_id,
+                    "phase": phase_name,
+                    "outcome": outcome_label,
+                    "duration_ms": elapsed_ms,
+                    "message": format!("spec phase '{}' {} ({}ms)", phase_name, outcome_label, elapsed_ms),
+                }));
 
                 match &outcome {
                     PhaseOutcome::Approved => {
@@ -493,9 +636,19 @@ pub fn run_worker_with_phases(
     if overall_success {
         queue.update_spec(spec_id, "completed")?;
         let _ = hooks::fire(hook_config, ON_COMPLETE, &json!({ "spec_id": spec_id }));
+        telemetry.emit("boi.spec.completed", LogLevel::Info, &json!({
+            "spec_id": spec_id,
+            "status": "completed",
+            "message": format!("spec {} completed", spec_id),
+        }));
     } else {
         queue.update_spec(spec_id, "failed")?;
         let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
+        telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
+            "spec_id": spec_id,
+            "status": "failed",
+            "message": format!("spec {} failed", spec_id),
+        }));
     }
 
     let _ = crate::worktree::cleanup(spec_id);
@@ -510,6 +663,9 @@ pub fn run_daemon(queue_path: &str, hook_config: HookConfig, config: WorkerConfi
 
     let active: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
         Arc::new(Mutex::new(Vec::new()));
+    let telemetry = Arc::new(Telemetry::new(
+        std::path::PathBuf::from(queue_path).to_path_buf(),
+    ));
 
     eprintln!("[boi daemon] started, max_workers={}", config.max_workers);
 
@@ -528,6 +684,7 @@ pub fn run_daemon(queue_path: &str, hook_config: HookConfig, config: WorkerConfi
                             let hc = hook_config.clone();
                             let timeout = config.task_timeout_secs;
                             let retries = config.retry_count;
+                            let tel = telemetry.clone();
 
                             eprintln!("[boi daemon] starting worker for {}", spec_id);
                             let handle = std::thread::spawn(move || {
@@ -537,7 +694,7 @@ pub fn run_daemon(queue_path: &str, hook_config: HookConfig, config: WorkerConfi
                                     retry_count: retries,
                                 };
                                 if let Err(e) =
-                                    run_worker(&spec_id, &spec_path, &qpath, &hc, &wc)
+                                    run_worker(&spec_id, &spec_path, &qpath, &hc, &wc, &tel)
                                 {
                                     eprintln!(
                                         "[boi daemon] worker error for {}: {}",
@@ -563,10 +720,21 @@ pub fn run_daemon(queue_path: &str, hook_config: HookConfig, config: WorkerConfi
 mod tests {
     use super::*;
     use crate::{hooks::HookConfig, queue::Queue, spec};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
-    // Serializes tests that mutate env vars to avoid races.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static TEL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_telemetry() -> Telemetry {
+        let n = TEL_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let db = std::path::PathBuf::from(format!(
+            "/tmp/boi-test-worker-tel-{}-{}.db",
+            std::process::id(), n
+        ));
+        let _ = std::fs::remove_file(&db);
+        Telemetry::new(db)
+    }
 
     /// Run `f` with CLAUDE_BIN set to `bin_path`, holding ENV_LOCK.
     fn with_claude_bin<F: FnOnce()>(bin_path: &str, f: F) {
@@ -720,6 +888,7 @@ tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it
             retry_count: 0,
         };
 
+        let tel = test_telemetry();
         with_test_env(script.to_str().unwrap(), repo.to_str().unwrap(), || {
             run_worker(
                 &spec_id,
@@ -727,6 +896,7 @@ tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it
                 &db_path,
                 &HookConfig::default(),
                 &config,
+                &tel,
             )
             .unwrap();
         });
@@ -751,6 +921,7 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
             retry_count: 0,
         };
 
+        let tel = test_telemetry();
         with_test_env(script.to_str().unwrap(), repo.to_str().unwrap(), || {
             let _ = run_worker(
                 &spec_id,
@@ -758,6 +929,7 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
                 &db_path,
                 &HookConfig::default(),
                 &config,
+                &tel,
             );
         });
 
@@ -781,6 +953,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
             retry_count: 0,
         };
 
+        let tel = test_telemetry();
         with_test_env(script.to_str().unwrap(), repo.to_str().unwrap(), || {
             run_worker(
                 &spec_id,
@@ -788,6 +961,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
                 &db_path,
                 &HookConfig::default(),
                 &config,
+                &tel,
             )
             .unwrap();
         });
@@ -819,8 +993,6 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
 
     #[test]
     fn test_phase_pipeline_all_approved() {
-        // execute mode: task_phases = [execute, task-verify], spec_phases = [critic]
-        // Mock returns Approved for all 3 calls (execute, task-verify, critic)
         let yaml = "title: \"Phase Pipeline Test\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n    verify: \"true\"\n";
         let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_ok", yaml);
         let config = WorkerConfig {
@@ -830,10 +1002,11 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved, // execute phase
-            PhaseOutcome::Approved, // task-verify phase
-            PhaseOutcome::Approved, // critic (post-task spec phase)
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
         ]);
+        let tel = test_telemetry();
 
         with_test_env("true", repo.to_str().unwrap(), || {
             run_worker_with_phases(
@@ -844,6 +1017,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
                 &config,
                 &registry,
                 &mock,
+                &tel,
             )
             .unwrap();
         });
@@ -855,7 +1029,6 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
 
     #[test]
     fn test_phase_pipeline_task_phase_fails() {
-        // execute phase succeeds, task-verify fails → task FAILED
         let yaml = "title: \"Phase Fail Test\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
         let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_fail", yaml);
         let config = WorkerConfig {
@@ -865,9 +1038,10 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved,                                    // execute phase
-            PhaseOutcome::Failed { reason: "verify failed".into() },   // task-verify fails
+            PhaseOutcome::Approved,
+            PhaseOutcome::Failed { reason: "verify failed".into() },
         ]);
+        let tel = test_telemetry();
 
         with_test_env("true", repo.to_str().unwrap(), || {
             run_worker_with_phases(
@@ -878,6 +1052,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
                 &config,
                 &registry,
                 &mock,
+                &tel,
             )
             .unwrap();
         });
@@ -889,7 +1064,6 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
 
     #[test]
     fn test_phase_pipeline_with_task_override() {
-        // Task specifies phases: ["execute"] — only one phase, no task-verify
         let yaml = "title: \"Override Test\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"Custom\"\n    status: PENDING\n    phases: [\"execute\"]\n";
         let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_override", yaml);
         let config = WorkerConfig {
@@ -899,9 +1073,10 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved, // execute phase (only task phase)
-            PhaseOutcome::Approved, // critic (post-task spec phase)
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
         ]);
+        let tel = test_telemetry();
 
         with_test_env("true", repo.to_str().unwrap(), || {
             run_worker_with_phases(
@@ -912,6 +1087,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
                 &config,
                 &registry,
                 &mock,
+                &tel,
             )
             .unwrap();
         });
@@ -932,8 +1108,9 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Timeout, // execute phase times out
+            PhaseOutcome::Timeout,
         ]);
+        let tel = test_telemetry();
 
         with_test_env("true", repo.to_str().unwrap(), || {
             run_worker_with_phases(
@@ -944,6 +1121,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
                 &config,
                 &registry,
                 &mock,
+                &tel,
             )
             .unwrap();
         });
@@ -955,8 +1133,6 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
 
     #[test]
     fn test_phase_pipeline_challenge_mode() {
-        // challenge mode: spec_phases = [plan-critique, critic]
-        //                 task_phases = [execute, code-review, task-verify]
         let yaml = "title: \"Challenge Test\"\nmode: challenge\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
         let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_challenge", yaml);
         let config = WorkerConfig {
@@ -966,12 +1142,13 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved, // plan-critique (pre-task spec phase)
-            PhaseOutcome::Approved, // execute
-            PhaseOutcome::Approved, // code-review
-            PhaseOutcome::Approved, // task-verify
-            PhaseOutcome::Approved, // critic (post-task spec phase)
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
         ]);
+        let tel = test_telemetry();
 
         with_test_env("true", repo.to_str().unwrap(), || {
             run_worker_with_phases(
@@ -982,6 +1159,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
                 &config,
                 &registry,
                 &mock,
+                &tel,
             )
             .unwrap();
         });
@@ -993,7 +1171,6 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
 
     #[test]
     fn test_phase_pipeline_multi_task() {
-        // Two tasks, both should get phase pipeline
         let yaml = "title: \"Multi Task\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"First\"\n    status: PENDING\n  - id: t-2\n    title: \"Second\"\n    status: PENDING\n    depends: [t-1]\n";
         let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_multi", yaml);
         let config = WorkerConfig {
@@ -1003,12 +1180,13 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            PhaseOutcome::Approved, // t-1 execute
-            PhaseOutcome::Approved, // t-1 task-verify
-            PhaseOutcome::Approved, // t-2 execute
-            PhaseOutcome::Approved, // t-2 task-verify
-            PhaseOutcome::Approved, // critic (post-task)
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
+            PhaseOutcome::Approved,
         ]);
+        let tel = test_telemetry();
 
         with_test_env("true", repo.to_str().unwrap(), || {
             run_worker_with_phases(
@@ -1019,6 +1197,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    tit
                 &config,
                 &registry,
                 &mock,
+                &tel,
             )
             .unwrap();
         });

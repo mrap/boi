@@ -1,4 +1,5 @@
 use crate::fmt::{ensure_db_dir, is_pid_alive};
+use crate::telemetry::Telemetry;
 use crate::{config, hooks, queue, worker};
 use std::path::PathBuf;
 
@@ -137,6 +138,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                                 .map(|t| t as u64)
                                 .unwrap_or(timeout);
 
+                            let tel = Telemetry::new(PathBuf::from(&qpath));
                             eprintln!("[boi daemon] starting worker for {}", spec_id);
                             let handle = std::thread::spawn(move || {
                                 let wc = worker::WorkerConfig {
@@ -145,7 +147,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                                     retry_count: retries,
                                 };
                                 if let Err(e) =
-                                    worker::run_worker(&spec_id, &spec_path, &qpath, &hc, &wc)
+                                    worker::run_worker(&spec_id, &spec_path, &qpath, &hc, &wc, &tel)
                                 {
                                     eprintln!("[boi daemon] worker error for {}: {}", spec_id, e);
                                 }
