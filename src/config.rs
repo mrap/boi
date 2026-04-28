@@ -68,7 +68,7 @@ impl Config {
             PathBuf::from(p)
         } else {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".boi").join("boi.db")
+            PathBuf::from(home).join(".boi").join("boi-rust.db")
         }
     }
 
