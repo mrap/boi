@@ -23,12 +23,19 @@ COPY --from=builder /build/target/release/boi /usr/local/bin/boi
 RUN chmod +x /usr/local/bin/boi
 
 # Set up test environment as root before switching users
-RUN mkdir -p $HOME/.boi/worktrees $HOME/.boi/logs $HOME/.boi/telemetry \
+RUN mkdir -p $HOME/.boi/worktrees $HOME/.boi/logs $HOME/.boi/telemetry $HOME/.boi/phases \
     && chown -R testuser:testuser $HOME
 
 # Copy test fixtures and mock claude
 COPY tests/rust-e2e/ $HOME/tests/
 RUN chmod +x $HOME/tests/*.sh 2>/dev/null || true
+
+# Copy phases to a core-specific directory (BOI_PHASES_DIR) so user overrides
+# in ~/.boi/phases/ are distinct from core phases
+COPY phases/ /opt/boi/phases/
+COPY templates/ $HOME/.boi/templates/
+# Also copy pipelines.toml to ~/.boi/ for pipeline resolution
+RUN cp /opt/boi/phases/pipelines.toml $HOME/.boi/pipelines.toml 2>/dev/null || true
 
 # Create mock claude binary
 RUN printf '#!/bin/sh\necho "{}"\nexit 0\n' > /usr/local/bin/claude \
@@ -46,5 +53,6 @@ RUN git config --global user.email "test@boi.test" \
 ENV BOI_HOME=$HOME/.boi
 ENV BOI_REPO=$HOME/test-repo
 ENV CLAUDE_BIN=claude
+ENV BOI_PHASES_DIR=/opt/boi/phases
 WORKDIR $HOME
 ENTRYPOINT ["bash", "tests/run-e2e.sh"]

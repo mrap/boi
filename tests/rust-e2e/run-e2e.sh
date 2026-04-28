@@ -793,6 +793,211 @@ fi
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════════
+bold "22. Phase loading from TOML"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Verify phases are loaded from ~/.boi/phases/
+out=$($BOI phases 2>&1); rc=$?
+assert_exit 0 $rc "phases command exits 0"
+assert_contains "$out" "execute" "phases shows execute"
+assert_contains "$out" "critic" "phases shows critic"
+assert_contains "$out" "task-verify" "phases shows task-verify"
+# Count: should have at least 5 core phases
+count=$(echo "$out" | grep -c "core\|override")
+if [ "$count" -ge 5 ]; then
+  assert_pass "at least 5 phases loaded from TOML ($count found)"
+else
+  assert_fail "expected 5+ phases, got $count"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "23. Pipeline config"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Verify pipelines.toml exists and is loaded
+# Dispatch with different modes and check they work
+out=$($BOI dispatch "$FIXTURES/valid-simple.yaml" --mode discover --dry-run 2>&1); rc=$?
+assert_exit 0 $rc "dispatch with --mode discover (dry-run) exits 0"
+out=$($BOI dispatch "$FIXTURES/valid-simple.yaml" --mode generate --dry-run 2>&1); rc=$?
+assert_exit 0 $rc "dispatch with --mode generate (dry-run) exits 0"
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "24. Cleanup on success"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Clean state
+$BOI stop 2>/dev/null || true
+rm -f ~/.boi/daemon.pid ~/.boi/daemon.heartbeat
+
+# Create a spec with workspace set so worktree is created
+cat > /tmp/cleanup-test.yaml <<YAML
+title: "Cleanup Test"
+mode: execute
+workspace: $HOME/test-repo
+tasks:
+  - id: t-1
+    title: "Simple task"
+    status: PENDING
+    spec: "echo done"
+    verify: "true"
+YAML
+CLEANUP_ID=$($BOI dispatch /tmp/cleanup-test.yaml 2>&1 | grep -o 'q-[0-9]*')
+if [ -n "$CLEANUP_ID" ]; then
+  assert_pass "cleanup test dispatched: $CLEANUP_ID"
+else
+  assert_fail "cleanup test dispatch failed"
+  CLEANUP_ID="q-999"
+fi
+
+# Start daemon in background
+$BOI daemon &
+DAEMON_PID=$!
+sleep 1
+
+# Wait for completion (mock claude exits 0, verify is "true")
+WAITED=0
+while [ $WAITED -lt 60 ]; do
+  s=$($BOI status "$CLEANUP_ID" 2>&1)
+  echo "$s" | grep -q "completed" && break
+  sleep 2
+  WAITED=$((WAITED + 2))
+done
+
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+
+# Check spec completed
+s=$($BOI status "$CLEANUP_ID" 2>&1)
+if echo "$s" | grep -q "completed"; then
+  assert_pass "cleanup test spec completed"
+else
+  assert_fail "cleanup test spec did not complete — status: $(echo "$s" | head -3)"
+fi
+
+# Check worktree was cleaned up
+if [ ! -d "$HOME/.boi/worktrees/$CLEANUP_ID" ]; then
+  assert_pass "worktree cleaned up after success"
+else
+  assert_fail "worktree NOT cleaned up after success"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "25. Cleanup skipped on failure"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Clean state
+$BOI stop 2>/dev/null || true
+rm -f ~/.boi/daemon.pid ~/.boi/daemon.heartbeat
+
+# Use fallback phases (no TOML) so task-verify runs the verify command directly
+# instead of spawning mock claude (which always approves).
+SAVED_PHASES_DIR="${BOI_PHASES_DIR:-}"
+unset BOI_PHASES_DIR
+
+# Create a spec that will fail verify
+cat > /tmp/fail-test.yaml <<YAML
+title: "Fail Test"
+mode: execute
+workspace: $HOME/test-repo
+tasks:
+  - id: t-1
+    title: "Will fail verify"
+    status: PENDING
+    spec: "echo hello"
+    verify: "false"
+YAML
+FAIL_ID=$($BOI dispatch /tmp/fail-test.yaml 2>&1 | grep -o 'q-[0-9]*')
+if [ -n "$FAIL_ID" ]; then
+  assert_pass "fail test dispatched: $FAIL_ID"
+else
+  assert_fail "fail test dispatch failed"
+  FAIL_ID="q-999"
+fi
+
+$BOI daemon &
+DAEMON_PID=$!
+sleep 1
+
+# Wait for spec to reach terminal state (failed or completed).
+# With fallback phases (task-verify requires_claude=false), the verify "false"
+# command runs directly and fails, triggering requeue→retry→fail cycle.
+WAITED=0
+while [ $WAITED -lt 60 ]; do
+  s=$($BOI status "$FAIL_ID" 2>&1)
+  echo "$s" | grep -q "failed\|completed" && break
+  sleep 2
+  WAITED=$((WAITED + 2))
+done
+
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+
+# Restore BOI_PHASES_DIR
+if [ -n "$SAVED_PHASES_DIR" ]; then
+  export BOI_PHASES_DIR="$SAVED_PHASES_DIR"
+fi
+
+# The spec should have failed
+s=$($BOI status "$FAIL_ID" 2>&1)
+if echo "$s" | grep -q "failed"; then
+  assert_pass "fail test spec reached failed state"
+else
+  assert_fail "fail test spec did not fail — status: $(echo "$s" | head -3)"
+fi
+
+# Check worktree was preserved (cleanup_on_failure defaults to false)
+if [ -d "$HOME/.boi/worktrees/$FAIL_ID" ]; then
+  assert_pass "worktree preserved after failure (cleanup_on_failure=false)"
+else
+  assert_fail "worktree was cleaned up on failure — should be preserved"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "26. User phase override"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Create a user phase that overrides execute
+mkdir -p $HOME/.boi/phases
+cat > $HOME/.boi/phases/execute.phase.toml <<TOML
+name = "execute"
+description = "Custom execute override"
+[worker]
+runtime = "claude"
+timeout = 300
+TOML
+out=$($BOI phases 2>&1)
+assert_contains "$out" "override" "execute shows as override after user phase"
+# Clean up
+rm -f $HOME/.boi/phases/execute.phase.toml
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "27. Phases detail view"
+# ══════════════════════════════════════════════════════════════════════════════
+
+out=$($BOI phases execute 2>&1); rc=$?
+assert_exit 0 $rc "phases execute exits 0"
+assert_contains "$out" "execute" "phases detail displays phase name"
+# Nonexistent phase
+out=$($BOI phases nonexistent 2>&1); rc=$?
+if [ "$rc" -ne 0 ]; then
+  assert_pass "phases nonexistent exits non-zero"
+else
+  assert_fail "phases nonexistent should exit non-zero"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ══════════════════════════════════════════════════════════════════════════════
 
