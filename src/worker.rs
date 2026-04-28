@@ -67,7 +67,7 @@ pub fn spawn_claude(
 ) -> Result<(bool, String), Box<dyn std::error::Error>> {
     let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
     let mut child = Command::new(&claude_bin)
-        .args(["-p", prompt, "--output-format", "json", "--dangerously-skip-permissions"])
+        .args(["-p", prompt, "--dangerously-skip-permissions"])
         .current_dir(worktree_path)
         .env("AGENT_DIR", worktree_path)
         .stdout(Stdio::piped())
@@ -167,7 +167,7 @@ enum WorkerState {
     /// Select the next ready task from the DAG
     TaskSelect,
     /// Run a task-level phase (execute, task-verify, code-review)
-    TaskPhase { task_id: String, phase_idx: usize },
+    TaskPhase { task_id: String, phase_idx: usize, requeue_attempts: usize },
     /// Task phase failed — retry the phase up to max_attempts
     TaskPhaseRetry { task_id: String, phase_idx: usize, attempt: u32 },
     /// Task verify/review failed — requeue back to a target phase
@@ -426,6 +426,7 @@ pub fn run_worker_with_phases(
                     state = WorkerState::TaskPhase {
                         task_id: task.id.clone(),
                         phase_idx: 0,
+                        requeue_attempts: 0,
                     };
                     break;
                 }
@@ -456,7 +457,7 @@ pub fn run_worker_with_phases(
                 }
             }
 
-            WorkerState::TaskPhase { ref task_id, phase_idx } => {
+            WorkerState::TaskPhase { ref task_id, phase_idx, requeue_attempts } => {
                 let task_id_owned = task_id.clone();
                 let task = match task_map.get(task_id_owned.as_str()) {
                     Some(t) => t,
@@ -502,6 +503,7 @@ pub fn run_worker_with_phases(
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
                             phase_idx: phase_idx + 1,
+                            requeue_attempts,
                         };
                         continue;
                     }
@@ -542,6 +544,7 @@ pub fn run_worker_with_phases(
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
                             phase_idx: phase_idx + 1,
+                            requeue_attempts,
                         };
                     }
                     PhaseOutcome::Skipped => {
@@ -549,6 +552,7 @@ pub fn run_worker_with_phases(
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
                             phase_idx: phase_idx + 1,
+                            requeue_attempts,
                         };
                     }
                     PhaseOutcome::AddedTasks(_) => {
@@ -556,6 +560,7 @@ pub fn run_worker_with_phases(
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
                             phase_idx: phase_idx + 1,
+                            requeue_attempts,
                         };
                     }
                     PhaseOutcome::Requeue { phase: ref target } => {
@@ -563,7 +568,7 @@ pub fn run_worker_with_phases(
                         state = WorkerState::TaskRequeue {
                             task_id: task_id_owned,
                             target_phase: target.clone(),
-                            attempts: 1,
+                            attempts: requeue_attempts + 1,
                         };
                     }
                     PhaseOutcome::Failed { reason } => {
@@ -694,6 +699,7 @@ pub fn run_worker_with_phases(
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
                             phase_idx: phase_idx + 1,
+                            requeue_attempts: 0,
                         };
                     }
                     PhaseOutcome::Requeue { phase: ref target } => {
@@ -776,6 +782,7 @@ pub fn run_worker_with_phases(
                 state = WorkerState::TaskPhase {
                     task_id: task_id_owned,
                     phase_idx: target_idx,
+                    requeue_attempts: attempts,
                 };
             }
 
