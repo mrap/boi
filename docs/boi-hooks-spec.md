@@ -644,20 +644,20 @@ The Python codebase hardcodes three `hex_emit.py` calls. In the Rust port, these
 ```yaml
 hooks:
   on_dispatch:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.dispatched"
+    command: >-
+      python3 ~/.hex-events/hex_emit.py boi.spec.dispatched "{\"spec_id\": \"$BOI_SPEC_ID\"}" boi-hooks
     blocking: false
-    timeout: 10
   on_complete:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.completed"
+    command: >-
+      python3 ~/.hex-events/hex_emit.py boi.spec.completed "{\"spec_id\": \"$BOI_SPEC_ID\"}" boi-hooks
     blocking: false
-    timeout: 10
   on_fail:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.failed"
+    command: >-
+      python3 ~/.hex-events/hex_emit.py boi.spec.failed "{\"spec_id\": \"$BOI_SPEC_ID\"}" boi-hooks
     blocking: false
-    timeout: 10
 ```
 
-The hex_emit.py script reads JSON from stdin unchanged — the payload format is a superset of what Python currently sends.
+Note: use double quotes (not single quotes) around the JSON argument so `$BOI_SPEC_ID` expands in the shell. The YAML `>-` block scalar preserves the `\"` escapes literally.
 
 ---
 
