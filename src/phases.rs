@@ -306,10 +306,17 @@ impl PhaseRegistry {
         for phase in phases {
             core.insert(phase.name.clone(), phase);
         }
-        PhaseRegistry {
+        let mut registry = PhaseRegistry {
             core,
             user: HashMap::new(),
+        };
+
+        let user_dir = user_phases_dir();
+        if user_dir.is_dir() {
+            registry.load_user_phases(&user_dir);
         }
+
+        registry
     }
 
     /// Create a registry loading phases from a specific directory.
@@ -509,25 +516,39 @@ fn load_phase_file_with_base(path: &Path, base_dir: Option<&Path>) -> Result<Pha
         format!("phase file missing name: {}", path.display())
     })?;
 
-    // If prompt_template is a file path (not inline content), resolve and read it
-    if let Some(base) = base_dir {
-        if !phase.prompt_template.is_empty()
-            && !phase.prompt_template.contains('\n')
-            && phase.prompt_template.ends_with(".md")
-        {
-            let template_path = base.join(&phase.prompt_template);
-            if template_path.is_file() {
-                match std::fs::read_to_string(&template_path) {
-                    Ok(template_content) => {
-                        phase.prompt_template = template_content;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "WARN: failed to read prompt template {}: {}",
-                            template_path.display(),
-                            e
-                        );
-                    }
+    // If prompt_template is a file path (not inline content), resolve and read it.
+    // Search order: ~/.boi/ (user override) → repo root (default)
+    if !phase.prompt_template.is_empty()
+        && !phase.prompt_template.contains('\n')
+        && phase.prompt_template.ends_with(".md")
+    {
+        let template_ref = &phase.prompt_template;
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let user_path = PathBuf::from(&home).join(".boi").join(template_ref);
+        let repo_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(template_ref);
+        let base_path = base_dir.map(|b| b.join(template_ref));
+
+        let resolved = if user_path.is_file() {
+            Some(user_path)
+        } else if repo_path.is_file() {
+            Some(repo_path)
+        } else if let Some(ref bp) = base_path {
+            if bp.is_file() { Some(bp.clone()) } else { None }
+        } else {
+            None
+        };
+
+        if let Some(template_path) = resolved {
+            match std::fs::read_to_string(&template_path) {
+                Ok(template_content) => {
+                    phase.prompt_template = template_content;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARN: failed to read prompt template {}: {}",
+                        template_path.display(),
+                        e
+                    );
                 }
             }
         }
@@ -536,14 +557,16 @@ fn load_phase_file_with_base(path: &Path, base_dir: Option<&Path>) -> Result<Pha
     Ok(phase)
 }
 
-/// Determine the core phases directory.
+/// Determine the core phases directory from the repo.
 ///
 /// Priority:
-/// 1. `BOI_INSTALL_DIR` env var → `{BOI_INSTALL_DIR}/phases/`
-/// 2. Binary's parent directory → `{binary_dir}/phases/`
+/// 1. `BOI_PHASES_DIR` env var (tests, development)
+/// 2. Repo root compiled at build time via CARGO_MANIFEST_DIR
 /// 3. None (use fallback defaults)
+///
+/// ~/.boi/phases/ is NOT checked here — it's loaded separately as user
+/// overrides via load_user_phases() in PhaseRegistry::new().
 fn core_phases_dir() -> Option<PathBuf> {
-    // 1. Explicit override via env var (tests, development)
     if let Ok(dir) = std::env::var("BOI_PHASES_DIR") {
         let path = PathBuf::from(&dir);
         if path.is_dir() {
@@ -551,16 +574,15 @@ fn core_phases_dir() -> Option<PathBuf> {
         }
     }
 
-    // 2. Well-known location: ~/.boi/phases/
-    // This is where install.sh copies the phase configs.
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let boi_phases = PathBuf::from(&home).join(".boi").join("phases");
-    if boi_phases.is_dir() {
-        return Some(boi_phases);
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_phases = repo_root.join("phases");
+    if repo_phases.is_dir() {
+        return Some(repo_phases);
     }
 
     None
 }
+
 
 /// Load core phases from TOML files in the phases/ directory.
 /// Returns empty vec if no directory found (caller should use fallback).
@@ -962,7 +984,7 @@ approve_signal = ""
 
         let exec = registry.get("execute").unwrap();
         assert_eq!(exec.name, "execute");
-        assert_eq!(exec.prompt_template, "templates/worker-prompt.md");
+        assert!(exec.prompt_template.contains("BOI Worker"), "template should be resolved, got: {}...", &exec.prompt_template[..80.min(exec.prompt_template.len())]);
 
         let _ = fs::remove_dir_all(&dir);
     }
