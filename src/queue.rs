@@ -112,7 +112,7 @@ fn gen_id(prefix: char, conn: &Connection) -> String {
     let table = if prefix == 's' { "specs" } else { "tasks" };
     loop {
         let bytes: [u8; 2] = rng.gen();
-        let candidate = format!("{}{:02x}{:02x}", prefix, bytes[0], bytes[1]);
+        let candidate = format!("{}{:02X}{:02X}", prefix, bytes[0], bytes[1]);
         let exists: bool = conn
             .query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE id = ?1)", table),
@@ -273,7 +273,7 @@ impl Queue {
     ) -> Result<String> {
         let tx = self.conn.unchecked_transaction()?;
 
-        let id = gen_id('s', &tx);
+        let id = gen_id('S', &tx);
 
         let now = Utc::now().to_rfc3339();
         let mode = spec.mode.as_deref().unwrap_or("execute");
@@ -287,7 +287,7 @@ impl Queue {
 
         let mut yaml_to_canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for task in spec.tasks.iter() {
-            let canonical_task_id = gen_id('t', &tx);
+            let canonical_task_id = gen_id('T', &tx);
             yaml_to_canonical.insert(task.id.clone(), canonical_task_id.clone());
         }
 
@@ -651,7 +651,7 @@ impl Queue {
         verify: Option<&str>,
         depends: &[String],
     ) -> Result<String> {
-        let task_id = gen_id('t', &self.conn);
+        let task_id = gen_id('T', &self.conn);
         let depends_json = serde_json::to_string(depends).unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
             "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)
@@ -929,13 +929,13 @@ mod tests {
 
     fn is_valid_spec_id(id: &str) -> bool {
         id.len() == 5
-            && id.starts_with('s')
+            && id.starts_with('S')
             && id[1..].chars().all(|c| c.is_ascii_hexdigit())
     }
 
     fn is_valid_task_id(id: &str) -> bool {
         id.len() == 5
-            && id.starts_with('t')
+            && id.starts_with('T')
             && id[1..].chars().all(|c| c.is_ascii_hexdigit())
     }
 
