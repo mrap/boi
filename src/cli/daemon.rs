@@ -3,6 +3,74 @@ use crate::telemetry::Telemetry;
 use crate::{config, hooks, queue, worker};
 use std::path::PathBuf;
 
+pub fn cmd_start() {
+    let pid_path = daemon_pid_path();
+    if check_existing_daemon(&pid_path) {
+        if let Ok(content) = std::fs::read_to_string(&pid_path) {
+            eprintln!("daemon already running (pid {})", content.trim());
+        } else {
+            eprintln!("daemon already running");
+        }
+        std::process::exit(1);
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let log_dir = PathBuf::from(&home).join(".boi").join("logs");
+    std::fs::create_dir_all(&log_dir).ok();
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let log_path = log_dir.join(format!("daemon-{}.log", timestamp));
+    let log_file = match std::fs::File::create(&log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error creating log file: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error finding current executable: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let stderr_file = match log_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error cloning log file handle: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let child = match std::process::Command::new(&exe)
+        .args(["daemon", "foreground"])
+        .stdout(log_file)
+        .stderr(stderr_file)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error spawning daemon: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("daemon started (pid {})", child.id());
+    println!("log: {}", log_path.display());
+}
+
+pub fn cmd_restart() {
+    let pid_path = daemon_pid_path();
+    if check_existing_daemon(&pid_path) {
+        cmd_stop();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    cmd_start();
+}
+
 pub fn daemon_pid_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".boi").join("daemon.pid")
@@ -75,6 +143,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         task_timeout_secs: cfg.task_timeout_secs(),
         retry_count: cfg.retry_count(),
         cleanup_on_failure: cfg.cleanup_on_failure(),
+        claude_bin: cfg.claude_bin(),
     };
 
     // Crash recovery: reset any specs stuck in 'running' or 'assigning' back to 'queued'
@@ -133,6 +202,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                             let timeout = wc.task_timeout_secs;
                             let retries = wc.retry_count;
                             let cleanup_fail = wc.cleanup_on_failure;
+                            let cbin = wc.claude_bin.clone();
 
                             // Use per-spec timeout if set, otherwise default
                             let spec_timeout = rec
@@ -148,6 +218,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                                     task_timeout_secs: spec_timeout,
                                     retry_count: retries,
                                     cleanup_on_failure: cleanup_fail,
+                                    claude_bin: cbin,
                                 };
                                 if let Err(e) =
                                     worker::run_worker(&spec_id, &spec_path, &qpath, &hc, &wc, &tel)
