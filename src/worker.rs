@@ -113,9 +113,10 @@ pub fn spawn_claude(
         args.push("--model".to_string());
         args.push(m.to_string());
     }
-    let flags: Vec<&str> = args.iter().filter(|a| a.starts_with('-')).map(|s| s.as_str()).collect();
-    boi_log!("spawning claude\n  bin:    {}\n  flags:  {}\n  cwd:    {}\n  prompt: {} chars",
-        claude_bin, flags.join(" "), worktree_path, prompt.len());
+    let args_display: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
+    boi_log!("spawning claude\n  bin:    {}\n  args:   {}\n  cwd:    {}\n  prompt: {} chars\n  prompt: {}",
+        claude_bin, args_display.join(" "), worktree_path, prompt.len(),
+        prompt.chars().take(500).collect::<String>());
     let mut child = Command::new(&claude_bin)
         .args(&args)
         .current_dir(worktree_path)
