@@ -401,7 +401,10 @@ pub fn run_worker_with_phases(
     let spec_content_raw = std::fs::read_to_string(spec_path)?;
     let boi_spec = spec::parse_unchecked(&spec_content_raw)?;
 
-    let worktree_path: String = match &boi_spec.workspace {
+    // Extract original workspace path before worktree creation (needed for path substitution).
+    let original_workspace = boi_spec.workspace.clone();
+
+    let worktree_path: String = match &original_workspace {
         Some(ws) if !ws.is_empty() => {
             let worktree_dir = crate::worktree::create(spec_id, ws)?;
             worktree_dir.to_str()
@@ -422,11 +425,24 @@ pub fn run_worker_with_phases(
         }
     };
 
-    // Rewrite workspace in spec content so Claude edits the worktree, not the source repo.
-    let spec_content = if let Some(ws) = &boi_spec.workspace {
-        spec_content_raw.replace(ws, &worktree_path)
+    // Rewrite workspace paths in spec content AND re-parse so task objects (including verify
+    // commands) also get rewritten paths. Without re-parsing, verify commands would still
+    // reference the original repo path, causing `cd /original/path && ...` to escape the worktree.
+    let (spec_content, boi_spec) = if let Some(ref ws) = original_workspace {
+        let rewritten = spec_content_raw.replace(ws.as_str(), &worktree_path);
+        let rewritten_spec = spec::parse_unchecked(&rewritten)?;
+
+        for task in &rewritten_spec.tasks {
+            if let Some(ref verify) = task.verify {
+                if verify.contains(ws.as_str()) {
+                    boi_log!("WARNING: task {} verify still references original workspace '{}'", task.id, ws);
+                }
+            }
+        }
+
+        (rewritten, rewritten_spec)
     } else {
-        spec_content_raw
+        (spec_content_raw, boi_spec)
     };
 
     let order = match spec::topological_sort(&boi_spec) {
@@ -1356,84 +1372,6 @@ fn emit_phase_verdict(
         payload["task_id"] = serde_json::Value::String(tid.to_string());
     }
     telemetry.emit("boi.phase.outcome", LogLevel::Info, &payload);
-}
-
-/// Poll the queue every 5 seconds and spawn workers up to `config.max_workers`.
-/// Runs until the process is killed.
-pub fn run_daemon(queue_path: &str, hook_config: HookConfig, config: WorkerConfig) {
-    use std::sync::{Arc, Mutex};
-
-    let active: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let telemetry = Arc::new(Telemetry::new(
-        std::path::PathBuf::from(queue_path).to_path_buf(),
-    ));
-
-    eprintln!("[boi daemon] started, max_workers={}", config.max_workers);
-
-    loop {
-        {
-            let mut workers = active.lock().unwrap();
-            let mut i = 0;
-            while i < workers.len() {
-                if workers[i].is_finished() {
-                    let handle = workers.remove(i);
-                    if let Err(panic_payload) = handle.join() {
-                        let msg = panic_payload
-                            .downcast_ref::<String>()
-                            .map(|s| s.as_str())
-                            .or_else(|| panic_payload.downcast_ref::<&str>().copied())
-                            .unwrap_or("unknown panic");
-                        eprintln!("[boi daemon] worker thread panicked: {}", msg);
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-
-            if workers.len() < config.max_workers as usize {
-                match Queue::open(queue_path) {
-                    Ok(queue) => match queue.dequeue() {
-                        Ok(Some(rec)) => {
-                            let spec_id = rec.id.clone();
-                            let spec_path = rec.spec_path.clone().unwrap_or_default();
-                            let qpath = queue_path.to_string();
-                            let hc = hook_config.clone();
-                            let timeout = config.task_timeout_secs;
-                            let retries = config.retry_count;
-                            let claude_bin = config.claude_bin.clone();
-                            let tel = telemetry.clone();
-
-                            eprintln!("[boi daemon] starting worker for {}", spec_id);
-                            let handle = std::thread::spawn(move || {
-                                let wc = WorkerConfig {
-                                    max_workers: 1,
-                                    task_timeout_secs: timeout,
-                                    retry_count: retries,
-                                    cleanup_on_failure: false,
-                                    claude_bin,
-                                };
-                                if let Err(e) =
-                                    run_worker(&spec_id, &spec_path, &qpath, &hc, &wc, &tel)
-                                {
-                                    eprintln!(
-                                        "[boi daemon] worker error for {}: {}",
-                                        spec_id, e
-                                    );
-                                }
-                            });
-                            workers.push(handle);
-                        }
-                        Ok(None) => {}
-                        Err(e) => eprintln!("[boi daemon] dequeue error: {}", e),
-                    },
-                    Err(e) => eprintln!("[boi daemon] queue open error: {}", e),
-                }
-            }
-        }
-
-        std::thread::sleep(Duration::from_secs(5));
-    }
 }
 
 #[cfg(test)]

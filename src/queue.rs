@@ -43,17 +43,6 @@ pub struct IterationRecord {
 }
 
 #[derive(Debug)]
-pub struct EventRecord {
-    pub seq: i64,
-    pub timestamp: String,
-    pub spec_id: Option<String>,
-    pub event_type: String,
-    pub message: Option<String>,
-    pub data: Option<String>,
-    pub level: String,
-}
-
-#[derive(Debug)]
 pub struct WorkerRecord {
     pub id: String,
     pub worktree_path: Option<String>,
@@ -62,18 +51,6 @@ pub struct WorkerRecord {
     pub start_time: Option<String>,
     pub current_phase: Option<String>,
     pub current_task_id: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct ProcessRecord {
-    pub pid: Option<i64>,
-    pub spec_id: String,
-    pub worker_id: Option<String>,
-    pub iteration: Option<i64>,
-    pub phase: Option<String>,
-    pub started_at: Option<String>,
-    pub ended_at: Option<String>,
-    pub exit_code: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -121,6 +98,7 @@ impl Queue {
         let conn = Connection::open(path)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+            PRAGMA foreign_keys=ON;
 
             CREATE TABLE IF NOT EXISTS specs (
                 id TEXT PRIMARY KEY,
@@ -354,8 +332,9 @@ impl Queue {
 
         let rec = {
             let mut stmt = tx.prepare(
-                "SELECT id, title, mode, status, spec_path, total_tasks,
-                        (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id AND tasks.status IN ('DONE', 'SKIPPED')) as completed_tasks,
+                "SELECT id, title, mode, status, spec_path,
+                        (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id) as total_tasks,
+                        completed_tasks,
                         priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                         max_iterations, iteration, project, phase, worker_timeout_seconds
                  FROM specs WHERE id = ?1",
@@ -375,6 +354,10 @@ impl Queue {
                     "UPDATE tasks SET status = ?1, completed_at = ?2
                      WHERE spec_id = ?3 AND id = ?4",
                     params![status, now, spec_id, task_id],
+                )?;
+                self.conn.execute(
+                    "UPDATE specs SET completed_tasks = completed_tasks + 1 WHERE id = ?1",
+                    params![spec_id],
                 )?;
             }
             "RUNNING" => {
@@ -421,8 +404,9 @@ impl Queue {
 
     pub fn status(&self, spec_id: &str) -> Result<Option<SpecStatus>> {
         let spec = match self.conn.query_row(
-            "SELECT id, title, mode, status, spec_path, total_tasks,
-                        (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id AND tasks.status IN ('DONE', 'SKIPPED')) as completed_tasks,
+            "SELECT id, title, mode, status, spec_path,
+                    (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id) as total_tasks,
+                    completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds
              FROM specs WHERE id = ?1",
@@ -448,8 +432,9 @@ impl Queue {
 
     pub fn status_all(&self) -> Result<Vec<SpecRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, mode, status, spec_path, total_tasks,
-                        (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id AND tasks.status IN ('DONE', 'SKIPPED')) as completed_tasks,
+            "SELECT id, title, mode, status, spec_path,
+                    (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id) as total_tasks,
+                    completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds
              FROM specs
@@ -466,15 +451,6 @@ impl Queue {
 
     pub fn cancel(&self, spec_id: &str) -> Result<()> {
         self.update_spec(spec_id, "cancelled")
-    }
-
-    /// Resume a paused spec by resetting its status to "queued".
-    pub fn resume_spec(&self, spec_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE specs SET status = 'queued' WHERE id = ?1 AND status = 'paused'",
-            params![spec_id],
-        )?;
-        Ok(())
     }
 
     pub fn set_spec_fields(
@@ -528,43 +504,6 @@ impl Queue {
         Ok(())
     }
 
-    pub fn increment_iteration(&self, spec_id: &str) -> Result<i64> {
-        self.conn.execute(
-            "UPDATE specs SET iteration = iteration + 1 WHERE id = ?1",
-            params![spec_id],
-        )?;
-        let iter: i64 = self.conn.query_row(
-            "SELECT iteration FROM specs WHERE id = ?1",
-            params![spec_id],
-            |row| row.get(0),
-        )?;
-        Ok(iter)
-    }
-
-    // --- Iteration records ---
-
-    pub fn insert_iteration(&self, rec: &IterationRecord) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO iterations
-             (spec_id, iteration, phase, worker_id, started_at, ended_at,
-              duration_seconds, tasks_completed, tasks_added, exit_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                rec.spec_id,
-                rec.iteration,
-                rec.phase,
-                rec.worker_id,
-                rec.started_at,
-                rec.ended_at,
-                rec.duration_seconds,
-                rec.tasks_completed,
-                rec.tasks_added,
-                rec.exit_code,
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn get_iterations(&self, spec_id: &str) -> Result<Vec<IterationRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT spec_id, iteration, phase, worker_id, started_at, ended_at,
@@ -609,49 +548,6 @@ impl Queue {
         Ok(())
     }
 
-    pub fn get_events(&self, spec_id: Option<&str>, limit: usize) -> Result<Vec<EventRecord>> {
-        let (sql, p_spec_id);
-        if let Some(sid) = spec_id {
-            sql = "SELECT seq, timestamp, spec_id, event_type, message, data, level
-                   FROM events WHERE spec_id = ?1 ORDER BY seq DESC LIMIT ?2";
-            p_spec_id = Some(sid.to_string());
-        } else {
-            sql = "SELECT seq, timestamp, spec_id, event_type, message, data, level
-                   FROM events ORDER BY seq DESC LIMIT ?1";
-            p_spec_id = None;
-        }
-
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = if let Some(ref sid) = p_spec_id {
-            stmt.query_map(params![sid, limit as i64], row_to_event)?
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            stmt.query_map(params![limit as i64], row_to_event)?
-                .collect::<Result<Vec<_>>>()?
-        };
-        Ok(rows)
-    }
-
-    // --- Worker records ---
-
-    pub fn upsert_worker(&self, rec: &WorkerRecord) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO workers
-             (id, worktree_path, current_spec_id, current_pid, start_time, current_phase, current_task_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                rec.id,
-                rec.worktree_path,
-                rec.current_spec_id,
-                rec.current_pid,
-                rec.start_time,
-                rec.current_phase,
-                rec.current_task_id,
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn get_workers(&self) -> Result<Vec<WorkerRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, worktree_path, current_spec_id, current_pid, start_time,
@@ -672,36 +568,6 @@ impl Queue {
             })?
             .collect::<Result<Vec<_>>>()?;
         Ok(rows)
-    }
-
-    pub fn clear_worker(&self, worker_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE workers SET current_spec_id = NULL, current_pid = NULL,
-                    current_phase = NULL, current_task_id = NULL
-             WHERE id = ?1",
-            params![worker_id],
-        )?;
-        Ok(())
-    }
-
-    // --- Process records ---
-
-    pub fn insert_process(&self, rec: &ProcessRecord) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO processes (pid, spec_id, worker_id, iteration, phase, started_at, ended_at, exit_code)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                rec.pid,
-                rec.spec_id,
-                rec.worker_id,
-                rec.iteration,
-                rec.phase,
-                rec.started_at,
-                rec.ended_at,
-                rec.exit_code,
-            ],
-        )?;
-        Ok(())
     }
 
     // --- Phase run records ---
@@ -842,8 +708,17 @@ impl Queue {
     /// Reset any specs stuck in 'running' or 'assigning' back to 'queued'.
     /// Called on daemon startup to recover from crashes.
     pub fn recover_stuck_specs(&self) -> Result<usize> {
+        // Reset RUNNING tasks back to PENDING before resetting specs,
+        // so the subquery still matches specs in ('running', 'assigning').
         self.conn.execute(
-            "UPDATE specs SET status = 'queued' WHERE status IN ('running', 'assigning')",
+            "UPDATE tasks SET status = 'PENDING', started_at = NULL
+             WHERE spec_id IN (SELECT id FROM specs WHERE status IN ('running', 'assigning'))
+               AND status = 'RUNNING'",
+            [],
+        )?;
+        self.conn.execute(
+            "UPDATE specs SET status = 'queued', worker_id = NULL, started_at = NULL, error = NULL
+             WHERE status IN ('running', 'assigning')",
             [],
         )
     }
@@ -862,21 +737,6 @@ impl Queue {
             "DELETE FROM phase_runs WHERE started_at < ?1",
             params![cutoff.to_rfc3339()],
         )
-    }
-
-    /// Get lifetime totals for failed and completed specs across all history
-    pub fn lifetime_stats(&self) -> Result<(i64, i64)> {
-        let failed: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM specs WHERE status = 'failed'",
-            [],
-            |r| r.get(0),
-        )?;
-        let completed: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM specs WHERE status = 'completed'",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok((failed, completed))
     }
 
     /// Get lifetime counts of failed and completed specs (across entire DB history)
@@ -972,18 +832,6 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
         project: row.get(16)?,
         phase: row.get::<_, Option<String>>(17)?.unwrap_or_else(|| "execute".to_string()),
         worker_timeout_seconds: row.get(18)?,
-    })
-}
-
-fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
-    Ok(EventRecord {
-        seq: row.get(0)?,
-        timestamp: row.get(1)?,
-        spec_id: row.get(2)?,
-        event_type: row.get(3)?,
-        message: row.get(4)?,
-        data: row.get(5)?,
-        level: row.get(6)?,
     })
 }
 
