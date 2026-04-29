@@ -1,11 +1,42 @@
 use crate::cli::daemon::{daemon_heartbeat_path, is_daemon_locked};
 use crate::config;
+use crate::failure::{truncate_display, FailureReason};
 use crate::fmt::{
     display_width, elapsed_since, ensure_db_dir, progress_bar, term_width, time_ago, truncate,
     BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW,
 };
 use crate::queue;
 use serde_json::json;
+
+/// Render a single error line for a failed spec.
+/// In normal mode: one DIM RED line with short_summary, truncated to terminal width.
+/// In verbose mode: multi-line DIM RED detail block.
+fn render_error_line(error_text: &str, verbose: bool, width: usize) -> String {
+    let reason = FailureReason::from_db(error_text);
+    if verbose {
+        let detail = reason.detail();
+        let mut out = String::new();
+        for line in detail.lines() {
+            out.push_str(&format!("{}{}{}{}{}\n", DIM, RED, "    ", line, RESET));
+        }
+        out
+    } else {
+        let summary = reason.short_summary();
+        let prefix = "    \u{2514}\u{2500} "; // "    └─ "
+        let prefix_width: usize = 7; // 4 spaces + └ + ─ + space
+        let budget = width.saturating_sub(prefix_width);
+        let truncated = truncate_display(&summary, budget);
+        format!("{}{}{}{}{}\n", DIM, RED, prefix, truncated, RESET)
+    }
+}
+
+/// Returns an error line for a failed spec's error column, or empty string if no error.
+fn maybe_render_error(error: Option<&str>, verbose: bool, width: usize) -> String {
+    match error {
+        Some(e) if !e.is_empty() => render_error_line(e, verbose, width),
+        _ => String::new(),
+    }
+}
 
 pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
     match q.status(id) {
@@ -69,7 +100,7 @@ pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
     }
 }
 
-fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
+fn render_status(spec_id: Option<&str>, all: bool, verbose: bool, db_str: &str) -> String {
     ensure_db_dir(db_str);
 
     let daemon_running = is_daemon_locked();
@@ -113,7 +144,7 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
     let queued: Vec<&queue::SpecRecord> = specs.iter().filter(|s| s.status == "queued").collect();
 
     let six_hours_ago = chrono::Utc::now() - chrono::Duration::hours(6);
-    let finished: Vec<&queue::SpecRecord> = specs
+    let mut finished: Vec<&queue::SpecRecord> = specs
         .iter()
         .filter(|s| {
             (s.status == "completed" || s.status == "failed" || s.status == "cancelled")
@@ -125,6 +156,9 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
                     }))
         })
         .collect();
+    // Sort recently-finished by completed_at DESC (most recent first).
+    // Specs without completed_at sink to the bottom.
+    finished.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
 
     // Layout constants (display column widths, not byte widths)
     // "▸ sa7f3  " = icon(1) + space(1) + id(5) + gap(2) = 9 display cols before title
@@ -269,6 +303,10 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
                 " ".repeat(spaces),
                 right,
             ));
+
+            if s.status == "failed" {
+                out.push_str(&maybe_render_error(s.error.as_deref(), verbose, width));
+            }
         }
         out.push('\n');
     }
@@ -353,15 +391,15 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
     out
 }
 
-pub fn cmd_status(spec_id: Option<&str>, all: bool, db_str: &str) {
-    println!("{}", render_status(spec_id, all, db_str));
+pub fn cmd_status(spec_id: Option<&str>, all: bool, verbose: bool, db_str: &str) {
+    println!("{}", render_status(spec_id, all, verbose, db_str));
 }
 
-pub fn cmd_status_watch(spec_id: Option<&str>, all: bool, db_str: &str) {
+pub fn cmd_status_watch(spec_id: Option<&str>, all: bool, verbose: bool, db_str: &str) {
     loop {
         // Clear screen
         print!("\x1b[2J\x1b[H");
-        print!("{}", render_status(spec_id, all, db_str));
+        print!("{}", render_status(spec_id, all, verbose, db_str));
         let now = chrono::Utc::now().format("%H:%M:%S");
         println!("\n{}Updated at {} — Ctrl+C to exit{}", DIM, now, RESET);
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -474,4 +512,74 @@ pub fn cmd_status_json(spec_id: Option<&str>, all: bool, db_str: &str) {
         serde_json::to_string_pretty(&json!({ "specs": items }))
             .expect("json! macro output is always serializable")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for ch in chars.by_ref() {
+                    if ch == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn status_render_error_no_error_returns_empty() {
+        let out = maybe_render_error(None, false, 80);
+        assert!(out.is_empty(), "None error should produce empty output, got: {:?}", out);
+    }
+
+    #[test]
+    fn status_render_error_empty_string_returns_empty() {
+        let out = maybe_render_error(Some(""), false, 80);
+        assert!(out.is_empty(), "empty error should produce empty output, got: {:?}", out);
+    }
+
+    #[test]
+    fn status_render_error_typed_error_shows_short_summary() {
+        let err = r#"{"ProviderRateLimit":{"provider":"anthropic","retry_after_s":null}}"#;
+        let out = render_error_line(err, false, 80);
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("\u{2514}\u{2500}"), "should contain └─: {:?}", plain);
+        assert!(plain.contains("rate limited by anthropic"), "should show short summary: {:?}", plain);
+    }
+
+    #[test]
+    fn status_render_error_long_error_truncated_with_ellipsis() {
+        let long_msg = "x".repeat(200);
+        let err = format!(r#"{{"Other":{{"message":"{}"}}}}"#, long_msg);
+        // Narrow terminal of 30 cols → prefix(7) + 23 cols for summary
+        let out = render_error_line(&err, false, 30);
+        let plain = strip_ansi(&out);
+        assert!(
+            plain.contains('\u{2026}'),
+            "should be truncated with ellipsis (…): {:?}",
+            plain
+        );
+    }
+
+    #[test]
+    fn status_render_error_verbose_shows_detail() {
+        let err = r#"{"ProviderHttp":{"provider":"anthropic","status":500,"body_excerpt":"internal server error"}}"#;
+        let out = render_error_line(err, true, 80);
+        let plain = strip_ansi(&out);
+        assert!(plain.contains("ProviderHttp"), "verbose should contain ProviderHttp: {:?}", plain);
+        assert!(
+            plain.contains("internal server error"),
+            "verbose should show body excerpt: {:?}",
+            plain
+        );
+    }
 }

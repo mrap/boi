@@ -73,8 +73,10 @@ pub struct PhaseConfig {
     pub can_add_tasks: bool,
     pub can_fail_spec: bool,
     pub requires_claude: bool,
-    /// Worker runtime: "claude", "deterministic", or None (defaults to "claude").
+    /// Worker runtime: "claude", "deterministic", "openrouter", or None (defaults to "claude").
     pub runtime: Option<String>,
+    /// For runtime=openrouter: env var holding the API key (default OPENROUTER_API_KEY).
+    pub api_key_env: Option<String>,
     /// Builtin handler name for deterministic phases, e.g. "builtin:commit".
     pub completion_handler: Option<String>,
     pub approve_signal: Option<String>,
@@ -88,6 +90,9 @@ pub struct PhaseConfig {
     pub effort: Option<String>,
     pub hooks_pre: Vec<String>,
     pub hooks_post: Vec<String>,
+    /// When true, append --bare to the claude CLI invocation (skips session/MCP/skill loading).
+    #[serde(default)]
+    pub bare: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +149,10 @@ struct WorkerSection {
     model: Option<String>,
     #[serde(default)]
     code_model: Option<String>,
+    #[serde(default)]
+    bare: Option<bool>,
+    #[serde(default)]
+    api_key_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +225,7 @@ impl PhaseConfig {
             .unwrap_or_else(|| derive_can_fail_spec(&name));
 
         let runtime = toml.worker.as_ref().and_then(|w| w.runtime.clone());
+        let api_key_env = toml.worker.as_ref().and_then(|w| w.api_key_env.clone());
         let completion_handler = toml.completion_handler.clone();
 
         // Derive requires_claude: explicit [phase] setting wins, else derive from worker.runtime.
@@ -240,6 +250,7 @@ impl PhaseConfig {
         let effort = toml.worker.as_ref().and_then(|w| w.effort.clone());
         let hooks_pre = toml.hooks.as_ref().and_then(|h| h.pre.clone()).unwrap_or_default();
         let hooks_post = toml.hooks.as_ref().and_then(|h| h.post.clone()).unwrap_or_default();
+        let bare = toml.worker.as_ref().and_then(|w| w.bare).unwrap_or(false);
 
         Some(PhaseConfig {
             name,
@@ -252,6 +263,7 @@ impl PhaseConfig {
             can_fail_spec,
             requires_claude,
             runtime,
+            api_key_env,
             completion_handler,
             approve_signal,
             reject_signal,
@@ -264,6 +276,7 @@ impl PhaseConfig {
             effort,
             hooks_pre,
             hooks_post,
+            bare,
         })
     }
 }
@@ -713,6 +726,7 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             can_fail_spec: false,
             requires_claude: true,
             runtime: Some("claude".into()),
+            api_key_env: None,
             completion_handler: None,
             approve_signal: None,
             reject_signal: None,
@@ -725,6 +739,7 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         },
         PhaseConfig {
             name: "task-verify".into(),
@@ -737,6 +752,7 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             can_fail_spec: false,
             requires_claude: false,
             runtime: None,
+            api_key_env: None,
             completion_handler: None,
             approve_signal: None,
             reject_signal: None,
@@ -749,6 +765,7 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         },
     ]
 }
@@ -1308,6 +1325,7 @@ approve_signal = ""
             can_fail_spec: false,
             requires_claude: true,
             runtime: None,
+            api_key_env: None,
             completion_handler: None,
             approve_signal: None,
             reject_signal: None,
@@ -1320,6 +1338,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let prompt = build_phase_prompt(&phase, "title: Test\ntasks: []", None, &std::collections::HashMap::new());
         assert!(prompt.contains("Review this spec carefully."));
@@ -1340,6 +1359,7 @@ approve_signal = ""
             can_fail_spec: false,
             requires_claude: true,
             runtime: None,
+            api_key_env: None,
             completion_handler: None,
             approve_signal: None,
             reject_signal: None,
@@ -1352,6 +1372,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let prompt = build_phase_prompt(&phase, "spec content", Some("task t-1 details"), &std::collections::HashMap::new());
         assert!(prompt.contains("--- TASK ---"));
@@ -1371,6 +1392,7 @@ approve_signal = ""
             can_fail_spec: false,
             requires_claude: false,
             runtime: None,
+            api_key_env: None,
             completion_handler: None,
             approve_signal: None,
             reject_signal: None,
@@ -1383,6 +1405,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let prompt = build_phase_prompt(&phase, "spec", None, &std::collections::HashMap::new());
         assert!(prompt.contains("Phase: task-verify"));
@@ -1424,6 +1447,7 @@ approve_signal = ""
             can_fail_spec: false,
             requires_claude: true,
             runtime: None,
+            api_key_env: None,
             completion_handler: None,
             approve_signal: None,
             reject_signal: None,
@@ -1436,6 +1460,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let outcome = parse_phase_output(&phase, "Task completed successfully.");
         assert_eq!(outcome, Verdict::Proceed);
@@ -1468,6 +1493,7 @@ approve_signal = ""
             can_fail_spec: true,
             requires_claude: true,
             runtime: None,
+            api_key_env: None,
             completion_handler: None,
             approve_signal: Some("## OK".into()),
             reject_signal: Some("[FAIL]".into()),
@@ -1480,6 +1506,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let outcome = parse_phase_output(&phase, "Found issue: [FAIL] bad code");
         match outcome {
@@ -1734,6 +1761,62 @@ template = "Do something at the spec level."
         let ctx = BuiltinContext { spec_id, task_title: "", repo_path: repo.to_str().unwrap() };
         assert!(matches!(run_builtin(handler, &ctx), BuiltinResult::Success(_)), "cleanup phase failed");
         assert!(!dest.exists(), "worktree must be removed after cleanup");
+    }
+
+    // --- bare flag tests ---
+
+    #[test]
+    fn test_phase_bare_defaults_to_false() {
+        let toml_content = r#"
+name = "critic"
+description = "Test phase"
+
+[phase]
+name = "critic"
+level = "spec"
+can_add_tasks = true
+can_fail_spec = true
+requires_claude = true
+
+[prompt]
+template = "Review the spec."
+"#;
+        let dir = test_utils::test_dir("bare-default");
+        fs::write(dir.join("critic.phase.toml"), toml_content).unwrap();
+        let mut registry = test_registry();
+        registry.load_user_phases(&dir);
+        let phase = registry.get("critic").unwrap();
+        assert!(!phase.bare, "bare should default to false when not set in TOML");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_phase_bare_true_parsed_from_toml() {
+        let toml_content = r#"
+name = "spec-critique-bare"
+description = "Bare phase for cold-start test"
+
+[phase]
+name = "spec-critique-bare"
+level = "spec"
+can_add_tasks = false
+can_fail_spec = false
+requires_claude = true
+
+[worker]
+bare = true
+runtime = "claude"
+
+[prompt]
+template = "Critique the spec."
+"#;
+        let dir = test_utils::test_dir("bare-true");
+        fs::write(dir.join("spec-critique-bare.phase.toml"), toml_content).unwrap();
+        let mut registry = test_registry();
+        registry.load_user_phases(&dir);
+        let phase = registry.get("spec-critique-bare").unwrap();
+        assert!(phase.bare, "bare = true in [worker] section must be parsed");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     mod pipeline_parse {

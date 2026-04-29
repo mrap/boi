@@ -1,10 +1,12 @@
 use crate::builtins::{self, BuiltinContext};
 use crate::phases::{PhaseConfig, Verdict};
+use crate::runtime::{ClaudeCLI, PhaseRuntime, RuntimeError};
+use crate::runtime::openrouter::OpenRouterRuntime;
 use crate::spec::BoiTask;
 use crate::telemetry::{LogLevel, Telemetry};
 use crate::worker;
 use serde_json::json;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Trait for running a single phase. Allows mocking in tests.
 #[allow(clippy::too_many_arguments)]
@@ -81,6 +83,13 @@ impl ClaudePhaseRunner {
             return (self.run_deterministic_phase(phase, task, spec_id), String::new());
         }
 
+        // OpenRouter phases: send prompt via HTTP unless BOI_FORCE_CLAUDE=1 is set.
+        if phase.runtime.as_deref() == Some("openrouter")
+            && std::env::var("BOI_FORCE_CLAUDE").as_deref() != Ok("1")
+        {
+            return self.run_openrouter_phase(phase, spec_content, task, timeout_secs, spec_id, vars);
+        }
+
         if !phase.requires_claude {
             return (self.run_verify_phase(phase, task, worktree_path, timeout_secs, spec_id), String::new());
         }
@@ -112,80 +121,57 @@ impl ClaudePhaseRunner {
             }),
         );
 
-        let result = worker::spawn_claude(
-            &prompt,
-            worktree_path,
-            timeout_secs,
-            phase.model.as_deref(),
-            spec_id,
-            &self.claude_bin,
-        );
-
-        if let Ok(ref cr) = result {
-            let startup_s = cr.startup_ms as f64 / 1000.0;
-            self.telemetry.emit(
-                "boi.claude.first_output",
-                LogLevel::Debug,
-                &json!({
-                    "spec_id": spec_id_hint,
-                    "task_id": task_id,
-                    "startup_ms": cr.startup_ms,
-                    "message": format!("first output after {:.1}s (startup)", startup_s),
-                }),
-            );
-        }
+        let model_str = phase.model.as_deref().unwrap_or("");
+        let rt = ClaudeCLI {
+            claude_bin: self.claude_bin.clone(),
+            worktree_path: worktree_path.to_string(),
+            spec_id: spec_id.map(|s| s.to_string()),
+            bare: phase.bare,
+        };
+        let result = rt.execute(&prompt, model_str, Duration::from_secs(timeout_secs));
 
         match result {
-            Ok(ref cr) if cr.success => {
-                let inference_s = cr.inference_ms as f64 / 1000.0;
-                let total_s = cr.total_ms as f64 / 1000.0;
+            Ok(ro) => {
+                let total_s = ro.duration_ms as f64 / 1000.0;
                 self.telemetry.emit("boi.claude.exit", LogLevel::Debug, &json!({
                     "spec_id": spec_id_hint,
                     "task_id": task_id,
                     "phase": phase.name,
                     "exit_code": 0,
-                    "output_length": cr.output.len(),
-                    "stderr_length": cr.stderr.len(),
-                    "stderr_preview": cr.stderr.chars().take(500).collect::<String>(),
-                    "startup_ms": cr.startup_ms,
-                    "inference_ms": cr.inference_ms,
-                    "total_ms": cr.total_ms,
-                    "message": format!("claude exit 0, {} chars ({:.1}s inference, {:.1}s total)",
-                        cr.output.len(), inference_s, total_s),
+                    "output_length": ro.text.len(),
+                    "total_ms": ro.duration_ms,
+                    "message": format!("claude exit 0, {} chars ({:.1}s total)", ro.text.len(), total_s),
                 }));
-                let verdict = crate::phases::parse_phase_output(phase, &cr.output);
-                (verdict, cr.output.clone())
+                let verdict = crate::phases::parse_phase_output(phase, &ro.text);
+                (verdict, ro.text)
             }
-            Ok(ref cr) => {
-                let inference_s = cr.inference_ms as f64 / 1000.0;
-                let total_s = cr.total_ms as f64 / 1000.0;
+            Err(RuntimeError::Timeout) => {
                 self.telemetry.emit("boi.claude.exit", LogLevel::Error, &json!({
                     "spec_id": spec_id_hint,
                     "task_id": task_id,
                     "phase": phase.name,
                     "exit_code": 1,
-                    "output_length": cr.output.len(),
-                    "stderr_length": cr.stderr.len(),
-                    "stderr_preview": cr.stderr.chars().take(500).collect::<String>(),
-                    "startup_ms": cr.startup_ms,
-                    "inference_ms": cr.inference_ms,
-                    "total_ms": cr.total_ms,
-                    "message": format!("claude exit non-zero, {} chars ({:.1}s inference, {:.1}s total){}",
-                        cr.output.len(), inference_s, total_s,
-                        if cr.stderr.is_empty() { String::new() } else {
-                            format!("\n  stderr: {}", cr.stderr.chars().take(200).collect::<String>())
-                        }),
+                    "message": "claude timeout",
                 }));
-                let verdict = if cr.output == "timeout" {
-                    Verdict::Done { success: false, reason: "timeout".into() }
-                } else if phase.on_crash.as_deref() == Some("retry") {
+                (Verdict::Done { success: false, reason: "timeout".into() }, "timeout".to_string())
+            }
+            Err(RuntimeError::NonZeroExit(output)) => {
+                self.telemetry.emit("boi.claude.exit", LogLevel::Error, &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "phase": phase.name,
+                    "exit_code": 1,
+                    "output_length": output.len(),
+                    "message": format!("claude exit non-zero, {} chars", output.len()),
+                }));
+                let verdict = if phase.on_crash.as_deref() == Some("retry") {
                     Verdict::Done { success: false, reason: format!("Phase {} claude exited non-zero", phase.name) }
                 } else {
-                    Verdict::Done { success: false, reason: format!("Phase {} failed: {}", phase.name, cr.output) }
+                    Verdict::Done { success: false, reason: format!("Phase {} failed: {}", phase.name, output) }
                 };
-                (verdict, cr.output.clone())
+                (verdict, output)
             }
-            Err(e) => {
+            Err(RuntimeError::SpawnError(e)) => {
                 self.telemetry.emit(
                     "boi.claude.error",
                     LogLevel::Error,
@@ -197,6 +183,96 @@ impl ClaudePhaseRunner {
                     }),
                 );
                 (Verdict::Done { success: false, reason: format!("Phase {} spawn error: {}", phase.name, e) }, String::new())
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_openrouter_phase(
+        &self,
+        phase: &PhaseConfig,
+        spec_content: &str,
+        task: Option<&BoiTask>,
+        timeout_secs: u64,
+        spec_id: Option<&str>,
+        vars: &std::collections::HashMap<String, String>,
+    ) -> (Verdict, String) {
+        let task_context = task.map(|t| {
+            format!(
+                "Task: {} — {}\nSpec: {}\nVerify: {}",
+                t.id,
+                t.title,
+                t.spec.as_deref().unwrap_or("(none)"),
+                t.verify.as_deref().unwrap_or("(none)")
+            )
+        });
+        let prompt =
+            crate::phases::build_phase_prompt(phase, spec_content, task_context.as_deref(), vars);
+
+        let model = phase.model.as_deref().unwrap_or("gemini-flash");
+        let api_key_env = phase.api_key_env.as_deref().unwrap_or("OPENROUTER_API_KEY");
+        let mut rt = OpenRouterRuntime::new();
+        rt.api_key_env = api_key_env.to_string();
+
+        let spec_id_hint = spec_id.unwrap_or("");
+        let task_id = task.map(|t| t.id.as_str());
+
+        self.telemetry.emit(
+            "boi.openrouter.spawn",
+            crate::telemetry::LogLevel::Debug,
+            &json!({
+                "spec_id": spec_id_hint,
+                "task_id": task_id,
+                "phase": phase.name,
+                "model": model,
+                "message": "sending prompt to openrouter...",
+            }),
+        );
+
+        let result = rt.execute(&prompt, model, Duration::from_secs(timeout_secs));
+
+        match result {
+            Ok(ro) => {
+                let total_s = ro.duration_ms as f64 / 1000.0;
+                self.telemetry.emit("boi.openrouter.exit", crate::telemetry::LogLevel::Debug, &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "phase": phase.name,
+                    "model": model,
+                    "output_length": ro.text.len(),
+                    "total_ms": ro.duration_ms,
+                    "cost_usd": ro.cost_usd,
+                    "message": format!("openrouter ok, {} chars ({:.1}s)", ro.text.len(), total_s),
+                }));
+                let verdict = crate::phases::parse_phase_output(phase, &ro.text);
+                (verdict, ro.text)
+            }
+            Err(RuntimeError::Timeout) => {
+                self.telemetry.emit("boi.openrouter.exit", crate::telemetry::LogLevel::Error, &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "phase": phase.name,
+                    "message": "openrouter timeout",
+                }));
+                (Verdict::Done { success: false, reason: "openrouter timeout".into() }, "timeout".to_string())
+            }
+            Err(RuntimeError::NonZeroExit(output)) => {
+                self.telemetry.emit("boi.openrouter.exit", crate::telemetry::LogLevel::Error, &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "phase": phase.name,
+                    "message": format!("openrouter error: {}", output),
+                }));
+                (Verdict::Done { success: false, reason: format!("openrouter phase {} failed: {}", phase.name, output) }, output)
+            }
+            Err(RuntimeError::SpawnError(e)) => {
+                self.telemetry.emit("boi.openrouter.error", crate::telemetry::LogLevel::Error, &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "phase": phase.name,
+                    "message": format!("openrouter error: {}", e),
+                }));
+                (Verdict::Done { success: false, reason: format!("openrouter phase {} error: {}", phase.name, e) }, String::new())
             }
         }
     }
@@ -358,48 +434,54 @@ impl ClaudePhaseRunner {
                 "message": format!("verify_prompt: spawning claude ({} chars)", verify_prompt.len()),
             }));
 
-            let result = worker::spawn_claude(
-                verify_prompt,
-                worktree_path,
-                timeout_secs,
-                None,
-                spec_id,
-                &self.claude_bin,
-            );
+            let rt = ClaudeCLI {
+                claude_bin: self.claude_bin.clone(),
+                worktree_path: worktree_path.to_string(),
+                spec_id: spec_id.map(|s| s.to_string()),
+                bare: false,
+            };
+            let result = rt.execute(verify_prompt, "", Duration::from_secs(timeout_secs));
 
             match result {
-                Ok(ref cr) if cr.success => {
+                Ok(ro) => {
                     self.telemetry.emit(
                         "boi.verify_prompt.result",
                         LogLevel::Debug,
                         &json!({
                             "task_id": task.id,
                             "passed": true,
-                            "output_length": cr.output.len(),
-                            "startup_ms": cr.startup_ms,
-                            "inference_ms": cr.inference_ms,
-                            "total_ms": cr.total_ms,
-                            "message": format!("verify_prompt passed ({}ms)", cr.total_ms),
+                            "output_length": ro.text.len(),
+                            "total_ms": ro.duration_ms,
+                            "message": format!("verify_prompt passed ({}ms)", ro.duration_ms),
                         }),
                     );
                 }
-                Ok(ref cr) => {
+                Err(RuntimeError::Timeout) => {
                     self.telemetry.emit(
                         "boi.verify_prompt.result",
                         LogLevel::Debug,
                         &json!({
                             "task_id": task.id,
                             "passed": false,
-                            "output_length": cr.output.len(),
-                            "startup_ms": cr.startup_ms,
-                            "inference_ms": cr.inference_ms,
-                            "total_ms": cr.total_ms,
-                            "message": format!("verify_prompt failed ({}ms)", cr.total_ms),
+                            "message": "verify_prompt timeout",
                         }),
                     );
                     return Verdict::Redo { tasks: vec![] };
                 }
-                Err(e) => {
+                Err(RuntimeError::NonZeroExit(output)) => {
+                    self.telemetry.emit(
+                        "boi.verify_prompt.result",
+                        LogLevel::Debug,
+                        &json!({
+                            "task_id": task.id,
+                            "passed": false,
+                            "output_length": output.len(),
+                            "message": format!("verify_prompt failed ({} chars)", output.len()),
+                        }),
+                    );
+                    return Verdict::Redo { tasks: vec![] };
+                }
+                Err(RuntimeError::SpawnError(e)) => {
                     self.telemetry.emit(
                         "boi.verify_prompt.error",
                         LogLevel::Error,
@@ -479,6 +561,7 @@ mod tests {
             can_fail_spec: false,
             requires_claude,
             runtime: None,
+            api_key_env: None,
             completion_handler: None,
             approve_signal: Some("## Approved".into()),
             reject_signal: Some("[REJECT]".into()),
@@ -491,6 +574,7 @@ mod tests {
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         }
     }
 

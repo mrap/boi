@@ -1,3 +1,4 @@
+use crate::failure::FailureReason;
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -58,6 +59,13 @@ pub struct TelemetryEvent {
     pub message: Option<String>,
     pub data: Option<String>,
     pub level: String,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct FailureCount {
+    pub reason_type: String,
+    pub count: i64,
 }
 
 impl Telemetry {
@@ -76,14 +84,43 @@ impl Telemetry {
                 event_type TEXT NOT NULL,
                 message TEXT,
                 data TEXT,
-                level TEXT DEFAULT 'info'
+                level TEXT DEFAULT 'info',
+                failure_reason TEXT
             );",
         )
         .ok();
+        // Migration for existing DBs that predate the failure_reason column.
+        conn.execute_batch(
+            "ALTER TABLE events ADD COLUMN failure_reason TEXT;",
+        )
+        .ok(); // ok() intentionally swallows the "duplicate column" error on fresh DBs
         Telemetry { db_path, stderr_level, conn: Arc::new(Mutex::new(conn)) }
     }
 
     pub fn emit(&self, event_type: &str, level: LogLevel, detail: &Value) {
+        self.emit_inner(event_type, level, detail, None);
+    }
+
+    /// Emit a failure event with a typed FailureReason stored in the failure_reason column.
+    /// The variant name (e.g. "ProviderRateLimit") is stored for typed querying.
+    pub fn emit_failure(
+        &self,
+        event_type: &str,
+        level: LogLevel,
+        detail: &Value,
+        reason: &FailureReason,
+    ) {
+        let variant = failure_variant_name(reason);
+        self.emit_inner(event_type, level, detail, Some(variant));
+    }
+
+    fn emit_inner(
+        &self,
+        event_type: &str,
+        level: LogLevel,
+        detail: &Value,
+        failure_reason: Option<&str>,
+    ) {
         let conn = match self.conn.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -95,9 +132,9 @@ impl Telemetry {
         let level_str = level.as_str();
 
         if let Err(e) = conn.execute(
-            "INSERT INTO events (timestamp, spec_id, event_type, message, data, level)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![now, spec_id, event_type, message, data_str, level_str],
+            "INSERT INTO events (timestamp, spec_id, event_type, message, data, level, failure_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![now, spec_id, event_type, message, data_str, level_str, failure_reason],
         ) {
             eprintln!("[boi] ERROR: telemetry insert failed for {}: {}", event_type, e);
         }
@@ -110,13 +147,44 @@ impl Telemetry {
         }
     }
 
+    /// Count failure events grouped by typed reason for a time window.
+    /// Returns rows like [("ProviderRateLimit", 4), ("Timeout", 1)].
+    pub fn failure_count_by_type(&self, since_hours: u64) -> Vec<FailureCount> {
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+        let cutoff = Utc::now()
+            .checked_sub_signed(chrono::Duration::hours(since_hours as i64))
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_default();
+        let mut stmt = match conn.prepare(
+            "SELECT failure_reason, COUNT(*) as cnt
+             FROM events
+             WHERE failure_reason IS NOT NULL AND timestamp >= ?1
+             GROUP BY failure_reason
+             ORDER BY cnt DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        stmt.query_map(params![cutoff], |row| {
+            Ok(FailureCount {
+                reason_type: row.get::<_, String>(0)?,
+                count: row.get(1)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
     pub fn recent(&self, limit: usize) -> Vec<TelemetryEvent> {
         let conn = match self.conn.lock() {
             Ok(c) => c,
             Err(_) => return vec![],
         };
         let mut stmt = match conn.prepare(
-            "SELECT seq, timestamp, spec_id, event_type, message, data, level
+            "SELECT seq, timestamp, spec_id, event_type, message, data, level, failure_reason
              FROM events ORDER BY seq DESC LIMIT ?1",
         ) {
             Ok(s) => s,
@@ -133,7 +201,7 @@ impl Telemetry {
             Err(_) => return vec![],
         };
         let mut stmt = match conn.prepare(
-            "SELECT seq, timestamp, spec_id, event_type, message, data, level
+            "SELECT seq, timestamp, spec_id, event_type, message, data, level, failure_reason
              FROM events WHERE spec_id = ?1 ORDER BY seq ASC",
         ) {
             Ok(s) => s,
@@ -150,7 +218,7 @@ impl Telemetry {
             Err(_) => return vec![],
         };
         let mut stmt = match conn.prepare(
-            "SELECT seq, timestamp, spec_id, event_type, message, data, level
+            "SELECT seq, timestamp, spec_id, event_type, message, data, level, failure_reason
              FROM events WHERE level = ?1 ORDER BY seq DESC",
         ) {
             Ok(s) => s,
@@ -167,7 +235,7 @@ impl Telemetry {
             Err(_) => return vec![],
         };
         let mut stmt = match conn.prepare(
-            "SELECT seq, timestamp, spec_id, event_type, message, data, level
+            "SELECT seq, timestamp, spec_id, event_type, message, data, level, failure_reason
              FROM events WHERE event_type = ?1 ORDER BY seq DESC",
         ) {
             Ok(s) => s,
@@ -199,7 +267,22 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TelemetryEvent> {
         message: row.get(4)?,
         data: row.get(5)?,
         level: row.get(6)?,
+        failure_reason: row.get(7).ok(),
     })
+}
+
+fn failure_variant_name(reason: &FailureReason) -> &'static str {
+    match reason {
+        FailureReason::ModelResolution { .. } => "ModelResolution",
+        FailureReason::ProviderRateLimit { .. } => "ProviderRateLimit",
+        FailureReason::ProviderHttp { .. } => "ProviderHttp",
+        FailureReason::ProviderAuth { .. } => "ProviderAuth",
+        FailureReason::Timeout { .. } => "Timeout",
+        FailureReason::ToolError { .. } => "ToolError",
+        FailureReason::VerifyFailed { .. } => "VerifyFailed",
+        FailureReason::WorkerCrash { .. } => "WorkerCrash",
+        FailureReason::Other { .. } => "Other",
+    }
 }
 
 #[cfg(test)]

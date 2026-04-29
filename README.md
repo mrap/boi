@@ -364,7 +364,7 @@ OpenRouter phases require `OPENROUTER_API_KEY` in the environment and a `model` 
 
 ```
 boi dispatch <file.yaml> [options]        Submit a spec to the queue
-boi status [--watch] [--json]             Show queue and worker status
+boi status [--watch] [--json] [-v|--verbose]  Show queue and worker status; -v shows full failure detail
 boi log <queue-id> [--full] [-f|--follow] Tail worker output for a spec
 boi cancel <queue-id>                     Cancel a running or queued spec
 boi daemon reload                         Send SIGHUP to reload max_workers/spawns_per_tick/claude_bin
@@ -406,6 +406,99 @@ boi dispatch-many <spec1.yaml> [spec2.yaml ...]   DAG-ordered multi-spec dispatc
 | `--priority N` | Priority applied to all dispatched specs (default: 100) |
 | `--mode MODE` | Mode applied to all specs |
 | `--after SA7F3` | Additional upstream dep for all dispatched specs |
+
+## DAG Planner: `boi plan` + `boi dispatch-many`
+
+### The problem
+
+Manual `--after` flags are fragile. When dispatching multiple specs, whoever dispatches has to remember all in-flight dependencies. Wrong ordering only surfaces when the dependent spec fails mid-execution — after tokens and time have already been spent.
+
+### `boi plan` — visualize and critique the DAG
+
+`boi plan` builds a dependency graph across all in-flight + queued + new specs, then asks an LLM to critique it: any specs that should depend on each other but don't? Any wrongly serial work that could be parallel? Any scopes that contradict each other?
+
+```bash
+boi plan                            # critique current in-flight state
+boi plan spec-a.yaml spec-b.yaml    # include new specs in the analysis
+boi plan --force-refresh            # re-run LLM critique (ignore cache)
+```
+
+Example output:
+
+```
+DAG (4 nodes):
+  SA7F3 (auth-api)       ← no deps
+  SB2E1 (user-model)     ← SA7F3
+  SC1F0 (dashboard)      ← SB2E1
+  SD4A2 (email-notify)   ← SA7F3
+
+Critique:
+  [WARN] email-notify reads auth tokens written by user-model, but no dep declared.
+         Suggested fix: --after SB2E1
+
+Proposed dispatch order: SA7F3 → SB2E1 → SC1F0 + SD4A2
+
+--after flags: boi dispatch email-notify.yaml --after SB2E1
+```
+
+The critique is cached by hash of (DAG topology + spec titles). Re-running on unchanged state costs zero tokens.
+
+### `boi dispatch-many` — gated multi-spec dispatch
+
+`boi dispatch-many` runs `plan` first, then dispatches all specs in topological order — automatically wiring `--after` chains.
+
+```bash
+boi dispatch-many spec-a.yaml spec-b.yaml spec-c.yaml
+```
+
+- **Block-severity concern** → refuses entirely, prints concerns, exits non-zero
+- **Warn-severity concern** → shows concern, prompts for confirmation (or auto-approves with `--yes`)
+- **Clean** → dispatches all specs in topological order with correct `--after` chains
+
+### Before/after: 3-spec chain that `dispatch-many` would have caught
+
+**Before (manual `--after`, misordered):**
+
+Three specs dispatched for a feature track. The dispatcher forgot `--after` on `build-api`.
+
+```bash
+boi dispatch build-schema.yaml
+boi dispatch build-api.yaml        # BUG: missing --after
+boi dispatch build-frontend.yaml --after <api-id>
+```
+
+`build-api` started in parallel with `build-schema`. Failed 4 tasks in because schema files weren't written yet. ~12k tokens spent on the wrong order. Re-dispatch required.
+
+**After (`boi dispatch-many`):**
+
+```bash
+boi dispatch-many build-schema.yaml build-api.yaml build-frontend.yaml
+```
+
+```
+Analyzing DAG...
+
+DAG (3 nodes):
+  SA000 (build-schema)    ← no deps
+  SA001 (build-api)       ← SA000 [implicit: src/schema/*.rs]
+  SA002 (build-frontend)  ← SA001 [declared]
+
+Critique:
+  [WARN] build-api has implicit dep on build-schema via src/schema/*.rs
+         but no --after declared. Adding automatically.
+
+Proposed dispatch order: SA000 → SA001 → SA002
+
+Dispatch? [y/N] y
+
+Dispatched: SA000 (build-schema)
+Dispatched: SA001 (build-api) --after SA000
+Dispatched: SA002 (build-frontend) --after SA001
+```
+
+No misordering. No re-dispatch. The implicit dep was caught before a single token was spent on the wrong order.
+
+See [docs/dag-reassess.md](docs/dag-reassess.md) for the full model and guidance on when to use `plan` vs `dispatch-many` vs `dispatch --after`.
 
 ## Output Preservation
 

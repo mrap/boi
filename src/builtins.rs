@@ -91,6 +91,7 @@ mod tests {
             can_fail_spec: false,
             requires_claude: false,
             runtime: Some("deterministic".into()),
+            api_key_env: None,
             completion_handler: Some("builtin:commit".into()),
             approve_signal: None,
             reject_signal: None,
@@ -103,6 +104,7 @@ mod tests {
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         assert_eq!(phase.runtime.as_deref(), Some("deterministic"));
         assert!(!phase.requires_claude);

@@ -53,7 +53,7 @@ After dispatch, run `boi status` to show initial state.
 ### Other Commands
 
 ```bash
-boi status [--watch] [--json]             Queue and worker status
+boi status [--watch] [--json] [-v|--verbose]  Queue and worker status; -v shows full failure detail
 boi log <queue-id> [--full]               Tail worker output
 boi cancel <queue-id>                     Cancel a spec
 boi stop                                  Stop daemon and all workers

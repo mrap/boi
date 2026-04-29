@@ -446,6 +446,29 @@ impl Queue {
         Ok(())
     }
 
+    /// Mark a spec as failed, writing the error column with a typed FailureReason.
+    /// Prefer this over `update_spec(id, "failed")` — it guarantees error is non-NULL.
+    pub fn fail_spec(&self, spec_id: &str, reason: &crate::failure::FailureReason) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let error_json = reason.to_json();
+        self.conn.execute(
+            "UPDATE specs SET status = 'failed', completed_at = ?1, error = ?2 WHERE id = ?3",
+            params![now, error_json, spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a task as failed, writing the error column with a typed FailureReason.
+    /// Prefer this over `update_task(id, "FAILED")` — it guarantees error is non-NULL.
+    pub fn fail_task(&self, spec_id: &str, task_id: &str, reason: &crate::failure::FailureReason) -> Result<()> {
+        let error_json = reason.to_json();
+        self.conn.execute(
+            "UPDATE tasks SET status = 'FAILED', error = ?1 WHERE spec_id = ?2 AND id = ?3",
+            params![error_json, spec_id, task_id],
+        )?;
+        Ok(())
+    }
+
     pub fn status(&self, spec_id: &str) -> Result<Option<SpecStatus>> {
         let spec = match self.conn.query_row(
             "SELECT id, title, mode, status, spec_path,
@@ -996,6 +1019,7 @@ mod tests {
             outcomes: None,
             spec_phases: None,
             task_phases: None,
+            brain: None,
             tasks,
         }
     }
@@ -1353,5 +1377,110 @@ mod tests {
 
         let st = q.status(&id).unwrap().unwrap();
         assert_eq!(st.spec.phase_loop_count, 2, "phase_loop_count must be readable from SpecRecord");
+    }
+
+    // --- failure_capture tests (matched by `cargo test --lib failure_capture`) ---
+
+    #[test]
+    fn failure_capture_fail_spec_sets_error_column() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        let reason = FailureReason::ToolError {
+            phase: "execute".to_string(),
+            message: "test error".to_string(),
+        };
+        q.fail_spec(&id, &reason).unwrap();
+
+        let st = q.status(&id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "failed");
+        let error = st.spec.error.expect("error must be non-NULL after fail_spec");
+        assert!(error.contains("ToolError"), "error should be JSON FailureReason, got: {}", error);
+        assert!(error.contains("test error"), "error should contain message, got: {}", error);
+    }
+
+    #[test]
+    fn failure_capture_fail_task_sets_error_column() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        let task_id = st.tasks[0].id.clone();
+
+        let reason = FailureReason::VerifyFailed {
+            task: "t-1".to_string(),
+            exit_code: 1,
+            stderr_excerpt: "assertion failed".to_string(),
+        };
+        q.fail_task(&id, &task_id, &reason).unwrap();
+
+        let st = q.status(&id).unwrap().unwrap();
+        let task = st.tasks.iter().find(|t| t.id == task_id).unwrap();
+        assert_eq!(task.status, "FAILED");
+        let error = task.error.as_ref().expect("task error must be non-NULL after fail_task");
+        assert!(error.contains("VerifyFailed"), "error should be JSON FailureReason, got: {}", error);
+        assert!(error.contains("assertion failed"), "error should contain stderr_excerpt, got: {}", error);
+    }
+
+    #[test]
+    fn failure_capture_fail_spec_error_roundtrips_as_failure_reason() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        let reason = FailureReason::ProviderRateLimit {
+            provider: "anthropic".to_string(),
+            retry_after_s: Some(60),
+        };
+        q.fail_spec(&id, &reason).unwrap();
+
+        let st = q.status(&id).unwrap().unwrap();
+        let error_str = st.spec.error.unwrap();
+        let parsed = FailureReason::from_db(&error_str);
+        assert_eq!(reason.to_json(), parsed.to_json(), "FailureReason should round-trip through DB");
+    }
+
+    #[test]
+    fn failure_capture_fail_spec_no_null_error() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        // Initially error is NULL
+        let st = q.status(&id).unwrap().unwrap();
+        assert!(st.spec.error.is_none(), "error should start as NULL");
+
+        // After fail_spec, error must be non-NULL
+        q.fail_spec(&id, &FailureReason::Other { message: "oops".to_string() }).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        assert!(st.spec.error.is_some(), "error must be non-NULL after fail_spec");
+    }
+
+    #[test]
+    fn failure_capture_fail_task_no_null_error() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        let task_id = st.tasks[0].id.clone();
+
+        // Initially task error is NULL
+        let task = st.tasks.iter().find(|t| t.id == task_id).unwrap();
+        assert!(task.error.is_none(), "task error should start as NULL");
+
+        // After fail_task, error must be non-NULL
+        q.fail_task(&id, &task_id, &FailureReason::Timeout {
+            phase: "execute".to_string(),
+            secs: 1800,
+        }).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        let task = st.tasks.iter().find(|t| t.id == task_id).unwrap();
+        assert!(task.error.is_some(), "task error must be non-NULL after fail_task");
     }
 }

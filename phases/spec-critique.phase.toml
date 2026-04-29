@@ -8,11 +8,11 @@ level = "spec"
 timeout_minutes = 2
 can_add_tasks = false
 can_fail_spec = false
-requires_claude = true
 
 [worker]
-runtime = "claude"
-model = "claude-sonnet-4-6"
+runtime = "openrouter"
+model = "gemini-flash"
+api_key_env = "OPENROUTER_API_KEY"
 prompt_template = "templates/spec-critique-prompt.md"
 effort = "medium"
 timeout = 120

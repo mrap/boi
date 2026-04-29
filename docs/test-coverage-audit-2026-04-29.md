@@ -331,7 +331,7 @@ fn test_spawn_claude_timeout() {
     // Overwrite with a sleep script
     std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
     let bin = script.to_str().unwrap();
-    let cr = spawn_claude("prompt", "/tmp", 2, None, None, bin).unwrap();
+    let cr = spawn_claude("prompt", "/tmp", 2, None, None, bin, false).unwrap();
     assert!(!cr.success);
     assert_eq!(cr.output, "timeout");
     assert!(cr.total_ms >= 2000);

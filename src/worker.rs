@@ -1,4 +1,5 @@
 use crate::{
+    failure::{infer_failure_reason, FailureReason},
     hooks::{
         self, HookConfig, ON_COMPLETE, ON_FAIL, ON_TASK_COMPLETE, ON_TASK_FAIL, ON_TASK_START,
         ON_WORKER_START, ON_PHASE_START, ON_PHASE_COMPLETE, ON_PHASE_FAIL,
@@ -30,6 +31,7 @@ pub use crate::prompt::build_prompt;
 
 pub struct WorkerConfig {
     pub max_workers: u32,
+    pub spawns_per_tick: u32,
     pub task_timeout_secs: u64,
     pub retry_count: u32,
     pub cleanup_on_failure: bool,
@@ -40,6 +42,7 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         WorkerConfig {
             max_workers: 5,
+            spawns_per_tick: 4,
             task_timeout_secs: 1800,
             retry_count: 3,
             cleanup_on_failure: false,
@@ -390,6 +393,7 @@ pub fn run_worker_with_phases(
         outcomes: None,
         spec_phases: None,
         task_phases: None,
+        brain: None,
         tasks,
     };
 
@@ -426,7 +430,10 @@ pub fn run_worker_with_phases(
     let mut order = match spec::topological_sort(&boi_spec) {
         Ok(o) => o,
         Err(e) => {
-            queue.update_spec(spec_id, "failed")?;
+            let _ = queue.fail_spec(spec_id, &FailureReason::ToolError {
+                phase: "init".to_string(),
+                message: e.to_string(),
+            });
             return Err(Box::new(e));
         }
     };
@@ -471,8 +478,12 @@ pub fn run_worker_with_phases(
                     dt.id, dt.depends, e
                 );
                 boi_log!(" ERROR: {}", msg);
-                let _ = queue.update_task(spec_id, &dt.id, "FAILED");
-                queue.update_spec(spec_id, "failed")?;
+                let init_reason = FailureReason::ToolError {
+                    phase: "init".to_string(),
+                    message: msg.clone(),
+                };
+                let _ = queue.fail_task(spec_id, &dt.id, &init_reason);
+                queue.fail_spec(spec_id, &init_reason)?;
                 return Err(msg.into());
             }
         }
@@ -564,12 +575,18 @@ pub fn run_worker_with_phases(
                         "[boi] ERROR: worktree {} disappeared — aborting spec {}",
                         worktree_path, spec_id
                     );
-                    if let Err(e) = queue.update_spec(spec_id, "failed") {
+                    let crash_reason = FailureReason::WorkerCrash {
+                        phase: "init".to_string(),
+                        signal: None,
+                        message: format!("worktree {} no longer exists", worktree_path),
+                    };
+                    if let Err(e) = queue.fail_spec(spec_id, &crash_reason) {
                         eprintln!("[boi] ERROR: failed to mark spec {} as failed after worktree loss: {}", spec_id, e);
                     }
                     telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
                         "spec_id": spec_id,
                         "status": "failed",
+                        "failure_reason": crash_reason.to_json(),
                         "message": format!("worktree {} no longer exists", worktree_path),
                     }));
                     break;
@@ -925,7 +942,8 @@ pub fn run_worker_with_phases(
                                 attempt: 1,
                             };
                         } else {
-                            queue.update_task(spec_id, &db_task_id, "FAILED")?;
+                            let task_fail_reason = infer_failure_reason(phase_name, reason);
+                            queue.fail_task(spec_id, &db_task_id, &task_fail_reason)?;
                             let task_payload = json!({
                                 "spec_id": spec_id,
                                 "task_id": task.id,
@@ -936,6 +954,7 @@ pub fn run_worker_with_phases(
                                 "spec_id": spec_id,
                                 "task_id": task.id,
                                 "status": "FAILED",
+                                "failure_reason": task_fail_reason.to_json(),
                                 "message": format!("{} failed: {}", task.id, reason),
                             }));
                             state = WorkerState::Failed {
@@ -988,7 +1007,11 @@ pub fn run_worker_with_phases(
                 if attempt >= max_attempts {
                     boi_log!("state: TaskPhaseRetry -> Failed (max retries {} reached for task {} phase '{}')",
                         max_attempts, task.id, phase_name);
-                    queue.update_task(spec_id, &db_task_id, "FAILED")?;
+                    let retry_reason = infer_failure_reason(
+                        phase_name,
+                        &format!("phase '{}' failed after {} retries", phase_name, attempt),
+                    );
+                    queue.fail_task(spec_id, &db_task_id, &retry_reason)?;
                     let task_payload = json!({
                         "spec_id": spec_id,
                         "task_id": task.id,
@@ -999,6 +1022,7 @@ pub fn run_worker_with_phases(
                         "spec_id": spec_id,
                         "task_id": task.id,
                         "status": "FAILED",
+                        "failure_reason": retry_reason.to_json(),
                         "message": format!("{} failed after {} retries", task.id, attempt),
                     }));
                     state = WorkerState::Failed {
@@ -1086,7 +1110,11 @@ pub fn run_worker_with_phases(
                     let task_title = task.map(|t| t.title.as_str()).unwrap_or("unknown");
                     boi_log!(" requeue limit ({}) exceeded for task {}", config.retry_count, task_id_owned);
                     let db_task_id_rq = task_id_owned.clone();
-                    queue.update_task(spec_id, &db_task_id_rq, "FAILED")?;
+                    let requeue_reason = FailureReason::ToolError {
+                        phase: "requeue".to_string(),
+                        message: format!("requeue limit ({}) exceeded", config.retry_count),
+                    };
+                    queue.fail_task(spec_id, &db_task_id_rq, &requeue_reason)?;
                     let task_payload = json!({
                         "spec_id": spec_id,
                         "task_id": task_id_owned,
@@ -1097,6 +1125,7 @@ pub fn run_worker_with_phases(
                         "spec_id": spec_id,
                         "task_id": task_id_owned,
                         "status": "FAILED",
+                        "failure_reason": requeue_reason.to_json(),
                         "message": format!("{} failed: requeue limit exceeded", task_id_owned),
                     }));
                     state = WorkerState::Failed {
@@ -1287,11 +1316,13 @@ pub fn run_worker_with_phases(
             WorkerState::Failed { ref reason } => {
                 let reason_owned = reason.clone();
                 boi_log!(" spec {} failed: {}", spec_id, reason_owned);
-                queue.update_spec(spec_id, "failed")?;
+                let spec_fail_reason = infer_failure_reason("worker", &reason_owned);
+                queue.fail_spec(spec_id, &spec_fail_reason)?;
                 let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id })); // intentional: best-effort hook notification
                 telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
                     "spec_id": spec_id,
                     "status": "failed",
+                    "failure_reason": spec_fail_reason.to_json(),
                     "message": format!("spec {} failed: {}", spec_id, reason_owned),
                 }));
                 if config.cleanup_on_failure {
@@ -1564,7 +1595,7 @@ mod tests {
     fn test_spawn_claude_exit_0() {
         let script = mock_claude(0, "exit0");
         let bin = script.to_str().unwrap();
-        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin).unwrap();
+        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin, false).unwrap();
         assert!(cr.success);
         assert!(cr.total_ms > 0 || cr.startup_ms == 0);
     }
@@ -1573,7 +1604,7 @@ mod tests {
     fn test_spawn_claude_exit_1() {
         let script = mock_claude(1, "exit1");
         let bin = script.to_str().unwrap();
-        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin).unwrap();
+        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin, false).unwrap();
         assert!(!cr.success);
     }
 
@@ -1581,7 +1612,7 @@ mod tests {
     fn test_spawn_claude_captures_stderr() {
         let script = mock_claude_with_stderr(1, "stdout-ok", "ERROR: something broke", "stderr_capture");
         let bin = script.to_str().unwrap();
-        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin).unwrap();
+        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin, false).unwrap();
         assert!(!cr.success);
         assert!(cr.stderr.contains("ERROR: something broke"),
             "stderr should be captured, got: '{}'", cr.stderr);
@@ -1591,7 +1622,7 @@ mod tests {
     fn test_spawn_claude_stderr_empty_on_success() {
         let script = mock_claude(0, "stderr_empty");
         let bin = script.to_str().unwrap();
-        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin).unwrap();
+        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin, false).unwrap();
         assert!(cr.success);
         assert!(cr.stderr.is_empty(), "stderr should be empty on clean exit");
     }
@@ -1625,6 +1656,7 @@ tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: script.to_str().unwrap().to_string(),
+            spawns_per_tick: 1,
         };
 
         let tel = test_telemetry();
@@ -1659,6 +1691,7 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: script.to_str().unwrap().to_string(),
+            spawns_per_tick: 1,
         };
 
         let tel = test_telemetry();
@@ -1696,6 +1729,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: script.to_str().unwrap().to_string(),
+            spawns_per_tick: 1,
         };
 
         let tel = test_telemetry();
@@ -1748,6 +1782,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1786,6 +1821,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1823,6 +1859,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1860,6 +1897,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
         };
         let registry = PhaseRegistry::new();
         // spec-review runs first (pre-spec phase), then execute times out
@@ -1898,6 +1936,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1938,6 +1977,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1982,6 +2022,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
         };
         let registry = PhaseRegistry::new();
         let new_task = spec::BoiTask {
@@ -2189,6 +2230,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -2217,6 +2259,122 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             st.spec.status, "failed",
             "spec should fail when a task has corrupted depends JSON, got: '{}'",
             st.spec.status
+        );
+    }
+
+    // --- failure_capture integration tests ---
+
+    #[test]
+    fn failure_capture_spec_error_non_null_on_task_failure() {
+        // spec-review (pre-task) consumes the first verdict; execute consumes the second
+        let yaml = "title: \"Fail Capture\"\ntasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("fc_task_fail", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+            cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            Verdict::Proceed, // spec-review pre-phase
+            Verdict::Done { success: false, reason: "execute phase crashed".into() },
+        ]);
+        let tel = test_telemetry();
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            let _ = run_worker_with_phases(
+                &spec_id, &spec_path, &db_path,
+                &HookConfig::default(), &config, &registry, &mock, &tel,
+            );
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "failed");
+        assert!(
+            st.spec.error.is_some(),
+            "spec.error must be non-NULL after failure, got None"
+        );
+        let error = st.spec.error.unwrap();
+        assert!(
+            !error.is_empty(),
+            "spec.error must not be empty after failure"
+        );
+    }
+
+    #[test]
+    fn failure_capture_task_error_non_null_on_task_failure() {
+        // spec-review (pre-task) consumes the first verdict; execute consumes the second
+        let yaml = "title: \"Task Error\"\ntasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("fc_task_error", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+            cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            Verdict::Proceed, // spec-review pre-phase
+            Verdict::Done { success: false, reason: "timeout".into() },
+        ]);
+        let tel = test_telemetry();
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            let _ = run_worker_with_phases(
+                &spec_id, &spec_path, &db_path,
+                &HookConfig::default(), &config, &registry, &mock, &tel,
+            );
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.tasks[0].status, "FAILED");
+        let task_error = st.tasks[0].error.as_ref()
+            .expect("task.error must be non-NULL after FAILED");
+        assert!(
+            task_error.contains("Timeout"),
+            "task error should be typed FailureReason JSON with Timeout, got: {}", task_error
+        );
+    }
+
+    #[test]
+    fn failure_capture_error_is_valid_failure_reason_json() {
+        // spec-review (pre-task) consumes the first verdict; execute consumes the second
+        use crate::failure::FailureReason;
+        let yaml = "title: \"JSON Check\"\ntasks:\n  - id: t-1\n    title: \"Fail\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("fc_json_check", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+            cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
+            spawns_per_tick: 1,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            Verdict::Proceed, // spec-review pre-phase
+            Verdict::Done { success: false, reason: "HTTP 429 rate limited".into() },
+        ]);
+        let tel = test_telemetry();
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            let _ = run_worker_with_phases(
+                &spec_id, &spec_path, &db_path,
+                &HookConfig::default(), &config, &registry, &mock, &tel,
+            );
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        let error_str = st.spec.error.expect("spec.error must be non-NULL");
+        let parsed = FailureReason::from_db(&error_str);
+        assert!(
+            matches!(parsed, FailureReason::ProviderRateLimit { .. }),
+            "HTTP 429 reason should parse as ProviderRateLimit, got: {:?}", parsed
         );
     }
 }

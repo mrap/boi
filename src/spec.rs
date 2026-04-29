@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BoiSpec {
@@ -16,6 +17,8 @@ pub struct BoiSpec {
     #[serde(default)]
     pub task_phases: Option<Vec<String>>,
     pub tasks: Vec<BoiTask>,
+    /// Per-spec brain directory override. Takes priority over global config.brain.
+    pub brain: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -533,5 +536,32 @@ tasks:
         let spec = parse(yaml).unwrap();
         assert_eq!(spec.tasks[0].phases, Some(vec!["execute".to_string()]));
         assert_eq!(spec.tasks[1].phases, None);
+    }
+
+    #[test]
+    fn test_brain_field_in_spec() {
+        let yaml = r#"
+title: "Brain Spec"
+brain: /some/brain/dir
+tasks:
+  - id: t-1
+    title: "Task"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(spec.brain, Some(PathBuf::from("/some/brain/dir")));
+    }
+
+    #[test]
+    fn test_brain_defaults_to_none_in_spec() {
+        let yaml = r#"
+title: "No Brain"
+tasks:
+  - id: t-1
+    title: "Task"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        assert!(spec.brain.is_none());
     }
 }
