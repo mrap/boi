@@ -37,8 +37,9 @@ COPY templates/ $HOME/.boi/templates/
 # Also copy pipelines.toml to ~/.boi/ for pipeline resolution
 RUN cp /opt/boi/phases/pipelines.toml $HOME/.boi/pipelines.toml 2>/dev/null || true
 
-# Create mock claude binary
-RUN printf '#!/bin/sh\necho "{}"\nexit 0\n' > /usr/local/bin/claude \
+# Create mock claude binary — outputs valid stream-json so the worker
+# parses a successful result and the phase pipeline completes.
+RUN printf '#!/bin/sh\necho '\''{"type":"assistant","message":{"content":[{"text":"done"}]}}'\''\necho '\''{"type":"result","subtype":"success","result":"done","duration_ms":100}'\''\nexit 0\n' > /usr/local/bin/claude \
     && chmod +x /usr/local/bin/claude
 
 # Set up a git repo for worktree testing

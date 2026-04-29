@@ -41,6 +41,28 @@ assert_not_contains() {
 
 FIXTURES="$HOME/tests/fixtures"
 
+# Wait for a background PID to exit (up to $2 seconds, default 15).
+wait_for_exit() {
+  local pid=$1 timeout_secs=${2:-15}
+  local max_ticks=$(( timeout_secs * 2 ))
+  local tick=0
+  while kill -0 "$pid" 2>/dev/null && [ "$tick" -lt "$max_ticks" ]; do
+    sleep 0.5
+    tick=$((tick + 1))
+  done
+}
+
+# Stop daemon by PID: SIGTERM, wait, cleanup files
+stop_daemon() {
+  local pid=$1
+  kill "$pid" 2>/dev/null
+  wait_for_exit "$pid" 15
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null
+  fi
+  rm -f ~/.boi/daemon.pid ~/.boi/daemon.heartbeat
+}
+
 echo ""
 bold "═══════════════════════════════════════════"
 bold "  BOI Rust Binary — E2E Tests"
@@ -296,3 +318,185 @@ else
 fi
 
 echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "17. Daemon starts and creates PID file"
+# ══════════════════════════════════════════════════════════════════════════════
+
+rm -f ~/.boi/daemon.pid ~/.boi/daemon.heartbeat
+$BOI daemon foreground &
+DAEMON_PID=$!
+sleep 3
+
+if [ -f ~/.boi/daemon.pid ]; then
+  assert_pass "daemon creates PID file"
+  WRITTEN_PID=$(cat ~/.boi/daemon.pid)
+  if [ "$WRITTEN_PID" = "$DAEMON_PID" ]; then
+    assert_pass "PID file contains correct PID ($DAEMON_PID)"
+  else
+    assert_fail "PID file contains $WRITTEN_PID, expected $DAEMON_PID"
+  fi
+else
+  assert_fail "daemon did not create PID file"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "18. Daemon heartbeat updates"
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEARTBEAT1=$(cat ~/.boi/daemon.heartbeat 2>/dev/null || echo "none")
+sleep 6
+HEARTBEAT2=$(cat ~/.boi/daemon.heartbeat 2>/dev/null || echo "none")
+
+if [ "$HEARTBEAT1" != "$HEARTBEAT2" ] && [ "$HEARTBEAT2" != "none" ]; then
+  assert_pass "heartbeat file updates over time"
+else
+  assert_fail "heartbeat not updating (was: $HEARTBEAT1, now: $HEARTBEAT2)"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "19. Daemon picks up dispatched spec"
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat > /tmp/daemon-e2e-spec.yaml <<'SPEC'
+title: "Daemon E2E — Pickup Test"
+mode: execute
+tasks:
+  - id: t-1
+    title: "No-op task"
+    status: PENDING
+    spec: "Say hello"
+    verify: "true"
+SPEC
+
+DAEMON_SPEC_OUT=$($BOI dispatch /tmp/daemon-e2e-spec.yaml 2>&1); rc=$?
+assert_exit 0 $rc "dispatch during daemon run exits 0"
+DAEMON_SPEC_ID=$(echo "$DAEMON_SPEC_OUT" | grep -o 'S[0-9]*')
+
+if [ -n "$DAEMON_SPEC_ID" ]; then
+  assert_pass "got spec ID: $DAEMON_SPEC_ID"
+
+  # Wait up to 30s for daemon to pick it up (status != queued)
+  PICKED_UP=false
+  for i in $(seq 1 15); do
+    SPEC_STATUS=$(sqlite3 ~/.boi/boi-rust.db "SELECT status FROM specs WHERE id='$DAEMON_SPEC_ID'" 2>/dev/null)
+    if [ -n "$SPEC_STATUS" ] && [ "$SPEC_STATUS" != "queued" ]; then
+      PICKED_UP=true
+      break
+    fi
+    sleep 2
+  done
+
+  if [ "$PICKED_UP" = true ]; then
+    assert_pass "daemon picked up spec (status: $SPEC_STATUS)"
+  else
+    assert_fail "daemon did not pick up spec within 30s (status: $SPEC_STATUS)"
+  fi
+else
+  assert_fail "dispatch did not return spec ID"
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "20. Daemon stops cleanly on SIGTERM"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Give worker time to finish before stopping
+sleep 3
+
+kill $DAEMON_PID 2>/dev/null
+wait_for_exit $DAEMON_PID 15
+
+if ! kill -0 $DAEMON_PID 2>/dev/null; then
+  assert_pass "daemon process exited after SIGTERM"
+else
+  assert_fail "daemon still running after SIGTERM"
+  kill -9 $DAEMON_PID 2>/dev/null
+fi
+
+if [ ! -f ~/.boi/daemon.pid ]; then
+  assert_pass "PID file cleaned up after shutdown"
+else
+  assert_fail "PID file still exists after shutdown"
+  rm -f ~/.boi/daemon.pid
+fi
+
+if [ ! -f ~/.boi/daemon.heartbeat ]; then
+  assert_pass "heartbeat file cleaned up after shutdown"
+else
+  assert_fail "heartbeat file still exists after shutdown"
+  rm -f ~/.boi/daemon.heartbeat
+fi
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "21. Stale spec recovery on daemon restart"
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Insert a spec stuck in "assigning" state (simulating a crash)
+sqlite3 ~/.boi/boi-rust.db "INSERT OR REPLACE INTO specs (id, title, status, priority, queued_at) VALUES ('stale-test', 'Stale Recovery Test', 'assigning', 100, datetime('now'))"
+
+PRE_STATUS=$(sqlite3 ~/.boi/boi-rust.db "SELECT status FROM specs WHERE id='stale-test'" 2>/dev/null)
+if [ "$PRE_STATUS" = "assigning" ]; then
+  assert_pass "inserted stale spec with status=assigning"
+else
+  assert_fail "failed to insert stale spec (status=$PRE_STATUS)"
+fi
+
+# Capture daemon stderr to verify recovery message
+$BOI daemon foreground 2>/tmp/daemon-recovery.log &
+DAEMON_PID2=$!
+sleep 2
+
+if grep -q "recovered.*stuck spec" /tmp/daemon-recovery.log; then
+  assert_pass "daemon logged stuck spec recovery"
+else
+  assert_fail "daemon did not log stuck spec recovery"
+fi
+
+stop_daemon $DAEMON_PID2
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+bold "22. Daemon rejects second instance"
+# ══════════════════════════════════════════════════════════════════════════════
+
+rm -f ~/.boi/daemon.pid ~/.boi/daemon.heartbeat
+$BOI daemon foreground &
+DAEMON_PID3=$!
+sleep 2
+
+out=$($BOI daemon foreground 2>&1); rc=$?
+if [ $rc -ne 0 ]; then
+  assert_pass "second daemon instance rejected (exit $rc)"
+else
+  assert_fail "second daemon instance was not rejected"
+fi
+
+stop_daemon $DAEMON_PID3
+
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Summary
+# ══════════════════════════════════════════════════════════════════════════════
+
+echo ""
+bold "═══════════════════════════════════════════"
+total=$((PASS + FAIL))
+if [ $FAIL -eq 0 ]; then
+  green "  ALL $total TESTS PASSED"
+else
+  red "  $FAIL/$total TESTS FAILED"
+fi
+bold "═══════════════════════════════════════════"
+echo ""
+
+exit $FAIL
