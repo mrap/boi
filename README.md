@@ -110,7 +110,9 @@ prompt_template = "templates/my-prompt.md"  # required for claude/default phases
 model = "claude-sonnet-4-6"                  # default: claude-sonnet-4-6
 effort = "medium"                            # low | medium | high
 timeout = 300                                # seconds; must be > 0
-runtime = "claude"                           # "claude" (default) | "deterministic"
+runtime = "claude"                           # "claude" (default) | "openrouter" | "deterministic"
+api_key_env = "OPENROUTER_API_KEY"           # openrouter only — env var holding the API key (default: OPENROUTER_API_KEY)
+bare = false                                 # true → append --bare (skips session/MCP/skill loading; ~96% cold-start reduction)
 
 # Completion routing
 [completion]
@@ -315,17 +317,19 @@ Exit 0 = passed. Any non-zero exit = failed. Stdout/stderr are captured as the f
 
 ## Runtime Configuration
 
-BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) is also supported.
+BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) and `openrouter` (direct HTTP to OpenRouter API) are also supported.
 
 ### Global Default
 
-Set in `~/.boi/config.json`:
+Set in `~/.boi/config.yaml`:
 
-```json
-{
-  "runtime": { "default": "claude" }
-}
+```yaml
+runtime:
+  default: claude
+brain: ~/mrap-hex   # optional — path to brain dir; must contain CLAUDE.md
 ```
+
+`brain` sets the default brain directory for all specs. Workers read `{brain}/CLAUDE.md` as system context before each task. BOI errors early if `brain` is set but the path or `CLAUDE.md` is missing.
 
 ### Per-Spec Override
 
@@ -339,13 +343,18 @@ Spec-level override takes precedence over the global default.
 
 ### Model Mappings
 
-Phase config accepts either full model IDs or aliases (`opus`, `sonnet`, `haiku`). The runtime resolves them:
+Phase config accepts either full model IDs or aliases. The runtime resolves them:
 
-| Alias | Claude | Codex |
-|-------|--------|-------|
-| `opus` | claude-opus-4-6 | o3 |
-| `sonnet` | claude-sonnet-4-6 | o4-mini |
-| `haiku` | claude-haiku-4-5-20251001 | o4-mini |
+| Alias | Claude | Codex | OpenRouter |
+|-------|--------|-------|------------|
+| `opus` | claude-opus-4-6 | o3 | — |
+| `sonnet` | claude-sonnet-4-6 | o4-mini | — |
+| `haiku` | claude-haiku-4-5-20251001 | o4-mini | anthropic/claude-haiku-4-5 |
+| `gemini-flash` | — | — | google/gemini-2.0-flash-001 |
+| `grok` | — | — | x-ai/grok-beta |
+| `qwen-coder` | — | — | qwen/qwen-2.5-coder-32b-instruct |
+
+OpenRouter phases require `OPENROUTER_API_KEY` in the environment and a `model` field in `[worker]`. Use `openrouter` runtime for text-only judgment phases (critic, plan-critique, spec-critique) to skip Claude cold-start and reduce cost.
 
 ### CLI Check
 
@@ -358,6 +367,7 @@ boi dispatch <file.yaml> [options]        Submit a spec to the queue
 boi status [--watch] [--json]             Show queue and worker status
 boi log <queue-id> [--full] [-f|--follow] Tail worker output for a spec
 boi cancel <queue-id>                     Cancel a running or queued spec
+boi daemon reload                         Send SIGHUP to reload max_workers/spawns_per_tick/claude_bin
 boi stop                                  Stop daemon and all workers
 boi install [--workers N]                 One-time setup (run outside Claude Code)
 boi resume <queue-id> | --all            Resume failed or canceled specs
@@ -372,6 +382,8 @@ boi dep add|remove|set|clear|show|viz|check
 boi project create|list|status|context|delete
 boi bench --pipeline name:path [--pipeline ...] --spec FILE | --battery DIR [--runs N]  Benchmark N pipelines
 boi bench --phase <name> --spec FILE [--runs N]  Benchmark a single phase in isolation
+boi plan [spec.yaml ...] [--force-refresh]        Build DAG + LLM critique for in-flight and new specs
+boi dispatch-many <spec1.yaml> [spec2.yaml ...]   DAG-ordered multi-spec dispatch with LLM gate
 ```
 
 **`dispatch` options:**
@@ -384,6 +396,16 @@ boi bench --phase <name> --spec FILE [--runs N]  Benchmark a single phase in iso
 | `--worktree-isolate` | Dedicated git worktree and branch for this spec |
 | `--after SA7F3,TB2E1` | Wait for listed specs to complete before starting |
 | `--project NAME` | Associate with a project (injects project context) |
+
+**`dispatch-many` options:**
+
+| Flag | Description |
+|------|-------------|
+| `--yes` | Auto-approve dispatch without interactive prompt |
+| `--force` | Override warn-level concerns (cannot override blocks) |
+| `--priority N` | Priority applied to all dispatched specs (default: 100) |
+| `--mode MODE` | Mode applied to all specs |
+| `--after SA7F3` | Additional upstream dep for all dispatched specs |
 
 ## Output Preservation
 
