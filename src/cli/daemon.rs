@@ -192,7 +192,10 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         }
     }
 
-    eprintln!("[boi daemon] started (pid {}), max_workers={}", pid, wc.max_workers);
+    eprintln!(
+        "[boi daemon] started (pid {}), max_workers={}",
+        pid, wc.max_workers
+    );
 
     let active: std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -203,7 +206,10 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         let _ = std::fs::write(&heartbeat_path, chrono::Utc::now().to_rfc3339());
 
         {
-            let mut workers = active.lock().unwrap();
+            let mut workers = active.lock().unwrap_or_else(|e| {
+                eprintln!("[boi daemon] worker mutex poisoned, recovering: {}", e);
+                e.into_inner()
+            });
             workers.retain(|h| !h.is_finished());
 
             if workers.len() < wc.max_workers as usize {
@@ -277,7 +283,10 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
     // Wait for workers to finish (with timeout)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     {
-        let mut workers = active.lock().unwrap();
+        let mut workers = active.lock().unwrap_or_else(|e| {
+            eprintln!("[boi daemon] worker mutex poisoned during shutdown: {}", e);
+            e.into_inner()
+        });
         while !workers.is_empty() && std::time::Instant::now() < deadline {
             workers.retain(|h| !h.is_finished());
             if !workers.is_empty() {
@@ -315,7 +324,9 @@ pub fn cmd_stop() {
     // `is_pid_alive`. Sending SIGTERM to a valid PID is a standard POSIX operation.
     // Worst case (PID recycled): SIGTERM to an unrelated process, which is the
     // inherent race in PID-based signaling; the flock guard minimizes this window.
-    unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
     println!("sent SIGTERM to daemon (pid {})", pid);
 
     for _ in 0..20 {
@@ -329,6 +340,8 @@ pub fn cmd_stop() {
     println!("daemon still running after 10s — sending SIGKILL");
     // SAFETY: Same PID as the SIGTERM above. SIGKILL is the last-resort escalation
     // after the 10s graceful shutdown window expired.
-    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
     let _ = std::fs::remove_file(daemon_heartbeat_path());
 }

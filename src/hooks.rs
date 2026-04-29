@@ -124,7 +124,13 @@ fn wait_with_timeout(
     let child_thread = Arc::clone(&child_arc);
 
     std::thread::spawn(move || {
-        let result = child_thread.lock().unwrap().wait();
+        let result = match child_thread.lock() {
+            Ok(mut guard) => guard.wait(),
+            Err(e) => {
+                eprintln!("[boi hooks] child mutex poisoned: {}", e);
+                return;
+            }
+        };
         let _ = tx.send(result);
     });
 
