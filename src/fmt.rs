@@ -108,6 +108,6 @@ pub fn is_pid_alive(pid: u32) -> bool {
 
 pub fn ensure_db_dir(db_str: &str) {
     if let Some(parent) = std::path::Path::new(db_str).parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::create_dir_all(parent); // intentional: best-effort dir creation; Queue::open reports actual error
     }
 }

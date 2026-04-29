@@ -95,11 +95,13 @@ impl Telemetry {
         let data_str = serde_json::to_string(detail).ok();
         let level_str = level.as_str();
 
-        let _ = conn.execute(
+        if let Err(e) = conn.execute(
             "INSERT INTO events (timestamp, spec_id, event_type, message, data, level)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![now, spec_id, event_type, message, data_str, level_str],
-        );
+        ) {
+            eprintln!("[boi] ERROR: telemetry insert failed for {}: {}", event_type, e);
+        }
 
         if level >= self.stderr_level {
             let msg = message

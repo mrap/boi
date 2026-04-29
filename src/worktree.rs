@@ -31,7 +31,7 @@ pub fn create(spec_id: &str, repo_path: &str) -> Result<PathBuf, Box<dyn std::er
     let branch = branch_name(spec_id);
 
     // Delete stale branch from a prior run if it exists.
-    let _ = Command::new("git")
+    let _ = Command::new("git") // intentional: best-effort stale branch cleanup from prior run
         .args(["branch", "-D", &branch])
         .current_dir(repo_path)
         .output();
@@ -119,7 +119,7 @@ pub fn cleanup(spec_id: &str) -> Result<(), Box<dyn std::error::Error>> {
             .output()?;
 
         if !output.status.success() {
-            let _ = std::fs::remove_dir_all(&dest);
+            let _ = std::fs::remove_dir_all(&dest); // intentional: fallback cleanup when git worktree remove fails
         }
     }
 
@@ -155,7 +155,7 @@ pub fn delete_branch(spec_id: &str, repo_path: &str) -> Result<(), Box<dyn std::
 /// any directories under ~/.boi/worktrees/ that are no longer registered.
 pub fn cleanup_stale() -> Result<(), Box<dyn std::error::Error>> {
     // git worktree prune removes stale administrative files.
-    let _ = Command::new("git").args(["worktree", "prune"]).output();
+    let _ = Command::new("git").args(["worktree", "prune"]).output(); // intentional: best-effort prune of stale refs
 
     let base = worktrees_base();
     if !base.exists() {
@@ -170,7 +170,7 @@ pub fn cleanup_stale() -> Result<(), Box<dyn std::error::Error>> {
             // A valid worktree has a .git file (not directory) inside it.
             if !path.join(".git").exists() {
                 eprintln!("Removing stale worktree dir: {}", path.display());
-                let _ = std::fs::remove_dir_all(&path);
+                let _ = std::fs::remove_dir_all(&path); // intentional: best-effort stale worktree cleanup
             }
         }
     }

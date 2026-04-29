@@ -15,7 +15,9 @@ pub fn daemon_lock_path() -> PathBuf {
 pub fn try_acquire_daemon_lock() -> Option<std::fs::File> {
     let lock_path = daemon_lock_path();
     if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("[boi daemon] ERROR: failed to create lock dir {}: {}", parent.display(), e);
+        }
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -29,8 +31,12 @@ pub fn try_acquire_daemon_lock() -> Option<std::fs::File> {
     if rc == 0 {
         use std::io::Write;
         let mut f = file;
-        let _ = f.set_len(0);
-        let _ = write!(f, "{}", std::process::id());
+        if let Err(e) = f.set_len(0) {
+            eprintln!("[boi daemon] ERROR: failed to truncate lock file: {}", e);
+        }
+        if let Err(e) = write!(f, "{}", std::process::id()) {
+            eprintln!("[boi daemon] ERROR: failed to write PID to lock file: {}", e);
+        }
         Some(f)
     } else {
         None
@@ -203,7 +209,9 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
     while running.load(std::sync::atomic::Ordering::SeqCst) {
         // Write heartbeat
         let heartbeat_path = daemon_heartbeat_path();
-        let _ = std::fs::write(&heartbeat_path, chrono::Utc::now().to_rfc3339());
+        if let Err(e) = std::fs::write(&heartbeat_path, chrono::Utc::now().to_rfc3339()) {
+            eprintln!("[boi daemon] ERROR: failed to write heartbeat: {}", e);
+        }
 
         {
             let mut workers = active.lock().unwrap_or_else(|e| {
@@ -225,7 +233,9 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                                         spec_id
                                     );
                                     if let Ok(q2) = queue::Queue::open(db_str) {
-                                        let _ = q2.update_spec(&spec_id, "failed");
+                                        if let Err(e) = q2.update_spec(&spec_id, "failed") {
+                                            eprintln!("[boi daemon] ERROR: failed to mark spec {} as failed: {}", spec_id, e);
+                                        }
                                     }
                                     continue;
                                 }
@@ -296,7 +306,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
     }
 
     // Clean up heartbeat (lock file releases automatically when _lock_file drops)
-    let _ = std::fs::remove_file(daemon_heartbeat_path());
+    let _ = std::fs::remove_file(daemon_heartbeat_path()); // intentional: best-effort heartbeat cleanup
 
     eprintln!("[boi daemon] stopped");
 }
@@ -316,7 +326,7 @@ pub fn cmd_stop() {
 
     if !is_pid_alive(pid) {
         eprintln!("daemon process {} is not running", pid);
-        let _ = std::fs::remove_file(daemon_heartbeat_path());
+        let _ = std::fs::remove_file(daemon_heartbeat_path()); // intentional: best-effort heartbeat cleanup
         return;
     }
 
@@ -340,8 +350,6 @@ pub fn cmd_stop() {
     println!("daemon still running after 10s — sending SIGKILL");
     // SAFETY: Same PID as the SIGTERM above. SIGKILL is the last-resort escalation
     // after the 10s graceful shutdown window expired.
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-    let _ = std::fs::remove_file(daemon_heartbeat_path());
+    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+    let _ = std::fs::remove_file(daemon_heartbeat_path()); // intentional: best-effort heartbeat cleanup
 }

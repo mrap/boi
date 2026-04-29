@@ -148,10 +148,14 @@ pub fn spawn_claude(
     let pid_path = spec_id.map(|sid| {
         let p = pid_file_for(sid);
         if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("[boi] ERROR: failed to create pid dir {}: {}", parent.display(), e);
+            }
         }
         let child_pid = child.id();
-        let _ = std::fs::write(&p, child_pid.to_string());
+        if let Err(e) = std::fs::write(&p, child_pid.to_string()) {
+            eprintln!("[boi] ERROR: failed to write pid file {}: {}", p.display(), e);
+        }
         boi_log!(" wrote pid {} to {}", child_pid, p.display());
         p
     });
@@ -162,7 +166,9 @@ pub fn spawn_claude(
 
     let stderr_handle = std::thread::spawn(move || {
         let mut buf = String::new();
-        let _ = std::io::BufReader::new(stderr_pipe).read_to_string(&mut buf);
+        if let Err(e) = std::io::BufReader::new(stderr_pipe).read_to_string(&mut buf) {
+            eprintln!("[boi] ERROR: failed to read claude stderr: {}", e);
+        }
         buf
     });
 
@@ -229,8 +235,8 @@ pub fn spawn_claude(
             }
             None => {
                 if spawn_time.elapsed().as_secs() >= timeout_secs {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _ = child.kill(); // intentional: best-effort cleanup on timeout
+                    let _ = child.wait(); // intentional: reap zombie after kill
                     // SAFETY: same as above — kill the entire process group on timeout.
                     unsafe { libc::kill(-pgid, libc::SIGKILL); }
                     timed_out = true;
@@ -245,11 +251,11 @@ pub fn spawn_claude(
 
     // Clean up PID file — child has exited (or been killed on timeout)
     if let Some(ref p) = pid_path {
-        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(p); // intentional: best-effort pid file cleanup
     }
 
     if timed_out {
-        let _ = reader_handle.join();
+        let _ = reader_handle.join(); // intentional: best-effort thread join on timeout
         let stderr_output = stderr_handle.join().unwrap_or_default();
         if !stderr_output.is_empty() {
             boi_log!("claude stderr (timeout):\n{}", stderr_output);
@@ -320,7 +326,9 @@ fn record_phase_run(
         started_at: started_at.to_string(),
         completed_at: Some(completed_at),
     };
-    let _ = queue.insert_phase_run(&rec);
+    if let Err(e) = queue.insert_phase_run(&rec) {
+        eprintln!("[boi] ERROR: failed to insert phase_run for spec={} phase={}: {}", spec_id, phase_name, e);
+    }
 }
 
 /// Execute all pending tasks for a queued spec.
@@ -346,7 +354,7 @@ pub fn run_worker(
 fn registry_load_user(registry: &PhaseRegistry) {
     // PhaseRegistry::new() already loads core phases. User phases need a mutable registry,
     // but we handle this by creating a new registry with user phases in run_worker_with_registry.
-    let _ = registry;
+    let _ = registry; // intentional: consume parameter to suppress unused warning
 }
 
 /// Worker state machine — flat loop, no nested breaks.
@@ -393,7 +401,7 @@ pub fn run_worker_with_phases(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let queue = Queue::open(queue_path)?;
     queue.update_spec(spec_id, "running")?;
-    let _ = hooks::fire(hook_config, ON_WORKER_START, &json!({ "spec_id": spec_id }));
+    let _ = hooks::fire(hook_config, ON_WORKER_START, &json!({ "spec_id": spec_id })); // intentional: best-effort hook notification
 
     telemetry.emit("boi.worker.started", LogLevel::Info, &json!({
         "spec_id": spec_id,
@@ -574,7 +582,9 @@ pub fn run_worker_with_phases(
                         "[boi] ERROR: worktree {} disappeared — aborting spec {}",
                         worktree_path, spec_id
                     );
-                    let _ = queue.update_spec(spec_id, "failed");
+                    if let Err(e) = queue.update_spec(spec_id, "failed") {
+                        eprintln!("[boi] ERROR: failed to mark spec {} as failed after worktree loss: {}", spec_id, e);
+                    }
                     telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
                         "spec_id": spec_id,
                         "status": "failed",
@@ -607,7 +617,7 @@ pub fn run_worker_with_phases(
                     "phase": phase_name,
                     "level": "spec",
                 });
-                let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
+                let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload); // intentional: best-effort hook notification
 
                 telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
                     "spec_id": spec_id,
@@ -634,15 +644,15 @@ pub fn run_worker_with_phases(
 
                 match &verdict {
                     Verdict::Proceed => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
                         state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
                     }
                     Verdict::Redo { tasks } => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
                         // Inject tasks if any, then go to TaskSelect
                         if !tasks.is_empty() {
                             for t in tasks {
-                                let _ = queue.add_task(
+                                let _ = queue.add_task( // intentional: best-effort task injection during redo
                                     spec_id,
                                     &t.id,
                                     &t.title,
@@ -659,7 +669,7 @@ pub fn run_worker_with_phases(
                     }
                     Verdict::Done { success: false, reason } => {
                         boi_log!(" pre-task spec phase '{}' failed: {}", phase_name, reason);
-                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload); // intentional: best-effort hook notification
                         if phase.can_fail_spec {
                             state = WorkerState::Failed {
                                 reason: format!("pre-task phase '{}' failed: {}", phase_name, reason),
@@ -669,7 +679,7 @@ pub fn run_worker_with_phases(
                         }
                     }
                     Verdict::Done { success: true, reason } => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
                         boi_log!(" pre-task spec phase '{}' done: {}", phase_name, reason);
                         state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
                     }
@@ -720,7 +730,7 @@ pub fn run_worker_with_phases(
                     });
                     let db_task_id = yaml_to_canonical.get(task_id.as_str()).map(|s| s.as_str()).unwrap_or(task_id.as_str());
                     queue.update_task(spec_id, db_task_id, "RUNNING")?;
-                    let _ = hooks::fire(hook_config, ON_TASK_START, &task_payload);
+                    let _ = hooks::fire(hook_config, ON_TASK_START, &task_payload); // intentional: best-effort hook notification
 
                     telemetry.emit("boi.task.started", LogLevel::Info, &json!({
                         "spec_id": spec_id,
@@ -797,7 +807,7 @@ pub fn run_worker_with_phases(
                         "task_id": task.id,
                         "task_title": task.title,
                     });
-                    let _ = hooks::fire(hook_config, ON_TASK_COMPLETE, &task_payload);
+                    let _ = hooks::fire(hook_config, ON_TASK_COMPLETE, &task_payload); // intentional: best-effort hook notification
                     telemetry.emit("boi.task.completed", LogLevel::Info, &json!({
                         "spec_id": spec_id,
                         "task_id": task.id,
@@ -832,7 +842,7 @@ pub fn run_worker_with_phases(
                     "phase": phase_name,
                     "level": "task",
                 });
-                let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
+                let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload); // intentional: best-effort hook notification
 
                 telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
                     "spec_id": spec_id,
@@ -862,7 +872,7 @@ pub fn run_worker_with_phases(
 
                 match &verdict {
                     Verdict::Proceed => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
                             phase_idx: phase_idx + 1,
@@ -880,9 +890,9 @@ pub fn run_worker_with_phases(
                             };
                         } else {
                             // Inject tasks and go to TaskSelect
-                            let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                            let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
                             for t in tasks {
-                                let _ = queue.add_task(
+                                let _ = queue.add_task( // intentional: best-effort task injection during redo
                                     spec_id,
                                     &t.id,
                                     &t.title,
@@ -899,7 +909,7 @@ pub fn run_worker_with_phases(
                     }
                     Verdict::Done { success: false, reason } => {
                         boi_log!(" phase '{}' failed for task {}: {}", phase_name, task.id, reason);
-                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload); // intentional: best-effort hook notification
                         let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
                         if max_attempts > 0 {
                             state = WorkerState::TaskPhaseRetry {
@@ -914,7 +924,7 @@ pub fn run_worker_with_phases(
                                 "task_id": task.id,
                                 "task_title": task.title,
                             });
-                            let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
+                            let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload); // intentional: best-effort hook notification
                             telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
                                 "spec_id": spec_id,
                                 "task_id": task.id,
@@ -927,7 +937,7 @@ pub fn run_worker_with_phases(
                         }
                     }
                     Verdict::Done { success: true, reason } => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
                         boi_log!(" phase '{}' done for task {}: {}", phase_name, task.id, reason);
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
@@ -977,7 +987,7 @@ pub fn run_worker_with_phases(
                         "task_id": task.id,
                         "task_title": task.title,
                     });
-                    let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
+                    let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload); // intentional: best-effort hook notification
                     telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
                         "spec_id": spec_id,
                         "task_id": task.id,
@@ -1066,7 +1076,7 @@ pub fn run_worker_with_phases(
                         "task_id": task_id_owned,
                         "task_title": task_title,
                     });
-                    let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
+                    let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload); // intentional: best-effort hook notification
                     telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
                         "spec_id": spec_id,
                         "task_id": task_id_owned,
@@ -1142,7 +1152,7 @@ pub fn run_worker_with_phases(
                     "phase": phase_name,
                     "level": "spec",
                 });
-                let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload);
+                let _ = hooks::fire(hook_config, ON_PHASE_START, &phase_payload); // intentional: best-effort hook notification
 
                 telemetry.emit("boi.phase.start", LogLevel::Info, &json!({
                     "spec_id": spec_id,
@@ -1169,15 +1179,15 @@ pub fn run_worker_with_phases(
 
                 match &verdict {
                     Verdict::Proceed => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
                         state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                     }
                     Verdict::Redo { tasks } => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
                         // Inject tasks if any, then re-enter task loop
                         if !tasks.is_empty() {
                             for t in tasks {
-                                let _ = queue.add_task(
+                                let _ = queue.add_task( // intentional: best-effort task injection during redo
                                     spec_id,
                                     &t.id,
                                     &t.title,
@@ -1204,7 +1214,7 @@ pub fn run_worker_with_phases(
                     }
                     Verdict::Done { success: false, reason } => {
                         boi_log!(" post-task spec phase '{}' failed: {}", phase_name, reason);
-                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload); // intentional: best-effort hook notification
                         if phase.can_fail_spec {
                             state = WorkerState::Failed {
                                 reason: format!("post-task phase '{}' failed: {}", phase_name, reason),
@@ -1214,7 +1224,7 @@ pub fn run_worker_with_phases(
                         }
                     }
                     Verdict::Done { success: true, reason } => {
-                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
+                        let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
                         boi_log!(" post-task spec phase '{}' done: {}", phase_name, reason);
                         state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                     }
@@ -1225,7 +1235,7 @@ pub fn run_worker_with_phases(
                 let prompt_owned = prompt.clone();
                 boi_log!(" spec {} paused: {}", spec_id, prompt_owned);
                 queue.update_spec(spec_id, "paused")?;
-                let _ = hooks::fire(hook_config, hooks::ON_SPEC_PAUSED, &json!({
+                let _ = hooks::fire(hook_config, hooks::ON_SPEC_PAUSED, &json!({ // intentional: best-effort hook notification
                     "spec_id": spec_id,
                     "prompt": prompt_owned,
                 }));
@@ -1244,7 +1254,7 @@ pub fn run_worker_with_phases(
                 boi_log!("state: Complete — spec {} done (tasks={}, spec_redo_count={})",
                     spec_id, done_ids.len(), spec_redo_count);
                 queue.update_spec(spec_id, "completed")?;
-                let _ = hooks::fire(hook_config, ON_COMPLETE, &json!({ "spec_id": spec_id }));
+                let _ = hooks::fire(hook_config, ON_COMPLETE, &json!({ "spec_id": spec_id })); // intentional: best-effort hook notification
                 telemetry.emit("boi.spec.completed", LogLevel::Info, &json!({
                     "spec_id": spec_id,
                     "status": "completed",
@@ -1257,7 +1267,7 @@ pub fn run_worker_with_phases(
                 let reason_owned = reason.clone();
                 boi_log!(" spec {} failed: {}", spec_id, reason_owned);
                 queue.update_spec(spec_id, "failed")?;
-                let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
+                let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id })); // intentional: best-effort hook notification
                 telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
                     "spec_id": spec_id,
                     "status": "failed",
@@ -1294,7 +1304,7 @@ pub fn run_worker_with_phases(
                                             "spec_id": spec_id,
                                             "error": e.to_string(),
                                         }));
-                                        let _ = crate::worktree::delete_branch(spec_id, ws);
+                                        let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
                                         break;
                                     }
                                 }
@@ -1313,15 +1323,15 @@ pub fn run_worker_with_phases(
                         }
                     }
                     boi_log!("state: Cleanup — removing worktree for spec {}", spec_id);
-                    let _ = crate::worktree::cleanup(spec_id);
+                    let _ = crate::worktree::cleanup(spec_id); // intentional: best-effort worktree cleanup
                     if let Some(ws) = &boi_spec.workspace {
-                        let _ = crate::worktree::delete_branch(spec_id, ws);
+                        let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
                     }
                 } else if config.cleanup_on_failure {
                     boi_log!("state: Cleanup — removing worktree for failed spec {}", spec_id);
-                    let _ = crate::worktree::cleanup(spec_id);
+                    let _ = crate::worktree::cleanup(spec_id); // intentional: best-effort worktree cleanup
                     if let Some(ws) = &boi_spec.workspace {
-                        let _ = crate::worktree::delete_branch(spec_id, ws);
+                        let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
                     }
                 } else {
                     boi_log!(" preserving worktree for failed spec {}", spec_id);
@@ -1332,7 +1342,7 @@ pub fn run_worker_with_phases(
                     .unwrap_or("default");
                 let tmp = std::env::temp_dir().join(format!("boi-{}-{}", spec_id, queue_tag));
                 if tmp.exists() {
-                    let _ = std::fs::remove_dir_all(&tmp);
+                    let _ = std::fs::remove_dir_all(&tmp); // intentional: best-effort temp dir cleanup
                 }
                 break;
             }
