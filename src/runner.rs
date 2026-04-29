@@ -46,8 +46,7 @@ impl PhaseRunner for ClaudePhaseRunner {
         timeout_secs: u64,
     ) -> Verdict {
         if !phase.requires_claude {
-            // Non-claude phase: run verify command directly
-            return self.run_verify_phase(phase, task, worktree_path);
+            return self.run_verify_phase(phase, task, worktree_path, timeout_secs);
         }
 
         let task_id = task.map(|t| t.id.as_str());
@@ -74,37 +73,55 @@ impl PhaseRunner for ClaudePhaseRunner {
             "task_id": task_id,
             "phase": phase.name,
             "prompt_length": prompt.len(),
-            "message": format!("spawning claude for phase '{}'", phase.name),
+            "message": "spawning claude...",
         }));
 
-        let start = Instant::now();
         let result = worker::spawn_claude(&prompt, worktree_path, timeout_secs);
-        let duration_ms = start.elapsed().as_millis() as u64;
+
+        if let Ok(ref cr) = result {
+            let startup_s = cr.startup_ms as f64 / 1000.0;
+            self.telemetry.emit("boi.claude.first_output", LogLevel::Debug, &json!({
+                "spec_id": spec_id_hint,
+                "task_id": task_id,
+                "startup_ms": cr.startup_ms,
+                "message": format!("first output after {:.1}s (startup)", startup_s),
+            }));
+        }
 
         match result {
-            Ok((true, ref output)) => {
+            Ok(ref cr) if cr.success => {
+                let inference_s = cr.inference_ms as f64 / 1000.0;
+                let total_s = cr.total_ms as f64 / 1000.0;
                 self.telemetry.emit("boi.claude.exit", LogLevel::Debug, &json!({
                     "spec_id": spec_id_hint,
                     "task_id": task_id,
                     "phase": phase.name,
                     "exit_code": 0,
-                    "output_length": output.len(),
-                    "duration_ms": duration_ms,
-                    "message": format!("claude exit 0, output: {} chars ({}ms)", output.len(), duration_ms),
+                    "output_length": cr.output.len(),
+                    "startup_ms": cr.startup_ms,
+                    "inference_ms": cr.inference_ms,
+                    "total_ms": cr.total_ms,
+                    "message": format!("claude exit 0, {} chars ({:.1}s inference, {:.1}s total)",
+                        cr.output.len(), inference_s, total_s),
                 }));
-                crate::phases::parse_phase_output(phase, output)
+                crate::phases::parse_phase_output(phase, &cr.output)
             }
-            Ok((false, ref output)) => {
+            Ok(ref cr) => {
+                let inference_s = cr.inference_ms as f64 / 1000.0;
+                let total_s = cr.total_ms as f64 / 1000.0;
                 self.telemetry.emit("boi.claude.exit", LogLevel::Debug, &json!({
                     "spec_id": spec_id_hint,
                     "task_id": task_id,
                     "phase": phase.name,
                     "exit_code": 1,
-                    "output_length": output.len(),
-                    "duration_ms": duration_ms,
-                    "message": format!("claude exit non-zero, output: {} chars ({}ms)", output.len(), duration_ms),
+                    "output_length": cr.output.len(),
+                    "startup_ms": cr.startup_ms,
+                    "inference_ms": cr.inference_ms,
+                    "total_ms": cr.total_ms,
+                    "message": format!("claude exit non-zero, {} chars ({:.1}s inference, {:.1}s total)",
+                        cr.output.len(), inference_s, total_s),
                 }));
-                if output == "timeout" {
+                if cr.output == "timeout" {
                     Verdict::Done {
                         success: false,
                         reason: "timeout".into(),
@@ -117,7 +134,7 @@ impl PhaseRunner for ClaudePhaseRunner {
                 } else {
                     Verdict::Done {
                         success: false,
-                        reason: format!("Phase {} failed: {}", phase.name, output),
+                        reason: format!("Phase {} failed: {}", phase.name, cr.output),
                     }
                 }
             }
@@ -126,7 +143,6 @@ impl PhaseRunner for ClaudePhaseRunner {
                     "spec_id": spec_id_hint,
                     "task_id": task_id,
                     "phase": phase.name,
-                    "duration_ms": duration_ms,
                     "message": format!("claude spawn error: {}", e),
                 }));
                 Verdict::Done {
@@ -144,40 +160,94 @@ impl ClaudePhaseRunner {
         _phase: &PhaseConfig,
         task: Option<&BoiTask>,
         worktree_path: &str,
+        timeout_secs: u64,
     ) -> Verdict {
         let task = match task {
             Some(t) => t,
             None => return Verdict::Proceed,
         };
 
-        let verify_cmd = match task.verify.as_deref() {
-            Some(cmd) if !cmd.is_empty() => cmd,
-            _ => return Verdict::Proceed,
-        };
+        let has_verify = task.verify.as_deref().map_or(false, |c| !c.is_empty());
+        let has_verify_prompt = task.verify_prompt.as_deref().map_or(false, |p| !p.is_empty());
 
-        self.telemetry.emit("boi.verify.run", LogLevel::Debug, &json!({
-            "task_id": task.id,
-            "verify_cmd": verify_cmd,
-            "message": format!("cmd: {}", verify_cmd),
-        }));
-
-        let start = Instant::now();
-        let passed = worker::run_verify(verify_cmd, worktree_path);
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        self.telemetry.emit("boi.verify.result", LogLevel::Debug, &json!({
-            "task_id": task.id,
-            "verify_cmd": verify_cmd,
-            "passed": passed,
-            "duration_ms": duration_ms,
-            "message": format!("exit {} ({})", if passed { "0 (passed)" } else { "non-zero (failed)" }, duration_ms),
-        }));
-
-        if passed {
-            Verdict::Proceed
-        } else {
-            Verdict::Redo { tasks: vec![] }
+        if !has_verify && !has_verify_prompt {
+            return Verdict::Proceed;
         }
+
+        // Shell verify
+        if has_verify {
+            let verify_cmd = task.verify.as_deref().unwrap();
+
+            self.telemetry.emit("boi.verify.run", LogLevel::Debug, &json!({
+                "task_id": task.id,
+                "verify_cmd": verify_cmd,
+                "message": format!("cmd: {}", verify_cmd),
+            }));
+
+            let start = Instant::now();
+            let passed = worker::run_verify(verify_cmd, worktree_path);
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            self.telemetry.emit("boi.verify.result", LogLevel::Debug, &json!({
+                "task_id": task.id,
+                "verify_cmd": verify_cmd,
+                "passed": passed,
+                "duration_ms": duration_ms,
+                "message": format!("exit {} ({}ms)", if passed { "0 (passed)" } else { "non-zero (failed)" }, duration_ms),
+            }));
+
+            if !passed {
+                return Verdict::Redo { tasks: vec![] };
+            }
+        }
+
+        // Claude verify_prompt (only reached if shell verify passed or wasn't set)
+        if has_verify_prompt {
+            let verify_prompt = task.verify_prompt.as_deref().unwrap();
+
+            self.telemetry.emit("boi.verify_prompt.run", LogLevel::Debug, &json!({
+                "task_id": task.id,
+                "verify_prompt_length": verify_prompt.len(),
+                "message": format!("verify_prompt: spawning claude ({} chars)", verify_prompt.len()),
+            }));
+
+            let result = worker::spawn_claude(verify_prompt, worktree_path, timeout_secs);
+
+            match result {
+                Ok(ref cr) if cr.success => {
+                    self.telemetry.emit("boi.verify_prompt.result", LogLevel::Debug, &json!({
+                        "task_id": task.id,
+                        "passed": true,
+                        "output_length": cr.output.len(),
+                        "startup_ms": cr.startup_ms,
+                        "inference_ms": cr.inference_ms,
+                        "total_ms": cr.total_ms,
+                        "message": format!("verify_prompt passed ({}ms)", cr.total_ms),
+                    }));
+                }
+                Ok(ref cr) => {
+                    self.telemetry.emit("boi.verify_prompt.result", LogLevel::Debug, &json!({
+                        "task_id": task.id,
+                        "passed": false,
+                        "output_length": cr.output.len(),
+                        "startup_ms": cr.startup_ms,
+                        "inference_ms": cr.inference_ms,
+                        "total_ms": cr.total_ms,
+                        "message": format!("verify_prompt failed ({}ms)", cr.total_ms),
+                    }));
+                    return Verdict::Redo { tasks: vec![] };
+                }
+                Err(e) => {
+                    self.telemetry.emit("boi.verify_prompt.error", LogLevel::Error, &json!({
+                        "task_id": task.id,
+                        "message": format!("verify_prompt spawn error: {}", e),
+                    }));
+                    return Verdict::Redo { tasks: vec![] };
+                }
+            }
+        }
+
+        Verdict::Proceed
     }
 }
 
@@ -263,6 +333,7 @@ mod tests {
             depends: None,
             spec: Some("Do something".into()),
             verify: Some(verify.into()),
+            verify_prompt: None,
             phases: None,
         }
     }
@@ -299,6 +370,7 @@ mod tests {
             depends: None,
             spec: None,
             verify: None,
+            verify_prompt: None,
             phases: None,
         };
         let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10);

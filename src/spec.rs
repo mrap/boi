@@ -65,6 +65,8 @@ pub struct BoiTask {
     pub depends: Option<Vec<String>>,
     pub spec: Option<String>,
     pub verify: Option<String>,
+    #[serde(default)]
+    pub verify_prompt: Option<String>,
     /// Override task-level phases for this specific task
     #[serde(default)]
     pub phases: Option<Vec<String>>,
