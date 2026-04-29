@@ -247,10 +247,10 @@ impl PhaseConfig {
     }
 }
 
-/// Derive phase level from name. Spec-level phases: plan-critique, critic, evaluate, review.
+/// Derive phase level from name. Spec-level phases: plan-critique, critic, evaluate, review, spec-review.
 fn derive_level(name: &str) -> PhaseLevel {
     match name {
-        "plan-critique" | "critic" | "evaluate" | "review" => PhaseLevel::Spec,
+        "plan-critique" | "critic" | "evaluate" | "review" | "spec-review" => PhaseLevel::Spec,
         _ => PhaseLevel::Task,
     }
 }
@@ -262,8 +262,8 @@ fn derive_can_add_tasks(name: &str, completion_handler: Option<&str>) -> bool {
             return true;
         }
     }
-    // Phases that structurally add tasks: critic, decompose, evaluate, plan-critique, code-review, review
-    matches!(name, "critic" | "decompose" | "evaluate" | "plan-critique" | "code-review" | "review")
+    // Phases that structurally add tasks: critic, decompose, evaluate, plan-critique, code-review, review, spec-review
+    matches!(name, "critic" | "decompose" | "evaluate" | "plan-critique" | "code-review" | "review" | "spec-review")
 }
 
 /// Derive can_fail_spec from name.
@@ -479,22 +479,22 @@ pub fn default_pipeline(mode: &str) -> PipelineConfig {
     fallback_pipeline(mode)
 }
 
-fn fallback_pipeline(mode: &str) -> PipelineConfig {
+pub(crate) fn fallback_pipeline(mode: &str) -> PipelineConfig {
     match mode {
         "execute" => PipelineConfig {
-            spec_phases: vec!["critic".into()],
+            spec_phases: vec!["spec-review".into(), "critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
         },
         "challenge" => PipelineConfig {
-            spec_phases: vec!["plan-critique".into(), "critic".into()],
+            spec_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
         },
         "discover" => PipelineConfig {
-            spec_phases: vec!["critic".into(), "evaluate".into()],
+            spec_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
         },
         "generate" => PipelineConfig {
-            spec_phases: vec!["plan-critique".into(), "critic".into(), "evaluate".into()],
+            spec_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into(), "evaluate".into()],
             task_phases: vec!["decompose".into(), "execute".into(), "code-review".into(), "task-verify".into()],
         },
         _ => PipelineConfig {
@@ -857,6 +857,11 @@ mod tests {
         let evaluate = registry.get("evaluate").unwrap();
         assert!(evaluate.can_add_tasks);
         assert!(!evaluate.can_fail_spec);
+
+        let spec_review = registry.get("spec-review").unwrap();
+        assert!(spec_review.can_add_tasks);
+        assert!(!spec_review.can_fail_spec);
+        assert!(spec_review.requires_claude);
     }
 
     #[test]
@@ -1005,11 +1010,12 @@ approve_signal = ""
     fn test_core_and_user_names() {
         let registry = test_registry();
         let core = registry.core_names();
-        assert_eq!(core.len(), 8);
+        assert_eq!(core.len(), 9);
         assert!(core.contains(&"execute"));
         assert!(core.contains(&"plan-critique"));
         assert!(core.contains(&"code-review"));
         assert!(core.contains(&"task-verify"));
+        assert!(core.contains(&"spec-review"));
 
         let user = registry.user_names();
         assert!(user.is_empty());
@@ -1021,7 +1027,7 @@ approve_signal = ""
         let nonexistent = test_utils::test_file("nonexistent-dir", "xyz");
         let _ = std::fs::remove_file(&nonexistent);
         registry.load_user_phases(&nonexistent);
-        assert_eq!(registry.list().len(), 8);
+        assert_eq!(registry.list().len(), 9);
     }
 
     // --- Step 1: PhaseLevel tests ---
@@ -1039,6 +1045,7 @@ approve_signal = ""
         assert_eq!(registry.get("critic").unwrap().level, PhaseLevel::Spec);
         assert_eq!(registry.get("evaluate").unwrap().level, PhaseLevel::Spec);
         assert_eq!(registry.get("plan-critique").unwrap().level, PhaseLevel::Spec);
+        assert_eq!(registry.get("spec-review").unwrap().level, PhaseLevel::Spec);
 
         // Task-level phases
         assert_eq!(registry.get("execute").unwrap().level, PhaseLevel::Task);
@@ -1051,37 +1058,49 @@ approve_signal = ""
 
     #[test]
     fn test_default_pipeline_execute() {
-        let p = default_pipeline("execute");
-        assert_eq!(p.spec_phases, vec!["critic"]);
+        let p = fallback_pipeline("execute");
+        assert_eq!(p.spec_phases, vec!["spec-review", "critic"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_challenge() {
-        let p = default_pipeline("challenge");
-        assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]);
+        let p = fallback_pipeline("challenge");
+        assert_eq!(p.spec_phases, vec!["spec-review", "plan-critique", "critic"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_discover() {
-        let p = default_pipeline("discover");
-        assert_eq!(p.spec_phases, vec!["critic", "evaluate"]);
+        let p = fallback_pipeline("discover");
+        assert_eq!(p.spec_phases, vec!["spec-review", "critic", "evaluate"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_generate() {
-        let p = default_pipeline("generate");
-        assert_eq!(p.spec_phases, vec!["plan-critique", "critic", "evaluate"]);
+        let p = fallback_pipeline("generate");
+        assert_eq!(p.spec_phases, vec!["spec-review", "plan-critique", "critic", "evaluate"]);
         assert_eq!(p.task_phases, vec!["decompose", "execute", "code-review", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_unknown_mode() {
-        let p = default_pipeline("unknown");
+        let p = fallback_pipeline("unknown");
         assert!(p.spec_phases.is_empty());
         assert_eq!(p.task_phases, vec!["execute"]);
+    }
+
+    #[test]
+    fn test_spec_review_is_first_spec_phase() {
+        for mode in &["execute", "challenge", "discover", "generate"] {
+            let p = fallback_pipeline(mode);
+            assert_eq!(
+                p.spec_phases.first().map(|s| s.as_str()),
+                Some("spec-review"),
+                "spec-review must be first spec phase in mode '{mode}'"
+            );
+        }
     }
 
     // --- Step 3: New core phases tests ---
@@ -1125,8 +1144,9 @@ approve_signal = ""
     #[test]
     fn test_resolve_pipeline_uses_defaults() {
         let p = resolve_pipeline("execute", None, None);
-        assert_eq!(p.spec_phases, vec!["critic"]);
-        assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
+        let expected = default_pipeline("execute");
+        assert_eq!(p.spec_phases, expected.spec_phases);
+        assert_eq!(p.task_phases, expected.task_phases);
     }
 
     #[test]
@@ -1134,14 +1154,18 @@ approve_signal = ""
         let spec_override = vec!["plan-critique".to_string(), "critic".to_string()];
         let p = resolve_pipeline("execute", Some(&spec_override), None);
         assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]);
-        assert_eq!(p.task_phases, vec!["execute", "task-verify"]); // unchanged
+        // task_phases unchanged — must match the default for this environment
+        let default = default_pipeline("execute");
+        assert_eq!(p.task_phases, default.task_phases);
     }
 
     #[test]
     fn test_resolve_pipeline_task_override() {
         let task_override = vec!["execute".to_string()];
         let p = resolve_pipeline("challenge", None, Some(&task_override));
-        assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]); // unchanged
+        // spec_phases unchanged — must match the default for this environment
+        let default = default_pipeline("challenge");
+        assert_eq!(p.spec_phases, default.spec_phases);
         assert_eq!(p.task_phases, vec!["execute"]); // overridden
     }
 
@@ -1158,7 +1182,7 @@ approve_signal = ""
     fn test_resolve_task_phases_no_override() {
         let pipeline = default_pipeline("execute");
         let phases = resolve_task_phases(&pipeline, None);
-        assert_eq!(phases, vec!["execute", "task-verify"]);
+        assert_eq!(phases, pipeline.task_phases);
     }
 
     #[test]

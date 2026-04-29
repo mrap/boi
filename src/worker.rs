@@ -59,6 +59,141 @@ pub fn build_prompt(spec_content: &str, task: &spec::BoiTask) -> String {
     )
 }
 
+/// Extract JSON content from Claude output, handling markdown code fences.
+fn extract_json_from_output(output: &str) -> String {
+    // Try ```json fence first
+    if let Some(start) = output.find("```json") {
+        let after = &output[start + 7..];
+        if let Some(end) = after.find("```") {
+            return after[..end].trim().to_string();
+        }
+    }
+    // Try generic ``` fence containing JSON
+    if let Some(start) = output.find("```") {
+        let after = &output[start + 3..];
+        if let Some(end) = after.find("```") {
+            let candidate = after[..end].trim();
+            if candidate.starts_with('[') || candidate.starts_with('{') {
+                return candidate.to_string();
+            }
+        }
+    }
+    // Fall back to first '[' for a bare JSON array
+    if let Some(idx) = output.find('[') {
+        return output[idx..].to_string();
+    }
+    output.to_string()
+}
+
+/// Parse spec-review JSON output and apply suggested changes to the DB.
+/// All changes are best-effort: failures are logged but never block execution.
+pub(crate) fn apply_spec_review_output(
+    queue: &crate::queue::Queue,
+    spec_id: &str,
+    yaml_to_canonical: &HashMap<String, String>,
+    output: &str,
+) {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Change {
+        task_id: String,
+        change_type: String,
+        content: Option<String>,
+        new_tasks: Option<Vec<NewTask>>,
+        deps: Option<Vec<String>>,
+    }
+
+    #[derive(Deserialize)]
+    struct NewTask {
+        title: String,
+        spec: Option<String>,
+        verify: Option<String>,
+        depends: Option<Vec<String>>,
+    }
+
+    #[derive(Deserialize)]
+    struct ReviewOutput {
+        changes: Vec<Change>,
+    }
+
+    // Try parsing directly first (bare array or wrapped object), then fall back to extraction
+    let changes: Vec<Change> = if let Ok(arr) = serde_json::from_str::<Vec<Change>>(output) {
+        arr
+    } else if let Ok(wrapped) = serde_json::from_str::<ReviewOutput>(output) {
+        wrapped.changes
+    } else {
+        let json_str = extract_json_from_output(output);
+        if let Ok(arr) = serde_json::from_str::<Vec<Change>>(&json_str) {
+            arr
+        } else if let Ok(wrapped) = serde_json::from_str::<ReviewOutput>(&json_str) {
+            wrapped.changes
+        } else {
+            boi_log!("spec-review: no valid JSON changes in output ({} chars)", output.len());
+            return;
+        }
+    };
+
+    boi_log!("spec-review: applying {} suggested changes", changes.len());
+
+    for change in &changes {
+        let canonical_id = yaml_to_canonical
+            .get(&change.task_id)
+            .map(|s| s.as_str())
+            .unwrap_or(change.task_id.as_str());
+
+        match change.change_type.as_str() {
+            "rewrite_spec" => {
+                if let Some(ref content) = change.content {
+                    match queue.update_task_spec_content(spec_id, canonical_id, content) {
+                        Ok(_) => boi_log!("spec-review: rewrote spec for {}", change.task_id),
+                        Err(e) => boi_log!("spec-review: failed to rewrite spec for {}: {}", change.task_id, e),
+                    }
+                }
+            }
+            "rewrite_verify" | "add_verify" => {
+                if let Some(ref content) = change.content {
+                    match queue.update_task_verify_content(spec_id, canonical_id, content) {
+                        Ok(_) => boi_log!("spec-review: updated verify for {} ({})", change.task_id, change.change_type),
+                        Err(e) => boi_log!("spec-review: failed to update verify for {}: {}", change.task_id, e),
+                    }
+                }
+            }
+            "add_dep" => {
+                if let Some(ref deps) = change.deps {
+                    for dep_yaml_id in deps {
+                        let dep_canonical = yaml_to_canonical
+                            .get(dep_yaml_id)
+                            .map(|s| s.as_str())
+                            .unwrap_or(dep_yaml_id.as_str());
+                        match queue.block_task(spec_id, canonical_id, dep_canonical) {
+                            Ok(_) => boi_log!("spec-review: added dep {} → {} for {}", dep_yaml_id, change.task_id, change.task_id),
+                            Err(e) => boi_log!("spec-review: failed to add dep for {}: {}", change.task_id, e),
+                        }
+                    }
+                }
+            }
+            "split" => {
+                if let Some(ref new_tasks) = change.new_tasks {
+                    for nt in new_tasks {
+                        let deps: Vec<String> = nt.depends.as_deref().unwrap_or(&[])
+                            .iter()
+                            .map(|d| yaml_to_canonical.get(d).cloned().unwrap_or_else(|| d.clone()))
+                            .collect();
+                        match queue.add_task(spec_id, "", &nt.title, nt.spec.as_deref(), nt.verify.as_deref(), &deps) {
+                            Ok(new_id) => boi_log!("spec-review: split {} → new task {} ({})", change.task_id, new_id, nt.title),
+                            Err(e) => boi_log!("spec-review: failed to add split task for {}: {}", change.task_id, e),
+                        }
+                    }
+                }
+            }
+            other => {
+                boi_log!("spec-review: unknown change_type '{}' for {}", other, change.task_id);
+            }
+        }
+    }
+}
+
 pub fn run_verify(verify_cmd: &str, dir: &str) -> bool {
     Command::new("sh")
         .args(["-c", verify_cmd])
@@ -516,12 +651,14 @@ pub fn run_worker_with_phases(
     }
 
     // Precompute phase lists
+    // Pre-task: spec-review (improves the spec before execution) and plan-critique (gate-checks it)
+    // Post-task: everything else (critic, evaluate, etc.)
     let pre_spec_phases: Vec<&str> = pipeline
         .spec_phases
         .iter()
         .filter_map(|name| {
             registry.get(name).and_then(|p| {
-                if p.level == PhaseLevel::Spec && name == "plan-critique" {
+                if p.level == PhaseLevel::Spec && matches!(name.as_str(), "spec-review" | "plan-critique") {
                     Some(name.as_str())
                 } else {
                     None
@@ -627,7 +764,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let verdict = runner.run_phase(
+                let (verdict, phase_output) = runner.run_phase_full(
                     phase,
                     &spec_content,
                     None,
@@ -640,6 +777,11 @@ pub fn run_worker_with_phases(
                 record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms);
 
                 emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
+
+                // Apply spec-review JSON suggestions to the DB before task execution begins.
+                if phase_name == "spec-review" && matches!(&verdict, Verdict::Proceed) {
+                    apply_spec_review_output(&queue, spec_id, &yaml_to_canonical, &phase_output);
+                }
 
                 match &verdict {
                     Verdict::Proceed => {
@@ -1785,8 +1927,10 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             claude_bin: "true".to_string(),
         };
         let registry = PhaseRegistry::new();
+        // spec-review runs first (pre-spec phase), then execute times out
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            Verdict::Done { success: false, reason: "timeout".into() },
+            Verdict::Proceed, // spec-review succeeds
+            Verdict::Done { success: false, reason: "timeout".into() }, // execute phase times out
         ]);
         let tel = test_telemetry();
 
@@ -1888,5 +2032,135 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
         assert_eq!(st.spec.status, "completed");
         assert_eq!(st.tasks[0].status, "DONE");
         assert_eq!(st.tasks[1].status, "DONE");
+    }
+
+    // --- apply_spec_review_output tests ---
+
+    fn setup_review_db(label: &str) -> (Queue, String, String, String) {
+        let spec_yaml = "title: \"Review Test\"\ntasks:\n  - id: t-1\n    title: \"Task One\"\n    status: PENDING\n  - id: t-2\n    title: \"Task Two\"\n    status: PENDING\n";
+        setup_test_db(&format!("review_{}", label), spec_yaml)
+    }
+
+    #[test]
+    fn test_apply_spec_review_rewrite_spec() {
+        let (queue, spec_id, _, _) = setup_review_db("rewrite_spec");
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        let t1_canonical = st.tasks[0].id.clone();
+
+        let mut yaml_to_canonical = HashMap::new();
+        yaml_to_canonical.insert("t-1".to_string(), t1_canonical.clone());
+
+        let output = r#"[{"task_id":"t-1","change_type":"rewrite_spec","content":"Updated spec content"}]"#.to_string();
+        apply_spec_review_output(&queue, &spec_id, &yaml_to_canonical, &output);
+
+        // Verify the spec_content was updated
+        let tasks = queue.get_tasks(&spec_id).unwrap();
+        let t1 = tasks.iter().find(|t| t.id == t1_canonical).unwrap();
+        // spec_content is stored but not in TaskRecord — verify via raw SQL is not accessible here.
+        // We verify indirectly: the function ran without panic and other tasks are untouched.
+        assert_eq!(tasks.len(), 2);
+        let _ = t1; // used to confirm task exists
+    }
+
+    #[test]
+    fn test_apply_spec_review_rewrite_verify() {
+        let (queue, spec_id, _, _) = setup_review_db("rewrite_verify");
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        let t1_canonical = st.tasks[0].id.clone();
+
+        let mut yaml_to_canonical = HashMap::new();
+        yaml_to_canonical.insert("t-1".to_string(), t1_canonical.clone());
+
+        let output = r#"[{"task_id":"t-1","change_type":"rewrite_verify","content":"grep -q 'ok' output.txt"}]"#;
+        apply_spec_review_output(&queue, &spec_id, &yaml_to_canonical, output);
+
+        let tasks = queue.get_tasks(&spec_id).unwrap();
+        assert_eq!(tasks.len(), 2); // no tasks added/removed
+    }
+
+    #[test]
+    fn test_apply_spec_review_add_dep() {
+        let (queue, spec_id, _, _) = setup_review_db("add_dep");
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        let t1_canonical = st.tasks[0].id.clone();
+        let t2_canonical = st.tasks[1].id.clone();
+
+        let mut yaml_to_canonical = HashMap::new();
+        yaml_to_canonical.insert("t-1".to_string(), t1_canonical.clone());
+        yaml_to_canonical.insert("t-2".to_string(), t2_canonical.clone());
+
+        let output = r#"[{"task_id":"t-2","change_type":"add_dep","deps":["t-1"]}]"#;
+        apply_spec_review_output(&queue, &spec_id, &yaml_to_canonical, output);
+
+        // t-2 should now depend on t-1
+        let tasks = queue.get_tasks(&spec_id).unwrap();
+        let t2 = tasks.iter().find(|t| t.id == t2_canonical).unwrap();
+        let deps: Vec<String> = serde_json::from_str(&t2.depends).unwrap_or_default();
+        assert!(deps.contains(&t1_canonical), "t-2 should depend on t-1, deps={:?}", deps);
+    }
+
+    #[test]
+    fn test_apply_spec_review_split() {
+        let (queue, spec_id, _, _) = setup_review_db("split");
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        let t1_canonical = st.tasks[0].id.clone();
+
+        let mut yaml_to_canonical = HashMap::new();
+        yaml_to_canonical.insert("t-1".to_string(), t1_canonical);
+
+        let output = r#"[{"task_id":"t-1","change_type":"split","new_tasks":[{"title":"Split Part A","spec":"Do part A","verify":"true"},{"title":"Split Part B","verify":"true"}]}]"#;
+        apply_spec_review_output(&queue, &spec_id, &yaml_to_canonical, output);
+
+        let tasks = queue.get_tasks(&spec_id).unwrap();
+        // 2 original + 2 split = 4 tasks
+        assert_eq!(tasks.len(), 4, "expected 4 tasks after split, got {}", tasks.len());
+        let titles: Vec<&str> = tasks.iter().map(|t| t.title.as_str()).collect();
+        assert!(titles.contains(&"Split Part A"));
+        assert!(titles.contains(&"Split Part B"));
+    }
+
+    #[test]
+    fn test_apply_spec_review_wrapped_json() {
+        let (queue, spec_id, _, _) = setup_review_db("wrapped_json");
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        let t1_canonical = st.tasks[0].id.clone();
+
+        let mut yaml_to_canonical = HashMap::new();
+        yaml_to_canonical.insert("t-1".to_string(), t1_canonical);
+
+        // Wrapped format: {"changes": [...]}
+        let output = r#"{"changes":[{"task_id":"t-1","change_type":"split","new_tasks":[{"title":"New Sub-Task","verify":"true"}]}]}"#;
+        apply_spec_review_output(&queue, &spec_id, &yaml_to_canonical, output);
+
+        let tasks = queue.get_tasks(&spec_id).unwrap();
+        assert_eq!(tasks.len(), 3, "expected 3 tasks after wrapped-format split");
+    }
+
+    #[test]
+    fn test_apply_spec_review_malformed_json() {
+        let (queue, spec_id, _, _) = setup_review_db("malformed");
+        let yaml_to_canonical = HashMap::new();
+        // Should not panic on malformed output
+        apply_spec_review_output(&queue, &spec_id, &yaml_to_canonical, "not json at all");
+        apply_spec_review_output(&queue, &spec_id, &yaml_to_canonical, "");
+        apply_spec_review_output(&queue, &spec_id, &yaml_to_canonical, "## Spec Review Complete\n\nNo changes needed.");
+        let tasks = queue.get_tasks(&spec_id).unwrap();
+        assert_eq!(tasks.len(), 2); // untouched
+    }
+
+    #[test]
+    fn test_apply_spec_review_json_in_code_fence() {
+        let (queue, spec_id, _, _) = setup_review_db("code_fence");
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        let t1_canonical = st.tasks[0].id.clone();
+
+        let mut yaml_to_canonical = HashMap::new();
+        yaml_to_canonical.insert("t-1".to_string(), t1_canonical);
+
+        let output = "## Spec Review Complete\n\n```json\n[{\"task_id\":\"t-1\",\"change_type\":\"split\",\"new_tasks\":[{\"title\":\"Extracted Task\",\"verify\":\"true\"}]}]\n```\n";
+        apply_spec_review_output(&queue, &spec_id, &yaml_to_canonical, output);
+
+        let tasks = queue.get_tasks(&spec_id).unwrap();
+        assert_eq!(tasks.len(), 3, "expected 3 tasks after code-fence JSON split");
     }
 }
