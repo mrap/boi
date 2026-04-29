@@ -18,6 +18,7 @@ pub struct Config {
     pub cleanup_on_failure: Option<bool>,
     pub hooks: Option<HashMap<String, HookEntry>>,
     pub paths: Option<Paths>,
+    pub claude_bin: Option<String>,
 }
 
 pub fn load() -> Config {
@@ -65,6 +66,13 @@ impl Config {
 
     pub fn cleanup_on_failure(&self) -> bool {
         self.cleanup_on_failure.unwrap_or(false)
+    }
+
+    pub fn claude_bin(&self) -> String {
+        if let Some(ref bin) = self.claude_bin {
+            return bin.clone();
+        }
+        std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
     }
 
     pub fn db_path(&self) -> PathBuf {

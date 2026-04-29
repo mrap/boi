@@ -30,6 +30,7 @@ pub struct WorkerConfig {
     pub task_timeout_secs: u64,
     pub retry_count: u32,
     pub cleanup_on_failure: bool,
+    pub claude_bin: String,
 }
 
 impl Default for WorkerConfig {
@@ -39,6 +40,7 @@ impl Default for WorkerConfig {
             task_timeout_secs: 1800,
             retry_count: 3,
             cleanup_on_failure: false,
+            claude_bin: std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string()),
         }
     }
 }
@@ -90,7 +92,7 @@ pub fn pid_file_for(spec_id: &str) -> std::path::PathBuf {
 /// startup_ms = time from spawn to first stdout byte.
 /// inference_ms = time from first byte to process exit.
 /// Respects timeout: kills the process and returns failure if exceeded.
-/// Override the claude binary via CLAUDE_BIN env var (useful for tests).
+/// The `claude_bin` parameter specifies the claude binary path.
 /// If `spec_id` is provided, writes the child PID to ~/.boi/pids/{spec_id}.pid
 /// so that `boi cancel` can kill it.
 pub fn spawn_claude(
@@ -99,11 +101,11 @@ pub fn spawn_claude(
     timeout_secs: u64,
     model: Option<&str>,
     spec_id: Option<&str>,
+    claude_bin: &str,
 ) -> Result<ClaudeResult, Box<dyn std::error::Error>> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
 
-    let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
     let mut args = vec![
         "-p".to_string(), prompt.to_string(),
         "--dangerously-skip-permissions".to_string(),
@@ -335,7 +337,7 @@ pub fn run_worker(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let registry = PhaseRegistry::new();
     registry_load_user(&registry);
-    let runner = Arc::new(ClaudePhaseRunner::new(telemetry.clone()));
+    let runner = Arc::new(ClaudePhaseRunner::new(telemetry.clone(), config.claude_bin.clone()));
     run_worker_with_phases(spec_id, spec_path, queue_path, hook_config, config, &registry, runner.as_ref(), telemetry)
 }
 
@@ -1399,6 +1401,7 @@ pub fn run_daemon(queue_path: &str, hook_config: HookConfig, config: WorkerConfi
                             let hc = hook_config.clone();
                             let timeout = config.task_timeout_secs;
                             let retries = config.retry_count;
+                            let claude_bin = config.claude_bin.clone();
                             let tel = telemetry.clone();
 
                             eprintln!("[boi daemon] starting worker for {}", spec_id);
@@ -1408,6 +1411,7 @@ pub fn run_daemon(queue_path: &str, hook_config: HookConfig, config: WorkerConfi
                                     task_timeout_secs: timeout,
                                     retry_count: retries,
                                     cleanup_on_failure: false,
+                                    claude_bin,
                                 };
                                 if let Err(e) =
                                     run_worker(&spec_id, &spec_path, &qpath, &hc, &wc, &tel)
@@ -1573,41 +1577,37 @@ mod tests {
     #[test]
     fn test_spawn_claude_exit_0() {
         let script = mock_claude(0, "exit0");
-        with_claude_bin(script.to_str().unwrap(), || {
-            let cr = spawn_claude("prompt", "/tmp", 10, None, None).unwrap();
-            assert!(cr.success);
-            assert!(cr.total_ms > 0 || cr.startup_ms == 0);
-        });
+        let bin = script.to_str().unwrap();
+        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin).unwrap();
+        assert!(cr.success);
+        assert!(cr.total_ms > 0 || cr.startup_ms == 0);
     }
 
     #[test]
     fn test_spawn_claude_exit_1() {
         let script = mock_claude(1, "exit1");
-        with_claude_bin(script.to_str().unwrap(), || {
-            let cr = spawn_claude("prompt", "/tmp", 10, None, None).unwrap();
-            assert!(!cr.success);
-        });
+        let bin = script.to_str().unwrap();
+        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin).unwrap();
+        assert!(!cr.success);
     }
 
     #[test]
     fn test_spawn_claude_captures_stderr() {
         let script = mock_claude_with_stderr(1, "stdout-ok", "ERROR: something broke", "stderr_capture");
-        with_claude_bin(script.to_str().unwrap(), || {
-            let cr = spawn_claude("prompt", "/tmp", 10, None, None).unwrap();
-            assert!(!cr.success);
-            assert!(cr.stderr.contains("ERROR: something broke"),
-                "stderr should be captured, got: '{}'", cr.stderr);
-        });
+        let bin = script.to_str().unwrap();
+        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin).unwrap();
+        assert!(!cr.success);
+        assert!(cr.stderr.contains("ERROR: something broke"),
+            "stderr should be captured, got: '{}'", cr.stderr);
     }
 
     #[test]
     fn test_spawn_claude_stderr_empty_on_success() {
         let script = mock_claude(0, "stderr_empty");
-        with_claude_bin(script.to_str().unwrap(), || {
-            let cr = spawn_claude("prompt", "/tmp", 10, None, None).unwrap();
-            assert!(cr.success);
-            assert!(cr.stderr.is_empty(), "stderr should be empty on clean exit");
-        });
+        let bin = script.to_str().unwrap();
+        let cr = spawn_claude("prompt", "/tmp", 10, None, None, bin).unwrap();
+        assert!(cr.success);
+        assert!(cr.stderr.is_empty(), "stderr should be empty on clean exit");
     }
 
     fn setup_test_db(suffix: &str, spec_yaml: &str) -> (Queue, String, String) {
@@ -1639,6 +1639,7 @@ tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it
             task_timeout_secs: 10,
             retry_count: 0,
             cleanup_on_failure: false,
+            claude_bin: script.to_str().unwrap().to_string(),
         };
 
         let tel = test_telemetry();
@@ -1673,6 +1674,7 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
             task_timeout_secs: 10,
             retry_count: 0,
             cleanup_on_failure: false,
+            claude_bin: script.to_str().unwrap().to_string(),
         };
 
         let tel = test_telemetry();
@@ -1710,6 +1712,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             task_timeout_secs: 10,
             retry_count: 0,
             cleanup_on_failure: false,
+            claude_bin: script.to_str().unwrap().to_string(),
         };
 
         let tel = test_telemetry();
@@ -1761,6 +1764,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             task_timeout_secs: 10,
             retry_count: 0,
             cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1798,6 +1802,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             task_timeout_secs: 10,
             retry_count: 0,
             cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1834,6 +1839,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             task_timeout_secs: 10,
             retry_count: 0,
             cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1870,6 +1876,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             task_timeout_secs: 10,
             retry_count: 0,
             cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1905,6 +1912,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             task_timeout_secs: 10,
             retry_count: 0,
             cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1944,6 +1952,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             task_timeout_secs: 10,
             retry_count: 0,
             cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
