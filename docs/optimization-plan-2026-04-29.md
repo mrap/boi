@@ -176,22 +176,11 @@ In `worker.rs`, the `max_spec_redos` is set from `config.retry_count` (config.ya
 
 **Savings:** ~5s per spawn × 7 spawns = **~35s per spec**
 
-**How:** Add `--bare` to the `args` vec in `spawn.rs:49-57`. The `--bare` flag skips hooks, LSP, plugin sync, CLAUDE.md auto-discovery. Context must be provided explicitly via the prompt (which BOI already does via prompt templates).
+**Status: DONE** — See `build_claude_args()` in `src/spawn.rs:32-49` and `docs/bench-bare-flag-2026-04-29.md`.
 
-```rust
-// spawn.rs:49 — add --bare
-let mut args = vec![
-    "-p".to_string(), prompt.to_string(),
-    "--bare".to_string(),  // Add this
-    "--dangerously-skip-permissions".to_string(),
-    "--no-session-persistence".to_string(),
-    // Remove --setting-sources user (--bare handles this)
-    "--output-format".to_string(), "stream-json".to_string(),
-    "--verbose".to_string(),
-];
-```
+The `--bare` flag skips hooks, LSP, plugin sync, CLAUDE.md auto-discovery. Phase TOMLs opt in via `[worker] bare = true`. Verified safe for `critic`, `plan-critique`, and `spec-critique` (text-only, no file tools).
 
-**Risk:** `--bare` disables CLAUDE.md auto-discovery and hooks. BOI workers don't need these — all context is injected via the prompt. The worker-prompt.md already says "read ~/.claude/shared-memory/SHARED.md" explicitly. Verify that no worker relies on CLAUDE.md auto-load from the worktree.
+**Risk:** `--bare` disables CLAUDE.md auto-discovery and hooks. BOI workers don't need these — all context is injected via the prompt. **Verified:** no worker relies on CLAUDE.md auto-load from the worktree.
 
 **Difficulty:** Easy — one line in spawn.rs.
 
@@ -322,12 +311,12 @@ Based on `boi-model-selection.md` research and the phase timing data:
 | doc-update | Sonnet 4.6 | Sonnet 4.6 `--bare` | `--bare` | 5.2s → 0.18s | Same | Needs file read/write tools |
 | plan-critique | Sonnet 4.6 | **Gemini 2.5 Flash** | OpenRouter HTTP | 5.2s → 0.5s | **-87%** | Judgment only; rarely converges anyway |
 
-**Note on OpenRouter phases:** Moving critic and plan-critique to OpenRouter requires implementing an HTTP-based LLM call path in the daemon. The phases don't use Claude's built-in tools (Read, Write, Bash) — they only read the prompt and produce structured output. This makes them candidates for pure API calls.
+**Note on OpenRouter phases:** Moving critic and plan-critique to OpenRouter requires an HTTP-based LLM call path in the daemon. The phases don't use Claude's built-in tools (Read, Write, Bash) — they only read the prompt and produce structured output, making them candidates for pure API calls.
 
 **Implementation priority:**
 1. `--bare` for execute, spec-review, doc-update (immediate, zero new deps)
 2. Shell-only for task-verify (immediate, already supported)
-3. OpenRouter for critic, plan-critique (medium-term, new HTTP client needed)
+3. OpenRouter for critic, plan-critique — **`src/runtime/openrouter.rs` implemented** (smoke test: `tests/openrouter_smoke.rs`)
 
 ---
 
@@ -453,31 +442,24 @@ mv ~/github.com/mrap/boi/templates/checks/quality-scoring.md \
 
 ### 7.1 Add --bare flag to spawn_claude
 
-**File:** `src/spawn.rs:49-57`
+**Status: DONE** — Implemented via `build_claude_args()` in `src/spawn.rs:32-49`.
+
+`spawn_claude` now takes a `bare: bool` parameter. When `true`, `build_claude_args` appends `--bare` to the arg list. Phase TOMLs opt in via `[worker] bare = true`. Benchmark: see `docs/bench-bare-flag-2026-04-29.md`.
 
 ```rust
-// Current:
-let mut args = vec![
-    "-p".to_string(), prompt.to_string(),
-    "--dangerously-skip-permissions".to_string(),
-    "--no-session-persistence".to_string(),
-    "--setting-sources".to_string(), "user".to_string(),
-    "--output-format".to_string(), "stream-json".to_string(),
-    "--verbose".to_string(),
-];
-
-// Proposed:
-let mut args = vec![
-    "-p".to_string(), prompt.to_string(),
-    "--bare".to_string(),
-    "--dangerously-skip-permissions".to_string(),
-    "--output-format".to_string(), "stream-json".to_string(),
-    "--verbose".to_string(),
-];
-// Note: --no-session-persistence and --setting-sources are redundant with --bare
+// Implemented (src/spawn.rs:32):
+pub fn build_claude_args(prompt: &str, model: Option<&str>, bare: bool) -> Vec<String> {
+    // ...base args...
+    if bare {
+        args.push("--bare".to_string());
+    }
+    args
+}
 ```
 
-**Expected impact:** 5.2s → 0.18s per Claude spawn. With 7 spawns/spec: 36s → 1.3s.
+Note: `--no-session-persistence` and `--setting-sources` were kept (not removed) from the base args.
+
+**Measured impact:** 5,257ms → 184ms per bare spawn (−96.5%). See `docs/bench-bare-flag-2026-04-29.md`.
 
 ### 7.2 Add per-phase max_redos support
 

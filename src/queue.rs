@@ -29,6 +29,8 @@ pub struct SpecRecord {
     pub worker_timeout_seconds: Option<i64>,
     pub context: Option<String>,
     pub workspace: Option<String>,
+    /// Number of completed critique↔improve loop cycles for this spec.
+    pub phase_loop_count: i64,
 }
 
 #[derive(Debug)]
@@ -267,6 +269,7 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "worker_timeout_seconds", "INTEGER");
         Self::ensure_column(&conn, "specs", "context", "TEXT");
         Self::ensure_column(&conn, "specs", "workspace", "TEXT");
+        Self::ensure_column(&conn, "specs", "phase_loop_count", "INTEGER DEFAULT 0");
         Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
         Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
 
@@ -377,7 +380,7 @@ impl Queue {
                         completed_tasks,
                         priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                         max_iterations, iteration, project, phase, worker_timeout_seconds,
-                        context, workspace
+                        context, workspace, phase_loop_count
                  FROM specs WHERE id = ?1",
             )?;
             stmt.query_row(params![id], row_to_spec)?
@@ -443,6 +446,29 @@ impl Queue {
         Ok(())
     }
 
+    /// Mark a spec as failed, writing the error column with a typed FailureReason.
+    /// Prefer this over `update_spec(id, "failed")` — it guarantees error is non-NULL.
+    pub fn fail_spec(&self, spec_id: &str, reason: &crate::failure::FailureReason) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let error_json = reason.to_json();
+        self.conn.execute(
+            "UPDATE specs SET status = 'failed', completed_at = ?1, error = ?2 WHERE id = ?3",
+            params![now, error_json, spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a task as failed, writing the error column with a typed FailureReason.
+    /// Prefer this over `update_task(id, "FAILED")` — it guarantees error is non-NULL.
+    pub fn fail_task(&self, spec_id: &str, task_id: &str, reason: &crate::failure::FailureReason) -> Result<()> {
+        let error_json = reason.to_json();
+        self.conn.execute(
+            "UPDATE tasks SET status = 'FAILED', error = ?1 WHERE spec_id = ?2 AND id = ?3",
+            params![error_json, spec_id, task_id],
+        )?;
+        Ok(())
+    }
+
     pub fn status(&self, spec_id: &str) -> Result<Option<SpecStatus>> {
         let spec = match self.conn.query_row(
             "SELECT id, title, mode, status, spec_path,
@@ -450,7 +476,7 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace
+                    context, workspace, phase_loop_count
              FROM specs WHERE id = ?1",
             params![spec_id],
             row_to_spec,
@@ -479,7 +505,7 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace
+                    context, workspace, phase_loop_count
              FROM specs
              ORDER BY
                CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
@@ -874,6 +900,55 @@ impl Queue {
         }
     }
 
+    /// Increment the critique↔improve loop counter for a spec.
+    /// Returns the new count after incrementing.
+    pub fn increment_phase_loop_count(&self, spec_id: &str) -> Result<i64> {
+        self.conn.execute(
+            "UPDATE specs SET phase_loop_count = phase_loop_count + 1 WHERE id = ?1",
+            params![spec_id],
+        )?;
+        let count: i64 = self.conn.query_row(
+            "SELECT phase_loop_count FROM specs WHERE id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get the current critique↔improve loop counter for a spec.
+    pub fn get_phase_loop_count(&self, spec_id: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COALESCE(phase_loop_count, 0) FROM specs WHERE id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Reset the critique↔improve loop counter to zero.
+    pub fn reset_phase_loop_count(&self, spec_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE specs SET phase_loop_count = 0 WHERE id = ?1",
+            params![spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// Returns true if the critique↔improve loop has reached or exceeded the cap.
+    /// Logs a warning when the cap is hit so the pipeline can proceed to task execution.
+    pub fn phase_loop_capped(&self, spec_id: &str, max_loops: i64) -> bool {
+        let count = self.get_phase_loop_count(spec_id).unwrap_or(0);
+        if count >= max_loops {
+            eprintln!(
+                "[boi] WARN: spec {} reached max critique/improve loops ({}/{}); proceeding to task execution",
+                spec_id, count, max_loops
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get the last updated timestamp across all specs (for heartbeat detection)
     pub fn last_spec_update(&self) -> Result<Option<String>> {
         let result: Option<String> = self
@@ -912,6 +987,7 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
         worker_timeout_seconds: row.get(18)?,
         context: row.get(19)?,
         workspace: row.get(20)?,
+        phase_loop_count: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
     })
 }
 
@@ -943,6 +1019,7 @@ mod tests {
             outcomes: None,
             spec_phases: None,
             task_phases: None,
+            brain: None,
             tasks,
         }
     }
@@ -1212,5 +1289,198 @@ mod tests {
         q.update_spec(&blocker_id, "completed").unwrap();
         let dequeued2 = q.dequeue().unwrap().unwrap();
         assert_eq!(dequeued2.id, id2);
+    }
+
+    // --- spec_improve: loop cap enforcement ---
+
+    #[test]
+    fn test_spec_improve_loop_count_starts_at_zero() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+        assert_eq!(q.get_phase_loop_count(&id).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_spec_improve_loop_count_increments() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        let after_first = q.increment_phase_loop_count(&id).unwrap();
+        assert_eq!(after_first, 1);
+
+        let after_second = q.increment_phase_loop_count(&id).unwrap();
+        assert_eq!(after_second, 2);
+    }
+
+    #[test]
+    fn test_spec_improve_loop_count_resets() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        q.increment_phase_loop_count(&id).unwrap();
+        q.increment_phase_loop_count(&id).unwrap();
+        q.reset_phase_loop_count(&id).unwrap();
+
+        assert_eq!(q.get_phase_loop_count(&id).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_spec_improve_loop_not_capped_below_max() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        q.increment_phase_loop_count(&id).unwrap();
+        q.increment_phase_loop_count(&id).unwrap();
+
+        assert!(!q.phase_loop_capped(&id, 3), "count=2 should not be capped at max=3");
+    }
+
+    #[test]
+    fn test_spec_improve_loop_capped_at_max() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        for _ in 0..3 {
+            q.increment_phase_loop_count(&id).unwrap();
+        }
+
+        assert!(q.phase_loop_capped(&id, 3), "count=3 must be capped at max=3");
+    }
+
+    #[test]
+    fn test_spec_improve_loop_cap_configurable() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        q.increment_phase_loop_count(&id).unwrap();
+
+        // max_loops=1: capped after 1 iteration
+        assert!(q.phase_loop_capped(&id, 1));
+        // max_loops=5: not capped yet
+        assert!(!q.phase_loop_capped(&id, 5));
+    }
+
+    #[test]
+    fn test_spec_improve_loop_count_in_spec_record() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        q.increment_phase_loop_count(&id).unwrap();
+        q.increment_phase_loop_count(&id).unwrap();
+
+        let st = q.status(&id).unwrap().unwrap();
+        assert_eq!(st.spec.phase_loop_count, 2, "phase_loop_count must be readable from SpecRecord");
+    }
+
+    // --- failure_capture tests (matched by `cargo test --lib failure_capture`) ---
+
+    #[test]
+    fn failure_capture_fail_spec_sets_error_column() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        let reason = FailureReason::ToolError {
+            phase: "execute".to_string(),
+            message: "test error".to_string(),
+        };
+        q.fail_spec(&id, &reason).unwrap();
+
+        let st = q.status(&id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "failed");
+        let error = st.spec.error.expect("error must be non-NULL after fail_spec");
+        assert!(error.contains("ToolError"), "error should be JSON FailureReason, got: {}", error);
+        assert!(error.contains("test error"), "error should contain message, got: {}", error);
+    }
+
+    #[test]
+    fn failure_capture_fail_task_sets_error_column() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        let task_id = st.tasks[0].id.clone();
+
+        let reason = FailureReason::VerifyFailed {
+            task: "t-1".to_string(),
+            exit_code: 1,
+            stderr_excerpt: "assertion failed".to_string(),
+        };
+        q.fail_task(&id, &task_id, &reason).unwrap();
+
+        let st = q.status(&id).unwrap().unwrap();
+        let task = st.tasks.iter().find(|t| t.id == task_id).unwrap();
+        assert_eq!(task.status, "FAILED");
+        let error = task.error.as_ref().expect("task error must be non-NULL after fail_task");
+        assert!(error.contains("VerifyFailed"), "error should be JSON FailureReason, got: {}", error);
+        assert!(error.contains("assertion failed"), "error should contain stderr_excerpt, got: {}", error);
+    }
+
+    #[test]
+    fn failure_capture_fail_spec_error_roundtrips_as_failure_reason() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        let reason = FailureReason::ProviderRateLimit {
+            provider: "anthropic".to_string(),
+            retry_after_s: Some(60),
+        };
+        q.fail_spec(&id, &reason).unwrap();
+
+        let st = q.status(&id).unwrap().unwrap();
+        let error_str = st.spec.error.unwrap();
+        let parsed = FailureReason::from_db(&error_str);
+        assert_eq!(reason.to_json(), parsed.to_json(), "FailureReason should round-trip through DB");
+    }
+
+    #[test]
+    fn failure_capture_fail_spec_no_null_error() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        // Initially error is NULL
+        let st = q.status(&id).unwrap().unwrap();
+        assert!(st.spec.error.is_none(), "error should start as NULL");
+
+        // After fail_spec, error must be non-NULL
+        q.fail_spec(&id, &FailureReason::Other { message: "oops".to_string() }).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        assert!(st.spec.error.is_some(), "error must be non-NULL after fail_spec");
+    }
+
+    #[test]
+    fn failure_capture_fail_task_no_null_error() {
+        use crate::failure::FailureReason;
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        let task_id = st.tasks[0].id.clone();
+
+        // Initially task error is NULL
+        let task = st.tasks.iter().find(|t| t.id == task_id).unwrap();
+        assert!(task.error.is_none(), "task error should start as NULL");
+
+        // After fail_task, error must be non-NULL
+        q.fail_task(&id, &task_id, &FailureReason::Timeout {
+            phase: "execute".to_string(),
+            secs: 1800,
+        }).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        let task = st.tasks.iter().find(|t| t.id == task_id).unwrap();
+        assert!(task.error.is_some(), "task error must be non-NULL after fail_task");
     }
 }

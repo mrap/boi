@@ -106,10 +106,13 @@ can_fail_spec = false                    # whether a rejection from this phase m
 
 # Worker configuration
 [worker]
-prompt_template = "templates/my-prompt.md"  # required — path to prompt template
+prompt_template = "templates/my-prompt.md"  # required for claude/default phases
 model = "claude-sonnet-4-6"                  # default: claude-sonnet-4-6
 effort = "medium"                            # low | medium | high
 timeout = 300                                # seconds; must be > 0
+runtime = "claude"                           # "claude" (default) | "openrouter" | "deterministic"
+api_key_env = "OPENROUTER_API_KEY"           # openrouter only — env var holding the API key (default: OPENROUTER_API_KEY)
+bare = false                                 # true → append --bare (skips session/MCP/skill loading; ~96% cold-start reduction)
 
 # Completion routing
 [completion]
@@ -137,7 +140,9 @@ post = ["diff-is-non-empty"]      # gates to run after this phase completes
 - `retry` — re-run this phase
 - `fail` — mark the spec failed
 
-**`completion_handler`:** Set this top-level field to delegate routing to a built-in handler (e.g. `"builtin:execute"`). Use it when you want a phase to reuse the same routing logic as a built-in phase rather than defining your own `approve_signal`/`reject_signal` strings. When `completion_handler` is set, the daemon calls the named built-in handler and ignores the `[completion]` signals.
+**`completion_handler`:** Used in two contexts:
+- **Claude phases** (default): delegates completion routing to a built-in handler (e.g. `"builtin:execute"`) instead of `approve_signal`/`reject_signal` strings.
+- **Deterministic phases** (`[worker] runtime = "deterministic"`): names the builtin to *execute* directly — no Claude spawn. Built-ins: `builtin:commit`, `builtin:merge`, `builtin:cleanup`. The `[completion]` block is ignored for deterministic phases.
 
 ### Creating a Custom Phase
 
@@ -202,6 +207,35 @@ post_phases = ["doc-update", "critic", "merge"]    # phases run after all tasks 
 ```
 
 Pass them with `--pipeline name:path/to/pipeline.toml` (repeatable for N-way comparisons).
+
+### Pipeline v2 Mode (opt-in)
+
+v2 is a redesigned pipeline with clean phase separation and deterministic steps that skip Claude cold-start. Set `mode: v2` in your spec:
+
+```yaml
+title: My Feature
+mode: v2
+
+tasks:
+  - id: t-1
+    title: Implement the thing
+    status: PENDING
+    spec: |
+      Add X to lib/foo.py following the existing pattern.
+    verify: "python3 -m pytest tests/test_foo.py -x -q"
+```
+
+v2 pipeline layout:
+
+```
+Spec-pre  (loop ≤3): spec-critique ↔ spec-improve
+Per-task:            execute → review → commit     (commit is deterministic)
+Spec-post:           doc-update → critic → merge → cleanup
+                                           ^         ^       ^
+                                           Claude    det.    det.
+```
+
+Deterministic phases (`commit`, `merge`, `cleanup`) run as plain shell operations — no Claude spawn, no cold-start latency. v1 is still the default; v2 is opt-in until A/B benchmarks confirm the speedup. See [docs/pipelines.md](docs/pipelines.md) for a full v1 vs v2 comparison and guidance on when to use each.
 
 ## Guardrails
 
@@ -283,17 +317,19 @@ Exit 0 = passed. Any non-zero exit = failed. Stdout/stderr are captured as the f
 
 ## Runtime Configuration
 
-BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) is also supported.
+BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) and `openrouter` (direct HTTP to OpenRouter API) are also supported.
 
 ### Global Default
 
-Set in `~/.boi/config.json`:
+Set in `~/.boi/config.yaml`:
 
-```json
-{
-  "runtime": { "default": "claude" }
-}
+```yaml
+runtime:
+  default: claude
+brain: ~/mrap-hex   # optional — path to brain dir; must contain CLAUDE.md
 ```
+
+`brain` sets the default brain directory for all specs. Workers read `{brain}/CLAUDE.md` as system context before each task. BOI errors early if `brain` is set but the path or `CLAUDE.md` is missing.
 
 ### Per-Spec Override
 
@@ -307,13 +343,18 @@ Spec-level override takes precedence over the global default.
 
 ### Model Mappings
 
-Phase config accepts either full model IDs or aliases (`opus`, `sonnet`, `haiku`). The runtime resolves them:
+Phase config accepts either full model IDs or aliases. The runtime resolves them:
 
-| Alias | Claude | Codex |
-|-------|--------|-------|
-| `opus` | claude-opus-4-6 | o3 |
-| `sonnet` | claude-sonnet-4-6 | o4-mini |
-| `haiku` | claude-haiku-4-5-20251001 | o4-mini |
+| Alias | Claude | Codex | OpenRouter |
+|-------|--------|-------|------------|
+| `opus` | claude-opus-4-6 | o3 | — |
+| `sonnet` | claude-sonnet-4-6 | o4-mini | — |
+| `haiku` | claude-haiku-4-5-20251001 | o4-mini | anthropic/claude-haiku-4-5 |
+| `gemini-flash` | — | — | google/gemini-2.0-flash-001 |
+| `grok` | — | — | x-ai/grok-beta |
+| `qwen-coder` | — | — | qwen/qwen-2.5-coder-32b-instruct |
+
+OpenRouter phases require `OPENROUTER_API_KEY` in the environment and a `model` field in `[worker]`. Use `openrouter` runtime for text-only judgment phases (critic, plan-critique, spec-critique) to skip Claude cold-start and reduce cost.
 
 ### CLI Check
 
@@ -323,9 +364,10 @@ Phase config accepts either full model IDs or aliases (`opus`, `sonnet`, `haiku`
 
 ```
 boi dispatch <file.yaml> [options]        Submit a spec to the queue
-boi status [--watch] [--json]             Show queue and worker status
+boi status [--watch] [--json] [-v|--verbose]  Show queue and worker status; -v shows full failure detail
 boi log <queue-id> [--full] [-f|--follow] Tail worker output for a spec
 boi cancel <queue-id>                     Cancel a running or queued spec
+boi daemon reload                         Send SIGHUP to reload max_workers/spawns_per_tick/claude_bin
 boi stop                                  Stop daemon and all workers
 boi install [--workers N]                 One-time setup (run outside Claude Code)
 boi resume <queue-id> | --all            Resume failed or canceled specs
@@ -340,6 +382,8 @@ boi dep add|remove|set|clear|show|viz|check
 boi project create|list|status|context|delete
 boi bench --pipeline name:path [--pipeline ...] --spec FILE | --battery DIR [--runs N]  Benchmark N pipelines
 boi bench --phase <name> --spec FILE [--runs N]  Benchmark a single phase in isolation
+boi plan [spec.yaml ...] [--force-refresh]        Build DAG + LLM critique for in-flight and new specs
+boi dispatch-many <spec1.yaml> [spec2.yaml ...]   DAG-ordered multi-spec dispatch with LLM gate
 ```
 
 **`dispatch` options:**
@@ -352,6 +396,109 @@ boi bench --phase <name> --spec FILE [--runs N]  Benchmark a single phase in iso
 | `--worktree-isolate` | Dedicated git worktree and branch for this spec |
 | `--after SA7F3,TB2E1` | Wait for listed specs to complete before starting |
 | `--project NAME` | Associate with a project (injects project context) |
+
+**`dispatch-many` options:**
+
+| Flag | Description |
+|------|-------------|
+| `--yes` | Auto-approve dispatch without interactive prompt |
+| `--force` | Override warn-level concerns (cannot override blocks) |
+| `--priority N` | Priority applied to all dispatched specs (default: 100) |
+| `--mode MODE` | Mode applied to all specs |
+| `--after SA7F3` | Additional upstream dep for all dispatched specs |
+
+## DAG Planner: `boi plan` + `boi dispatch-many`
+
+### The problem
+
+Manual `--after` flags are fragile. When dispatching multiple specs, whoever dispatches has to remember all in-flight dependencies. Wrong ordering only surfaces when the dependent spec fails mid-execution — after tokens and time have already been spent.
+
+### `boi plan` — visualize and critique the DAG
+
+`boi plan` builds a dependency graph across all in-flight + queued + new specs, then asks an LLM to critique it: any specs that should depend on each other but don't? Any wrongly serial work that could be parallel? Any scopes that contradict each other?
+
+```bash
+boi plan                            # critique current in-flight state
+boi plan spec-a.yaml spec-b.yaml    # include new specs in the analysis
+boi plan --force-refresh            # re-run LLM critique (ignore cache)
+```
+
+Example output:
+
+```
+DAG (4 nodes):
+  SA7F3 (auth-api)       ← no deps
+  SB2E1 (user-model)     ← SA7F3
+  SC1F0 (dashboard)      ← SB2E1
+  SD4A2 (email-notify)   ← SA7F3
+
+Critique:
+  [WARN] email-notify reads auth tokens written by user-model, but no dep declared.
+         Suggested fix: --after SB2E1
+
+Proposed dispatch order: SA7F3 → SB2E1 → SC1F0 + SD4A2
+
+--after flags: boi dispatch email-notify.yaml --after SB2E1
+```
+
+The critique is cached by hash of (DAG topology + spec titles). Re-running on unchanged state costs zero tokens.
+
+### `boi dispatch-many` — gated multi-spec dispatch
+
+`boi dispatch-many` runs `plan` first, then dispatches all specs in topological order — automatically wiring `--after` chains.
+
+```bash
+boi dispatch-many spec-a.yaml spec-b.yaml spec-c.yaml
+```
+
+- **Block-severity concern** → refuses entirely, prints concerns, exits non-zero
+- **Warn-severity concern** → shows concern, prompts for confirmation (or auto-approves with `--yes`)
+- **Clean** → dispatches all specs in topological order with correct `--after` chains
+
+### Before/after: 3-spec chain that `dispatch-many` would have caught
+
+**Before (manual `--after`, misordered):**
+
+Three specs dispatched for a feature track. The dispatcher forgot `--after` on `build-api`.
+
+```bash
+boi dispatch build-schema.yaml
+boi dispatch build-api.yaml        # BUG: missing --after
+boi dispatch build-frontend.yaml --after <api-id>
+```
+
+`build-api` started in parallel with `build-schema`. Failed 4 tasks in because schema files weren't written yet. ~12k tokens spent on the wrong order. Re-dispatch required.
+
+**After (`boi dispatch-many`):**
+
+```bash
+boi dispatch-many build-schema.yaml build-api.yaml build-frontend.yaml
+```
+
+```
+Analyzing DAG...
+
+DAG (3 nodes):
+  SA000 (build-schema)    ← no deps
+  SA001 (build-api)       ← SA000 [implicit: src/schema/*.rs]
+  SA002 (build-frontend)  ← SA001 [declared]
+
+Critique:
+  [WARN] build-api has implicit dep on build-schema via src/schema/*.rs
+         but no --after declared. Adding automatically.
+
+Proposed dispatch order: SA000 → SA001 → SA002
+
+Dispatch? [y/N] y
+
+Dispatched: SA000 (build-schema)
+Dispatched: SA001 (build-api) --after SA000
+Dispatched: SA002 (build-frontend) --after SA001
+```
+
+No misordering. No re-dispatch. The implicit dep was caught before a single token was spent on the wrong order.
+
+See [docs/dag-reassess.md](docs/dag-reassess.md) for the full model and guidance on when to use `plan` vs `dispatch-many` vs `dispatch --after`.
 
 ## Output Preservation
 

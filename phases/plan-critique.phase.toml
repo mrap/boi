@@ -5,8 +5,9 @@ description = "Evaluate spec quality before execution: catch non-executable veri
 level = "spec"
 
 [worker]
-runtime = "claude"
-model = "claude-sonnet-4-6"
+runtime = "openrouter"
+model = "gemini-flash"
+api_key_env = "OPENROUTER_API_KEY"
 prompt_template = "templates/plan-critique-prompt.md"
 effort = "medium"
 timeout = 300

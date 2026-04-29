@@ -1,5 +1,11 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+/// Global mutex for tests that mutate the HOME env var.
+/// Any test that calls std::env::set_var("HOME", ...) must hold this lock
+/// to prevent races across modules running in parallel.
+pub static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 

@@ -1,0 +1,9 @@
+title: "v2 smoke"
+mode: v2
+tasks:
+  - id: t-1
+    title: "Create smoke output file"
+    status: PENDING
+    spec: |
+      Create a file named smoke-output.txt with content "hello from v2 smoke test".
+    verify: "test -f smoke-output.txt"

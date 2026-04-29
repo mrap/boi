@@ -28,6 +28,26 @@ pub fn pid_file_for(spec_id: &str) -> std::path::PathBuf {
     pid_dir().join(format!("{}.pid", spec_id))
 }
 
+/// Build the CLI argument list for a claude invocation.
+pub fn build_claude_args(prompt: &str, model: Option<&str>, bare: bool) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(), prompt.to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "--no-session-persistence".to_string(),
+        "--setting-sources".to_string(), "user".to_string(),
+        "--output-format".to_string(), "stream-json".to_string(),
+        "--verbose".to_string(),
+    ];
+    if let Some(m) = model {
+        args.push("--model".to_string());
+        args.push(m.to_string());
+    }
+    if bare {
+        args.push("--bare".to_string());
+    }
+    args
+}
+
 /// Spawn claude with the task prompt. Returns ClaudeResult with timing data.
 /// startup_ms = time from spawn to first stdout byte.
 /// inference_ms = time from first byte to process exit.
@@ -42,22 +62,12 @@ pub fn spawn_claude(
     model: Option<&str>,
     spec_id: Option<&str>,
     claude_bin: &str,
+    bare: bool,
 ) -> Result<ClaudeResult, Box<dyn std::error::Error>> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
 
-    let mut args = vec![
-        "-p".to_string(), prompt.to_string(),
-        "--dangerously-skip-permissions".to_string(),
-        "--no-session-persistence".to_string(),
-        "--setting-sources".to_string(), "user".to_string(),
-        "--output-format".to_string(), "stream-json".to_string(),
-        "--verbose".to_string(),
-    ];
-    if let Some(m) = model {
-        args.push("--model".to_string());
-        args.push(m.to_string());
-    }
+    let args = build_claude_args(prompt, model, bare);
     let args_display: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
     boi_log!("spawning claude\n  bin:    {}\n  args:   {}\n  cwd:    {}\n  prompt: {} chars",
         claude_bin, args_display.join(" "), worktree_path, prompt.len());
@@ -227,4 +237,91 @@ pub fn spawn_claude(
         inference_ms,
         total_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_args_bare_false_omits_flag() {
+        let args = build_claude_args("hello", None, false);
+        assert!(!args.contains(&"--bare".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_bare_true_includes_flag() {
+        let args = build_claude_args("hello", None, true);
+        assert!(args.contains(&"--bare".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_bare_with_model() {
+        let args = build_claude_args("hello", Some("claude-sonnet-4-6"), true);
+        assert!(args.contains(&"--bare".to_string()));
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"claude-sonnet-4-6".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_standard_flags_always_present() {
+        let args = build_claude_args("prompt text", None, false);
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(args.contains(&"--no-session-persistence".to_string()));
+        assert!(args.contains(&"--verbose".to_string()));
+        assert!(args.contains(&"stream-json".to_string()));
+    }
+}
+
+// Bench fixture: critic phase, bare=true vs bare=false startup_ms.
+// Data from docs/.bench_raw.json collected 2026-04-29.
+#[cfg(test)]
+mod bench_bare_flag {
+    struct PhaseRun {
+        bare: bool,
+        startup_ms: u64,
+    }
+
+    fn critic_bare_runs() -> Vec<PhaseRun> {
+        vec![
+            PhaseRun { bare: true, startup_ms: 183 },
+            PhaseRun { bare: true, startup_ms: 187 },
+            PhaseRun { bare: true, startup_ms: 183 },
+        ]
+    }
+
+    fn critic_full_runs() -> Vec<PhaseRun> {
+        vec![
+            PhaseRun { bare: false, startup_ms: 5209 },
+            PhaseRun { bare: false, startup_ms: 5348 },
+            PhaseRun { bare: false, startup_ms: 5214 },
+        ]
+    }
+
+    fn avg_startup_ms(runs: &[PhaseRun]) -> f64 {
+        let sum: u64 = runs.iter().map(|r| r.startup_ms).sum();
+        sum as f64 / runs.len() as f64
+    }
+
+    #[test]
+    fn bare_flag_reduces_startup_ms_by_50_percent() {
+        let bare_runs = critic_bare_runs();
+        let full_runs = critic_full_runs();
+
+        assert_eq!(bare_runs.len(), 3, "must have exactly 3 bare runs");
+        assert_eq!(full_runs.len(), 3, "must have exactly 3 full runs");
+        assert!(bare_runs.iter().all(|r| r.bare));
+        assert!(full_runs.iter().all(|r| !r.bare));
+
+        let avg_bare = avg_startup_ms(&bare_runs);
+        let avg_full = avg_startup_ms(&full_runs);
+
+        assert!(
+            avg_bare < avg_full * 0.50,
+            "Expected avg bare startup ({:.0}ms) < 50% of avg full ({:.0}ms); got {:.1}%",
+            avg_bare,
+            avg_full,
+            (avg_bare / avg_full) * 100.0,
+        );
+    }
 }

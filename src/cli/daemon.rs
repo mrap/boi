@@ -199,8 +199,18 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         .ok();
     }
 
-    let wc = worker::WorkerConfig {
+    // SIGHUP hot-reload flag: set to true by signal_hook when SIGHUP arrives.
+    let reload_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Err(e) = signal_hook::flag::register(
+        signal_hook::consts::SIGHUP,
+        std::sync::Arc::clone(&reload_flag),
+    ) {
+        eprintln!("[boi daemon] WARNING: failed to install SIGHUP handler: {}", e);
+    }
+
+    let mut wc = worker::WorkerConfig {
         max_workers: cfg.max_workers(),
+        spawns_per_tick: cfg.spawns_per_tick(),
         task_timeout_secs: cfg.task_timeout_secs(),
         retry_count: cfg.retry_count(),
         cleanup_on_failure: cfg.cleanup_on_failure(),
@@ -244,6 +254,21 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
             eprintln!("[boi daemon] ERROR: failed to write heartbeat: {}", e);
         }
 
+        // SIGHUP hot-reload: only max_workers, spawns_per_tick, claude_bin are live-updated.
+        // All other settings remain frozen at startup. In-flight workers keep their original config.
+        if reload_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            match config::try_load() {
+                Ok(new_cfg) => {
+                    apply_reload(&mut wc, &new_cfg);
+                    eprintln!(
+                        "[boi daemon] reloaded config: max_workers={}, spawns_per_tick={}, claude_bin={}",
+                        wc.max_workers, wc.spawns_per_tick, wc.claude_bin
+                    );
+                }
+                Err(e) => eprintln!("[boi daemon] reload FAILED: {}; keeping current config", e),
+            }
+        }
+
         {
             let mut workers = active.lock().unwrap_or_else(|e| {
                 eprintln!("[boi daemon] worker mutex poisoned, recovering: {}", e);
@@ -251,7 +276,9 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
             });
             workers.retain(|h| !h.is_finished());
 
-            if workers.len() < wc.max_workers as usize {
+            let to_spawn = compute_to_spawn(workers.len(), wc.max_workers, wc.spawns_per_tick);
+
+            for slot in 0..to_spawn {
                 match queue::Queue::open(db_str) {
                     Ok(queue) => match queue.dequeue() {
                         Ok(Some(rec)) => {
@@ -268,7 +295,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                                             eprintln!("[boi daemon] ERROR: failed to mark spec {} as failed: {}", spec_id, e);
                                         }
                                     }
-                                    continue;
+                                    continue; // skip to next batch slot
                                 }
                             };
                             let qpath = db_str.to_string();
@@ -285,10 +312,16 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                                 .unwrap_or(timeout);
 
                             let tel = Telemetry::new(PathBuf::from(&qpath));
-                            eprintln!("[boi daemon] starting worker for {}", spec_id);
+                            eprintln!(
+                                "[boi daemon] starting worker for {} (batch slot {}/{})",
+                                spec_id,
+                                slot + 1,
+                                to_spawn
+                            );
                             let handle = std::thread::spawn(move || {
                                 let wc = worker::WorkerConfig {
                                     max_workers: 1,
+                                    spawns_per_tick: 1,
                                     task_timeout_secs: spec_timeout,
                                     retry_count: retries,
                                     cleanup_on_failure: cleanup_fail,
@@ -301,11 +334,27 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                                 }
                             });
                             workers.push(handle);
+
+                            // Micro-jitter between successive spawns to smooth cold-start burst
+                            if slot + 1 < to_spawn {
+                                let jitter_ns = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.subsec_nanos() as u64)
+                                    .unwrap_or(0);
+                                let jitter_ms = 50 + (jitter_ns % 101);
+                                std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
+                            }
                         }
-                        Ok(None) => {}
-                        Err(e) => eprintln!("[boi daemon] dequeue error: {}", e),
+                        Ok(None) => break, // queue drained
+                        Err(e) => {
+                            eprintln!("[boi daemon] dequeue error: {}", e);
+                            break;
+                        }
                     },
-                    Err(e) => eprintln!("[boi daemon] queue open error: {}", e),
+                    Err(e) => {
+                        eprintln!("[boi daemon] queue open error: {}", e);
+                        break;
+                    }
                 }
             }
         }
@@ -386,6 +435,240 @@ pub fn cmd_stop() {
     // after the 10s graceful shutdown window expired.
     unsafe { libc::kill(pid as i32, libc::SIGKILL); }
     let _ = std::fs::remove_file(daemon_heartbeat_path()); // intentional: best-effort heartbeat cleanup
+}
+
+/// How many workers to spawn this tick: capped by capacity and per-tick limit.
+pub(crate) fn compute_to_spawn(workers_len: usize, max_workers: u32, spawns_per_tick: u32) -> u32 {
+    let cap_remaining = max_workers.saturating_sub(workers_len as u32);
+    cap_remaining.min(spawns_per_tick)
+}
+
+/// Hot-reload the three live-mutable fields from a freshly parsed config.
+/// All other WorkerConfig fields remain at their startup values.
+pub(crate) fn apply_reload(wc: &mut worker::WorkerConfig, new_cfg: &config::Config) {
+    wc.max_workers = new_cfg.max_workers();
+    wc.spawns_per_tick = new_cfg.spawns_per_tick();
+    wc.claude_bin = new_cfg.claude_bin();
+}
+
+/// Send SIGHUP to the running daemon so it picks up config changes.
+pub fn cmd_reload() {
+    let pid = match read_daemon_pid() {
+        Some(p) => p,
+        None => {
+            eprintln!("no daemon running (PID file not found)");
+            std::process::exit(1);
+        }
+    };
+
+    if !crate::fmt::is_pid_alive(pid) {
+        eprintln!("daemon process {} is not running", pid);
+        std::process::exit(1);
+    }
+
+    // SAFETY: `pid` was read from the daemon lock file and verified alive above.
+    // SIGHUP to a known-live PID is a standard POSIX config-reload signal.
+    unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+    println!("sent SIGHUP to daemon (pid {}); config will reload within one tick", pid);
+}
+
+#[cfg(test)]
+mod daemon_batch {
+    use super::*;
+    use crate::{queue, spec, test_utils};
+
+    const SIMPLE_SPEC: &str = "title: \"Batch Test\"\ntasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it\"\n";
+
+    fn open_queue(label: &str) -> (queue::Queue, String) {
+        let db_file = test_utils::test_file(label, "db");
+        let _ = std::fs::remove_file(&db_file);
+        let db_path = db_file.to_str().unwrap().to_string();
+        let q = queue::Queue::open(&db_path).unwrap();
+        (q, db_path)
+    }
+
+    fn enqueue_n(q: &queue::Queue, n: usize) {
+        let boi_spec = spec::parse(SIMPLE_SPEC).unwrap();
+        for _ in 0..n {
+            q.enqueue(&boi_spec, None).unwrap();
+        }
+    }
+
+    fn drain_n(q: &queue::Queue, to_spawn: u32) -> usize {
+        let mut count = 0;
+        for _ in 0..to_spawn {
+            match q.dequeue() {
+                Ok(Some(_)) => count += 1,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn test_compute_to_spawn_at_capacity() {
+        // workers_len == max_workers → 0 slots remaining
+        assert_eq!(compute_to_spawn(4, 4, 4), 0);
+    }
+
+    #[test]
+    fn test_compute_to_spawn_limited_by_spawns_per_tick() {
+        // cap_remaining=8 but spawns_per_tick=4 → 4
+        assert_eq!(compute_to_spawn(0, 8, 4), 4);
+    }
+
+    #[test]
+    fn test_compute_to_spawn_limited_by_cap_remaining() {
+        // cap_remaining=2, spawns_per_tick=4 → 2
+        assert_eq!(compute_to_spawn(6, 8, 4), 2);
+    }
+
+    #[test]
+    fn test_empty_queue_zero_spawns() {
+        let (q, _db) = open_queue("batch-empty");
+        let to_spawn = compute_to_spawn(0, 4, 4);
+        let spawned = drain_n(&q, to_spawn);
+        assert_eq!(spawned, 0);
+    }
+
+    #[test]
+    fn test_one_eligible_cap4_tick4_spawns_one() {
+        let (q, _db) = open_queue("batch-one");
+        enqueue_n(&q, 1);
+        let to_spawn = compute_to_spawn(0, 4, 4); // = 4
+        let spawned = drain_n(&q, to_spawn);
+        assert_eq!(spawned, 1, "only 1 item in queue, expect 1 spawn");
+    }
+
+    #[test]
+    fn test_six_eligible_cap4_tick4_spawns_four_then_two() {
+        let (q, _db) = open_queue("batch-six-cap4");
+        enqueue_n(&q, 6);
+        let to_spawn = compute_to_spawn(0, 4, 4); // = 4
+        let first_tick = drain_n(&q, to_spawn);
+        assert_eq!(first_tick, 4, "first tick: 4 spawned");
+
+        // Second tick: 2 remain
+        let to_spawn2 = compute_to_spawn(4, 8, 4); // simulate 4 workers running, max=8
+        let second_tick = drain_n(&q, to_spawn2);
+        assert_eq!(second_tick, 2, "second tick: remaining 2 spawned");
+    }
+
+    #[test]
+    fn test_six_eligible_cap8_tick4_spawns_four() {
+        let (q, _db) = open_queue("batch-six-cap8");
+        enqueue_n(&q, 6);
+        let to_spawn = compute_to_spawn(0, 8, 4); // = 4 (tick limit)
+        let spawned = drain_n(&q, to_spawn);
+        assert_eq!(spawned, 4);
+    }
+
+    #[test]
+    fn test_four_eligible_cap2_tick4_spawns_two() {
+        let (q, _db) = open_queue("batch-four-cap2");
+        enqueue_n(&q, 4);
+        let to_spawn = compute_to_spawn(6, 8, 4); // cap_remaining=2, tick=4 → 2
+        let spawned = drain_n(&q, to_spawn);
+        assert_eq!(spawned, 2);
+    }
+}
+
+#[cfg(test)]
+mod daemon_hotreload {
+    use super::*;
+    use crate::{config, test_utils, worker};
+
+    fn make_wc(max_workers: u32, spawns_per_tick: u32, claude_bin: &str) -> worker::WorkerConfig {
+        worker::WorkerConfig {
+            max_workers,
+            spawns_per_tick,
+            task_timeout_secs: 1800,
+            retry_count: 3,
+            cleanup_on_failure: false,
+            claude_bin: claude_bin.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_apply_reload_updates_hot_fields() {
+        let mut wc = make_wc(4, 2, "claude");
+        let new_cfg = config::Config {
+            max_workers: Some(8),
+            spawns_per_tick: Some(6),
+            claude_bin: Some("/usr/bin/claude".to_string()),
+            ..Default::default()
+        };
+        apply_reload(&mut wc, &new_cfg);
+        assert_eq!(wc.max_workers, 8);
+        assert_eq!(wc.spawns_per_tick, 6);
+        assert_eq!(wc.claude_bin, "/usr/bin/claude");
+    }
+
+    #[test]
+    fn test_apply_reload_leaves_other_fields_unchanged() {
+        let mut wc = make_wc(4, 2, "claude");
+        wc.task_timeout_secs = 7200;
+        wc.retry_count = 5;
+        let new_cfg = config::Config {
+            max_workers: Some(8),
+            ..Default::default()
+        };
+        apply_reload(&mut wc, &new_cfg);
+        assert_eq!(wc.task_timeout_secs, 7200, "task_timeout_secs must not change on reload");
+        assert_eq!(wc.retry_count, 5, "retry_count must not change on reload");
+    }
+
+    #[test]
+    fn test_bad_config_returns_err() {
+        use std::io::Write;
+        let path = test_utils::test_file("hotreload-bad-config", "yaml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Deliberately invalid YAML
+        f.write_all(b"max_workers: [this is: not: valid yaml\n").unwrap();
+        let result = config::try_load_from(&path);
+        assert!(result.is_err(), "invalid YAML should return Err, got: {:?}", result);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_missing_config_returns_defaults() {
+        let path = test_utils::test_file("hotreload-missing", "yaml");
+        let _ = std::fs::remove_file(&path);
+        let cfg = config::try_load_from(&path)
+            .expect("missing config file should return Ok with defaults");
+        assert_eq!(cfg.max_workers(), 5);
+        assert_eq!(cfg.spawns_per_tick(), 4);
+    }
+
+    #[test]
+    fn test_noop_reload_same_values() {
+        // Default config → default wc values; apply_reload is a no-op
+        let mut wc = make_wc(5, 4, "claude");
+        let same_cfg = config::Config::default();
+        apply_reload(&mut wc, &same_cfg);
+        assert_eq!(wc.max_workers, 5);
+        assert_eq!(wc.spawns_per_tick, 4);
+        assert_eq!(wc.claude_bin, "claude");
+    }
+
+    #[test]
+    fn test_bad_config_keeps_original_wc() {
+        use std::io::Write;
+        let mut wc = make_wc(8, 3, "my-claude");
+        let path = test_utils::test_file("hotreload-bad-keep", "yaml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"max_workers: [broken\n").unwrap();
+        // Simulate what the daemon does: if load fails, don't call apply_reload
+        if let Ok(new_cfg) = config::try_load_from(&path) {
+            apply_reload(&mut wc, &new_cfg);
+        }
+        // Values must be unchanged
+        assert_eq!(wc.max_workers, 8, "max_workers must be retained on bad config");
+        assert_eq!(wc.spawns_per_tick, 3, "spawns_per_tick must be retained on bad config");
+        assert_eq!(wc.claude_bin, "my-claude", "claude_bin must be retained on bad config");
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

@@ -53,7 +53,7 @@ After dispatch, run `boi status` to show initial state.
 ### Other Commands
 
 ```bash
-boi status [--watch] [--json]             Queue and worker status
+boi status [--watch] [--json] [-v|--verbose]  Queue and worker status; -v shows full failure detail
 boi log <queue-id> [--full]               Tail worker output
 boi cancel <queue-id>                     Cancel a spec
 boi stop                                  Stop daemon and all workers
@@ -66,6 +66,8 @@ boi critic status | run | enable | disable | checks
 boi spec <queue-id> [add|skip|next|block|edit|deps]
 boi dep add|remove|set|clear|show|viz|check
 boi project create|list|status|context|delete
+boi plan [spec.yaml ...] [--force-refresh]        Build DAG + LLM critique for in-flight and new specs
+boi dispatch-many <spec1.yaml> [spec2.yaml ...]   DAG-ordered multi-spec dispatch with LLM gate
 ```
 
 ## Spec Format
@@ -123,6 +125,11 @@ A **phase** is a named worker role defined by a `.phase.toml` file. The daemon h
 | `critic` | Quality gate: adds `[CRITIC]` tasks on failure | 300s |
 | `decompose` | Decompose a high-level spec into actionable tasks | 600s |
 | `evaluate` | Evaluate spec completion and determine next steps | 300s |
+| `spec-critique` | Critique spec quality before execution (also: `spec-review` alias) | 120s |
+| `spec-improve` | Improve spec in response to critique, then requeue for re-critique | 120s |
+| `commit` | Commit staged changes in the spec worktree — deterministic, no Claude | — |
+| `merge` | Merge spec worktree branch into the target branch — deterministic, no Claude | — |
+| `cleanup` | Remove spec worktree and delete branch — deterministic, no Claude | — |
 
 ### Phase File Schema (`~/.boi/phases/*.phase.toml`)
 
@@ -132,10 +139,13 @@ description = "What this phase does"
 completion_handler = "builtin:execute"   # optional — use built-in routing logic
 
 [worker]
-prompt_template = "path/to/prompt.md"   # required
+prompt_template = "path/to/prompt.md"   # required for claude phases
 model = "claude-sonnet-4-6"
 effort = "medium"                        # low | medium | high
 timeout = 300                            # seconds
+runtime = "claude"                       # "claude" (default) | "openrouter" | "deterministic"
+api_key_env = "OPENROUTER_API_KEY"       # openrouter only — env var holding the API key (default: OPENROUTER_API_KEY)
+bare = false                             # true → --bare flag (skips session/MCP/skill loading; ~96% cold-start reduction)
 
 [completion]
 approve_signal = "## Approved"
@@ -287,7 +297,7 @@ Exit 0 = passed. Any non-zero = failed.
 ## Constraints
 
 - `boi install` runs **outside Claude Code** in a terminal.
-- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. Configured globally in `~/.boi/config.json` or per-spec via `**Runtime:** codex` header.
+- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. OpenRouter runtime: direct HTTP to `openrouter.ai/api/v1/chat/completions` (requires `OPENROUTER_API_KEY`; used for text-only judgment phases). Configured globally in `~/.boi/config.yaml` or per-spec via `**Runtime:** codex` header.
 - Daemon polls every 5 seconds. Status may lag slightly.
 - Default 3 workers, max 5. Set during install.
 - Workers get fresh context each iteration. No memory of previous iterations.

@@ -553,6 +553,7 @@ pub fn cmd_bench_phase(phase_name: &str, spec_path: &Path, runs: u32) {
             phase.model.as_deref(),
             None,
             &claude_bin,
+            phase.bare,
         ) {
             Ok(cr) => {
                 let verdict = crate::phases::parse_phase_output(&phase, &cr.output);

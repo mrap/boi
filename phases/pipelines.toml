@@ -13,3 +13,9 @@ task_phases = ["execute", "task-verify"]
 [mode.generate]
 spec_phases = ["plan-critique", "critic", "evaluate"]
 task_phases = ["decompose", "execute", "code-review", "task-verify"]
+
+[mode.v2]
+spec_pre_phases  = ["spec-critique", "spec-improve"]
+task_phases      = ["execute", "review", "commit"]
+spec_post_phases = ["doc-update", "critic", "merge", "cleanup"]
+max_loops        = 3

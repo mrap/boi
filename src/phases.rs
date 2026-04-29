@@ -73,6 +73,12 @@ pub struct PhaseConfig {
     pub can_add_tasks: bool,
     pub can_fail_spec: bool,
     pub requires_claude: bool,
+    /// Worker runtime: "claude", "deterministic", "openrouter", or None (defaults to "claude").
+    pub runtime: Option<String>,
+    /// For runtime=openrouter: env var holding the API key (default OPENROUTER_API_KEY).
+    pub api_key_env: Option<String>,
+    /// Builtin handler name for deterministic phases, e.g. "builtin:commit".
+    pub completion_handler: Option<String>,
     pub approve_signal: Option<String>,
     pub reject_signal: Option<String>,
     pub on_approve: Option<String>,
@@ -84,6 +90,9 @@ pub struct PhaseConfig {
     pub effort: Option<String>,
     pub hooks_pre: Vec<String>,
     pub hooks_post: Vec<String>,
+    /// When true, append --bare to the claude CLI invocation (skips session/MCP/skill loading).
+    #[serde(default)]
+    pub bare: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +149,10 @@ struct WorkerSection {
     model: Option<String>,
     #[serde(default)]
     code_model: Option<String>,
+    #[serde(default)]
+    bare: Option<bool>,
+    #[serde(default)]
+    api_key_env: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,12 +224,16 @@ impl PhaseConfig {
             .phase.as_ref().and_then(|p| p.can_fail_spec)
             .unwrap_or_else(|| derive_can_fail_spec(&name));
 
-        // Derive requires_claude: explicit [phase] setting wins, else derive from worker.runtime
+        let runtime = toml.worker.as_ref().and_then(|w| w.runtime.clone());
+        let api_key_env = toml.worker.as_ref().and_then(|w| w.api_key_env.clone());
+        let completion_handler = toml.completion_handler.clone();
+
+        // Derive requires_claude: explicit [phase] setting wins, else derive from worker.runtime.
+        // "deterministic" and any non-"claude" value → false.
         let requires_claude = toml
             .phase.as_ref().and_then(|p| p.requires_claude)
             .unwrap_or_else(|| {
-                toml.worker.as_ref()
-                    .and_then(|w| w.runtime.as_deref())
+                runtime.as_deref()
                     .map(|r| r == "claude")
                     .unwrap_or(true)
             });
@@ -233,6 +250,7 @@ impl PhaseConfig {
         let effort = toml.worker.as_ref().and_then(|w| w.effort.clone());
         let hooks_pre = toml.hooks.as_ref().and_then(|h| h.pre.clone()).unwrap_or_default();
         let hooks_post = toml.hooks.as_ref().and_then(|h| h.post.clone()).unwrap_or_default();
+        let bare = toml.worker.as_ref().and_then(|w| w.bare).unwrap_or(false);
 
         Some(PhaseConfig {
             name,
@@ -244,6 +262,9 @@ impl PhaseConfig {
             can_add_tasks,
             can_fail_spec,
             requires_claude,
+            runtime,
+            api_key_env,
+            completion_handler,
             approve_signal,
             reject_signal,
             on_approve,
@@ -255,14 +276,16 @@ impl PhaseConfig {
             effort,
             hooks_pre,
             hooks_post,
+            bare,
         })
     }
 }
 
-/// Derive phase level from name. Spec-level phases: plan-critique, critic, evaluate, review, spec-review.
+/// Derive phase level from name. Spec-level phases: plan-critique, critic, evaluate, review, spec-review/spec-critique/spec-improve.
 fn derive_level(name: &str) -> PhaseLevel {
     match name {
-        "plan-critique" | "critic" | "evaluate" | "review" | "spec-review" => PhaseLevel::Spec,
+        "plan-critique" | "critic" | "evaluate" | "review"
+        | "spec-review" | "spec-critique" | "spec-improve" => PhaseLevel::Spec,
         _ => PhaseLevel::Task,
     }
 }
@@ -274,8 +297,8 @@ fn derive_can_add_tasks(name: &str, completion_handler: Option<&str>) -> bool {
             return true;
         }
     }
-    // Phases that structurally add tasks: critic, decompose, evaluate, plan-critique, code-review, review, spec-review
-    matches!(name, "critic" | "decompose" | "evaluate" | "plan-critique" | "code-review" | "review" | "spec-review")
+    // Phases that structurally add tasks: critic, decompose, evaluate, plan-critique, code-review, review, spec-review/spec-critique
+    matches!(name, "critic" | "decompose" | "evaluate" | "plan-critique" | "code-review" | "review" | "spec-review" | "spec-critique")
 }
 
 /// Derive can_fail_spec from name.
@@ -384,7 +407,9 @@ impl PhaseRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<&PhaseConfig> {
-        self.user.get(name).or_else(|| self.core.get(name))
+        // "spec-review" is a backward-compat alias for "spec-critique".
+        let resolved = if name == "spec-review" { "spec-critique" } else { name };
+        self.user.get(resolved).or_else(|| self.core.get(resolved))
     }
 
     pub fn list(&self) -> Vec<&PhaseConfig> {
@@ -432,10 +457,26 @@ pub fn default_phases(mode: &str) -> Vec<String> {
 /// Pipeline configuration separating spec-level and task-level phases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
-    /// Phases that run once for the whole spec (before/after all tasks)
+    /// Legacy: phases run once for the whole spec. If spec_post_phases is empty,
+    /// spec_phases is used as spec_post_phases (backward compat).
+    #[serde(default)]
     pub spec_phases: Vec<String>,
-    /// Phases that run for each individual task
+    /// Phases that run before task execution (spec-pre loop, e.g. spec-critique ↔ spec-improve).
+    #[serde(default)]
+    pub spec_pre_phases: Vec<String>,
+    /// Phases that run after all tasks complete (e.g. doc-update, critic, merge, cleanup).
+    #[serde(default)]
+    pub spec_post_phases: Vec<String>,
+    /// Phases that run for each individual task.
+    #[serde(default)]
     pub task_phases: Vec<String>,
+    /// Max iterations for the spec-pre loop before proceeding to task execution.
+    #[serde(default = "default_max_loops")]
+    pub max_loops: u32,
+}
+
+fn default_max_loops() -> u32 {
+    3
 }
 
 #[derive(Debug, Deserialize)]
@@ -445,8 +486,16 @@ struct PipelinesToml {
 
 #[derive(Debug, Deserialize)]
 struct PipelineModeToml {
+    #[serde(default)]
     spec_phases: Vec<String>,
+    #[serde(default)]
+    spec_pre_phases: Vec<String>,
+    #[serde(default)]
+    spec_post_phases: Vec<String>,
+    #[serde(default)]
     task_phases: Vec<String>,
+    #[serde(default = "default_max_loops")]
+    max_loops: u32,
 }
 
 /// Find the pipelines.toml file.
@@ -473,9 +522,20 @@ fn load_pipeline_from_file(path: &Path, mode: &str) -> Option<PipelineConfig> {
         "execute" | "" => "default",
         other => other,
     };
-    parsed.mode.get(key).map(|m| PipelineConfig {
-        spec_phases: m.spec_phases.clone(),
-        task_phases: m.task_phases.clone(),
+    parsed.mode.get(key).map(|m| {
+        // Backward compat: if spec_post_phases not provided, use spec_phases as spec_post_phases.
+        let spec_post = if !m.spec_post_phases.is_empty() {
+            m.spec_post_phases.clone()
+        } else {
+            m.spec_phases.clone()
+        };
+        PipelineConfig {
+            spec_phases: m.spec_phases.clone(),
+            spec_pre_phases: m.spec_pre_phases.clone(),
+            spec_post_phases: spec_post,
+            task_phases: m.task_phases.clone(),
+            max_loops: m.max_loops,
+        }
     })
 }
 
@@ -495,23 +555,38 @@ pub(crate) fn fallback_pipeline(mode: &str) -> PipelineConfig {
     match mode {
         "execute" => PipelineConfig {
             spec_phases: vec!["spec-review".into(), "critic".into()],
+            spec_pre_phases: vec![],
+            spec_post_phases: vec!["spec-review".into(), "critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
+            max_loops: 3,
         },
         "challenge" => PipelineConfig {
             spec_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into()],
+            spec_pre_phases: vec![],
+            spec_post_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
+            max_loops: 3,
         },
         "discover" => PipelineConfig {
             spec_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
+            spec_pre_phases: vec![],
+            spec_post_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
+            max_loops: 3,
         },
         "generate" => PipelineConfig {
             spec_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
+            spec_pre_phases: vec![],
+            spec_post_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
             task_phases: vec!["decompose".into(), "execute".into(), "code-review".into(), "task-verify".into()],
+            max_loops: 3,
         },
         _ => PipelineConfig {
             spec_phases: vec![],
+            spec_pre_phases: vec![],
+            spec_post_phases: vec![],
             task_phases: vec!["execute".into()],
+            max_loops: 3,
         },
     }
 }
@@ -650,6 +725,9 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             can_add_tasks: false,
             can_fail_spec: false,
             requires_claude: true,
+            runtime: Some("claude".into()),
+            api_key_env: None,
+            completion_handler: None,
             approve_signal: None,
             reject_signal: None,
             on_approve: None,
@@ -661,6 +739,7 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         },
         PhaseConfig {
             name: "task-verify".into(),
@@ -672,6 +751,9 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             can_add_tasks: false,
             can_fail_spec: false,
             requires_claude: false,
+            runtime: None,
+            api_key_env: None,
+            completion_handler: None,
             approve_signal: None,
             reject_signal: None,
             on_approve: Some("next".into()),
@@ -683,6 +765,7 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         },
     ]
 }
@@ -703,13 +786,23 @@ pub fn resolve_pipeline(
     task_phases: Option<&[String]>,
 ) -> PipelineConfig {
     let defaults = default_pipeline(mode);
+    let resolved_spec = spec_phases
+        .map(|v| v.to_vec())
+        .unwrap_or(defaults.spec_phases.clone());
+    // When spec_phases is overridden directly, treat it as spec_post_phases (backward compat).
+    let resolved_post = if spec_phases.is_some() {
+        resolved_spec.clone()
+    } else {
+        defaults.spec_post_phases
+    };
     PipelineConfig {
-        spec_phases: spec_phases
-            .map(|v| v.to_vec())
-            .unwrap_or(defaults.spec_phases),
+        spec_phases: resolved_spec,
+        spec_pre_phases: defaults.spec_pre_phases,
+        spec_post_phases: resolved_post,
         task_phases: task_phases
             .map(|v| v.to_vec())
             .unwrap_or(defaults.task_phases),
+        max_loops: defaults.max_loops,
     }
 }
 
@@ -870,10 +963,16 @@ mod tests {
         assert!(evaluate.can_add_tasks);
         assert!(!evaluate.can_fail_spec);
 
-        let spec_review = registry.get("spec-review").unwrap();
-        assert!(spec_review.can_add_tasks);
-        assert!(!spec_review.can_fail_spec);
-        assert!(spec_review.requires_claude);
+        // spec-critique is the canonical name; spec-review is a backward-compat alias.
+        // spec-critique rejects+requeues rather than adding tasks directly.
+        let spec_critique = registry.get("spec-critique").unwrap();
+        assert!(!spec_critique.can_add_tasks);
+        assert!(!spec_critique.can_fail_spec);
+        assert!(spec_critique.requires_claude);
+
+        // alias still resolves
+        let via_alias = registry.get("spec-review").unwrap();
+        assert_eq!(via_alias.name, "spec-critique");
     }
 
     #[test]
@@ -1022,12 +1121,16 @@ approve_signal = ""
     fn test_core_and_user_names() {
         let registry = test_registry();
         let core = registry.core_names();
-        assert_eq!(core.len(), 10);
+        assert_eq!(core.len(), 14);
         assert!(core.contains(&"execute"));
         assert!(core.contains(&"plan-critique"));
         assert!(core.contains(&"code-review"));
         assert!(core.contains(&"task-verify"));
-        assert!(core.contains(&"spec-review"));
+        assert!(core.contains(&"spec-critique"));
+        assert!(core.contains(&"spec-improve"));
+        assert!(core.contains(&"commit"));
+        assert!(core.contains(&"merge"));
+        assert!(core.contains(&"cleanup"));
 
         let user = registry.user_names();
         assert!(user.is_empty());
@@ -1039,7 +1142,7 @@ approve_signal = ""
         let nonexistent = test_utils::test_file("nonexistent-dir", "xyz");
         let _ = std::fs::remove_file(&nonexistent);
         registry.load_user_phases(&nonexistent);
-        assert_eq!(registry.list().len(), 10);
+        assert_eq!(registry.list().len(), 14);
     }
 
     // --- Step 1: PhaseLevel tests ---
@@ -1057,7 +1160,9 @@ approve_signal = ""
         assert_eq!(registry.get("critic").unwrap().level, PhaseLevel::Spec);
         assert_eq!(registry.get("evaluate").unwrap().level, PhaseLevel::Spec);
         assert_eq!(registry.get("plan-critique").unwrap().level, PhaseLevel::Spec);
-        assert_eq!(registry.get("spec-review").unwrap().level, PhaseLevel::Spec);
+        assert_eq!(registry.get("spec-critique").unwrap().level, PhaseLevel::Spec);
+        assert_eq!(registry.get("spec-review").unwrap().level, PhaseLevel::Spec); // alias
+        assert_eq!(registry.get("spec-improve").unwrap().level, PhaseLevel::Spec);
 
         // Task-level phases
         assert_eq!(registry.get("execute").unwrap().level, PhaseLevel::Task);
@@ -1219,6 +1324,9 @@ approve_signal = ""
             can_add_tasks: false,
             can_fail_spec: false,
             requires_claude: true,
+            runtime: None,
+            api_key_env: None,
+            completion_handler: None,
             approve_signal: None,
             reject_signal: None,
             on_approve: None,
@@ -1230,6 +1338,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let prompt = build_phase_prompt(&phase, "title: Test\ntasks: []", None, &std::collections::HashMap::new());
         assert!(prompt.contains("Review this spec carefully."));
@@ -1249,6 +1358,9 @@ approve_signal = ""
             can_add_tasks: false,
             can_fail_spec: false,
             requires_claude: true,
+            runtime: None,
+            api_key_env: None,
+            completion_handler: None,
             approve_signal: None,
             reject_signal: None,
             on_approve: None,
@@ -1260,6 +1372,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let prompt = build_phase_prompt(&phase, "spec content", Some("task t-1 details"), &std::collections::HashMap::new());
         assert!(prompt.contains("--- TASK ---"));
@@ -1278,6 +1391,9 @@ approve_signal = ""
             can_add_tasks: false,
             can_fail_spec: false,
             requires_claude: false,
+            runtime: None,
+            api_key_env: None,
+            completion_handler: None,
             approve_signal: None,
             reject_signal: None,
             on_approve: None,
@@ -1289,6 +1405,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let prompt = build_phase_prompt(&phase, "spec", None, &std::collections::HashMap::new());
         assert!(prompt.contains("Phase: task-verify"));
@@ -1329,6 +1446,9 @@ approve_signal = ""
             can_add_tasks: false,
             can_fail_spec: false,
             requires_claude: true,
+            runtime: None,
+            api_key_env: None,
+            completion_handler: None,
             approve_signal: None,
             reject_signal: None,
             on_approve: None,
@@ -1340,6 +1460,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let outcome = parse_phase_output(&phase, "Task completed successfully.");
         assert_eq!(outcome, Verdict::Proceed);
@@ -1371,6 +1492,9 @@ approve_signal = ""
             can_add_tasks: false,
             can_fail_spec: true,
             requires_claude: true,
+            runtime: None,
+            api_key_env: None,
+            completion_handler: None,
             approve_signal: Some("## OK".into()),
             reject_signal: Some("[FAIL]".into()),
             on_approve: None,
@@ -1382,6 +1506,7 @@ approve_signal = ""
             effort: None,
             hooks_pre: vec![],
             hooks_post: vec![],
+            bare: false,
         };
         let outcome = parse_phase_output(&phase, "Found issue: [FAIL] bad code");
         match outcome {
@@ -1402,15 +1527,16 @@ approve_signal = ""
             .expect("spec_with_issues.yaml must exist");
 
         let registry = test_registry();
-        let spec_review = registry.get("spec-review").expect("spec-review phase must exist");
+        // spec-review is now a backward-compat alias for spec-critique
+        let spec_critique = registry.get("spec-review").expect("spec-review alias must exist");
 
-        let prompt = build_phase_prompt(spec_review, &spec_content, None, &std::collections::HashMap::new());
+        let prompt = build_phase_prompt(spec_critique, &spec_content, None, &std::collections::HashMap::new());
 
         assert!(prompt.contains("Set up CSV ingestion"), "prompt must contain task title from fixture");
         assert!(prompt.contains("Optimize database writes"), "prompt must contain second task title");
         assert!(
             prompt.to_lowercase().contains("verify"),
-            "spec-review prompt must reference verify command validation"
+            "spec-critique prompt must reference verify command validation"
         );
     }
 
@@ -1418,7 +1544,8 @@ approve_signal = ""
     fn test_phase_level_from_toml() {
         let registry = PhaseRegistry::from_dir(&repo_root().join("phases"));
 
-        let spec_phases = ["spec-review", "plan-critique", "critic", "evaluate", "review"];
+        // spec-review resolves via alias to spec-critique
+        let spec_phases = ["spec-review", "spec-critique", "spec-improve", "plan-critique", "critic", "evaluate", "review"];
         for name in &spec_phases {
             let phase = registry.get(name).unwrap_or_else(|| panic!("phase '{name}' not found"));
             assert_eq!(
@@ -1502,5 +1629,284 @@ template = "Do something at the spec level."
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- spec_improve: signal parsing + phase properties ---
+
+    #[test]
+    fn test_spec_improve_phase_exists_and_is_spec_level() {
+        let registry = test_registry();
+        let phase = registry.get("spec-improve").expect("spec-improve phase must exist");
+        assert_eq!(phase.level, PhaseLevel::Spec);
+        assert!(!phase.can_add_tasks);
+        assert!(!phase.can_fail_spec);
+        assert!(phase.requires_claude);
+    }
+
+    #[test]
+    fn test_spec_improve_approve_signal_is_proceed() {
+        let registry = test_registry();
+        let phase = registry.get("spec-improve").unwrap();
+        assert_eq!(phase.approve_signal.as_deref(), Some("## Spec Improved"));
+        let verdict = parse_phase_output(phase, "Work done.\n\n## Spec Improved\n");
+        assert_eq!(verdict, Verdict::Proceed, "approved output must yield Proceed");
+    }
+
+    #[test]
+    fn test_spec_improve_on_approve_requeues_spec_critique() {
+        let registry = test_registry();
+        let phase = registry.get("spec-improve").unwrap();
+        assert_eq!(
+            phase.on_approve.as_deref(),
+            Some("requeue:spec-critique"),
+            "spec-improve on_approve must be requeue:spec-critique"
+        );
+    }
+
+    #[test]
+    fn test_spec_critique_phase_signals() {
+        let registry = test_registry();
+        let phase = registry.get("spec-critique").unwrap();
+        assert_eq!(phase.approve_signal.as_deref(), Some("## Spec Approved"));
+        assert_eq!(phase.reject_signal.as_deref(), Some("[CRITIQUE]"));
+        assert_eq!(phase.on_reject.as_deref(), Some("requeue:spec-improve"));
+    }
+
+    #[test]
+    fn test_spec_critique_approve_signal_is_proceed() {
+        let registry = test_registry();
+        let phase = registry.get("spec-critique").unwrap();
+        let verdict = parse_phase_output(phase, "All checks passed.\n\n## Spec Approved\n");
+        assert_eq!(verdict, Verdict::Proceed);
+    }
+
+    #[test]
+    fn test_spec_critique_reject_signal_is_redo() {
+        let registry = test_registry();
+        let phase = registry.get("spec-critique").unwrap();
+        // [CRITIQUE] in output + on_reject = "requeue:spec-improve" → Redo
+        let verdict = parse_phase_output(phase, "### [CRITIQUE] 1\n\nTask t-3 verify is broken.\n");
+        assert!(
+            matches!(verdict, Verdict::Redo { .. }),
+            "critique rejection must yield Redo (requeue), got {:?}", verdict
+        );
+    }
+
+    #[test]
+    fn test_spec_review_alias_signals_match_spec_critique() {
+        let registry = test_registry();
+        let via_alias = registry.get("spec-review").unwrap();
+        let direct = registry.get("spec-critique").unwrap();
+        assert_eq!(via_alias.approve_signal, direct.approve_signal);
+        assert_eq!(via_alias.reject_signal, direct.reject_signal);
+        assert_eq!(via_alias.on_reject, direct.on_reject);
+    }
+
+    // --- Pipeline v2: deterministic commit / merge / cleanup phases ---
+
+    #[test]
+    fn test_pipeline_v2_phase_configs() {
+        let registry = test_registry();
+
+        let commit = registry.get("commit").expect("commit phase must exist");
+        assert_eq!(commit.level, PhaseLevel::Task);
+        assert_eq!(commit.runtime.as_deref(), Some("deterministic"));
+        assert_eq!(commit.completion_handler.as_deref(), Some("builtin:commit"));
+        assert!(!commit.requires_claude);
+
+        let merge = registry.get("merge").expect("merge phase must exist");
+        assert_eq!(merge.level, PhaseLevel::Spec);
+        assert_eq!(merge.runtime.as_deref(), Some("deterministic"));
+        assert_eq!(merge.completion_handler.as_deref(), Some("builtin:merge"));
+        assert!(!merge.requires_claude);
+
+        let cleanup = registry.get("cleanup").expect("cleanup phase must exist");
+        assert_eq!(cleanup.level, PhaseLevel::Spec);
+        assert_eq!(cleanup.runtime.as_deref(), Some("deterministic"));
+        assert_eq!(cleanup.completion_handler.as_deref(), Some("builtin:cleanup"));
+        assert!(!cleanup.requires_claude);
+    }
+
+    #[test]
+    fn test_pipeline_v2_end_to_end() {
+        use crate::builtins::{run_builtin, BuiltinContext, BuiltinResult};
+
+        let _guard = test_utils::HOME_LOCK.lock().unwrap();
+        let repo = test_utils::test_git_repo("pv2-e2e");
+        let home = test_utils::test_dir("pv2-e2e-home");
+        std::env::set_var("HOME", home.to_str().unwrap());
+
+        let registry = test_registry();
+        let spec_id = "pv2-e2e-001";
+
+        let dest = crate::worktree::create(spec_id, repo.to_str().unwrap()).unwrap();
+        std::fs::write(dest.join("output.txt"), "v2 output").unwrap();
+
+        // commit phase: commits changes in the worktree
+        let commit = registry.get("commit").unwrap();
+        let handler = commit.completion_handler.as_deref().unwrap();
+        let ctx = BuiltinContext { spec_id, task_title: "Add output", repo_path: repo.to_str().unwrap() };
+        assert!(matches!(run_builtin(handler, &ctx), BuiltinResult::Success(_)), "commit phase failed");
+
+        // merge phase: brings worktree branch into the main branch
+        let merge = registry.get("merge").unwrap();
+        let handler = merge.completion_handler.as_deref().unwrap();
+        let ctx = BuiltinContext { spec_id, task_title: "", repo_path: repo.to_str().unwrap() };
+        assert!(matches!(run_builtin(handler, &ctx), BuiltinResult::Success(_)), "merge phase failed");
+        assert!(repo.join("output.txt").exists(), "merged file must appear in main repo");
+
+        // cleanup phase: removes worktree dir and deletes branch
+        let cleanup = registry.get("cleanup").unwrap();
+        let handler = cleanup.completion_handler.as_deref().unwrap();
+        let ctx = BuiltinContext { spec_id, task_title: "", repo_path: repo.to_str().unwrap() };
+        assert!(matches!(run_builtin(handler, &ctx), BuiltinResult::Success(_)), "cleanup phase failed");
+        assert!(!dest.exists(), "worktree must be removed after cleanup");
+    }
+
+    // --- bare flag tests ---
+
+    #[test]
+    fn test_phase_bare_defaults_to_false() {
+        let toml_content = r#"
+name = "critic"
+description = "Test phase"
+
+[phase]
+name = "critic"
+level = "spec"
+can_add_tasks = true
+can_fail_spec = true
+requires_claude = true
+
+[prompt]
+template = "Review the spec."
+"#;
+        let dir = test_utils::test_dir("bare-default");
+        fs::write(dir.join("critic.phase.toml"), toml_content).unwrap();
+        let mut registry = test_registry();
+        registry.load_user_phases(&dir);
+        let phase = registry.get("critic").unwrap();
+        assert!(!phase.bare, "bare should default to false when not set in TOML");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_phase_bare_true_parsed_from_toml() {
+        let toml_content = r#"
+name = "spec-critique-bare"
+description = "Bare phase for cold-start test"
+
+[phase]
+name = "spec-critique-bare"
+level = "spec"
+can_add_tasks = false
+can_fail_spec = false
+requires_claude = true
+
+[worker]
+bare = true
+runtime = "claude"
+
+[prompt]
+template = "Critique the spec."
+"#;
+        let dir = test_utils::test_dir("bare-true");
+        fs::write(dir.join("spec-critique-bare.phase.toml"), toml_content).unwrap();
+        let mut registry = test_registry();
+        registry.load_user_phases(&dir);
+        let phase = registry.get("spec-critique-bare").unwrap();
+        assert!(phase.bare, "bare = true in [worker] section must be parsed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    mod pipeline_parse {
+        use super::*;
+
+        fn toml_file(content: &str) -> std::path::PathBuf {
+            let path = test_utils::test_file("pipeline-parse", "toml");
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+
+        #[test]
+        fn test_v2_mode_all_fields() {
+            let path = toml_file(r#"
+[mode.v2]
+spec_pre_phases  = ["spec-critique", "spec-improve"]
+task_phases      = ["execute", "review", "commit"]
+spec_post_phases = ["doc-update", "critic", "merge", "cleanup"]
+max_loops        = 3
+"#);
+            let cfg = load_pipeline_from_file(&path, "v2").unwrap();
+            assert_eq!(cfg.spec_pre_phases, vec!["spec-critique", "spec-improve"]);
+            assert_eq!(cfg.task_phases, vec!["execute", "review", "commit"]);
+            assert_eq!(cfg.spec_post_phases, vec!["doc-update", "critic", "merge", "cleanup"]);
+            assert_eq!(cfg.max_loops, 3);
+        }
+
+        #[test]
+        fn test_backward_compat_spec_phases_becomes_spec_post() {
+            let path = toml_file(r#"
+[mode.default]
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+"#);
+            let cfg = load_pipeline_from_file(&path, "execute").unwrap();
+            assert_eq!(cfg.spec_post_phases, vec!["critic"]);
+            assert!(cfg.spec_pre_phases.is_empty());
+        }
+
+        #[test]
+        fn test_max_loops_defaults_to_3() {
+            let path = toml_file(r#"
+[mode.v2]
+spec_pre_phases  = ["spec-critique"]
+task_phases      = ["execute"]
+spec_post_phases = ["critic"]
+"#);
+            let cfg = load_pipeline_from_file(&path, "v2").unwrap();
+            assert_eq!(cfg.max_loops, 3);
+        }
+
+        #[test]
+        fn test_mode_v2_from_pipelines_toml() {
+            let pipelines_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("phases")
+                .join("pipelines.toml");
+            let cfg = load_pipeline_from_file(&pipelines_path, "v2")
+                .expect("mode.v2 must exist in phases/pipelines.toml");
+            assert!(!cfg.spec_pre_phases.is_empty(), "spec_pre_phases must not be empty");
+            assert!(!cfg.spec_post_phases.is_empty(), "spec_post_phases must not be empty");
+            assert!(!cfg.task_phases.is_empty(), "task_phases must not be empty");
+            assert!(cfg.spec_pre_phases.contains(&"spec-critique".to_string()));
+            assert!(cfg.spec_post_phases.contains(&"critic".to_string()));
+        }
+
+        #[test]
+        fn test_pre_and_post_are_distinct() {
+            let path = toml_file(r#"
+[mode.v2]
+spec_pre_phases  = ["spec-critique", "spec-improve"]
+task_phases      = ["execute", "review", "commit"]
+spec_post_phases = ["doc-update", "critic", "merge", "cleanup"]
+"#);
+            let cfg = load_pipeline_from_file(&path, "v2").unwrap();
+            for pre in &cfg.spec_pre_phases {
+                assert!(
+                    !cfg.spec_post_phases.contains(pre),
+                    "phase '{pre}' must not appear in both pre and post"
+                );
+            }
+        }
+
+        #[test]
+        fn test_mode_not_found_returns_none() {
+            let path = toml_file(r#"
+[mode.default]
+spec_phases = ["critic"]
+task_phases = ["execute"]
+"#);
+            assert!(load_pipeline_from_file(&path, "nonexistent").is_none());
+        }
     }
 }

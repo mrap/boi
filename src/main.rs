@@ -1,15 +1,18 @@
 use boi::cli::bench::cmd_bench;
 use boi::cli::cancel::cmd_cancel;
 use boi::cli::config_cmd::cmd_config;
-use boi::cli::daemon::{cmd_daemon, cmd_restart, cmd_start, cmd_stop};
+use boi::cli::daemon::{cmd_daemon, cmd_reload, cmd_restart, cmd_start, cmd_stop};
 use boi::cli::dispatch::cmd_dispatch;
+use boi::cli::dispatch_many::cmd_dispatch_many;
 use boi::cli::doctor::cmd_doctor;
 use boi::cli::log::cmd_log;
 use boi::cli::outputs::cmd_outputs;
 use boi::cli::phases_cmd::{cmd_phases_list, cmd_phases_show};
+use boi::cli::plan::cmd_plan;
 use boi::cli::spec_mgmt::{cmd_spec, SpecActionData};
 use boi::cli::status::{cmd_status, cmd_status_json, cmd_status_watch};
 use boi::cli::telemetry_cmd::cmd_telemetry;
+use boi::cli::why::cmd_why;
 use boi::cli::workers::cmd_workers;
 use boi::{config, hooks};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -75,6 +78,9 @@ enum Commands {
         /// Override workspace path for spec
         #[arg(long)]
         workspace: Option<String>,
+        /// Skip the implicit-dep DAG check (use when you know the ordering is correct)
+        #[arg(long)]
+        skip_plan: bool,
     },
     /// Show queue status
     Status {
@@ -87,6 +93,9 @@ enum Commands {
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// Show full FailureReason detail for failed specs
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// View worker output log
     Log {
@@ -135,6 +144,43 @@ enum Commands {
     },
     /// Health check
     Doctor,
+    /// Plan dispatch order + LLM critique for in-flight and/or new specs
+    Plan {
+        /// Additional spec files to include in DAG analysis (in-flight specs are loaded automatically)
+        specs: Vec<PathBuf>,
+        /// Force re-run LLM critique even if a cached result exists
+        #[arg(long)]
+        force_refresh: bool,
+    },
+    /// Dispatch multiple specs in DAG order after an LLM critique gate
+    DispatchMany {
+        /// Spec files to dispatch (dispatched in dependency order)
+        specs: Vec<PathBuf>,
+        /// Auto-approve the dispatch prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Auto-approve warn-level concerns (does not override blocks)
+        #[arg(long, short = 'f')]
+        force: bool,
+        #[arg(long, default_value = "100")]
+        priority: i64,
+        #[arg(long, short = 'm', value_enum)]
+        mode: Option<SpecMode>,
+        /// Maximum iterations (default 30)
+        #[arg(long, default_value = "30")]
+        max_iter: i64,
+        /// Task timeout in minutes (default 30)
+        #[arg(long, default_value = "30")]
+        timeout: u32,
+        /// Project name
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Print full failure detail for a spec — fast forensics when boi status shows an error
+    Why {
+        /// Spec ID (e.g. SA015)
+        spec_id: String,
+    },
     /// Print version
     Version,
     /// Benchmark N pipelines across a spec or battery of specs
@@ -170,6 +216,8 @@ enum DaemonAction {
     Restart,
     /// Run the daemon in the foreground (default)
     Foreground,
+    /// Send SIGHUP to the running daemon to reload max_workers, spawns_per_tick, and claude_bin
+    Reload,
 }
 
 #[derive(Subcommand)]
@@ -217,6 +265,7 @@ fn main() {
             project,
             dry_run,
             workspace,
+            skip_plan,
         } => {
             let mode_str = mode.map(|m| m.to_string());
             cmd_dispatch(
@@ -230,6 +279,7 @@ fn main() {
                 project.as_deref(),
                 dry_run,
                 workspace.as_deref(),
+                skip_plan,
                 db_str,
                 &hook_cfg,
             );
@@ -239,13 +289,14 @@ fn main() {
             all,
             watch,
             json,
+            verbose,
         } => {
             if watch {
-                cmd_status_watch(spec_id.as_deref(), all, db_str);
+                cmd_status_watch(spec_id.as_deref(), all, verbose, db_str);
             } else if json {
                 cmd_status_json(spec_id.as_deref(), all, db_str);
             } else {
-                cmd_status(spec_id.as_deref(), all, db_str);
+                cmd_status(spec_id.as_deref(), all, verbose, db_str);
             }
         }
         Commands::Log { spec_id, full, debug, follow } => {
@@ -263,6 +314,7 @@ fn main() {
                 DaemonAction::Stop => cmd_stop(),
                 DaemonAction::Restart => cmd_restart(),
                 DaemonAction::Foreground => cmd_daemon(db_str, hook_cfg, &cfg),
+                DaemonAction::Reload => cmd_reload(),
             }
         }
         Commands::Config { key, value } => {
@@ -297,6 +349,38 @@ fn main() {
         }
         Commands::Doctor => {
             cmd_doctor(db_str, &cfg);
+        }
+        Commands::Plan { specs, force_refresh } => {
+            let exit_code = cmd_plan(&specs, db_str, force_refresh);
+            std::process::exit(exit_code);
+        }
+        Commands::DispatchMany {
+            specs,
+            yes,
+            force,
+            priority,
+            mode,
+            max_iter,
+            timeout,
+            project,
+        } => {
+            let mode_str = mode.map(|m| m.to_string());
+            let exit_code = cmd_dispatch_many(
+                &specs,
+                yes,
+                force,
+                priority,
+                mode_str.as_deref(),
+                max_iter,
+                timeout,
+                project.as_deref(),
+                db_str,
+                &hook_cfg,
+            );
+            std::process::exit(exit_code);
+        }
+        Commands::Why { spec_id } => {
+            cmd_why(&spec_id, db_str);
         }
         Commands::Version => {
             println!("boi {}", env!("CARGO_PKG_VERSION"));

@@ -183,12 +183,9 @@ mod tests {
     use super::*;
     use crate::test_utils;
 
-    use std::sync::Mutex;
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn test_create_and_cleanup() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_utils::HOME_LOCK.lock().unwrap();
         let repo_dir = test_utils::test_git_repo("wt-repo");
 
         let wt_base = test_utils::test_dir("wt-home");
@@ -205,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_create_idempotent() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_utils::HOME_LOCK.lock().unwrap();
         let repo_dir = test_utils::test_git_repo("wt-repo2");
 
         let wt_base = test_utils::test_dir("wt-home2");
@@ -219,13 +216,13 @@ mod tests {
 
     #[test]
     fn test_cleanup_nonexistent_is_ok() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_utils::HOME_LOCK.lock().unwrap();
         assert!(cleanup("nonexistent-spec-xyz").is_ok());
     }
 
     #[test]
     fn test_cleanup_stale_empty_base() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_utils::HOME_LOCK.lock().unwrap();
         let wt_base = test_utils::test_dir("wt-home3");
         std::env::set_var("HOME", wt_base.to_str().unwrap());
         assert!(cleanup_stale().is_ok());
@@ -233,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_commit_and_merge_back() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_utils::HOME_LOCK.lock().unwrap();
         let repo_dir = test_utils::test_git_repo("wt-merge-repo");
 
         let wt_base = test_utils::test_dir("wt-merge-home");
@@ -265,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_commit_no_changes() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_utils::HOME_LOCK.lock().unwrap();
         let repo_dir = test_utils::test_git_repo("wt-no-change-repo");
 
         let wt_base = test_utils::test_dir("wt-no-change-home");
@@ -282,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_branch_deleted_after_cleanup() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_utils::HOME_LOCK.lock().unwrap();
         let repo_dir = test_utils::test_git_repo("wt-branch-del-repo");
 
         let wt_base = test_utils::test_dir("wt-branch-del-home");
@@ -310,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_source_repo_clean_during_worktree_work() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_utils::HOME_LOCK.lock().unwrap();
         let repo_dir = test_utils::test_git_repo("wt-isolation-repo");
 
         let wt_base = test_utils::test_dir("wt-isolation-home");

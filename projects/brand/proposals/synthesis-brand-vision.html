@@ -1,0 +1,1251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>The Hex Brand — Vision</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,300;1,9..144,400;1,9..144,500&family=Work+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --cream: #FAF6F0;
+      --cream-dark: #F0E9DF;
+      --red: #C4553A;
+      --red-dark: #A33E26;
+      --ink: #1A1612;
+      --ink-soft: #3D3530;
+      --ink-muted: #7A6E67;
+      --border: #E0D5C8;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--cream);
+      color: var(--ink);
+      font-family: 'Work Sans', sans-serif;
+      font-size: 17px;
+      line-height: 1.7;
+    }
+
+    /* ── NAV ── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: var(--cream);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .nav-logo {
+      font-family: 'Fraunces', serif;
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--red);
+      letter-spacing: -0.02em;
+    }
+    .nav-links {
+      display: flex;
+      gap: 32px;
+      list-style: none;
+    }
+    .nav-links a {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--ink-muted);
+      text-decoration: none;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--red); }
+
+    /* ── LAYOUT ── */
+    .container {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 0 40px;
+    }
+    .container-wide {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 0 40px;
+    }
+
+    /* ── HERO ── */
+    .hero {
+      padding: 120px 0 100px;
+      text-align: center;
+      position: relative;
+    }
+    .hero-eyebrow {
+      display: inline-block;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 32px;
+      padding: 6px 16px;
+      border: 1px solid var(--red);
+      border-radius: 2px;
+    }
+    .hero h1 {
+      font-family: 'Fraunces', serif;
+      font-size: clamp(48px, 7vw, 84px);
+      font-weight: 300;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      color: var(--ink);
+      max-width: 820px;
+      margin: 0 auto 28px;
+    }
+    .hero h1 em {
+      font-style: italic;
+      color: var(--red);
+    }
+    .hero-subtitle {
+      font-size: 20px;
+      font-weight: 300;
+      color: var(--ink-soft);
+      max-width: 560px;
+      margin: 0 auto 60px;
+      line-height: 1.6;
+    }
+    .hero-stats {
+      display: flex;
+      justify-content: center;
+      gap: 60px;
+      padding-top: 60px;
+      border-top: 1px solid var(--border);
+    }
+    .stat {
+      text-align: center;
+    }
+    .stat-number {
+      font-family: 'Fraunces', serif;
+      font-size: 42px;
+      font-weight: 300;
+      color: var(--red);
+      line-height: 1;
+      display: block;
+    }
+    .stat-label {
+      font-size: 12px;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--ink-muted);
+      margin-top: 8px;
+      display: block;
+    }
+
+    /* ── SECTION HEADERS ── */
+    .section {
+      padding: 100px 0;
+    }
+    .section + .section {
+      border-top: 1px solid var(--border);
+    }
+    .section-number {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 16px;
+      display: block;
+    }
+    .section-title {
+      font-family: 'Fraunces', serif;
+      font-size: clamp(32px, 4vw, 48px);
+      font-weight: 400;
+      letter-spacing: -0.025em;
+      line-height: 1.15;
+      color: var(--ink);
+      margin-bottom: 24px;
+    }
+    .section-lead {
+      font-size: 19px;
+      font-weight: 300;
+      color: var(--ink-soft);
+      max-width: 620px;
+      line-height: 1.65;
+      margin-bottom: 64px;
+    }
+
+    /* ── POSITIONING BLOCK ── */
+    .positioning {
+      background: var(--ink);
+      color: var(--cream);
+      padding: 100px 0;
+    }
+    .positioning .section-number { color: var(--red); }
+    .positioning .section-title { color: var(--cream); }
+    .positioning .section-lead { color: rgba(250,246,240,0.7); }
+    .positioning-quote {
+      font-family: 'Fraunces', serif;
+      font-size: clamp(28px, 4vw, 42px);
+      font-weight: 300;
+      font-style: italic;
+      line-height: 1.3;
+      color: var(--cream);
+      max-width: 760px;
+      margin: 0 auto 60px;
+      text-align: center;
+      padding: 60px 40px;
+      border-top: 1px solid rgba(250,246,240,0.15);
+      border-bottom: 1px solid rgba(250,246,240,0.15);
+    }
+    .positioning-quote cite {
+      display: block;
+      font-family: 'Work Sans', sans-serif;
+      font-style: normal;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-top: 24px;
+    }
+    .positioning-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2px;
+      margin-top: 60px;
+    }
+    .position-card {
+      background: rgba(250,246,240,0.04);
+      padding: 40px;
+    }
+    .position-card-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 16px;
+    }
+    .position-card-text {
+      font-size: 16px;
+      line-height: 1.7;
+      color: rgba(250,246,240,0.75);
+    }
+    .position-card-text strong {
+      color: var(--cream);
+      font-weight: 500;
+    }
+
+    /* ── PILLARS ── */
+    .pillar {
+      padding: 80px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .pillar:last-child { border-bottom: none; }
+    .pillar-header {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 32px;
+      align-items: start;
+      margin-bottom: 56px;
+    }
+    .pillar-number-block {
+      width: 64px;
+      height: 64px;
+      background: var(--red);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .pillar-num {
+      font-family: 'Fraunces', serif;
+      font-size: 26px;
+      font-weight: 400;
+      color: var(--cream);
+      line-height: 1;
+    }
+    .pillar-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 10px;
+      display: block;
+    }
+    .pillar-title {
+      font-family: 'Fraunces', serif;
+      font-size: clamp(26px, 3.5vw, 38px);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--ink);
+      margin-bottom: 14px;
+    }
+    .pillar-description {
+      font-size: 17px;
+      font-weight: 300;
+      color: var(--ink-soft);
+      line-height: 1.65;
+      max-width: 580px;
+    }
+    .posts-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    .posts-grid.three { grid-template-columns: 1fr 1fr 1fr; }
+
+    /* ── POST CARD ── */
+    .post-card {
+      background: var(--cream-dark);
+      border: 1px solid var(--border);
+      padding: 28px;
+      position: relative;
+    }
+    .post-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0;
+      width: 3px;
+      height: 100%;
+      background: var(--red);
+    }
+    .post-platform {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+      margin-bottom: 14px;
+    }
+    .post-hook {
+      font-family: 'Fraunces', serif;
+      font-size: 18px;
+      font-weight: 500;
+      line-height: 1.3;
+      color: var(--ink);
+      margin-bottom: 14px;
+    }
+    .post-body {
+      font-size: 14px;
+      line-height: 1.7;
+      color: var(--ink-soft);
+      font-weight: 300;
+    }
+    .post-body p + p { margin-top: 10px; }
+    .post-tag {
+      display: inline-block;
+      margin-top: 16px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--red);
+      background: rgba(196,85,58,0.08);
+      padding: 4px 10px;
+    }
+    .post-note {
+      font-size: 13px;
+      color: var(--ink-muted);
+      font-style: italic;
+      margin-top: 8px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+    }
+
+    /* ── PROFILE REBRAND ── */
+    .profiles-section {
+      background: var(--cream-dark);
+      padding: 100px 0;
+    }
+    .bio-set {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 2px;
+      margin-top: 48px;
+    }
+    .bio-card {
+      background: var(--cream);
+      padding: 40px 36px;
+      position: relative;
+    }
+    .bio-platform {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .bio-platform::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+    .bio-char-limit {
+      font-size: 11px;
+      color: var(--ink-muted);
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .bio-text {
+      font-size: 15px;
+      line-height: 1.65;
+      color: var(--ink);
+      font-family: 'Work Sans', sans-serif;
+    }
+    .bio-text .bio-handle {
+      color: var(--red);
+      font-weight: 500;
+    }
+    .bio-rationale {
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+      font-size: 13px;
+      color: var(--ink-muted);
+      font-style: italic;
+      line-height: 1.6;
+    }
+    .bio-headline {
+      background: var(--ink);
+      color: var(--cream);
+      padding: 24px 36px;
+      margin-bottom: 2px;
+    }
+    .bio-headline-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 10px;
+    }
+    .bio-headline-text {
+      font-family: 'Fraunces', serif;
+      font-size: 22px;
+      font-weight: 300;
+      font-style: italic;
+      line-height: 1.4;
+      color: var(--cream);
+    }
+
+    /* ── LAUNCH PLAN ── */
+    .launch-plan {
+      padding: 100px 0;
+    }
+    .week-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2px;
+      margin-top: 48px;
+    }
+    .week-card {
+      background: var(--cream-dark);
+      border: 1px solid var(--border);
+      padding: 40px;
+    }
+    .week-header {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+    .week-number {
+      font-family: 'Fraunces', serif;
+      font-size: 48px;
+      font-weight: 300;
+      color: var(--red);
+      line-height: 1;
+    }
+    .week-theme {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+    }
+    .week-title {
+      font-family: 'Fraunces', serif;
+      font-size: 22px;
+      font-weight: 400;
+      color: var(--ink);
+      margin-bottom: 20px;
+      line-height: 1.25;
+    }
+    .week-posts {
+      list-style: none;
+    }
+    .week-posts li {
+      padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--ink-soft);
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 12px;
+    }
+    .week-posts li:last-child { border-bottom: none; }
+    .week-day {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--red);
+      padding-top: 2px;
+      white-space: nowrap;
+    }
+    .week-goal {
+      margin-top: 24px;
+      padding: 16px 20px;
+      background: rgba(196,85,58,0.07);
+      border-left: 3px solid var(--red);
+    }
+    .week-goal-label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 6px;
+    }
+    .week-goal-text {
+      font-size: 14px;
+      color: var(--ink-soft);
+      line-height: 1.55;
+    }
+
+    /* ── MANIFESTO CLOSE ── */
+    .manifesto {
+      background: var(--ink);
+      padding: 120px 0;
+      text-align: center;
+    }
+    .manifesto-eyebrow {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--red);
+      margin-bottom: 40px;
+      display: block;
+    }
+    .manifesto-title {
+      font-family: 'Fraunces', serif;
+      font-size: clamp(36px, 5vw, 60px);
+      font-weight: 300;
+      font-style: italic;
+      line-height: 1.2;
+      color: var(--cream);
+      max-width: 760px;
+      margin: 0 auto 48px;
+      letter-spacing: -0.02em;
+    }
+    .manifesto-lines {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      max-width: 560px;
+      margin: 0 auto 64px;
+    }
+    .manifesto-line {
+      font-size: 17px;
+      font-weight: 300;
+      color: rgba(250,246,240,0.65);
+      line-height: 1.6;
+    }
+    .manifesto-line strong {
+      color: var(--cream);
+      font-weight: 500;
+    }
+    .manifesto-cta {
+      display: inline-block;
+      padding: 16px 40px;
+      background: var(--red);
+      color: var(--cream);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      text-decoration: none;
+    }
+
+    /* ── DIVIDERS ── */
+    .divider {
+      width: 48px;
+      height: 2px;
+      background: var(--red);
+      margin: 32px 0;
+    }
+    .divider.center { margin: 32px auto; }
+
+    /* ── INSIGHT BOX ── */
+    .insight-box {
+      background: var(--ink);
+      color: var(--cream);
+      padding: 40px 48px;
+      margin: 48px 0;
+      position: relative;
+    }
+    .insight-box::before {
+      content: '"';
+      font-family: 'Fraunces', serif;
+      font-size: 120px;
+      font-weight: 300;
+      color: var(--red);
+      opacity: 0.3;
+      position: absolute;
+      top: -20px;
+      left: 32px;
+      line-height: 1;
+    }
+    .insight-text {
+      font-family: 'Fraunces', serif;
+      font-size: 22px;
+      font-weight: 300;
+      font-style: italic;
+      line-height: 1.45;
+      color: var(--cream);
+      position: relative;
+      z-index: 1;
+    }
+    .insight-source {
+      margin-top: 16px;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--red);
+      position: relative;
+      z-index: 1;
+    }
+
+    /* ── FOOTER ── */
+    footer {
+      padding: 48px;
+      border-top: 1px solid var(--border);
+      text-align: center;
+    }
+    .footer-text {
+      font-size: 13px;
+      color: var(--ink-muted);
+    }
+    .footer-text strong { color: var(--red); }
+
+    /* ── RESPONSIVE ── */
+    @media (max-width: 768px) {
+      nav { padding: 14px 24px; }
+      .nav-links { display: none; }
+      .container, .container-wide { padding: 0 24px; }
+      .hero { padding: 72px 0 64px; }
+      .hero-stats { gap: 32px; }
+      .positioning-grid { grid-template-columns: 1fr; }
+      .posts-grid, .posts-grid.three { grid-template-columns: 1fr; }
+      .bio-set { grid-template-columns: 1fr; }
+      .week-grid { grid-template-columns: 1fr; }
+      .pillar-header { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- NAV -->
+  <nav>
+    <span class="nav-logo">Hex Brand</span>
+    <ul class="nav-links">
+      <li><a href="#positioning">Positioning</a></li>
+      <li><a href="#pillars">Pillars</a></li>
+      <li><a href="#profiles">Profiles</a></li>
+      <li><a href="#launch">Launch Plan</a></li>
+    </ul>
+  </nav>
+
+  <!-- HERO -->
+  <section class="hero" id="hero">
+    <div class="container">
+      <span class="hero-eyebrow">Brand Vision — 2026</span>
+      <h1>The builder who finally <em>stopped hiding</em></h1>
+      <p class="hero-subtitle">A brand strategy for the person who spent years building exquisite infrastructure and never told anyone about it.</p>
+      <div class="hero-stats">
+        <div class="stat">
+          <span class="stat-number">300+</span>
+          <span class="stat-label">BOI iterations executed</span>
+        </div>
+        <div class="stat">
+          <span class="stat-number">0</span>
+          <span class="stat-label">brand specs run — until now</span>
+        </div>
+        <div class="stat">
+          <span class="stat-number">5</span>
+          <span class="stat-label">content pillars</span>
+        </div>
+        <div class="stat">
+          <span class="stat-number">4</span>
+          <span class="stat-label">week launch</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- POSITIONING -->
+  <section class="positioning" id="positioning">
+    <div class="container">
+      <span class="section-number">01 — Core Positioning</span>
+      <h2 class="section-title">The honest story no one's told yet</h2>
+      <p class="section-lead">Not "compound engineer." Not "AI researcher." Not the polished version. The real one: a person who has been building sophisticated systems in private for years and is finally ready to be seen.</p>
+
+      <blockquote class="positioning-quote">
+        "Mike builds exquisite infrastructure for work he hasn't started yet. The abandoned projects are infrastructure improvements for a builder who hasn't yet decided what he's building for others."
+        <cite>— Abandoned Projects Analysis, 2026</cite>
+      </blockquote>
+
+      <p style="color: rgba(250,246,240,0.7); font-size: 17px; line-height: 1.7; max-width: 640px; margin: 0 auto 48px; text-align: center; font-weight: 300;">
+        That sentence — written as a self-assessment — is the entire brand. Not as shame. As <strong style="color: var(--cream);">origin story.</strong> The hiding was real. The ending it is the brand.
+      </p>
+
+      <div class="positioning-grid">
+        <div class="position-card">
+          <div class="position-card-label">Who You Are</div>
+          <p class="position-card-text">
+            A systems engineer who competes against himself. You've spent three years building AI infrastructure — <strong>hex, BOI, a Python-to-Rust rewrite done mid-flight</strong> — with the same rigor you'd apply if 10,000 people depended on it. No one was watching. That discipline is the brand.
+          </p>
+        </div>
+        <div class="position-card">
+          <div class="position-card-label">Who You're Not</div>
+          <p class="position-card-text">
+            Not a content creator who codes. Not a Twitter founder who threads his way to deals. Not a build-in-public person posting growth charts. <strong>You went deep or you didn't start.</strong> That's the edge — and the thing most builders refuse to say out loud.
+          </p>
+        </div>
+        <div class="position-card">
+          <div class="position-card-label">What Makes This Rare</div>
+          <p class="position-card-text">
+            Most people who write about building have shipped one product to users. You've shipped <strong>a production agent system with 300+ autonomous iterations, real memory benchmarking across 7 configurations, and a full Rust rewrite.</strong> You're not writing about the theory.
+          </p>
+        </div>
+        <div class="position-card">
+          <div class="position-card-label">The Honest Gap</div>
+          <p class="position-card-text">
+            "The brand-building work shows zero BOI specs executed against it." That line, from your own project analysis, is the most important sentence in this document. <strong>The brand starts the moment you start running specs against it.</strong> The first post is the spec executing.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PILLARS OVERVIEW -->
+  <section class="section" id="pillars">
+    <div class="container">
+      <span class="section-number">02 — Content Pillars</span>
+      <h2 class="section-title">Five pillars. One coherent signal.</h2>
+      <p class="section-lead">Each pillar is a different angle on the same truth: what it looks like when someone builds with full commitment, in private, for a long time — and then finally comes out.</p>
+    </div>
+  </section>
+
+  <!-- PILLAR 1: THE COST REALITY -->
+  <div class="container">
+    <div class="pillar">
+      <div class="pillar-header">
+        <div class="pillar-number-block">
+          <span class="pillar-num">01</span>
+        </div>
+        <div>
+          <span class="pillar-label">Pillar One</span>
+          <h3 class="pillar-title">The Cost Reality</h3>
+          <p class="pillar-description">The actual price of building in private for years. Not opportunity cost as an abstraction — the real, compounding cost of sophisticated work that no one sees. This pillar does what most builders won't: it names the loss.</p>
+        </div>
+      </div>
+
+      <div class="insight-box">
+        <p class="insight-text">The brand-building work appears repeatedly in stated goals but shows zero BOI specs executed against it. Three years of quarterly targets. Zero specs run.</p>
+        <p class="insight-source">— Signal driving this pillar</p>
+      </div>
+
+      <div class="posts-grid three">
+        <div class="post-card">
+          <div class="post-platform">LinkedIn / Long-form</div>
+          <div class="post-hook">I've been "building my brand" as a quarterly goal for three years. I ran zero specs against it.</div>
+          <div class="post-body">
+            <p>Last week I ran an analysis of every project I've ever created. 49 project containers. Career analysis, market research, AI infrastructure — all with specs dispatched, outcomes tracked, iterations documented.</p>
+            <p>Brand building: a stated quarterly goal in every assessment. Zero specs run. Not one.</p>
+            <p>This is not a productivity post. This is what the data looks like when you're using "someday" as a strategy.</p>
+            <p>The cost is specific: I built a production agent system that 300+ specs have been run against, a Rust rewrite done mid-flight, 7 memory configurations benchmarked. I wrote none of it down where anyone could see it.</p>
+            <p>Today, that changes. Not because I'm ready. Because I noticed the gap.</p>
+          </div>
+          <span class="post-tag">Opening Shot</span>
+          <p class="post-note">This is post 1. It names the gap publicly and signals intention without making a promise you'll abandon.</p>
+        </div>
+        <div class="post-card">
+          <div class="post-platform">X / Thread</div>
+          <div class="post-hook">The hidden cost of building for yourself: your best work has no feedback loop.</div>
+          <div class="post-body">
+            <p>I've built an AI agent system sophisticated enough that it runs its own improvement cycles. Automated. Iterative. Production-proven.</p>
+            <p>For three years, the only feedback loop was: did it work today?</p>
+            <p>No external signal. No one to push back. No one to say "that's obvious" or "I've never seen that approach."</p>
+            <p>The cost: you get very good at building things that work exactly as you designed them. You get very bad at knowing if you designed the right things.</p>
+            <p>The fix is uncomfortable: other people.</p>
+          </div>
+          <span class="post-tag">Core Tension</span>
+        </div>
+        <div class="post-card">
+          <div class="post-platform">LinkedIn / Insight</div>
+          <div class="post-hook">I analyzed my own project graveyard. Here's what 12 abandoned projects reveal.</div>
+          <div class="post-body">
+            <p>The pattern wasn't what I expected. I don't abandon projects halfway. I either never start them (the project container sits empty forever) or I finish them completely.</p>
+            <p>The graveyard is 12 containers created, never executed. Zero specs dispatched.</p>
+            <p>Why? Because I won't start work I can't define success for. The empty context.md is a filter, not laziness.</p>
+            <p>But here's the honest version: "I haven't defined success" sometimes means "I'm scared to commit in public."</p>
+            <p>That's the cost reality. The filter protects quality. It also protects hiding.</p>
+          </div>
+          <span class="post-tag">Self-Autopsy</span>
+          <p class="post-note">Cites real data. Shows pattern analysis skills. Makes the personal structural.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- PILLAR 2: FAILURE PATTERNS -->
+    <div class="pillar">
+      <div class="pillar-header">
+        <div class="pillar-number-block">
+          <span class="pillar-num">02</span>
+        </div>
+        <div>
+          <span class="pillar-label">Pillar Two</span>
+          <h3 class="pillar-title">The Failure Patterns</h3>
+          <p class="pillar-description">Honest, structural autopsy of how things break. Not failure-porn — patterns that reveal how your mind works. This pillar teaches systems thinking by example: your own systems, your own failures, the readable architecture of how you got stuck.</p>
+        </div>
+      </div>
+
+      <div class="posts-grid">
+        <div class="post-card">
+          <div class="post-platform">X / Thread</div>
+          <div class="post-hook">My biggest failure pattern isn't what I abandon. It's what I create instead of building.</div>
+          <div class="post-body">
+            <p>I call it the Cluster Creation Problem. When I get excited about multiple ideas at once, I create project containers for all of them. It feels like progress. It isn't.</p>
+            <p>April 24, 2026: I created two projects in one day. Dispatched specs against neither. Both are still empty.</p>
+            <p>The act of creating the container scratches the itch of "I should do this" without requiring commitment. It's the engineering equivalent of putting something on a to-do list you never open again.</p>
+            <p>The tell: when I create more than one project container in a day, I'm managing anxiety about ideas, not executing on them.</p>
+            <p>Knowing this doesn't fix it. It just makes the pattern visible.</p>
+          </div>
+          <span class="post-tag">Meta-Awareness</span>
+          <p class="post-note">Shows the cluster creation pattern clearly. Names a specific date. Makes structural what others just feel as "distraction."</p>
+        </div>
+        <div class="post-card">
+          <div class="post-platform">LinkedIn / Short</div>
+          <div class="post-hook">I don't fail mid-project. I fail before I start. Here's why that's actually unusual.</div>
+          <div class="post-body">
+            <p>Most people abandon projects at the "nearly done" stage. The last 10% kills them.</p>
+            <p>I don't. In three years of building, I've never stopped a project mid-sprint. My projects are either never dispatched or fully complete.</p>
+            <p>The failure mode is binary: start late and go deep, or don't start at all. Halfway doesn't exist in my project history.</p>
+            <p>This is unusual. It's also a trap. The binary commitment means I'll abandon interesting-but-unclear work before I've learned anything from it.</p>
+            <p>The fix isn't to be okay with halfway. It's to define "halfway" as a valid stopping point for research, not just for execution.</p>
+          </div>
+          <span class="post-tag">Structural Pattern</span>
+        </div>
+      </div>
+
+      <div class="posts-grid" style="margin-top: 20px;">
+        <div class="post-card" style="grid-column: 1 / -1;">
+          <div class="post-platform">X / Long Thread</div>
+          <div class="post-hook">I built the infrastructure to fix a problem. Then I built a different infrastructure that made the first one unnecessary. Five times.</div>
+          <div class="post-body">
+            <p>When I find an incremental solution to a problem, I'll often abandon it when a more fundamental solution appears. This sounds smart until you realize that "more fundamental solution" sometimes means "another level of abstraction that also needs building."</p>
+            <p>Examples from my own history: timeout-resilience project (abandoned when root cause was diagnosed). boi-optimizer (abandoned when the Rust rewrite made it irrelevant). tmux-makeover (abandoned when a web UI was built instead).</p>
+            <p>I call it the Infrastructure Trap: you can improve infrastructure forever without ever shipping what the infrastructure is for. The graveyard is mostly meta-infrastructure — tools to improve tools that improve tools.</p>
+            <p>The honest version: I have a talent for finding the right level of solution. The failure mode is that I'll find a "better level" forever rather than ship at any level.</p>
+          </div>
+          <span class="post-tag">Deep Pattern</span>
+          <p class="post-note">This is the "Infrastructure Trap" — one of the most resonant patterns for senior engineers who recognize themselves in it.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- PILLAR 3: PSYCHOLOGY OF TRUST -->
+    <div class="pillar">
+      <div class="pillar-header">
+        <div class="pillar-number-block">
+          <span class="pillar-num">03</span>
+        </div>
+        <div>
+          <span class="pillar-label">Pillar Three</span>
+          <h3 class="pillar-title">The Psychology of Trust</h3>
+          <p class="pillar-description">Why you ship for people you love and stall for strangers. The mechanics of what trust actually enables — in engineering, in publishing, in building something for an audience you haven't met yet. This pillar is the warmest one.</p>
+        </div>
+      </div>
+
+      <div class="insight-box">
+        <p class="insight-text">Projects with a real person attached ship. Projects with only a theoretical beneficiary don't. Love is a more reliable shipping driver than intellectual curiosity.</p>
+        <p class="insight-source">— From the project completion pattern</p>
+      </div>
+
+      <div class="posts-grid">
+        <div class="post-card">
+          <div class="post-platform">LinkedIn / Personal</div>
+          <div class="post-hook">The most reliable shipping trigger I've found isn't discipline. It's a specific human who needs it.</div>
+          <div class="post-body">
+            <p>My project history shows a pattern I didn't see until I mapped it: the only projects I've shipped to completion (outside my own tools) have a real person attached to them.</p>
+            <p>I built a photo curation system for my girlfriend. Firebase infrastructure, AI classification, admin queue — complete. Why? Because she needed it and I could see her using it.</p>
+            <p>"A tool for anyone who does X" doesn't ship. "A tool for Whitney" does.</p>
+            <p>This isn't a motivation hack. It's an architecture insight. Abstraction is the enemy of completion. The most powerful thing you can do for a stalled project: name one specific person it would help. Not a persona. A person.</p>
+          </div>
+          <span class="post-tag">Trust Insight</span>
+          <p class="post-note">Real story, structural insight, immediately applicable. The "trust as completion trigger" framing is uncommon.</p>
+        </div>
+        <div class="post-card">
+          <div class="post-platform">X / Thread</div>
+          <div class="post-hook">Building in public is an act of trust extension. You're shipping to strangers before you know if they're worth shipping to.</div>
+          <div class="post-body">
+            <p>I've spent three years building for an audience of one (me) and one other person (Whitney). Every completed project had a specific human attached.</p>
+            <p>Building in public requires trusting strangers before they've earned it. That's the discomfort. You don't know if the audience will be worth the cost of making the work visible.</p>
+            <p>The alternative is what I did: build sophisticated systems in private, knowing every line is correct, never having to defend the choices, never risking being misunderstood.</p>
+            <p>That's not discipline. That's the same as never publishing a draft until it's perfect. The draft that never ships isn't perfect — it's just safe.</p>
+          </div>
+          <span class="post-tag">The Pivot</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- PILLAR 4: THE EDGES -->
+    <div class="pillar">
+      <div class="pillar-header">
+        <div class="pillar-number-block">
+          <span class="pillar-num">04</span>
+        </div>
+        <div>
+          <span class="pillar-label">Pillar Four</span>
+          <h3 class="pillar-title">The Edges</h3>
+          <p class="pillar-description">The imposter/alpha tension. The transcendence moments (when a system works the way you imagined). The mission that competes with the practical. This pillar goes to the uncomfortable edges that most technical writers sand smooth.</p>
+        </div>
+      </div>
+
+      <div class="posts-grid three">
+        <div class="post-card">
+          <div class="post-platform">X / Short</div>
+          <div class="post-hook">I rewrote 20,000 lines of Python in Rust while it was in production. Not because I had to. Because doing it right matters more than doing it fast.</div>
+          <div class="post-body">
+            <p>BOI v1 was Python. 20K+ lines. 80+ test files. 1,536 test cases. Running in production with a full dashboard, critic system, eval system, and 300+ real specs.</p>
+            <p>I rewrote it completely in Rust in April 2026. Typed correctness. ~10x speed gain. Same architecture, none of the accumulated Python debt.</p>
+            <p>Why? Because I knew what it could be, and what it was wasn't it.</p>
+            <p>The imposter voice says: "shipping it is enough." The builder voice says: "the architecture is wrong." Sometimes both are right and you have to pick one.</p>
+            <p>I picked the harder one. The system is cleaner. The delay was real. Both are true.</p>
+          </div>
+          <span class="post-tag">The Rust Rewrite</span>
+          <p class="post-note">This story is powerful. It demonstrates conviction, technical depth, and the refusal to rationalize mediocrity.</p>
+        </div>
+        <div class="post-card">
+          <div class="post-platform">LinkedIn / Philosophical</div>
+          <div class="post-hook">Imposter syndrome in engineering is usually real information being misread.</div>
+          <div class="post-body">
+            <p>The voice that says "I don't know enough to ship this" is sometimes right. Not about whether you know enough — you often do — but about whether the thing you're about to ship is the right version.</p>
+            <p>I've had that voice stall me on work that was genuinely good. I've also had it catch real architectural problems before they made it to production.</p>
+            <p>The pattern I've noticed: the voice is loudest when the gap between what the system IS and what it COULD BE is most visible to you.</p>
+            <p>That gap-perception is a skill. It's also a liability. Learning to hear it without obeying it blindly is most of senior engineering.</p>
+          </div>
+          <span class="post-tag">Technical Edge</span>
+        </div>
+        <div class="post-card">
+          <div class="post-platform">X / Thread</div>
+          <div class="post-hook">The moment a self-improving system works exactly as you imagined is one of the strangest feelings in engineering.</div>
+          <div class="post-body">
+            <p>Hex has a self-improvement loop: reflect → eval → archive → score → dispatch. Fully automated. Proven end-to-end.</p>
+            <p>The first time I watched it run — identify a gap in its own behavior, write a spec to address it, run the spec, archive the result, update its own parameters — I had no idea what to feel.</p>
+            <p>Proud? Unsettled? It's both. You built something that improves without you. That's the goal. It's also the exact thing that makes you wonder why you're needed.</p>
+            <p>The transcendence moments in engineering feel like this: the system doing what you designed it for is both the proof that you succeeded and the beginning of what comes after success.</p>
+          </div>
+          <span class="post-tag">Transcendence</span>
+          <p class="post-note">Rare vulnerability about what it actually feels like when an autonomous system works. This is the stuff no one writes.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- PILLAR 5: THE CREATIVE BRIDGE -->
+    <div class="pillar">
+      <div class="pillar-header">
+        <div class="pillar-number-block">
+          <span class="pillar-num">05</span>
+        </div>
+        <div>
+          <span class="pillar-label">Pillar Five</span>
+          <h3 class="pillar-title">The Creative Bridge</h3>
+          <p class="pillar-description">The channel between music and engineering. What composition teaches systems design. What debugging teaches arrangement. The unexpected clarity that comes from holding two disciplines at once — and what it means to compound them.</p>
+        </div>
+      </div>
+
+      <div class="posts-grid">
+        <div class="post-card">
+          <div class="post-platform">LinkedIn / Cross-domain</div>
+          <div class="post-hook">Music and software share one failure mode: you can keep refining forever and never ship.</div>
+          <div class="post-body">
+            <p>In music production, "finished" is a decision, not a state. There's always another mix pass, another layer to pull back, another section that could be tighter.</p>
+            <p>Software is the same — but software has tests. You can convince yourself that green tests mean done. No equivalent exists in music. Done is purely a judgment call.</p>
+            <p>What music taught me about engineering: ship when the intention is legible, not when every edge case is handled. Some edge cases are features of the thing, not flaws to fix.</p>
+            <p>What engineering taught me about music: a spec clarifies what success looks like before you start. Sitting down to a blank session with no defined output is why tracks never finish.</p>
+          </div>
+          <span class="post-tag">Cross-Domain</span>
+          <p class="post-note">This is the bridge pillar. It humanizes the technical work and reaches a wider audience without losing depth.</p>
+        </div>
+        <div class="post-card">
+          <div class="post-platform">X / Thread</div>
+          <div class="post-hook">The debugging mindset and the mixing mindset are the same process with different vocabulary.</div>
+          <div class="post-body">
+            <p>Debugging: isolate the signal from the noise. Identify which component changed. Find the invariant that was violated.</p>
+            <p>Mixing: isolate each element. Identify where frequencies conflict. Find the space where each sound lives without competing.</p>
+            <p>Both are about finding what shouldn't be there and removing it. The elegance is not in what you add — it's in what you subtract.</p>
+            <p>I've been doing both for long enough that I don't know which one I learned first. They're the same discipline practiced in two different rooms.</p>
+          </div>
+          <span class="post-tag">The Parallel</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PROFILE REBRAND -->
+  <section class="profiles-section" id="profiles">
+    <div class="container">
+      <span class="section-number">03 — Profile Rebrand</span>
+      <h2 class="section-title">The bio set</h2>
+      <p class="section-lead">Recommended bios for X, LinkedIn, and Instagram. Each is tuned to the platform's context and audience expectation — but all three point to the same person.</p>
+
+      <div class="bio-headline">
+        <div class="bio-headline-label">Recommended Headline / Tagline</div>
+        <p class="bio-headline-text">Systems engineer. I build things that compound. I've been doing it privately for three years. This is where that changes.</p>
+      </div>
+
+      <div class="bio-set">
+        <div class="bio-card">
+          <div class="bio-platform">X (Twitter) <span class="bio-char-limit">160 chars</span></div>
+          <p class="bio-text">
+            Building AI infrastructure that compounds. hex + BOI — autonomous agent systems running in production.<br><br>
+            I went deep for three years. Now I'm writing it down.
+          </p>
+          <p class="bio-rationale">Short, signal-dense, honest about the "now writing it down" shift. Positions compound + agent work without jargon-stacking. The pivot is built into the bio itself.</p>
+        </div>
+        <div class="bio-card">
+          <div class="bio-platform">LinkedIn <span class="bio-char-limit">220 chars headline</span></div>
+          <p class="bio-text">
+            Systems Engineer · AI Infrastructure · Compound Engineering<br><br>
+            I build agent systems that improve themselves over time. hex (persistent AI agent) + BOI (autonomous spec orchestrator) — both in production, both in Rust.<br><br>
+            Writing about what it looks like when you build for real: the architecture, the failures, the patterns that only emerge after three years of private iteration.
+          </p>
+          <p class="bio-rationale">LinkedIn audience expects credentials + context. The "writing about what it looks like" line sets expectations for the content without promising a newsletter or framework.</p>
+        </div>
+        <div class="bio-card">
+          <div class="bio-platform">Instagram <span class="bio-char-limit">150 chars</span></div>
+          <p class="bio-text">
+            Systems that compound.<br>
+            Music that breathes.<br><br>
+            Engineering + production.<br>
+            Building in public after three years private.
+          </p>
+          <p class="bio-rationale">Instagram is visual. The short-line format works with the medium. "Music that breathes" introduces the creative bridge pillar. The "after three years private" line is the hook — it implies a story.</p>
+        </div>
+      </div>
+
+      <div style="margin-top: 48px; padding: 40px; background: var(--cream); border: 1px solid var(--border);">
+        <div class="section-number" style="margin-bottom: 16px;">Bio Strategy Note</div>
+        <p style="font-size: 16px; line-height: 1.7; color: var(--ink-soft); max-width: 640px;">
+          All three bios share the same honest anchor: <strong style="color: var(--ink);">the shift from private to public is built into the copy.</strong> This is intentional. "Building in public after three years private" positions the brand work as the real story — not just a showcase of past work. It signals ongoing, not archived.
+        </p>
+        <p style="font-size: 16px; line-height: 1.7; color: var(--ink-soft); max-width: 640px; margin-top: 16px;">
+          Do not lead with "compound engineering" as a brand term until you've used it in 10-15 posts where its meaning is visible. Right now it sounds like jargon. In six weeks, it'll sound like a precise description of what readers have already seen.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- LAUNCH PLAN -->
+  <section class="launch-plan" id="launch">
+    <div class="container">
+      <span class="section-number">04 — Launch Plan</span>
+      <h2 class="section-title">Week 1–4 posting cadence</h2>
+      <p class="section-lead">Four weeks. One week per pillar arc, with a consistent anchor post each Monday and at least one engagement-optimized thread mid-week. No cross-posting until week 3 — build one channel deeply first.</p>
+
+      <div class="week-grid">
+        <!-- WEEK 1 -->
+        <div class="week-card">
+          <div class="week-header">
+            <span class="week-number">01</span>
+            <span class="week-theme">Foundation</span>
+          </div>
+          <div class="week-title">The builder who finally stopped hiding</div>
+          <p style="font-size: 14px; color: var(--ink-muted); margin-bottom: 20px; line-height: 1.6;">Name the gap publicly. Establish the positioning. Do not summarize everything you've built — let the fact that you've been building privately be the entire story this week.</p>
+          <ul class="week-posts">
+            <li>
+              <span class="week-day">Mon</span>
+              <span>LinkedIn: "I've been 'building my brand' as a quarterly goal for three years. I ran zero specs against it." — The opening post. Acknowledge the gap. Signal the shift.</span>
+            </li>
+            <li>
+              <span class="week-day">Wed</span>
+              <span>X Thread: "The hidden cost of building for yourself: your best work has no feedback loop." — Cost Reality pillar, first post.</span>
+            </li>
+            <li>
+              <span class="week-day">Fri</span>
+              <span>LinkedIn: Brief intro to hex + BOI — one paragraph each. "Here's what I've been building." Not a launch. A door opening.</span>
+            </li>
+          </ul>
+          <div class="week-goal">
+            <div class="week-goal-label">Week Goal</div>
+            <p class="week-goal-text">Establish the positioning. The "stopped hiding" arc is now live. Don't rush to the next pillar — let this land first.</p>
+          </div>
+        </div>
+
+        <!-- WEEK 2 -->
+        <div class="week-card">
+          <div class="week-header">
+            <span class="week-number">02</span>
+            <span class="week-theme">Cost & Failure</span>
+          </div>
+          <div class="week-title">The graveyard tells the truth</div>
+          <p style="font-size: 14px; color: var(--ink-muted); margin-bottom: 20px; line-height: 1.6;">Go into the graveyard. Failure patterns pillar. The cluster creation problem, the binary commitment pattern, the infrastructure trap. Use real data — named projects, actual dates.</p>
+          <ul class="week-posts">
+            <li>
+              <span class="week-day">Mon</span>
+              <span>LinkedIn: "I analyzed my own project graveyard. Here's what 12 abandoned projects reveal." — The pattern post. Data-driven, structural, honest.</span>
+            </li>
+            <li>
+              <span class="week-day">Wed</span>
+              <span>X Thread: The Cluster Creation Problem. "When I get excited about multiple ideas at once, I create project containers for all of them. It feels like progress." Named dates, named projects.</span>
+            </li>
+            <li>
+              <span class="week-day">Thu</span>
+              <span>X Short: The binary pattern. "I don't fail mid-project. I fail before I start." — Punchy, counterintuitive. Designed to retweet.</span>
+            </li>
+            <li>
+              <span class="week-day">Fri</span>
+              <span>LinkedIn: The Infrastructure Trap. "I built the infrastructure to fix a problem. Then I built a different infrastructure that made the first one unnecessary. Five times."</span>
+            </li>
+          </ul>
+          <div class="week-goal">
+            <div class="week-goal-label">Week Goal</div>
+            <p class="week-goal-text">Establish that you write about failure as clearly as success. This is what earns trust from the engineers who've been through it.</p>
+          </div>
+        </div>
+
+        <!-- WEEK 3 -->
+        <div class="week-card">
+          <div class="week-header">
+            <span class="week-number">03</span>
+            <span class="week-theme">Trust & Edges</span>
+          </div>
+          <div class="week-title">What it takes to ship for strangers</div>
+          <p style="font-size: 14px; color: var(--ink-muted); margin-bottom: 20px; line-height: 1.6;">Psychology of Trust pillar + The Edges. The Whitney insight, the building-in-public vulnerability, the Rust rewrite story. This week goes personal and deep. Start cross-posting LinkedIn → X this week.</p>
+          <ul class="week-posts">
+            <li>
+              <span class="week-day">Mon</span>
+              <span>LinkedIn: "The most reliable shipping trigger I've found isn't discipline. It's a specific human who needs it." — The Whitney story.</span>
+            </li>
+            <li>
+              <span class="week-day">Tue</span>
+              <span>X Thread: Building in public as trust extension. "You're shipping to strangers before you know if they're worth shipping to." — The vulnerability post.</span>
+            </li>
+            <li>
+              <span class="week-day">Thu</span>
+              <span>X Short: The Rust rewrite story. "I rewrote 20,000 lines of Python in Rust while it was in production. Not because I had to. Because doing it right matters more than doing it fast."</span>
+            </li>
+            <li>
+              <span class="week-day">Fri</span>
+              <span>LinkedIn: "Imposter syndrome in engineering is usually real information being misread." — The nuanced take that earns senior engineer respect.</span>
+            </li>
+          </ul>
+          <div class="week-goal">
+            <div class="week-goal-label">Week Goal</div>
+            <p class="week-goal-text">The Rust rewrite thread is the high-leverage play this week. It's specific, verifiable, and rare. Cross-post it everywhere.</p>
+          </div>
+        </div>
+
+        <!-- WEEK 4 -->
+        <div class="week-card">
+          <div class="week-header">
+            <span class="week-number">04</span>
+            <span class="week-theme">Synthesis</span>
+          </div>
+          <div class="week-title">The creative bridge + what comes next</div>
+          <p style="font-size: 14px; color: var(--ink-muted); margin-bottom: 20px; line-height: 1.6;">Creative Bridge pillar + your first "looking forward" post. End the month by introducing the music angle and beginning the compound engineering concept without naming it as a brand.</p>
+          <ul class="week-posts">
+            <li>
+              <span class="week-day">Mon</span>
+              <span>LinkedIn: "Music and software share one failure mode: you can keep refining forever and never ship." — The cross-domain bridge.</span>
+            </li>
+            <li>
+              <span class="week-day">Wed</span>
+              <span>X Thread: "The debugging mindset and the mixing mindset are the same process with different vocabulary." — The parallel post.</span>
+            </li>
+            <li>
+              <span class="week-day">Fri</span>
+              <span>LinkedIn: Month-1 close. "Here's what I've learned from writing publicly for the first time in three years." — Meta-reflection on the launch itself. What surprised you. What the feedback loop revealed.</span>
+            </li>
+          </ul>
+          <div class="week-goal">
+            <div class="week-goal-label">Week Goal</div>
+            <p class="week-goal-text">The Friday close post is the most important of the month. It names what you've learned from the experiment — and signals you're continuing. Write it honestly. It'll be your most-read post.</p>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top: 48px; padding: 40px; background: var(--cream-dark); border: 1px solid var(--border);">
+        <span class="section-number" style="margin-bottom: 16px;">Cadence Rules</span>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 32px;">
+          <div>
+            <p style="font-weight: 600; font-size: 15px; margin-bottom: 12px; color: var(--ink);">What to protect</p>
+            <ul style="font-size: 14px; color: var(--ink-soft); line-height: 1.8; padding-left: 20px;">
+              <li>Monday anchor posts — these set the weekly frame</li>
+              <li>One real failure story per week — no sanitizing</li>
+              <li>Specific data (dates, line counts, iteration numbers)</li>
+              <li>The "shift" narrative — you're building in public now</li>
+            </ul>
+          </div>
+          <div>
+            <p style="font-weight: 600; font-size: 15px; margin-bottom: 12px; color: var(--ink);">What to avoid</p>
+            <ul style="font-size: 14px; color: var(--ink-soft); line-height: 1.8; padding-left: 20px;">
+              <li>Engagement bait with no substance ("hot take: X")</li>
+              <li>"Compound engineering" as a brand term until week 6+</li>
+              <li>Summarizing more projects than you can explain in 3 lines</li>
+              <li>Posting on all platforms before establishing one</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- MANIFESTO CLOSE -->
+  <section class="manifesto">
+    <div class="container">
+      <span class="manifesto-eyebrow">The Brand in One Paragraph</span>
+      <h2 class="manifesto-title">He went deep for three years. Now he's writing it down.</h2>
+
+      <div class="manifesto-lines">
+        <p class="manifesto-line"><strong>The work is real.</strong> Two production systems. One complete rewrite. 300+ autonomous iterations documented.</p>
+        <p class="manifesto-line"><strong>The hiding was real.</strong> Brand-building as a quarterly target for three years. Zero specs run.</p>
+        <p class="manifesto-line"><strong>The shift is the brand.</strong> Not the systems he built — the decision to stop building in private.</p>
+        <p class="manifesto-line"><strong>The voice is earned.</strong> He doesn't write about the theory of compound engineering. He's been doing it, alone, since before it was a useful phrase.</p>
+      </div>
+
+      <a href="#hero" class="manifesto-cta">Back to top</a>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer>
+    <p class="footer-text">
+      <strong>The Hex Brand Vision</strong> — Synthesized from abandoned projects analysis, personality research, and three years of BOI iteration history.
+      <br>Generated: 2026-04-29 · Task TB29B
+    </p>
+  </footer>
+
+</body>
+</html>

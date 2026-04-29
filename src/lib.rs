@@ -1,3 +1,5 @@
+pub mod builtins;
+pub mod failure;
 pub mod cli;
 pub mod config;
 pub mod fmt;
@@ -5,6 +7,7 @@ pub mod hooks;
 pub mod phases;
 pub mod prompt;
 pub mod queue;
+pub mod runtime;
 pub mod runner;
 pub mod spawn;
 pub mod spec;

@@ -14,10 +14,11 @@ Use `.yaml` or `.yml` extension. BOI detects format by extension:
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
 | `title` | Yes | string | Human-readable spec title |
-| `mode` | Yes | string | Execution mode: `execute`, `generate`, `challenge`, `discover` |
+| `mode` | Yes | string | Execution mode: `execute`, `generate`, `challenge`, `discover`, `v2` |
 | `context` | No | string | Free-text background information for workers |
 | `workspace` | No | string | Pin spec to a specific worktree path |
 | `blocked_by` | No | list of strings | Spec IDs this spec depends on (e.g. `[SA7F3, SF2B1]`) |
+| `brain` | No | path | Per-spec brain directory override. Must exist and contain `CLAUDE.md`. Overrides global `brain` in `config.yaml`. |
 | `outcomes` | Recommended | list of outcome objects | Spec-level declarations of what this spec delivers. Verified after all tasks DONE. |
 | `tasks` | Yes | list of task objects | Ordered list of tasks |
 
@@ -77,13 +78,14 @@ A task with `depends` is skipped until all listed tasks are `DONE`. Circular dep
 
 ```yaml
 title: string           # required
-mode: execute           # required: execute | generate | challenge | discover
+mode: execute           # required: execute | generate | challenge | discover | v2
 context: |              # optional, free text
   Multi-line context
   about the spec.
 workspace: /path        # optional
 blocked_by:             # optional
   - SA7F3
+brain: ~/mrap-hex       # optional — overrides global config.brain
 outcomes:               # recommended — verified after all tasks DONE
   - description: "Artifact exists and is correct"
     verify: "test -f /path/to/artifact"
