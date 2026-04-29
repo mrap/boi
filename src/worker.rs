@@ -11,6 +11,13 @@ use crate::{
 };
 use chrono::Utc;
 use serde_json::json;
+
+macro_rules! boi_log {
+    ($($arg:tt)*) => {
+        eprintln!("[boi {}] {}", Utc::now().format("%H:%M:%S"), format!($($arg)*))
+    };
+}
+
 use std::{
     collections::{HashMap, HashSet},
     process::{Command, Stdio},
@@ -94,13 +101,17 @@ pub fn spawn_claude(
     use std::io::Read;
 
     let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+    let args = vec![
+        "-p", prompt,
+        "--dangerously-skip-permissions",
+        "--no-session-persistence",
+        "--setting-sources", "user",
+    ];
+    let flags: Vec<&str> = args.iter().filter(|a| a.starts_with('-')).copied().collect();
+    boi_log!("spawning claude\n  bin:    {}\n  flags:  {}\n  cwd:    {}\n  prompt: {} chars",
+        claude_bin, flags.join(" "), worktree_path, prompt.len());
     let mut child = Command::new(&claude_bin)
-        .args([
-            "-p", prompt,
-            "--dangerously-skip-permissions",
-            "--no-session-persistence",
-            "--setting-sources", "user",
-        ])
+        .args(&args)
         .current_dir(worktree_path)
         .env("AGENT_DIR", worktree_path)
         .stdout(Stdio::piped())
@@ -115,7 +126,7 @@ pub fn spawn_claude(
         }
         let child_pid = child.id();
         let _ = std::fs::write(&p, child_pid.to_string());
-        eprintln!("[boi] wrote pid {} to {}", child_pid, p.display());
+        boi_log!(" wrote pid {} to {}", child_pid, p.display());
         p
     });
 
@@ -311,7 +322,7 @@ pub fn run_worker_with_phases(
         _ => {
             let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
             std::fs::create_dir_all(&tmp)?;
-            eprintln!("[boi] no workspace set — running in temp dir: {}", tmp.display());
+            boi_log!(" no workspace set — running in temp dir: {}", tmp.display());
             tmp.to_str().unwrap_or("/tmp").to_string()
         }
     };
@@ -494,7 +505,7 @@ pub fn run_worker_with_phases(
                         state = WorkerState::Paused { prompt: prompt.clone() };
                     }
                     Verdict::Done { success: false, reason } => {
-                        eprintln!("[boi] pre-task spec phase '{}' failed: {}", phase_name, reason);
+                        boi_log!(" pre-task spec phase '{}' failed: {}", phase_name, reason);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
                         if phase.can_fail_spec {
                             state = WorkerState::Failed {
@@ -506,7 +517,7 @@ pub fn run_worker_with_phases(
                     }
                     Verdict::Done { success: true, reason } => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
-                        eprintln!("[boi] pre-task spec phase '{}' done: {}", phase_name, reason);
+                        boi_log!(" pre-task spec phase '{}' done: {}", phase_name, reason);
                         state = WorkerState::SpecPhase { phase_idx: phase_idx + 1 };
                     }
                 }
@@ -635,7 +646,7 @@ pub fn run_worker_with_phases(
                 let phase = match registry.get(phase_name) {
                     Some(p) => p,
                     None => {
-                        eprintln!("[boi] unknown phase '{}' in task {} — skipping", phase_name, task.id);
+                        boi_log!(" unknown phase '{}' in task {} — skipping", phase_name, task.id);
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
                             phase_idx: phase_idx + 1,
@@ -687,7 +698,7 @@ pub fn run_worker_with_phases(
                     Verdict::Redo { tasks } => {
                         if tasks.is_empty() {
                             // Redo with no new tasks = requeue back to execute
-                            eprintln!("[boi] phase '{}' requests redo for task {}", phase_name, task.id);
+                            boi_log!(" phase '{}' requests redo for task {}", phase_name, task.id);
                             state = WorkerState::TaskRequeue {
                                 task_id: task_id_owned,
                                 target_phase: "execute".to_string(),
@@ -713,7 +724,7 @@ pub fn run_worker_with_phases(
                         state = WorkerState::Paused { prompt: prompt.clone() };
                     }
                     Verdict::Done { success: false, reason } => {
-                        eprintln!("[boi] phase '{}' failed for task {}: {}", phase_name, task.id, reason);
+                        boi_log!(" phase '{}' failed for task {}: {}", phase_name, task.id, reason);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
                         let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
                         if max_attempts > 0 {
@@ -743,7 +754,7 @@ pub fn run_worker_with_phases(
                     }
                     Verdict::Done { success: true, reason } => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
-                        eprintln!("[boi] phase '{}' done for task {}: {}", phase_name, task.id, reason);
+                        boi_log!(" phase '{}' done for task {}: {}", phase_name, task.id, reason);
                         state = WorkerState::TaskPhase {
                             task_id: task_id_owned,
                             phase_idx: phase_idx + 1,
@@ -857,7 +868,7 @@ pub fn run_worker_with_phases(
                 if attempts > config.retry_count as usize {
                     let task = task_map.get(task_id_owned.as_str());
                     let task_title = task.map(|t| t.title.as_str()).unwrap_or("unknown");
-                    eprintln!("[boi] requeue limit ({}) exceeded for task {}", config.retry_count, task_id_owned);
+                    boi_log!(" requeue limit ({}) exceeded for task {}", config.retry_count, task_id_owned);
                     queue.update_task(spec_id, &task_id_owned, "FAILED")?;
                     let task_payload = json!({
                         "spec_id": spec_id,
@@ -984,10 +995,10 @@ pub fn run_worker_with_phases(
                         // Re-enter task loop (iterative quality loop), capped
                         spec_redo_count += 1;
                         if spec_redo_count > max_spec_redos {
-                            eprintln!("[boi] spec redo limit ({}) exceeded — completing despite critic feedback", max_spec_redos);
+                            boi_log!(" spec redo limit ({}) exceeded — completing despite critic feedback", max_spec_redos);
                             state = WorkerState::Complete;
                         } else {
-                            eprintln!("[boi] critic requests redo ({}/{})", spec_redo_count, max_spec_redos);
+                            boi_log!(" critic requests redo ({}/{})", spec_redo_count, max_spec_redos);
                             state = WorkerState::TaskSelect;
                         }
                     }
@@ -995,7 +1006,7 @@ pub fn run_worker_with_phases(
                         state = WorkerState::Paused { prompt: prompt.clone() };
                     }
                     Verdict::Done { success: false, reason } => {
-                        eprintln!("[boi] post-task spec phase '{}' failed: {}", phase_name, reason);
+                        boi_log!(" post-task spec phase '{}' failed: {}", phase_name, reason);
                         let _ = hooks::fire(hook_config, ON_PHASE_FAIL, &phase_payload);
                         if phase.can_fail_spec {
                             state = WorkerState::Failed {
@@ -1007,7 +1018,7 @@ pub fn run_worker_with_phases(
                     }
                     Verdict::Done { success: true, reason } => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload);
-                        eprintln!("[boi] post-task spec phase '{}' done: {}", phase_name, reason);
+                        boi_log!(" post-task spec phase '{}' done: {}", phase_name, reason);
                         state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                     }
                 }
@@ -1015,7 +1026,7 @@ pub fn run_worker_with_phases(
 
             WorkerState::Paused { ref prompt } => {
                 let prompt_owned = prompt.clone();
-                eprintln!("[boi] spec {} paused: {}", spec_id, prompt_owned);
+                boi_log!(" spec {} paused: {}", spec_id, prompt_owned);
                 queue.update_spec(spec_id, "paused")?;
                 let _ = hooks::fire(hook_config, hooks::ON_SPEC_PAUSED, &json!({
                     "spec_id": spec_id,
@@ -1045,7 +1056,7 @@ pub fn run_worker_with_phases(
 
             WorkerState::Failed { ref reason } => {
                 let reason_owned = reason.clone();
-                eprintln!("[boi] spec {} failed: {}", spec_id, reason_owned);
+                boi_log!(" spec {} failed: {}", spec_id, reason_owned);
                 queue.update_spec(spec_id, "failed")?;
                 let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
                 telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
@@ -1056,7 +1067,7 @@ pub fn run_worker_with_phases(
                 if config.cleanup_on_failure {
                     state = WorkerState::Cleanup { success: false };
                 } else {
-                    eprintln!("[boi] worktree preserved for inspection (cleanup_on_failure=false)");
+                    boi_log!(" worktree preserved for inspection (cleanup_on_failure=false)");
                     break;
                 }
             }
@@ -1069,7 +1080,7 @@ pub fn run_worker_with_phases(
                         let _ = std::fs::remove_dir_all(&tmp);
                     }
                 } else {
-                    eprintln!("[boi] preserving worktree for failed spec {}", spec_id);
+                    boi_log!(" preserving worktree for failed spec {}", spec_id);
                 }
                 break;
             }
