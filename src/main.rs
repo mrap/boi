@@ -1,5 +1,6 @@
 use boi::cli::bench::cmd_bench;
 use boi::cli::cancel::cmd_cancel;
+use boi::cli::dashboard::run_dashboard;
 use boi::cli::config_cmd::cmd_config;
 use boi::cli::daemon::{cmd_daemon, cmd_restart, cmd_start, cmd_stop};
 use boi::cli::dispatch::cmd_dispatch;
@@ -158,6 +159,8 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Launch interactive TUI dashboard
+    Dashboard,
 }
 
 #[derive(Subcommand)]
@@ -352,6 +355,9 @@ fn main() {
             }
 
             cmd_bench(&spec_paths, &pipeline_entries, runs, db_str, json);
+        }
+        Commands::Dashboard => {
+            run_dashboard(db_str);
         }
     }
 }

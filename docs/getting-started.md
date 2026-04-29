@@ -128,13 +128,22 @@ boi status --watch
 
 Updates every 2 seconds. Press `Ctrl+C` to stop.
 
-### Compact dashboard
+### Interactive dashboard
 
 ```bash
 boi dashboard
 ```
 
-A tmux-friendly compact view, good for small panes.
+A keyboard-driven TUI showing running specs with progress bars and queued count. Key bindings:
+
+- `j`/`k` or arrow keys — navigate selection
+- `f` — toggle finished specs (last 6h)
+- `a` — show/hide all specs
+- `/` — search by title substring
+- `Enter` — open detail view for selected spec
+- `Esc` — back to list (from detail view) or exit search mode
+- `l` — tail log for the spec shown in detail view
+- `q` or `Ctrl+C` — quit
 
 ## Check Results
 

@@ -394,6 +394,7 @@ Both lists are merged at dispatch time. File contents are read once and stored i
 ```
 boi dispatch <file.yaml> [options]        Submit a spec to the queue
 boi status [--watch] [--json]             Show queue and worker status
+boi dashboard                             Interactive TUI dashboard (keyboard-driven)
 boi log <queue-id> [--full] [-f|--follow] Tail worker output for a spec
 boi cancel <queue-id>                     Cancel a running or queued spec
 boi stop                                  Stop daemon and all workers
