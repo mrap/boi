@@ -364,8 +364,13 @@ pub fn run_worker_with_phases(
             _ => spec::TaskStatus::Pending,
         },
         depends: {
-            let deps: Vec<String> = serde_json::from_str(&t.depends).unwrap_or_default();
-            if deps.is_empty() { None } else { Some(deps) }
+            match serde_json::from_str::<Vec<String>>(&t.depends) {
+                Ok(deps) => if deps.is_empty() { None } else { Some(deps) },
+                Err(e) => {
+                    boi_log!(" WARNING: task {} has corrupted depends JSON '{}': {} — will be caught during dep validation", t.id, t.depends, e);
+                    None
+                }
+            }
         },
         spec: t.spec_content.clone(),
         verify: t.verify_content.clone(),
@@ -373,7 +378,7 @@ pub fn run_worker_with_phases(
         phases: None,
     }).collect();
 
-    let boi_spec = spec::BoiSpec {
+    let mut boi_spec = spec::BoiSpec {
         title: spec_rec.title.clone(),
         mode: Some(spec_rec.mode.clone()),
         workspace: original_workspace.clone(),
@@ -397,7 +402,7 @@ pub fn run_worker_with_phases(
         s
     };
 
-    let order = match spec::topological_sort(&boi_spec) {
+    let mut order = match spec::topological_sort(&boi_spec) {
         Ok(o) => o,
         Err(e) => {
             queue.update_spec(spec_id, "failed")?;
@@ -414,10 +419,10 @@ pub fn run_worker_with_phases(
     );
 
     // All task IDs are canonical (loaded from DB). No YAML-to-DB mapping needed.
-    let task_map: HashMap<String, &spec::BoiTask> = boi_spec
+    let mut task_map: HashMap<String, spec::BoiTask> = boi_spec
         .tasks
         .iter()
-        .map(|t| (t.id.clone(), t))
+        .map(|t| (t.id.clone(), t.clone()))
         .collect();
 
     let mut done_ids: HashSet<String> = HashSet::new();
@@ -432,10 +437,23 @@ pub fn run_worker_with_phases(
             }
             _ => {}
         }
-        let raw_deps: Vec<String> = serde_json::from_str(&dt.depends).unwrap_or_default();
-        if !raw_deps.is_empty() {
-            boi_log!("  dep-map: id={} deps={:?}", dt.id, raw_deps);
-            db_depends.insert(dt.id.clone(), raw_deps);
+        match serde_json::from_str::<Vec<String>>(&dt.depends) {
+            Ok(raw_deps) => {
+                if !raw_deps.is_empty() {
+                    boi_log!("  dep-map: id={} deps={:?}", dt.id, raw_deps);
+                    db_depends.insert(dt.id.clone(), raw_deps);
+                }
+            }
+            Err(e) => {
+                let msg = format!(
+                    "task {} has corrupted depends JSON '{}': {}",
+                    dt.id, dt.depends, e
+                );
+                boi_log!(" ERROR: {}", msg);
+                let _ = queue.update_task(spec_id, &dt.id, "FAILED");
+                queue.update_spec(spec_id, "failed")?;
+                return Err(msg.into());
+            }
         }
     }
 
@@ -474,7 +492,7 @@ pub fn run_worker_with_phases(
     let mut task_select_passes: usize = 0;
     let mut spec_redo_count: usize = 0;
     let max_spec_redos = config.retry_count as usize;
-    let max_task_select_passes = order.len().max(1);
+    let mut max_task_select_passes = order.len().max(1);
 
     // Template variables for phase prompts
     use crate::phases::TemplateVar;
@@ -602,6 +620,8 @@ pub fn run_worker_with_phases(
                                     t.depends.as_deref().unwrap_or(&[]),
                                 );
                             }
+                            refresh_task_state(&queue, spec_id, &original_workspace, &worktree_path,
+                                &mut boi_spec, &mut order, &mut task_map, &mut db_depends, &mut max_task_select_passes);
                         }
                         state = WorkerState::TaskSelect;
                     }
@@ -854,6 +874,8 @@ pub fn run_worker_with_phases(
                                     t.depends.as_deref().unwrap_or(&[]),
                                 );
                             }
+                            refresh_task_state(&queue, spec_id, &original_workspace, &worktree_path,
+                                &mut boi_spec, &mut order, &mut task_map, &mut db_depends, &mut max_task_select_passes);
                             state = WorkerState::TaskSelect;
                         }
                     }
@@ -1158,6 +1180,8 @@ pub fn run_worker_with_phases(
                                     t.depends.as_deref().unwrap_or(&[]),
                                 );
                             }
+                            refresh_task_state(&queue, spec_id, &original_workspace, &worktree_path,
+                                &mut boi_spec, &mut order, &mut task_map, &mut db_depends, &mut max_task_select_passes);
                         }
                         // Re-enter task loop (iterative quality loop), capped
                         spec_redo_count += 1;
@@ -1312,6 +1336,78 @@ pub fn run_worker_with_phases(
     }
 
     Ok(())
+}
+
+/// Reload task state from DB after a Verdict::Redo injects new tasks.
+/// Updates order, task_map, boi_spec.tasks, db_depends, and max_task_select_passes
+/// so that TaskSelect can see the newly-added tasks.
+#[allow(clippy::too_many_arguments)]
+fn refresh_task_state(
+    queue: &crate::queue::Queue,
+    spec_id: &str,
+    original_workspace: &Option<String>,
+    worktree_path: &str,
+    boi_spec: &mut spec::BoiSpec,
+    order: &mut Vec<String>,
+    task_map: &mut HashMap<String, spec::BoiTask>,
+    db_depends: &mut HashMap<String, Vec<String>>,
+    max_task_select_passes: &mut usize,
+) {
+    match queue.get_tasks_full(spec_id) {
+        Ok(mut fresh_tasks) => {
+            if let Some(ref ws) = original_workspace {
+                for t in &mut fresh_tasks {
+                    if let Some(ref mut s) = t.spec_content {
+                        *s = s.replace(ws.as_str(), worktree_path);
+                    }
+                    if let Some(ref mut v) = t.verify_content {
+                        *v = v.replace(ws.as_str(), worktree_path);
+                    }
+                }
+            }
+            boi_spec.tasks = fresh_tasks.iter().map(|t| spec::BoiTask {
+                id: t.id.clone(),
+                title: t.title.clone(),
+                status: match t.status.as_str() {
+                    "DONE" => spec::TaskStatus::Done,
+                    "FAILED" => spec::TaskStatus::Failed,
+                    "SKIPPED" => spec::TaskStatus::Skipped,
+                    "RUNNING" => spec::TaskStatus::Running,
+                    _ => spec::TaskStatus::Pending,
+                },
+                depends: {
+                    match serde_json::from_str::<Vec<String>>(&t.depends) {
+                        Ok(deps) => if deps.is_empty() { None } else { Some(deps) },
+                        Err(_) => None,
+                    }
+                },
+                spec: t.spec_content.clone(),
+                verify: t.verify_content.clone(),
+                verify_prompt: None,
+                phases: None,
+            }).collect();
+            match spec::topological_sort(boi_spec) {
+                Ok(new_order) => {
+                    *order = new_order;
+                    *max_task_select_passes = order.len().max(1);
+                }
+                Err(e) => {
+                    boi_log!(" Redo refresh: topological sort failed after task injection: {}", e);
+                }
+            }
+            *task_map = boi_spec.tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
+            for dt in &fresh_tasks {
+                if let Ok(raw_deps) = serde_json::from_str::<Vec<String>>(&dt.depends) {
+                    if !raw_deps.is_empty() {
+                        db_depends.insert(dt.id.clone(), raw_deps);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            boi_log!(" Redo: failed to reload tasks from DB: {}", e);
+        }
+    }
 }
 
 /// Emit a phase verdict telemetry event (DRY helper for the state machine).
@@ -1833,6 +1929,59 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
         assert_eq!(st.tasks[1].status, "DONE");
     }
 
+    #[test]
+    fn test_redo_tasks_are_executed() {
+        // BUG M-5: When Verdict::Redo injects new tasks via queue.add_task(), the
+        // in-memory `order` and `task_map` (built once at startup) are never updated.
+        // New tasks are invisible to TaskSelect and never run, leaving them PENDING.
+        let yaml = "title: \"Redo Tasks Test\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"Original\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("redo_tasks", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+            cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
+        };
+        let registry = PhaseRegistry::new();
+        let new_task = spec::BoiTask {
+            id: "injected".into(),
+            title: "Injected by Redo".into(),
+            status: spec::TaskStatus::Pending,
+            depends: None,
+            spec: None,
+            verify: None,
+            verify_prompt: None,
+            phases: None,
+        };
+        // First call (execute phase for t-1) returns Redo with a new task.
+        // All subsequent calls return Proceed (MockPhaseRunner default when list exhausted).
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            Verdict::Redo { tasks: vec![new_task] },
+        ]);
+        let tel = test_telemetry();
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+                &tel,
+            )
+            .unwrap();
+        });
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.tasks.len(), 2, "injected task should be added to DB");
+        let injected = st.tasks.iter().find(|t| t.title == "Injected by Redo")
+            .expect("injected task not found in DB");
+        assert_eq!(injected.status, "DONE",
+            "injected task should be DONE — was never executed (ghost task bug M-5)");
+        assert_eq!(st.spec.status, "completed");
+    }
+
     // --- apply_spec_review_output tests ---
 
     fn setup_review_db(label: &str) -> (Queue, String, String, String) {
@@ -1961,5 +2110,73 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
 
         let tasks = queue.get_tasks(&spec_id).unwrap();
         assert_eq!(tasks.len(), 3, "expected 3 tasks after code-fence JSON split");
+    }
+
+    #[test]
+    fn test_corrupted_deps() {
+        // RED: With unwrap_or_default(), corrupted depends JSON is silently treated as no deps,
+        // causing t-2 to run without waiting for t-1. The spec must FAIL instead.
+        let yaml = concat!(
+            "title: \"Corrupted Deps Test\"\n",
+            "mode: execute\n",
+            "tasks:\n",
+            "  - id: t-1\n",
+            "    title: \"First\"\n",
+            "    status: PENDING\n",
+            "  - id: t-2\n",
+            "    title: \"Second\"\n",
+            "    status: PENDING\n",
+            "    depends: [t-1]\n",
+        );
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("corrupted_deps", yaml);
+
+        // Get canonical t-2 ID before corrupting
+        let pre_st = queue.status(&spec_id).unwrap().unwrap();
+        let t2_id = pre_st.tasks.iter().find(|t| t.title == "Second").unwrap().id.clone();
+
+        // Corrupt the depends column for t-2 to invalid JSON via a direct DB connection
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET depends = 'NOT_JSON' WHERE id = ?1 AND spec_id = ?2",
+                (t2_id.as_str(), spec_id.as_str()),
+            ).unwrap();
+        }
+
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+            cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            Verdict::Proceed,
+            Verdict::Proceed,
+            Verdict::Proceed,
+            Verdict::Proceed,
+        ]);
+        let tel = test_telemetry();
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            let _ = run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+                &tel,
+            );
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(
+            st.spec.status, "failed",
+            "spec should fail when a task has corrupted depends JSON, got: '{}'",
+            st.spec.status
+        );
     }
 }
