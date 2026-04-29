@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Spec validator now runs dependency validation after format checks during `boi dispatch`
 
 ### Fixed
+- `hooks/default.yaml` shell quoting fixed: `$BOI_SPEC_ID` now expands correctly in hook commands (was single-quoted, preventing variable expansion)
 - Orphaned worker processes no longer linger after spec completion (`boi cleanup`)
 - Multiple daemon instances no longer spawn (daemon lock via `fcntl.flock`)
 - Exit codes 143 (SIGTERM) and 137 (SIGKILL) no longer count as consecutive failures, preventing false failure states from external kills
