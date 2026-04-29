@@ -6,8 +6,8 @@ completion_handler = "builtin:task-verify"
 runtime = "claude"
 model = "claude-sonnet-4-6"
 prompt_template = "templates/task-verify-worker-prompt.md"
-effort = "high"
-timeout = 300
+effort = "low"
+timeout = 120
 
 [completion]
 approve_signal = "## Task Verification Approved"

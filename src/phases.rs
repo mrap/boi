@@ -504,7 +504,7 @@ pub(crate) fn fallback_pipeline(mode: &str) -> PipelineConfig {
             task_phases: vec!["execute".into(), "task-verify".into()],
         },
         "generate" => PipelineConfig {
-            spec_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into(), "evaluate".into()],
+            spec_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
             task_phases: vec!["decompose".into(), "execute".into(), "code-review".into(), "task-verify".into()],
         },
         _ => PipelineConfig {
@@ -1090,7 +1090,7 @@ approve_signal = ""
     #[test]
     fn test_default_pipeline_generate() {
         let p = fallback_pipeline("generate");
-        assert_eq!(p.spec_phases, vec!["spec-review", "plan-critique", "critic", "evaluate"]);
+        assert_eq!(p.spec_phases, vec!["spec-review", "critic", "evaluate"]);
         assert_eq!(p.task_phases, vec!["decompose", "execute", "code-review", "task-verify"]);
     }
 

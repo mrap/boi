@@ -5,8 +5,8 @@ description = "Review completed spec for quality issues. Add [CRITIC] tasks if p
 runtime = "claude"
 model = "claude-sonnet-4-6"
 prompt_template = "templates/critic-prompt.md"
-effort = "high"
-timeout = 900
+effort = "medium"
+timeout = 300
 
 [completion]
 approve_signal = "## Critic Approved"
