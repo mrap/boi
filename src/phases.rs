@@ -185,7 +185,7 @@ impl PhaseConfig {
             .or_else(|| toml.worker.as_ref().and_then(|w| w.timeout.map(|t| t / 60)));
 
         // Derive level from name: spec-level phases operate on the whole spec
-        let level = toml.phase.as_ref().and_then(|_| None).unwrap_or_else(|| {
+        let level = toml.phase.as_ref().and(None).unwrap_or_else(|| {
             derive_level(&name)
         });
 

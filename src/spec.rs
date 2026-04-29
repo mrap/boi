@@ -24,9 +24,10 @@ pub struct Outcome {
     pub verify: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub enum TaskStatus {
     #[serde(rename = "PENDING")]
+    #[default]
     Pending,
     #[serde(rename = "RUNNING")]
     Running,
@@ -38,11 +39,6 @@ pub enum TaskStatus {
     Skipped,
 }
 
-impl Default for TaskStatus {
-    fn default() -> Self {
-        TaskStatus::Pending
-    }
-}
 
 impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
