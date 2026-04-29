@@ -230,7 +230,9 @@ impl Queue {
 
         if !has_col {
             let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type);
-            let _ = conn.execute(&sql, []);
+            if let Err(e) = conn.execute(&sql, []) {
+                eprintln!("[boi] ERROR: failed to add column {}.{}: {}", table, column, e);
+            }
         }
     }
 
@@ -660,13 +662,15 @@ impl Queue {
             "UPDATE specs SET total_tasks = (SELECT COUNT(*) FROM tasks WHERE spec_id = ?1) WHERE id = ?1",
             params![spec_id],
         )?;
-        let _ = self.insert_event(
+        if let Err(e) = self.insert_event(
             Some(spec_id),
             "task.added",
             Some(&format!("Added task {} to {}", task_id, spec_id)),
             None,
             "info",
-        );
+        ) {
+            eprintln!("[boi] ERROR: failed to insert task.added event for {} in {}: {}", task_id, spec_id, e);
+        }
         Ok(task_id)
     }
 

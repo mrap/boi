@@ -89,7 +89,7 @@ pub fn fire(
 
     // Write JSON payload to stdin then close it.
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(payload_str.as_bytes());
+        let _ = stdin.write_all(payload_str.as_bytes()); // intentional: best-effort payload delivery to hook
         // stdin dropped here → EOF sent to child
     }
 
@@ -106,7 +106,7 @@ pub fn fire(
     } else {
         // Reap child in background thread to avoid zombies.
         std::thread::spawn(move || {
-            let _ = child.wait();
+            let _ = child.wait(); // intentional: reap zombie in background
         });
     }
 
@@ -125,7 +125,7 @@ fn wait_with_timeout(
 
     std::thread::spawn(move || {
         let result = child_thread.lock().unwrap().wait();
-        let _ = tx.send(result);
+        let _ = tx.send(result); // intentional: receiver may have dropped on timeout
     });
 
     match rx.recv_timeout(timeout) {
@@ -134,8 +134,8 @@ fn wait_with_timeout(
         Err(_) => {
             // Timeout — kill the child process to prevent zombie
             if let Ok(mut child_guard) = child_arc.lock() {
-                let _ = child_guard.kill();
-                let _ = child_guard.wait(); // reap
+                let _ = child_guard.kill(); // intentional: best-effort kill on timeout
+                let _ = child_guard.wait(); // intentional: reap zombie after kill
             }
             eprintln!("[boi hooks] {} timed out after {:?}", event, timeout);
             Err("hook timed out".into())

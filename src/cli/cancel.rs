@@ -58,7 +58,7 @@ pub fn cmd_cancel(spec_id: &str, db_str: &str, hook_cfg: &hooks::HookConfig) {
                 }
             }
         }
-        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&pid_path); // intentional: best-effort pid file cleanup
     }
 
     if let Err(e) = q.cancel(spec_id) {
@@ -70,7 +70,7 @@ pub fn cmd_cancel(spec_id: &str, db_str: &str, hook_cfg: &hooks::HookConfig) {
     eprintln!("[boi] worktree preserved for inspection");
 
     let payload = json!({ "spec_id": spec_id });
-    let _ = hooks::fire(hook_cfg, hooks::ON_CANCEL, &payload);
+    let _ = hooks::fire(hook_cfg, hooks::ON_CANCEL, &payload); // intentional: best-effort hook notification
 
     println!("cancelled {}", spec_id);
 }

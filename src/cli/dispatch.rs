@@ -63,20 +63,26 @@ pub fn cmd_dispatch(
     } else {
         None
     };
-    let _ = q.set_spec_fields(
+    if let Err(e) = q.set_spec_fields(
         &spec_id,
         mode,
         if max_iter != 30 { Some(max_iter) } else { None },
         project,
         timeout_secs,
-    );
+    ) {
+        eprintln!("[boi] ERROR: failed to set spec fields for {}: {}", spec_id, e);
+    }
 
     if priority != 100 {
-        let _ = q.set_priority(&spec_id, priority);
+        if let Err(e) = q.set_priority(&spec_id, priority) {
+            eprintln!("[boi] ERROR: failed to set priority for {}: {}", spec_id, e);
+        }
     }
 
     if let Some(dep) = after {
-        let _ = q.set_depends_on(&spec_id, dep);
+        if let Err(e) = q.set_depends_on(&spec_id, dep) {
+            eprintln!("[boi] ERROR: failed to set depends_on for {}: {}", spec_id, e);
+        }
     }
 
     let payload = json!({
@@ -84,7 +90,7 @@ pub fn cmd_dispatch(
         "title": boi_spec.title,
         "spec_path": spec_path_str,
     });
-    let _ = hooks::fire(hook_cfg, hooks::ON_DISPATCH, &payload);
+    let _ = hooks::fire(hook_cfg, hooks::ON_DISPATCH, &payload); // intentional: best-effort hook notification
 
     println!("{}", spec_id);
 }

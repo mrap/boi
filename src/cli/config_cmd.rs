@@ -56,7 +56,7 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>, cfg: &config::Config) 
                 );
             }
             if let Some(parent) = config_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                let _ = std::fs::create_dir_all(parent); // intentional: best-effort dir creation before config write
             }
             std::fs::write(&config_path, serde_yml::to_string(&cfg_map).unwrap()).unwrap();
             println!("set {} = {}", k, v);
