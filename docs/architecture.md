@@ -162,12 +162,12 @@ Computes quality scores across 18 signals in 4 categories (Code Quality, Test Qu
   daemon.pid                    # Daemon process ID
   boi.db                        # SQLite database (WAL mode)
   queue/                        # Spec queue
-    q-001.spec.yaml               # Copy of spec file
-    q-001.prompt.md             # Generated worker prompt
-    q-001.run.sh                # Worker run script
+    SA1B2.spec.yaml               # Copy of spec file
+    SA1B2.prompt.md             # Generated worker prompt
+    SA1B2.run.sh                # Worker run script
   logs/
     daemon.log                  # Daemon log
-    q-001-iter-1.log            # Worker output per iteration
+    SA1B2-iter-1.log            # Worker output per iteration
   hooks/                        # Optional: on-complete.sh, on-fail.sh
   worktrees/                    # Git worktrees (one per worker)
     boi-worker-1/

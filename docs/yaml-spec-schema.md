@@ -17,7 +17,7 @@ Use `.yaml` or `.yml` extension. BOI detects format by extension:
 | `mode` | Yes | string | Execution mode: `execute`, `generate`, `challenge`, `discover` |
 | `context` | No | string | Free-text background information for workers |
 | `workspace` | No | string | Pin spec to a specific worktree path |
-| `blocked_by` | No | list of strings | Queue IDs this spec depends on (e.g. `[q-001, q-002]`) |
+| `blocked_by` | No | list of strings | Spec IDs this spec depends on (e.g. `[SA1B2, SC3D4]`) |
 | `outcomes` | Recommended | list of outcome objects | Spec-level declarations of what this spec delivers. Verified after all tasks DONE. |
 | `tasks` | Yes | list of task objects | Ordered list of tasks |
 
@@ -83,7 +83,7 @@ context: |              # optional, free text
   about the spec.
 workspace: /path        # optional
 blocked_by:             # optional
-  - q-001
+  - SA1B2
 outcomes:               # recommended — verified after all tasks DONE
   - description: "Artifact exists and is correct"
     verify: "test -f /path/to/artifact"

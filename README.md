@@ -26,8 +26,9 @@ EOF
 boi dispatch my-feature.yaml
 
 # 4. Monitor
-boi status
-boi log <queue-id>
+boi status              # shows hash IDs (e.g. SA7F3)
+boi dashboard           # live interactive TUI
+boi log SA7F3 -f        # live tail worker output
 ```
 
 ## Spec Format
@@ -247,7 +248,7 @@ set -uo pipefail
 
 # Environment variables available:
 #   SPEC_PATH — path to the spec file
-#   SPEC_ID   — queue ID (e.g. q-042)
+#   SPEC_ID   — queue ID (e.g. SA7F3)
 
 if some-command fails; then
   echo "Reason for failure" >&2
@@ -334,7 +335,7 @@ boi bench --spec FILE --a PIPELINE --b PIPELINE  Compare two pipeline configs on
 | `--max-iter N` | Max iterations before marking failed (default: 30) |
 | `--mode MODE` | `execute` \| `challenge` \| `discover` \| `generate` (aliases: e/c/d/g) |
 | `--worktree-isolate` | Dedicated git worktree and branch for this spec |
-| `--after q-A,q-B` | Wait for listed specs to complete before starting |
+| `--after SA7F3,TB2E1` | Wait for listed specs to complete before starting |
 | `--project NAME` | Associate with a project (injects project context) |
 
 ## Output Preservation
@@ -357,11 +358,11 @@ Files written **outside** the worktree (e.g. to `~/.hex/`, permanent config path
 ### Viewing outputs
 
 ```bash
-boi outputs q-823
+boi outputs SA7F3
 ```
 
 ```
-Spec: pulse-message-persistence (q-823)
+Spec: pulse-message-persistence (SA7F3)
 Completed: 2026-04-25T20:15:00Z
 Mode: execute
 
@@ -370,7 +371,7 @@ Outputs (3 files):
   ~/.hex/audit/events.jsonl  (outside_worktree, 0KB)
   docs/context-eval.md       (created, 2.1KB)
 
-Files preserved at: ~/.boi/outputs/q-823/files/
+Files preserved at: ~/.boi/outputs/SA7F3/files/
 ```
 
 ```bash
