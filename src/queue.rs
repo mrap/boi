@@ -31,6 +31,7 @@ pub struct SpecRecord {
     pub workspace: Option<String>,
     /// Number of completed critique↔improve loop cycles for this spec.
     pub phase_loop_count: i64,
+    pub project_context: Option<String>,
 }
 
 #[derive(Debug)]
@@ -169,7 +170,8 @@ impl Queue {
                 max_iterations INTEGER DEFAULT 30,
                 iteration INTEGER DEFAULT 0,
                 project TEXT,
-                phase TEXT DEFAULT 'execute'
+                phase TEXT DEFAULT 'execute',
+                project_context TEXT
             );
 
             CREATE TABLE IF NOT EXISTS tasks (
@@ -270,6 +272,7 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "context", "TEXT");
         Self::ensure_column(&conn, "specs", "workspace", "TEXT");
         Self::ensure_column(&conn, "specs", "phase_loop_count", "INTEGER DEFAULT 0");
+        Self::ensure_column(&conn, "specs", "project_context", "TEXT");
         Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
         Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
 
@@ -302,6 +305,18 @@ impl Queue {
         spec: &crate::spec::BoiSpec,
         spec_path: Option<&str>,
     ) -> Result<String> {
+        self.enqueue_with_context(spec, spec_path, None)
+    }
+
+    /// Enqueue a spec with optional pre-computed project context content.
+    /// The project_context is stored in the DB and injected into worker prompts
+    /// via the {{PROJECT_CONTEXT}} template variable.
+    pub fn enqueue_with_context(
+        &self,
+        spec: &crate::spec::BoiSpec,
+        spec_path: Option<&str>,
+        project_context: Option<&str>,
+    ) -> Result<String> {
         let tx = self.conn.unchecked_transaction()?;
 
         let id = gen_id('S', &tx);
@@ -311,9 +326,9 @@ impl Queue {
         let total = spec.tasks.len() as i64;
 
         tx.execute(
-            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace)
-             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8)",
-            params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace],
+            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace, project_context)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace, project_context],
         )?;
 
         let mut yaml_to_canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -380,7 +395,7 @@ impl Queue {
                         completed_tasks,
                         priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                         max_iterations, iteration, project, phase, worker_timeout_seconds,
-                        context, workspace, phase_loop_count
+                        context, workspace, phase_loop_count, project_context
                  FROM specs WHERE id = ?1",
             )?;
             stmt.query_row(params![id], row_to_spec)?
@@ -453,7 +468,7 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace, phase_loop_count
+                    context, workspace, phase_loop_count, project_context
              FROM specs WHERE id = ?1",
             params![spec_id],
             row_to_spec,
@@ -482,7 +497,7 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace, phase_loop_count
+                    context, workspace, phase_loop_count, project_context
              FROM specs
              ORDER BY
                CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
@@ -941,6 +956,26 @@ impl Queue {
     }
 }
 
+/// Read and concatenate content from a list of file paths.
+/// Expands `~` to $HOME. Missing files are skipped silently.
+/// Truncates at 50 000 chars to prevent prompt bloat.
+pub fn read_context_files(paths: &[String]) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut out = String::new();
+    for raw in paths {
+        let path = raw.replace('~', &home);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            out.push_str(&format!("\n<!-- context: {} -->\n", path));
+            out.push_str(&content);
+        }
+        if out.len() >= 50_000 {
+            out.truncate(50_000);
+            break;
+        }
+    }
+    out
+}
+
 fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
     Ok(SpecRecord {
         id: row.get(0)?,
@@ -965,6 +1000,7 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
         context: row.get(19)?,
         workspace: row.get(20)?,
         phase_loop_count: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
+        project_context: row.get(22)?,
     })
 }
 
@@ -996,6 +1032,7 @@ mod tests {
             outcomes: None,
             spec_phases: None,
             task_phases: None,
+            context_files: None,
             tasks,
         }
     }
@@ -1154,6 +1191,41 @@ mod tests {
         let id = q.enqueue(&spec, Some("/path/to/spec.yaml")).unwrap();
         let st = q.status(&id).unwrap().unwrap();
         assert_eq!(st.spec.spec_path.as_deref(), Some("/path/to/spec.yaml"));
+    }
+
+    #[test]
+    fn test_enqueue_with_context_stores_project_context() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue_with_context(&spec, None, Some("my context content")).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        assert_eq!(st.spec.project_context.as_deref(), Some("my context content"));
+    }
+
+    #[test]
+    fn test_enqueue_project_context_defaults_to_none() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        assert!(st.spec.project_context.is_none());
+    }
+
+    #[test]
+    fn test_read_context_files_missing_file() {
+        let result = read_context_files(&["/tmp/nonexistent-boi-test-file.md".to_string()]);
+        assert!(result.is_empty(), "missing files should produce empty output");
+    }
+
+    #[test]
+    fn test_read_context_files_reads_content() {
+        use std::io::Write;
+        let path = crate::test_utils::test_file("context-test", "md");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"hello context").unwrap();
+        let result = read_context_files(&[path.to_str().unwrap().to_string()]);
+        assert!(result.contains("hello context"), "result={}", result);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

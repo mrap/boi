@@ -67,6 +67,7 @@ tasks:
 - `spec` — what the worker must do (multiline string)
 - `verify` — shell command that proves the work is done; non-zero exit = task incomplete
 - `depends` — optional list of task IDs that must be `DONE` first
+- `context_files` — optional list of file paths injected into every worker prompt for this spec (see [Context Injection](#context-injection))
 
 **Rules:**
 - Workers update `status: DONE` in the YAML file on success
@@ -346,6 +347,43 @@ Phase config accepts either full model IDs or aliases (`opus`, `sonnet`, `haiku`
 | `opus` | claude-opus-4-6 | o3 |
 | `sonnet` | claude-sonnet-4-6 | o4-mini |
 | `haiku` | claude-haiku-4-5-20251001 | o4-mini |
+
+### Per-Phase Model Overrides
+
+Override the model for any phase globally via `~/.boi/config.yaml`:
+
+```yaml
+models:
+  spec-review: claude-opus-4-7
+  plan-critique: claude-opus-4-7
+  execute: claude-sonnet-4-6
+  task-verify: claude-haiku-4-5-20251001
+```
+
+Keys are phase names. Values are full model IDs or aliases. Config-level overrides take precedence over the `model` field in each phase's `.phase.toml` at runtime.
+
+### Context Injection
+
+Inject files into every worker prompt so workers have access to shared memory, project notes, or other context.
+
+**Global (all specs):** add to `~/.boi/config.yaml`:
+
+```yaml
+context:
+  always_include:
+    - ~/.claude/shared-memory/SHARED.md
+    - ~/notes.md
+```
+
+**Per-spec:** add `context_files` to any spec YAML:
+
+```yaml
+context_files:
+  - ~/.claude/shared-memory/SHARED.md
+  - docs/architecture.md
+```
+
+Both lists are merged at dispatch time. File contents are read once and stored in the DB. Missing files are silently skipped. Total context is capped at 50,000 characters to prevent prompt bloat. The combined content is available in prompt templates as `{{PROJECT_CONTEXT}}`.
 
 ### CLI Check
 
