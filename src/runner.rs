@@ -32,11 +32,12 @@ pub trait PhaseRunner: Send + Sync {
 /// and runs verify commands for non-claude phases.
 pub struct ClaudePhaseRunner {
     pub telemetry: Telemetry,
+    pub claude_bin: String,
 }
 
 impl ClaudePhaseRunner {
-    pub fn new(telemetry: Telemetry) -> Self {
-        ClaudePhaseRunner { telemetry }
+    pub fn new(telemetry: Telemetry, claude_bin: String) -> Self {
+        ClaudePhaseRunner { telemetry, claude_bin }
     }
 }
 
@@ -83,7 +84,7 @@ impl PhaseRunner for ClaudePhaseRunner {
             "message": "spawning claude...",
         }));
 
-        let result = worker::spawn_claude(&prompt, worktree_path, timeout_secs, phase.model.as_deref(), spec_id);
+        let result = worker::spawn_claude(&prompt, worktree_path, timeout_secs, phase.model.as_deref(), spec_id, &self.claude_bin);
 
         if let Ok(ref cr) = result {
             let startup_s = cr.startup_ms as f64 / 1000.0;
@@ -226,7 +227,7 @@ impl ClaudePhaseRunner {
                 "message": format!("verify_prompt: spawning claude ({} chars)", verify_prompt.len()),
             }));
 
-            let result = worker::spawn_claude(verify_prompt, worktree_path, timeout_secs, None, spec_id);
+            let result = worker::spawn_claude(verify_prompt, worktree_path, timeout_secs, None, spec_id, &self.claude_bin);
 
             match result {
                 Ok(ref cr) if cr.success => {
@@ -362,7 +363,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_verify_phase_success() {
-        let runner = ClaudePhaseRunner::new(test_telemetry());
+        let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("true");
         let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None, &std::collections::HashMap::new());
@@ -371,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_verify_phase_failure() {
-        let runner = ClaudePhaseRunner::new(test_telemetry());
+        let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("false");
         let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None, &std::collections::HashMap::new());
@@ -383,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_verify_phase_no_verify_cmd() {
-        let runner = ClaudePhaseRunner::new(test_telemetry());
+        let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
         let phase = make_phase("task-verify", false);
         let task = BoiTask {
             id: "t-1".into(),
@@ -401,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_spec_level_no_claude_proceeds() {
-        let runner = ClaudePhaseRunner::new(test_telemetry());
+        let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
         let phase = make_phase("no-op", false);
         // Spec-level phase with no task → proceed (skip is just proceed)
         let outcome = runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new());

@@ -203,6 +203,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                             let retries = wc.retry_count;
                             let cleanup_fail = wc.cleanup_on_failure;
                             let cbin = wc.claude_bin.clone();
+                            let cbin = wc.claude_bin.clone();
 
                             // Use per-spec timeout if set, otherwise default
                             let spec_timeout = rec
