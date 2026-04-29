@@ -296,6 +296,8 @@ pub fn run_worker_with_phases(
 
     // Track pass count for deadlock detection in TaskSelect
     let mut task_select_passes: usize = 0;
+    let mut spec_redo_count: usize = 0;
+    let max_spec_redos = config.retry_count as usize;
     let max_task_select_passes = order.len().max(1);
 
     // --- State machine ---
@@ -861,8 +863,15 @@ pub fn run_worker_with_phases(
                                 );
                             }
                         }
-                        // Re-enter task loop (iterative quality loop)
-                        state = WorkerState::TaskSelect;
+                        // Re-enter task loop (iterative quality loop), capped
+                        spec_redo_count += 1;
+                        if spec_redo_count > max_spec_redos {
+                            eprintln!("[boi] spec redo limit ({}) exceeded — completing despite critic feedback", max_spec_redos);
+                            state = WorkerState::Complete;
+                        } else {
+                            eprintln!("[boi] critic requests redo ({}/{})", spec_redo_count, max_spec_redos);
+                            state = WorkerState::TaskSelect;
+                        }
                     }
                     Verdict::Pause { prompt } => {
                         state = WorkerState::Paused { prompt: prompt.clone() };
