@@ -385,13 +385,31 @@ pub fn run_worker_with_phases(
         tasks,
     };
 
-    // Reconstruct minimal spec content from DB fields for spec-level phase runners.
+    // Reconstruct full spec content from DB fields for spec-level phase runners.
     let spec_content = {
         let mut s = format!("title: \"{}\"\nmode: {}\n", boi_spec.title, spec_rec.mode);
         if let Some(ctx) = &spec_rec.context {
             s.push_str("context: |\n");
             for line in ctx.lines() {
                 s.push_str(&format!("  {}\n", line));
+            }
+        }
+        s.push_str("\ntasks:\n");
+        for t in &boi_spec.tasks {
+            s.push_str(&format!("  - id: {}\n    title: \"{}\"\n", t.id, t.title));
+            if let Some(ref spec) = t.spec {
+                s.push_str("    spec: |\n");
+                for line in spec.lines() {
+                    s.push_str(&format!("      {}\n", line));
+                }
+            }
+            if let Some(ref verify) = t.verify {
+                s.push_str(&format!("    verify: \"{}\"\n", verify.replace('"', "\\\"")));
+            }
+            if let Some(ref deps) = t.depends {
+                if !deps.is_empty() {
+                    s.push_str(&format!("    depends: {:?}\n", deps));
+                }
             }
         }
         s
