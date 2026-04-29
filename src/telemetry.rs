@@ -227,11 +227,11 @@ mod tests {
         let _ = std::fs::remove_file(&db);
 
         let t = Telemetry::new(db.clone());
-        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-001"}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "s0001"}));
         t.emit(
             "boi.task.completed",
             LogLevel::Info,
-            &json!({"spec_id": "q-001", "task_id": "t-1"}),
+            &json!({"spec_id": "s0001", "task_id": "t0001"}),
         );
 
         let events = t.recent(10);
@@ -248,13 +248,13 @@ mod tests {
         let _ = std::fs::remove_file(&db);
 
         let t = Telemetry::new(db.clone());
-        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-001"}));
-        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-002"}));
-        t.emit("boi.task.completed", LogLevel::Info, &json!({"spec_id": "q-001"}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "s0001"}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "s0002"}));
+        t.emit("boi.task.completed", LogLevel::Info, &json!({"spec_id": "s0001"}));
 
-        let events = t.by_spec("q-001");
+        let events = t.by_spec("s0001");
         assert_eq!(events.len(), 2);
-        assert!(events.iter().all(|e| e.spec_id.as_deref() == Some("q-001")));
+        assert!(events.iter().all(|e| e.spec_id.as_deref() == Some("s0001")));
 
         let _ = std::fs::remove_file(&db);
     }
@@ -265,9 +265,9 @@ mod tests {
         let _ = std::fs::remove_file(&db);
 
         let t = Telemetry::new(db.clone());
-        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-001"}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "s0001"}));
         t.emit("boi.worker.started", LogLevel::Info, &json!({}));
-        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "q-002"}));
+        t.emit("boi.spec.dispatched", LogLevel::Info, &json!({"spec_id": "s0002"}));
 
         let events = t.by_type("boi.spec.dispatched");
         assert_eq!(events.len(), 2);
@@ -281,9 +281,9 @@ mod tests {
         let _ = std::fs::remove_file(&db);
 
         let t = Telemetry::new(db.clone());
-        t.emit("boi.phase.start", LogLevel::Debug, &json!({"spec_id": "q-001"}));
-        t.emit("boi.task.done", LogLevel::Info, &json!({"spec_id": "q-001"}));
-        t.emit("boi.verify.fail", LogLevel::Error, &json!({"spec_id": "q-001"}));
+        t.emit("boi.phase.start", LogLevel::Debug, &json!({"spec_id": "s0001"}));
+        t.emit("boi.task.done", LogLevel::Info, &json!({"spec_id": "s0001"}));
+        t.emit("boi.verify.fail", LogLevel::Error, &json!({"spec_id": "s0001"}));
 
         let debug_events = t.by_level(LogLevel::Debug);
         assert_eq!(debug_events.len(), 1);
@@ -320,8 +320,8 @@ mod tests {
         let _ = std::fs::remove_file(&db);
 
         let t = Telemetry::new(db.clone());
-        t.emit("boi.debug.event", LogLevel::Debug, &json!({"spec_id": "q-001"}));
-        t.emit("boi.error.event", LogLevel::Error, &json!({"spec_id": "q-001"}));
+        t.emit("boi.debug.event", LogLevel::Debug, &json!({"spec_id": "s0001"}));
+        t.emit("boi.error.event", LogLevel::Error, &json!({"spec_id": "s0001"}));
 
         let events = t.recent(10);
         assert_eq!(events.len(), 2);

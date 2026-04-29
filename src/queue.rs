@@ -1,4 +1,5 @@
 use chrono::Utc;
+use rand::Rng;
 use rusqlite::{params, Connection, Result};
 
 pub struct Queue {
@@ -91,6 +92,25 @@ pub struct TaskRecord {
 pub struct SpecStatus {
     pub spec: SpecRecord,
     pub tasks: Vec<TaskRecord>,
+}
+
+fn gen_id(prefix: char, conn: &Connection) -> String {
+    let mut rng = rand::thread_rng();
+    let table = if prefix == 's' { "specs" } else { "tasks" };
+    loop {
+        let bytes: [u8; 2] = rng.gen();
+        let candidate = format!("{}{:02x}{:02x}", prefix, bytes[0], bytes[1]);
+        let exists: bool = conn
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE id = ?1)", table),
+                rusqlite::params![candidate],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            return candidate;
+        }
+    }
 }
 
 impl Queue {
@@ -195,12 +215,7 @@ impl Queue {
                 completed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_phase_runs_spec ON phase_runs(spec_id);
-            CREATE INDEX IF NOT EXISTS idx_phase_runs_phase ON phase_runs(phase);
-
-            CREATE TABLE IF NOT EXISTS _counters (
-                name TEXT PRIMARY KEY,
-                value INTEGER NOT NULL DEFAULT 0
-            );",
+            CREATE INDEX IF NOT EXISTS idx_phase_runs_phase ON phase_runs(phase);",
         )?;
 
         // Migrate existing specs tables that lack new columns
@@ -243,20 +258,7 @@ impl Queue {
     ) -> Result<String> {
         let tx = self.conn.unchecked_transaction()?;
 
-        // Compute max spec number across both old q-N and new S{N:06} formats
-        let max_n: Option<i64> = tx
-            .query_row(
-                "SELECT MAX(CASE
-                    WHEN id LIKE 'q-%' THEN CAST(SUBSTR(id, 3) AS INTEGER)
-                    WHEN id LIKE 'S%'  THEN CAST(SUBSTR(id, 2) AS INTEGER)
-                    ELSE 0
-                 END) FROM specs",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(None);
-        let n = max_n.map(|n| n + 1).unwrap_or(1);
-        let id = format!("S{:06}", n);
+        let id = gen_id('s', &tx);
 
         let now = Utc::now().to_rfc3339();
         let mode = spec.mode.as_deref().unwrap_or("execute");
@@ -268,25 +270,8 @@ impl Queue {
             params![id, spec.title, mode, spec_path, total, now],
         )?;
 
-        // Reserve a block of global task IDs from the counter
-        let task_counter_start: i64 = tx
-            .query_row(
-                "SELECT value FROM _counters WHERE name = 'task'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let task_count = spec.tasks.len() as i64;
-        if task_count > 0 {
-            tx.execute(
-                "INSERT INTO _counters (name, value) VALUES ('task', ?1)
-                 ON CONFLICT(name) DO UPDATE SET value = excluded.value",
-                params![task_counter_start + task_count],
-            )?;
-        }
-
-        for (i, task) in spec.tasks.iter().enumerate() {
-            let canonical_task_id = format!("T{:06}", task_counter_start + (i as i64) + 1);
+        for task in spec.tasks.iter() {
+            let canonical_task_id = gen_id('t', &tx);
             let depends_json = serde_json::to_string(task.depends.as_deref().unwrap_or(&[]))
                 .unwrap_or_else(|_| "[]".to_string());
             tx.execute(
@@ -638,20 +623,7 @@ impl Queue {
         verify: Option<&str>,
         depends: &[String],
     ) -> Result<String> {
-        let counter: i64 = self.conn
-            .query_row(
-                "SELECT value FROM _counters WHERE name = 'task'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-        let new_counter = counter + 1;
-        self.conn.execute(
-            "INSERT INTO _counters (name, value) VALUES ('task', ?1)
-             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
-            params![new_counter],
-        )?;
-        let task_id = format!("T{:06}", new_counter);
+        let task_id = gen_id('t', &self.conn);
         let depends_json = serde_json::to_string(depends).unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
             "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)
@@ -888,22 +860,39 @@ mod tests {
         Queue::open(":memory:").unwrap()
     }
 
-    #[test]
-    fn test_enqueue_returns_id() {
-        let q = open_mem();
-        let spec = make_spec("My Spec", vec![make_task("t-1", "Setup")]);
-        let id = q.enqueue(&spec, None).unwrap();
-        assert!(id.starts_with("S"), "id={}", id);
+    fn is_valid_spec_id(id: &str) -> bool {
+        id.len() == 5
+            && id.starts_with('s')
+            && id[1..].chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    fn is_valid_task_id(id: &str) -> bool {
+        id.len() == 5
+            && id.starts_with('t')
+            && id[1..].chars().all(|c| c.is_ascii_hexdigit())
     }
 
     #[test]
-    fn test_sequential_ids() {
+    fn test_enqueue_auto_id() {
+        let q = open_mem();
+        let spec = make_spec("My Spec", vec![make_task("t-1", "Setup"), make_task("t-2", "Run")]);
+        let id = q.enqueue(&spec, None).unwrap();
+        assert!(is_valid_spec_id(&id), "spec id={}", id);
+        let st = q.status(&id).unwrap().unwrap();
+        for task in &st.tasks {
+            assert!(is_valid_task_id(&task.id), "task id={}", task.id);
+        }
+    }
+
+    #[test]
+    fn test_unique_ids() {
         let q = open_mem();
         let spec = make_spec("S1", vec![make_task("t-1", "A")]);
         let id1 = q.enqueue(&spec, None).unwrap();
         let id2 = q.enqueue(&spec, None).unwrap();
-        assert_eq!(id1, "S000001");
-        assert_eq!(id2, "S000002");
+        assert!(is_valid_spec_id(&id1), "id1={}", id1);
+        assert!(is_valid_spec_id(&id2), "id2={}", id2);
+        assert_ne!(id1, id2);
     }
 
     #[test]
@@ -986,7 +975,7 @@ mod tests {
     #[test]
     fn test_status_not_found() {
         let q = open_mem();
-        assert!(q.status("q-999").unwrap().is_none());
+        assert!(q.status("sffff").unwrap().is_none());
     }
 
     #[test]
@@ -1020,8 +1009,8 @@ mod tests {
         let id = q.enqueue(&spec, None).unwrap();
         let st = q.status(&id).unwrap().unwrap();
         assert_eq!(st.tasks.len(), 2);
-        assert!(st.tasks[0].id.starts_with("T"), "task[0].id={}", st.tasks[0].id);
-        assert!(st.tasks[1].id.starts_with("T"), "task[1].id={}", st.tasks[1].id);
+        assert!(is_valid_task_id(&st.tasks[0].id), "task[0].id={}", st.tasks[0].id);
+        assert!(is_valid_task_id(&st.tasks[1].id), "task[1].id={}", st.tasks[1].id);
         assert_ne!(st.tasks[0].id, st.tasks[1].id);
     }
 
