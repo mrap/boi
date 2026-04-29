@@ -51,26 +51,15 @@ pub fn cmd_spec(queue_id: &str, action: SpecActionData, db_str: &str) {
             verify,
             depends,
         } => {
-            // Generate a task ID using max existing ID to avoid collisions
-            let existing = q.status(queue_id);
-            let max_id: i64 = match &existing {
-                Ok(Some(st)) => st.tasks.iter()
-                    .filter_map(|t| t.id.strip_prefix("t-").and_then(|n| n.parse::<i64>().ok()))
-                    .max()
-                    .unwrap_or(0),
-                _ => 0,
-            };
-            let task_id = format!("t-{}", max_id + 1);
-
             match q.add_task(
                 queue_id,
-                &task_id,
+                "",
                 &title,
                 spec.as_deref(),
                 verify.as_deref(),
                 &depends,
             ) {
-                Ok(()) => println!("added {} to {}", task_id, queue_id),
+                Ok(task_id) => println!("added {} to {}", task_id, queue_id),
                 Err(e) => {
                     eprintln!("error: {}", e);
                     std::process::exit(1);

@@ -217,7 +217,12 @@ impl Queue {
                 completed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_phase_runs_spec ON phase_runs(spec_id);
-            CREATE INDEX IF NOT EXISTS idx_phase_runs_phase ON phase_runs(phase);",
+            CREATE INDEX IF NOT EXISTS idx_phase_runs_phase ON phase_runs(phase);
+
+            CREATE TABLE IF NOT EXISTS _counters (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            );",
         )?;
 
         // Migrate existing specs tables that lack new columns
@@ -258,15 +263,20 @@ impl Queue {
     ) -> Result<String> {
         let tx = self.conn.unchecked_transaction()?;
 
+        // Compute max spec number across both old q-N and new S{N:06} formats
         let max_n: Option<i64> = tx
             .query_row(
-                "SELECT MAX(CAST(SUBSTR(id, 3) AS INTEGER)) FROM specs WHERE id LIKE 'q-%'",
+                "SELECT MAX(CASE
+                    WHEN id LIKE 'q-%' THEN CAST(SUBSTR(id, 3) AS INTEGER)
+                    WHEN id LIKE 'S%'  THEN CAST(SUBSTR(id, 2) AS INTEGER)
+                    ELSE 0
+                 END) FROM specs",
                 [],
                 |row| row.get(0),
             )
             .unwrap_or(None);
         let n = max_n.map(|n| n + 1).unwrap_or(1);
-        let id = format!("q-{}", n);
+        let id = format!("S{:06}", n);
 
         let now = Utc::now().to_rfc3339();
         let mode = spec.mode.as_deref().unwrap_or("execute");
@@ -278,13 +288,31 @@ impl Queue {
             params![id, spec.title, mode, spec_path, total, now],
         )?;
 
-        for task in &spec.tasks {
+        // Reserve a block of global task IDs from the counter
+        let task_counter_start: i64 = tx
+            .query_row(
+                "SELECT value FROM _counters WHERE name = 'task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let task_count = spec.tasks.len() as i64;
+        if task_count > 0 {
+            tx.execute(
+                "INSERT INTO _counters (name, value) VALUES ('task', ?1)
+                 ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+                params![task_counter_start + task_count],
+            )?;
+        }
+
+        for (i, task) in spec.tasks.iter().enumerate() {
+            let canonical_task_id = format!("T{:06}", task_counter_start + (i as i64) + 1);
             let depends_json = serde_json::to_string(task.depends.as_deref().unwrap_or(&[]))
                 .unwrap_or_else(|_| "[]".to_string());
             tx.execute(
                 "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)
                  VALUES (?1, ?2, ?3, 'PENDING', ?4, ?5, ?6)",
-                params![task.id, id, task.title, depends_json, task.spec, task.verify],
+                params![canonical_task_id, id, task.title, depends_json, task.spec, task.verify],
             )?;
         }
 
@@ -737,24 +765,36 @@ impl Queue {
     pub fn add_task(
         &self,
         spec_id: &str,
-        task_id: &str,
+        _authoring_id: &str,
         title: &str,
         spec_text: Option<&str>,
         verify: Option<&str>,
         depends: &[String],
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let counter: i64 = self.conn
+            .query_row(
+                "SELECT value FROM _counters WHERE name = 'task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let new_counter = counter + 1;
+        self.conn.execute(
+            "INSERT INTO _counters (name, value) VALUES ('task', ?1)
+             ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+            params![new_counter],
+        )?;
+        let task_id = format!("T{:06}", new_counter);
         let depends_json = serde_json::to_string(depends).unwrap_or_else(|_| "[]".to_string());
         self.conn.execute(
             "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)
              VALUES (?1, ?2, ?3, 'PENDING', ?4, ?5, ?6)",
             params![task_id, spec_id, title, depends_json, spec_text, verify],
         )?;
-        // Update total_tasks count
         self.conn.execute(
             "UPDATE specs SET total_tasks = (SELECT COUNT(*) FROM tasks WHERE spec_id = ?1) WHERE id = ?1",
             params![spec_id],
         )?;
-        // Also log the addition as an event for audit trail
         let _ = self.insert_event(
             Some(spec_id),
             "task.added",
@@ -762,7 +802,7 @@ impl Queue {
             None,
             "info",
         );
-        Ok(())
+        Ok(task_id)
     }
 
     pub fn skip_task(&self, spec_id: &str, task_id: &str) -> Result<()> {
@@ -1002,7 +1042,7 @@ mod tests {
         let q = open_mem();
         let spec = make_spec("My Spec", vec![make_task("t-1", "Setup")]);
         let id = q.enqueue(&spec, None).unwrap();
-        assert!(id.starts_with("q-"), "id={}", id);
+        assert!(id.starts_with("S"), "id={}", id);
     }
 
     #[test]
@@ -1011,8 +1051,8 @@ mod tests {
         let spec = make_spec("S1", vec![make_task("t-1", "A")]);
         let id1 = q.enqueue(&spec, None).unwrap();
         let id2 = q.enqueue(&spec, None).unwrap();
-        assert_eq!(id1, "q-1");
-        assert_eq!(id2, "q-2");
+        assert_eq!(id1, "S000001");
+        assert_eq!(id2, "S000002");
     }
 
     #[test]
@@ -1064,7 +1104,9 @@ mod tests {
         let q = open_mem();
         let spec = make_spec("S", vec![make_task("t-1", "T"), make_task("t-2", "U")]);
         let id = q.enqueue(&spec, None).unwrap();
-        q.update_task(&id, "t-1", "DONE").unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        let task_id = st.tasks[0].id.clone();
+        q.update_task(&id, &task_id, "DONE").unwrap();
         let st = q.status(&id).unwrap().unwrap();
         assert_eq!(st.spec.completed_tasks, 1);
     }
@@ -1127,8 +1169,9 @@ mod tests {
         let id = q.enqueue(&spec, None).unwrap();
         let st = q.status(&id).unwrap().unwrap();
         assert_eq!(st.tasks.len(), 2);
-        assert_eq!(st.tasks[0].id, "t-1");
-        assert_eq!(st.tasks[1].id, "t-2");
+        assert!(st.tasks[0].id.starts_with("T"), "task[0].id={}", st.tasks[0].id);
+        assert!(st.tasks[1].id.starts_with("T"), "task[1].id={}", st.tasks[1].id);
+        assert_ne!(st.tasks[0].id, st.tasks[1].id);
     }
 
     #[test]

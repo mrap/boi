@@ -30,13 +30,14 @@ impl TemplateVar {
         &[Self::QueueId, Self::SpecPath, Self::SpecContent]
     }
 
-    /// Validate that all required vars are present. Panics loudly if missing.
-    pub fn validate(vars: &HashMap<String, String>) {
+    /// Validate that all required vars are present. Returns an error if any are missing.
+    pub fn validate(vars: &HashMap<String, String>) -> Result<(), String> {
         for v in Self::required() {
             if !vars.contains_key(v.key()) {
-                panic!("[boi] FATAL: required template var '{}' missing from prompt_vars", v.key());
+                return Err(format!("[boi] required template var '{}' missing from prompt_vars", v.key()));
             }
         }
+        Ok(())
     }
 }
 

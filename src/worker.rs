@@ -101,6 +101,7 @@ pub fn spawn_claude(
     spec_id: Option<&str>,
 ) -> Result<ClaudeResult, Box<dyn std::error::Error>> {
     use std::io::Read;
+    use std::os::unix::process::CommandExt;
 
     let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
     let mut args = vec![
@@ -117,13 +118,27 @@ pub fn spawn_claude(
     boi_log!("spawning claude\n  bin:    {}\n  args:   {}\n  cwd:    {}\n  prompt: {} chars\n  prompt: {}",
         claude_bin, args_display.join(" "), worktree_path, prompt.len(),
         prompt.chars().take(500).collect::<String>());
-    let mut child = Command::new(&claude_bin)
-        .args(&args)
+
+    let mut cmd = Command::new(&claude_bin);
+    cmd.args(&args)
         .current_dir(worktree_path)
         .env("AGENT_DIR", worktree_path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    // SAFETY: setsid() is async-signal-safe per POSIX, safe to call after fork before exec.
+    // This puts the child in its own process group so we can kill all grandchildren via -pgid.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn()?;
+
+    // Store process group ID for killing grandchildren on exit/timeout
+    let pgid = child.id() as i32;
 
     // Write PID file so `boi cancel` can kill this subprocess
     let pid_path = spec_id.map(|sid| {
@@ -165,13 +180,22 @@ pub fn spawn_claude(
     });
 
     let mut timed_out = false;
+    let mut exit_status = None;
     loop {
         match child.try_wait()? {
-            Some(_) => break,
+            Some(status) => {
+                exit_status = Some(status);
+                // SAFETY: pgid is the child's PID (valid after setsid), negative value targets
+                // the entire process group, killing any grandchildren that inherited the pipes.
+                unsafe { libc::kill(-pgid, libc::SIGKILL); }
+                break;
+            }
             None => {
                 if spawn_time.elapsed().as_secs() >= timeout_secs {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // SAFETY: same as above — kill the entire process group on timeout.
+                    unsafe { libc::kill(-pgid, libc::SIGKILL); }
                     timed_out = true;
                     break;
                 }
@@ -203,34 +227,9 @@ pub fn spawn_claude(
         });
     }
 
-    let status = child.wait()?;
-
-    // Give reader threads a bounded wait — child processes spawned by Claude
-    // can inherit the pipe and keep it open after Claude exits.
-    let reader_result = std::thread::Builder::new()
-        .spawn(move || reader_handle.join().unwrap_or((None, String::new())))
-        .unwrap();
-    let stderr_result = std::thread::Builder::new()
-        .spawn(move || stderr_handle.join().unwrap_or_default())
-        .unwrap();
-
-    let reader_timeout = Duration::from_secs(10);
-    let (first_byte_instant, output) = loop {
-        if reader_result.is_finished() {
-            break reader_result.join().unwrap_or((None, String::new()));
-        }
-        if spawn_time.elapsed() > Duration::from_secs(timeout_secs + 10) {
-            boi_log!("stdout reader still blocked after child exit — orphaned pipe");
-            break (None, String::new());
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    };
-    let stderr_output = if stderr_result.is_finished() {
-        stderr_result.join().unwrap_or_default()
-    } else {
-        boi_log!("stderr reader still blocked after child exit");
-        String::new()
-    };
+    // With setsid + process group kill, grandchildren are dead and pipes unblock naturally.
+    let (first_byte_instant, output) = reader_handle.join().unwrap_or((None, String::new()));
+    let stderr_output = stderr_handle.join().unwrap_or_default();
 
     if !stderr_output.is_empty() {
         boi_log!("claude stderr:\n{}", stderr_output);
@@ -241,8 +240,9 @@ pub fn spawn_claude(
         .unwrap_or(total_ms);
     let inference_ms = total_ms.saturating_sub(startup_ms);
 
+    let success = exit_status.map(|s| s.success()).unwrap_or(false);
     Ok(ClaudeResult {
-        success: status.success(),
+        success,
         output,
         stderr: stderr_output,
         startup_ms,
@@ -367,13 +367,21 @@ pub fn run_worker_with_phases(
     let worktree_path: String = match &boi_spec.workspace {
         Some(ws) if !ws.is_empty() => {
             let worktree_dir = crate::worktree::create(spec_id, ws)?;
-            worktree_dir.to_str().unwrap_or("/tmp").to_string()
+            worktree_dir.to_str()
+                .ok_or_else(|| -> Box<dyn std::error::Error> { "worktree path is not valid UTF-8".into() })?
+                .to_string()
         }
         _ => {
-            let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
+            let queue_tag = std::path::Path::new(queue_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("default");
+            let tmp = std::env::temp_dir().join(format!("boi-{}-{}", spec_id, queue_tag));
             std::fs::create_dir_all(&tmp)?;
             boi_log!(" no workspace set — running in temp dir: {}", tmp.display());
-            tmp.to_str().unwrap_or("/tmp").to_string()
+            tmp.to_str()
+                .ok_or_else(|| -> Box<dyn std::error::Error> { "temp dir path is not valid UTF-8".into() })?
+                .to_string()
         }
     };
 
@@ -410,16 +418,17 @@ pub fn run_worker_with_phases(
         }
     }
 
+    // task_map keyed by YAML authoring IDs (matching `order` from topological_sort)
     let task_map: HashMap<String, &spec::BoiTask> = boi_spec
         .tasks
         .iter()
-        .map(|t| {
-            let canonical = yaml_to_canonical
-                .get(&t.id)
-                .cloned()
-                .unwrap_or_else(|| t.id.clone());
-            (canonical, t)
-        })
+        .map(|t| (t.id.clone(), t))
+        .collect();
+
+    // Reverse map: canonical DB ID → YAML authoring ID
+    let canonical_to_yaml: HashMap<String, String> = yaml_to_canonical
+        .iter()
+        .map(|(yaml, canonical)| (canonical.clone(), yaml.clone()))
         .collect();
 
     let mut done_ids: HashSet<String> = HashSet::new();
@@ -427,17 +436,19 @@ pub fn run_worker_with_phases(
     let mut db_depends: HashMap<String, Vec<String>> = HashMap::new();
     if let Ok(db_tasks) = queue.get_tasks(spec_id) {
         for dt in &db_tasks {
+            // Use YAML IDs internally so they match `order` and `task_map` keys
+            let yaml_id = canonical_to_yaml.get(&dt.id).unwrap_or(&dt.id).clone();
             match dt.status.as_str() {
-                "DONE" => { done_ids.insert(dt.id.clone()); }
+                "DONE" => { done_ids.insert(yaml_id.clone()); }
                 "SKIPPED" => {
-                    skipped_ids.insert(dt.id.clone());
-                    done_ids.insert(dt.id.clone());
+                    skipped_ids.insert(yaml_id.clone());
+                    done_ids.insert(yaml_id.clone());
                 }
                 _ => {}
             }
             let deps: Vec<String> = serde_json::from_str(&dt.depends).unwrap_or_default();
             if !deps.is_empty() {
-                db_depends.insert(dt.id.clone(), deps);
+                db_depends.insert(yaml_id.clone(), deps);
             }
         }
     }
@@ -490,7 +501,7 @@ pub fn run_worker_with_phases(
         boi_spec.workspace.as_ref()
             .map(|_| format!("Workspace: {}\n", worktree_path))
             .unwrap_or_default());
-    TemplateVar::validate(&prompt_vars);
+    TemplateVar::validate(&prompt_vars).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // --- State machine ---
     let mut state = WorkerState::SpecPhase { phase_idx: 0 };
@@ -611,6 +622,11 @@ pub fn run_worker_with_phases(
             }
 
             WorkerState::TaskSelect => {
+                // Refresh dynamic template vars so phases see current state
+                let pending_count = order.len() - done_ids.len();
+                prompt_vars.insert(TemplateVar::PendingCount.key().into(), pending_count.to_string());
+                prompt_vars.insert(TemplateVar::Iteration.key().into(), (spec_redo_count + 1).to_string());
+
                 // Find next ready task: PENDING, all deps satisfied
                 let mut found = false;
                 for task_id in &order {
@@ -647,7 +663,8 @@ pub fn run_worker_with_phases(
                         "task_id": task.id,
                         "task_title": task.title,
                     });
-                    queue.update_task(spec_id, &task.id, "RUNNING")?;
+                    let db_task_id = yaml_to_canonical.get(task_id.as_str()).map(|s| s.as_str()).unwrap_or(task_id.as_str());
+                    queue.update_task(spec_id, db_task_id, "RUNNING")?;
                     let _ = hooks::fire(hook_config, ON_TASK_START, &task_payload);
 
                     telemetry.emit("boi.task.started", LogLevel::Info, &json!({
@@ -688,11 +705,9 @@ pub fn run_worker_with_phases(
                                 reason: "deadlock: pending tasks but none ready".to_string(),
                             };
                         } else {
-                            // Re-scan (same state) — done_ids may have grown from a previous pass
-                            // but if not, the pass counter will catch it
-                            state = WorkerState::Failed {
-                                reason: "deadlock: pending tasks but none ready".to_string(),
-                            };
+                            // Re-scan — done_ids may have grown from a previous pass.
+                            // If not, the pass counter will catch it on the next iteration.
+                            state = WorkerState::TaskSelect;
                         }
                     }
                 }
@@ -700,6 +715,7 @@ pub fn run_worker_with_phases(
 
             WorkerState::TaskPhase { ref task_id, phase_idx, requeue_attempts } => {
                 let task_id_owned = task_id.clone();
+                let db_task_id = yaml_to_canonical.get(&task_id_owned).cloned().unwrap_or_else(|| task_id_owned.clone());
                 let task = match task_map.get(task_id_owned.as_str()) {
                     Some(t) => t,
                     None => {
@@ -719,7 +735,7 @@ pub fn run_worker_with_phases(
                 if phase_idx >= task_phases.len() {
                     boi_log!("state: TaskPhase -> TaskSelect (task {} complete, all {} phases passed)",
                         task.id, task_phases.len());
-                    queue.update_task(spec_id, &task.id, "DONE")?;
+                    queue.update_task(spec_id, &db_task_id, "DONE")?;
                     done_ids.insert(task.id.clone());
                     let task_payload = json!({
                         "spec_id": spec_id,
@@ -837,7 +853,7 @@ pub fn run_worker_with_phases(
                                 attempt: 1,
                             };
                         } else {
-                            queue.update_task(spec_id, &task.id, "FAILED")?;
+                            queue.update_task(spec_id, &db_task_id, "FAILED")?;
                             let task_payload = json!({
                                 "spec_id": spec_id,
                                 "task_id": task.id,
@@ -869,6 +885,7 @@ pub fn run_worker_with_phases(
 
             WorkerState::TaskPhaseRetry { ref task_id, phase_idx, attempt } => {
                 let task_id_owned = task_id.clone();
+                let db_task_id = yaml_to_canonical.get(&task_id_owned).cloned().unwrap_or_else(|| task_id_owned.clone());
                 boi_log!("state: TaskPhaseRetry {{ task: {}, phase_idx: {}, attempt: {} }}", task_id_owned, phase_idx, attempt);
                 let task = match task_map.get(task_id_owned.as_str()) {
                     Some(t) => t,
@@ -885,13 +902,21 @@ pub fn run_worker_with_phases(
                     task.phases.as_deref(),
                 );
                 let phase_name = &task_phases[phase_idx];
-                let phase = registry.get(phase_name).unwrap(); // safe: we checked in TaskPhase
+                let phase = match registry.get(phase_name) {
+                    Some(p) => p,
+                    None => {
+                        state = WorkerState::Failed {
+                            reason: format!("phase '{}' not found in registry during retry", phase_name),
+                        };
+                        continue;
+                    }
+                };
                 let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
 
                 if attempt >= max_attempts {
                     boi_log!("state: TaskPhaseRetry -> Failed (max retries {} reached for task {} phase '{}')",
                         max_attempts, task.id, phase_name);
-                    queue.update_task(spec_id, &task.id, "FAILED")?;
+                    queue.update_task(spec_id, &db_task_id, "FAILED")?;
                     let task_payload = json!({
                         "spec_id": spec_id,
                         "task_id": task.id,
@@ -979,7 +1004,8 @@ pub fn run_worker_with_phases(
                     let task = task_map.get(task_id_owned.as_str());
                     let task_title = task.map(|t| t.title.as_str()).unwrap_or("unknown");
                     boi_log!(" requeue limit ({}) exceeded for task {}", config.retry_count, task_id_owned);
-                    queue.update_task(spec_id, &task_id_owned, "FAILED")?;
+                    let db_task_id_rq = yaml_to_canonical.get(&task_id_owned).cloned().unwrap_or_else(|| task_id_owned.clone());
+                    queue.update_task(spec_id, &db_task_id_rq, "FAILED")?;
                     let task_payload = json!({
                         "spec_id": spec_id,
                         "task_id": task_id_owned,
@@ -1213,6 +1239,7 @@ pub fn run_worker_with_phases(
                                             "spec_id": spec_id,
                                             "error": e.to_string(),
                                         }));
+                                        let _ = crate::worktree::delete_branch(spec_id, ws);
                                         break;
                                     }
                                 }
@@ -1244,7 +1271,11 @@ pub fn run_worker_with_phases(
                 } else {
                     boi_log!(" preserving worktree for failed spec {}", spec_id);
                 }
-                let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
+                let queue_tag = std::path::Path::new(queue_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("default");
+                let tmp = std::env::temp_dir().join(format!("boi-{}-{}", spec_id, queue_tag));
                 if tmp.exists() {
                     let _ = std::fs::remove_dir_all(&tmp);
                 }
@@ -1306,7 +1337,22 @@ pub fn run_daemon(queue_path: &str, hook_config: HookConfig, config: WorkerConfi
     loop {
         {
             let mut workers = active.lock().unwrap();
-            workers.retain(|h| !h.is_finished());
+            let mut i = 0;
+            while i < workers.len() {
+                if workers[i].is_finished() {
+                    let handle = workers.remove(i);
+                    if let Err(panic_payload) = handle.join() {
+                        let msg = panic_payload
+                            .downcast_ref::<String>()
+                            .map(|s| s.as_str())
+                            .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown panic");
+                        eprintln!("[boi daemon] worker thread panicked: {}", msg);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
 
             if workers.len() < config.max_workers as usize {
                 match Queue::open(queue_path) {
@@ -1535,6 +1581,8 @@ mod tests {
 
         let db_file = std::env::temp_dir().join(format!("boi_test_db_{}.db", suffix));
         let _ = std::fs::remove_file(&db_file);
+        let _ = std::fs::remove_file(db_file.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_file.with_extension("db-shm"));
         let queue = Queue::open(db_file.to_str().unwrap()).unwrap();
         let boi_spec = spec::parse(spec_yaml).unwrap();
         let spec_id = queue.enqueue(&boi_spec, spec_file.to_str()).unwrap();
@@ -1659,6 +1707,8 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
         std::fs::write(&spec_file, spec_yaml).unwrap();
         let db_file = std::env::temp_dir().join(format!("boi_phase_db_{}.db", suffix));
         let _ = std::fs::remove_file(&db_file);
+        let _ = std::fs::remove_file(db_file.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_file.with_extension("db-shm"));
         let queue = Queue::open(db_file.to_str().unwrap()).unwrap();
         let boi_spec = spec::parse(spec_yaml).unwrap();
         let spec_id = queue.enqueue(&boi_spec, spec_file.to_str()).unwrap();
