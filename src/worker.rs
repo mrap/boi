@@ -204,8 +204,33 @@ pub fn spawn_claude(
     }
 
     let status = child.wait()?;
-    let (first_byte_instant, output) = reader_handle.join().unwrap_or((None, String::new()));
-    let stderr_output = stderr_handle.join().unwrap_or_default();
+
+    // Give reader threads a bounded wait — child processes spawned by Claude
+    // can inherit the pipe and keep it open after Claude exits.
+    let reader_result = std::thread::Builder::new()
+        .spawn(move || reader_handle.join().unwrap_or((None, String::new())))
+        .unwrap();
+    let stderr_result = std::thread::Builder::new()
+        .spawn(move || stderr_handle.join().unwrap_or_default())
+        .unwrap();
+
+    let reader_timeout = Duration::from_secs(10);
+    let (first_byte_instant, output) = loop {
+        if reader_result.is_finished() {
+            break reader_result.join().unwrap_or((None, String::new()));
+        }
+        if spawn_time.elapsed() > Duration::from_secs(timeout_secs + 10) {
+            boi_log!("stdout reader still blocked after child exit — orphaned pipe");
+            break (None, String::new());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let stderr_output = if stderr_result.is_finished() {
+        stderr_result.join().unwrap_or_default()
+    } else {
+        boi_log!("stderr reader still blocked after child exit");
+        String::new()
+    };
 
     if !stderr_output.is_empty() {
         boi_log!("claude stderr:\n{}", stderr_output);
