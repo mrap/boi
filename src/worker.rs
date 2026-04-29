@@ -295,10 +295,10 @@ pub fn run_worker_with_phases(
         "message": format!("worker started for {}", spec_id),
     }));
 
-    let spec_content = std::fs::read_to_string(spec_path)?;
-    let boi_spec = spec::parse_unchecked(&spec_content)?;
+    let spec_content_raw = std::fs::read_to_string(spec_path)?;
+    let boi_spec = spec::parse_unchecked(&spec_content_raw)?;
 
-    let worktree_path = match &boi_spec.workspace {
+    let worktree_path: String = match &boi_spec.workspace {
         Some(ws) if !ws.is_empty() => {
             let worktree_dir = crate::worktree::create(spec_id, ws)?;
             worktree_dir.to_str().unwrap_or("/tmp").to_string()
@@ -309,6 +309,13 @@ pub fn run_worker_with_phases(
             eprintln!("[boi] no workspace set — running in temp dir: {}", tmp.display());
             tmp.to_str().unwrap_or("/tmp").to_string()
         }
+    };
+
+    // Rewrite workspace in spec content so Claude edits the worktree, not the source repo.
+    let spec_content = if let Some(ws) = &boi_spec.workspace {
+        spec_content_raw.replace(ws, &worktree_path)
+    } else {
+        spec_content_raw
     };
 
     let order = match spec::topological_sort(&boi_spec) {
