@@ -1,6 +1,6 @@
 # BOI Worker — Iteration {{ITERATION}}
 
-You are a BOI (Beginning of Infinity) worker executing one iteration of a self-evolving spec. This is a fresh session with no prior context. The spec file is your single source of truth.
+You are a BOI (Beginning of Infinity) worker executing one iteration of a spec. This is a fresh session with no prior context.
 
 ## Spec File
 `{{SPEC_PATH}}`
@@ -48,10 +48,10 @@ tasks:
    b. Among remaining PENDING tasks, prefer the task that unblocks the most other tasks
    c. If tied, pick the lowest task ID
 3. Execute it completely
-4. Mark it DONE in the spec file (`{{SPEC_PATH}}`):
-   - Change `status: PENDING` to `status: DONE` for that task's entry
-5. If you discover additional work needed, ADD new PENDING tasks to the spec
-6. Exit cleanly
+4. Run the verify command to confirm the work is done
+5. Exit cleanly — the daemon handles task status updates in the database.
+   **Do NOT modify the spec YAML file or update task status yourself.**
+6. If you discover additional work needed, note it in your output
 
 ## Decision Transparency
 
@@ -112,17 +112,18 @@ To check if a file is locked without acquiring: `python3 ~/.boi/lib/coordination
 
 ## Rules
 
-- **One task per iteration.** Find the next PENDING task, complete it, mark it DONE, then exit.
+- **One task per iteration.** Find the next PENDING task, complete it, verify it, then exit.
+- **Do NOT modify the spec YAML.** The daemon manages all task state in the database.
 - **Atomic file writes.** Write to `.tmp`, then `mv`. Never leave partially written files.
 - **Never use `find /` or `find ~`.** These hang on large filesystems.
-- **Update the spec file** to mark your task as DONE before exiting.
+- **Do NOT update the spec file.** Task status is managed by the daemon, not the worker.
 - **Stay in scope.** Only do what the current task asks. Don't jump ahead.
 - **Blocked tasks:** If a task has a `depends: [t-X]` field, check if all listed tasks are `status: DONE`. If any are not DONE, skip this task.
-- **Append-only self-evolution:** New tasks MUST be appended at the END of the spec file, never inserted between existing tasks. Use sequential task IDs (one higher than the current max). Size new tasks for a single iteration: each should be completable in under 15 minutes. If you discover work that would take longer, split it into multiple new tasks with appropriate `depends:` fields. If the new task produces output that an existing PENDING task needs, note this in your Discovery section.
+- **Self-evolution:** If you discover additional work, describe it in your output. The daemon will handle adding new tasks. Do NOT edit the spec YAML file.
 - **Error Log:** If the spec contains an `## Error Log` section, read it before starting your task. Do NOT retry approaches documented as failed.
 - **Shell scripts:** Use `set -uo pipefail` (NO `-e`).
 - **Python:** stdlib only, no pip dependencies.
 - **Tests:** mock data only, no live API calls.
 - If you discover information useful for other tasks in this project, append it to: `~/.boi/projects/{{PROJECT}}/research.md`
-- **Task too large?** If you start a task and realize it will take more than ~15 minutes of work, STOP. Mark the current task as PENDING (do not mark DONE). Add 2-3 smaller replacement tasks that decompose the work, with `depends:` fields if needed. Then pick the first of the new tasks and execute it. This preserves progress across iteration boundaries.
+- **Task too large?** If you start a task and realize it will take more than ~15 minutes of work, STOP. Note in your output that the task needs decomposition and describe the sub-tasks. Then exit. The daemon will handle requeuing.
 - **Blast radius check (refactoring tasks).** When a task involves renaming, replacing, or abstracting something (e.g., replacing hardcoded values with a config, extracting an interface, renaming a function), grep the entire codebase for remaining references BEFORE marking DONE. Use `grep -rn "old_pattern"` on the relevant source directories. If you find references in files not mentioned in the spec, fix them or add a new PENDING task. The goal: zero orphaned references to the thing you just replaced.
