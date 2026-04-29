@@ -477,6 +477,21 @@ pub fn run_worker_with_phases(
     let max_spec_redos = config.retry_count as usize;
     let max_task_select_passes = order.len().max(1);
 
+    // Template variables for phase prompts
+    use crate::phases::TemplateVar;
+    let pending_count = order.len() - done_ids.len();
+    let mut prompt_vars: HashMap<String, String> = HashMap::new();
+    prompt_vars.insert(TemplateVar::QueueId.key().into(), spec_id.to_string());
+    prompt_vars.insert(TemplateVar::SpecPath.key().into(), spec_path.to_string());
+    prompt_vars.insert(TemplateVar::Iteration.key().into(), "1".into());
+    prompt_vars.insert(TemplateVar::PendingCount.key().into(), pending_count.to_string());
+    prompt_vars.insert(TemplateVar::SpecContent.key().into(), spec_content.clone());
+    prompt_vars.insert(TemplateVar::WorkspaceHeader.key().into(),
+        boi_spec.workspace.as_ref()
+            .map(|_| format!("Workspace: {}\n", worktree_path))
+            .unwrap_or_default());
+    TemplateVar::validate(&prompt_vars);
+
     // --- State machine ---
     let mut state = WorkerState::SpecPhase { phase_idx: 0 };
     boi_log!("state machine start: spec={} mode={} tasks={} pre_spec_phases={} post_spec_phases={}",
@@ -544,6 +559,7 @@ pub fn run_worker_with_phases(
                     &worktree_path,
                     config.task_timeout_secs,
                     Some(spec_id),
+                    &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms);
@@ -763,6 +779,7 @@ pub fn run_worker_with_phases(
                     &worktree_path,
                     config.task_timeout_secs,
                     Some(spec_id),
+                    &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &verdict, &phase_started_at, elapsed_ms);
@@ -907,6 +924,7 @@ pub fn run_worker_with_phases(
                     &worktree_path,
                     config.task_timeout_secs,
                     Some(spec_id),
+                    &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &retry_verdict, &phase_started_at, elapsed_ms);
@@ -1061,6 +1079,7 @@ pub fn run_worker_with_phases(
                     &worktree_path,
                     config.task_timeout_secs,
                     Some(spec_id),
+                    &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms);

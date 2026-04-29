@@ -23,6 +23,7 @@ pub trait PhaseRunner: Send + Sync {
         worktree_path: &str,
         timeout_secs: u64,
         spec_id: Option<&str>,
+        vars: &std::collections::HashMap<String, String>,
     ) -> Verdict;
 }
 
@@ -47,6 +48,7 @@ impl PhaseRunner for ClaudePhaseRunner {
         worktree_path: &str,
         timeout_secs: u64,
         spec_id: Option<&str>,
+        vars: &std::collections::HashMap<String, String>,
     ) -> Verdict {
         if !phase.requires_claude {
             return self.run_verify_phase(phase, task, worktree_path, timeout_secs, spec_id);
@@ -69,6 +71,7 @@ impl PhaseRunner for ClaudePhaseRunner {
             phase,
             spec_content,
             task_context.as_deref(),
+            vars,
         );
 
         self.telemetry.emit("boi.claude.spawn", LogLevel::Debug, &json!({
@@ -288,6 +291,7 @@ impl PhaseRunner for MockPhaseRunner {
         _worktree_path: &str,
         _timeout_secs: u64,
         _spec_id: Option<&str>,
+        _vars: &std::collections::HashMap<String, String>,
     ) -> Verdict {
         let mut verdicts = self.verdicts.lock().unwrap();
         if verdicts.is_empty() {
@@ -360,7 +364,7 @@ mod tests {
         let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("true");
-        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None);
+        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None, &std::collections::HashMap::new());
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -369,7 +373,7 @@ mod tests {
         let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("false");
-        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None);
+        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None, &std::collections::HashMap::new());
         assert_eq!(
             outcome,
             Verdict::Redo { tasks: vec![] }
@@ -390,7 +394,7 @@ mod tests {
             verify_prompt: None,
             phases: None,
         };
-        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None);
+        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None, &std::collections::HashMap::new());
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -399,7 +403,7 @@ mod tests {
         let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("no-op", false);
         // Spec-level phase with no task → proceed (skip is just proceed)
-        let outcome = runner.run_phase(&phase, "", None, "/tmp", 10, None);
+        let outcome = runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new());
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -413,20 +417,20 @@ mod tests {
         let phase = make_phase("test", true);
 
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10, None),
+            runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new()),
             Verdict::Proceed
         );
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10, None),
+            runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new()),
             Verdict::Done { success: false, reason: "timeout".into() }
         );
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10, None),
+            runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new()),
             Verdict::Done { success: false, reason: "bad".into() }
         );
         // Exhausted verdicts → default to Proceed
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10, None),
+            runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new()),
             Verdict::Proceed
         );
     }

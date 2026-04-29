@@ -2,6 +2,44 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Canonical template variable keys for phase prompts.
+/// Using this enum prevents typos and makes it easy to find all usages.
+pub enum TemplateVar {
+    QueueId,
+    SpecPath,
+    Iteration,
+    PendingCount,
+    SpecContent,
+    WorkspaceHeader,
+}
+
+impl TemplateVar {
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::QueueId => "QUEUE_ID",
+            Self::SpecPath => "SPEC_PATH",
+            Self::Iteration => "ITERATION",
+            Self::PendingCount => "PENDING_COUNT",
+            Self::SpecContent => "SPEC_CONTENT",
+            Self::WorkspaceHeader => "WORKSPACE_HEADER",
+        }
+    }
+
+    /// Required vars that must be present for a valid prompt.
+    pub fn required() -> &'static [TemplateVar] {
+        &[Self::QueueId, Self::SpecPath, Self::SpecContent]
+    }
+
+    /// Validate that all required vars are present. Panics loudly if missing.
+    pub fn validate(vars: &HashMap<String, String>) {
+        for v in Self::required() {
+            if !vars.contains_key(v.key()) {
+                panic!("[boi] FATAL: required template var '{}' missing from prompt_vars", v.key());
+            }
+        }
+    }
+}
+
 /// Whether a phase operates at the whole-spec level or per-task level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -672,6 +710,7 @@ pub fn build_phase_prompt(
     phase: &PhaseConfig,
     spec_content: &str,
     task_context: Option<&str>,
+    vars: &std::collections::HashMap<String, String>,
 ) -> String {
     if phase.prompt_template.is_empty() {
         return format!(
@@ -683,6 +722,20 @@ pub fn build_phase_prompt(
     }
 
     let mut prompt = phase.prompt_template.clone();
+
+    // Substitute template variables
+    for (key, value) in vars {
+        prompt = prompt.replace(&format!("{{{{{}}}}}", key), value);
+    }
+    // Strip any remaining unsubstituted {{VAR}}
+    while let Some(start) = prompt.find("{{") {
+        if let Some(end) = prompt[start..].find("}}") {
+            prompt.replace_range(start..start + end + 2, "");
+        } else {
+            break;
+        }
+    }
+
     prompt.push_str("\n\n--- SPEC ---\n");
     prompt.push_str(spec_content);
     if let Some(ctx) = task_context {
@@ -1116,7 +1169,7 @@ approve_signal = ""
             hooks_pre: vec![],
             hooks_post: vec![],
         };
-        let prompt = build_phase_prompt(&phase, "title: Test\ntasks: []", None);
+        let prompt = build_phase_prompt(&phase, "title: Test\ntasks: []", None, &std::collections::HashMap::new());
         assert!(prompt.contains("Review this spec carefully."));
         assert!(prompt.contains("--- SPEC ---"));
         assert!(prompt.contains("title: Test"));
@@ -1146,7 +1199,7 @@ approve_signal = ""
             hooks_pre: vec![],
             hooks_post: vec![],
         };
-        let prompt = build_phase_prompt(&phase, "spec content", Some("task t-1 details"));
+        let prompt = build_phase_prompt(&phase, "spec content", Some("task t-1 details"), &std::collections::HashMap::new());
         assert!(prompt.contains("--- TASK ---"));
         assert!(prompt.contains("task t-1 details"));
     }
@@ -1175,7 +1228,7 @@ approve_signal = ""
             hooks_pre: vec![],
             hooks_post: vec![],
         };
-        let prompt = build_phase_prompt(&phase, "spec", None);
+        let prompt = build_phase_prompt(&phase, "spec", None, &std::collections::HashMap::new());
         assert!(prompt.contains("Phase: task-verify"));
         assert!(prompt.contains("spec"));
     }
