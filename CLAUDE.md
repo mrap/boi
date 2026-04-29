@@ -24,6 +24,8 @@ boi (Rust binary)
 | Spec parser | `src/spec.rs` | YAML parsing, validation, dependency DAG |
 | Queue | `src/queue.rs` | SQLite state store (specs, tasks, iterations, events, workers, processes) |
 | Worker | `src/worker.rs` | Execute tasks: git worktree → claude -p → verify → retry |
+| Spawn | `src/spawn.rs` | Spawn claude subprocess, PID tracking, timing, timeout |
+| Prompt | `src/prompt.rs` | Build task prompt from spec content and task fields |
 | Hooks | `src/hooks.rs` | Lifecycle hooks (9 events, JSON on stdin, configurable) |
 | Config | `src/config.rs` | Load ~/.boi/config.yaml, defaults for everything |
 | Telemetry | `src/telemetry.rs` | Append-only JSONL at ~/.boi/telemetry/boi.jsonl |
