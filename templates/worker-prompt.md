@@ -115,7 +115,7 @@ To check if a file is locked without acquiring: `python3 ~/.boi/lib/coordination
 - **One task per iteration.** Find the next PENDING task, complete it, verify it, then exit.
 - **Do NOT modify the spec YAML.** The daemon manages all task state in the database.
 - **Atomic file writes.** Write to `.tmp`, then `mv`. Never leave partially written files.
-- **Never use `find /` or `find ~`.** These hang on large filesystems.
+- **Never use `find` outside the project directory.** `find /`, `find ~`, `find /Users` all hang on large filesystems. Confine `find` to the workspace directory only.
 - **Do NOT update the spec file.** Task status is managed by the daemon, not the worker.
 - **Stay in scope.** Only do what the current task asks. Don't jump ahead.
 - **Blocked tasks:** If a task has a `depends: [t-X]` field, check if all listed tasks are `status: DONE`. If any are not DONE, skip this task.
