@@ -1,7 +1,7 @@
-use crate::cli::daemon::{daemon_heartbeat_path, daemon_pid_path, is_daemon_locked};
+use crate::cli::daemon::{daemon_heartbeat_path, is_daemon_locked};
 use crate::config;
 use crate::fmt::{
-    display_width, elapsed_since, ensure_db_dir, is_pid_alive, progress_bar, term_width, time_ago,
+    display_width, elapsed_since, ensure_db_dir, progress_bar, term_width, time_ago,
     truncate, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW,
 };
 use crate::queue;

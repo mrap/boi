@@ -123,7 +123,7 @@ pub fn spawn_claude(
         claude_bin, args_display.join(" "), worktree_path, prompt.len(),
         prompt.chars().take(500).collect::<String>());
 
-    let mut cmd = Command::new(&claude_bin);
+    let mut cmd = Command::new(claude_bin);
     cmd.args(&args)
         .current_dir(worktree_path)
         .env("AGENT_DIR", worktree_path)
@@ -288,6 +288,7 @@ pub fn spawn_claude(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_phase_run(
     queue: &Queue,
     spec_id: &str,
@@ -379,6 +380,7 @@ enum WorkerState {
 
 /// Execute all pending tasks using the phase pipeline with a custom PhaseRunner.
 /// This is the core implementation, testable with mock runners.
+#[allow(clippy::too_many_arguments)]
 pub fn run_worker_with_phases(
     spec_id: &str,
     spec_path: &str,

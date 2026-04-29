@@ -52,10 +52,7 @@ pub fn cmd_telemetry(spec_id: &str, db_str: &str) {
     }
 
     // Phase cost breakdown
-    let phase_costs = match q.phase_cost_summary(spec_id) {
-        Ok(c) => c,
-        Err(_) => Vec::new(),
-    };
+    let phase_costs: Vec<queue::PhaseCostSummary> = q.phase_cost_summary(spec_id).unwrap_or_default();
 
     if phase_costs.is_empty() && iterations.is_empty() {
         println!("no telemetry records for {}", spec_id);
