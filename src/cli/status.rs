@@ -127,7 +127,7 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
         .collect();
 
     // Layout constants (display column widths, not byte widths)
-    // "▸ q-NNN  " = icon(1) + space(1) + id-field(5) + gap(2) = 9 display cols before title
+    // "▸ sa7f3  " = icon(1) + space(1) + id(5) + gap(2) = 9 display cols before title
     let prefix_dcols: usize = 9; // icon(1) + space(1) + id-padded(5) + gap(2)
 
     // Running section

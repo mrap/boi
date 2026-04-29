@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn test_fire_no_hooks_configured() {
         let config = HookConfig::default();
-        let payload = json!({"spec_id": "q-001"});
+        let payload = json!({"spec_id": "s0001"});
         assert!(fire(&config, ON_DISPATCH, &payload).is_ok());
     }
 
@@ -160,7 +160,7 @@ mod tests {
         let config = HookConfig {
             hooks: Some(HashMap::new()),
         };
-        let payload = json!({"spec_id": "q-001"});
+        let payload = json!({"spec_id": "s0001"});
         assert!(fire(&config, ON_DISPATCH, &payload).is_ok());
     }
 
@@ -176,7 +176,7 @@ mod tests {
             },
         );
         let config = HookConfig { hooks: Some(hooks) };
-        let payload = json!({"spec_id": "q-test", "task_id": "t-1"});
+        let payload = json!({"spec_id": "s0099", "task_id": "t0001"});
         assert!(fire(&config, ON_DISPATCH, &payload).is_ok());
     }
 
@@ -192,7 +192,7 @@ mod tests {
             },
         );
         let config = HookConfig { hooks: Some(hooks) };
-        let payload = json!({"spec_id": "q-test"});
+        let payload = json!({"spec_id": "s0099"});
         assert!(fire(&config, ON_COMPLETE, &payload).is_ok());
     }
 
@@ -210,7 +210,7 @@ mod tests {
             },
         );
         let config = HookConfig { hooks: Some(hooks) };
-        let payload = json!({"spec_id": "q-999", "task_id": "t-5"});
+        let payload = json!({"spec_id": "s0999", "task_id": "t0005"});
         assert!(fire(&config, ON_TASK_START, &payload).is_ok());
     }
 
@@ -226,7 +226,7 @@ mod tests {
             },
         );
         let config = HookConfig { hooks: Some(hooks) };
-        let payload = json!({"spec_id": "q-bad"});
+        let payload = json!({"spec_id": "s0998"});
         // Must not panic or return Err — errors are swallowed as warnings.
         assert!(fire(&config, ON_FAIL, &payload).is_ok());
     }
