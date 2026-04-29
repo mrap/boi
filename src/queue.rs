@@ -270,9 +270,19 @@ impl Queue {
             params![id, spec.title, mode, spec_path, total, now],
         )?;
 
+        let mut yaml_to_canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for task in spec.tasks.iter() {
             let canonical_task_id = gen_id('t', &tx);
-            let depends_json = serde_json::to_string(task.depends.as_deref().unwrap_or(&[]))
+            yaml_to_canonical.insert(task.id.clone(), canonical_task_id.clone());
+        }
+
+        for task in spec.tasks.iter() {
+            let canonical_task_id = &yaml_to_canonical[&task.id];
+            let canonical_deps: Vec<String> = task.depends.as_deref().unwrap_or(&[])
+                .iter()
+                .map(|d| yaml_to_canonical.get(d).cloned().unwrap_or_else(|| d.clone()))
+                .collect();
+            let depends_json = serde_json::to_string(&canonical_deps)
                 .unwrap_or_else(|_| "[]".to_string());
             tx.execute(
                 "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)

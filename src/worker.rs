@@ -504,7 +504,10 @@ pub fn run_worker_with_phases(
                 }
                 _ => {}
             }
-            let deps: Vec<String> = serde_json::from_str(&dt.depends).unwrap_or_default();
+            let raw_deps: Vec<String> = serde_json::from_str(&dt.depends).unwrap_or_default();
+            let deps: Vec<String> = raw_deps.iter()
+                .map(|d| canonical_to_yaml.get(d).cloned().unwrap_or_else(|| d.clone()))
+                .collect();
             if !deps.is_empty() {
                 db_depends.insert(yaml_id.clone(), deps);
             }
