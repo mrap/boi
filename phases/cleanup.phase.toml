@@ -1,0 +1,9 @@
+name = "cleanup"
+description = "Remove spec worktree and delete branch (deterministic, no Claude)"
+completion_handler = "builtin:cleanup"
+
+[phase]
+level = "spec"
+
+[worker]
+runtime = "deterministic"

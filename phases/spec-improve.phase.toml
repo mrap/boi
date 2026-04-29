@@ -1,0 +1,26 @@
+name = "spec-improve"
+description = "Improve spec quality in response to critique feedback, then requeue for re-critique"
+
+[phase]
+name = "spec-improve"
+description = "Improve spec quality in response to critique feedback"
+level = "spec"
+timeout_minutes = 3
+can_add_tasks = false
+can_fail_spec = false
+requires_claude = true
+
+[worker]
+runtime = "claude"
+prompt_template = "templates/spec-improve-prompt.md"
+effort = "medium"
+timeout = 180
+
+[completion]
+approve_signal = "## Spec Improved"
+on_approve = "requeue:spec-critique"
+on_crash = "retry"
+
+[hooks]
+pre = []
+post = []

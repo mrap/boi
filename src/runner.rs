@@ -1,3 +1,4 @@
+use crate::builtins::{self, BuiltinContext};
 use crate::phases::{PhaseConfig, Verdict};
 use crate::spec::BoiTask;
 use crate::telemetry::{LogLevel, Telemetry};
@@ -36,11 +37,15 @@ pub trait PhaseRunner: Send + Sync {
     }
 }
 
-/// Production phase runner that spawns claude for requires_claude phases
-/// and runs verify commands for non-claude phases.
+/// Production phase runner that spawns claude for requires_claude phases,
+/// runs verify commands for non-claude phases, and dispatches deterministic
+/// builtin handlers without any Claude cold-start.
 pub struct ClaudePhaseRunner {
     pub telemetry: Telemetry,
     pub claude_bin: String,
+    /// Source repo path for deterministic builtins that need to merge/cleanup.
+    /// Empty string disables merge/cleanup builtins.
+    pub repo_path: String,
 }
 
 impl ClaudePhaseRunner {
@@ -48,7 +53,13 @@ impl ClaudePhaseRunner {
         ClaudePhaseRunner {
             telemetry,
             claude_bin,
+            repo_path: String::new(),
         }
+    }
+
+    pub fn with_repo_path(mut self, repo_path: impl Into<String>) -> Self {
+        self.repo_path = repo_path.into();
+        self
     }
 }
 
@@ -65,6 +76,11 @@ impl ClaudePhaseRunner {
         spec_id: Option<&str>,
         vars: &std::collections::HashMap<String, String>,
     ) -> (Verdict, String) {
+        // Deterministic phases: skip Claude entirely, run a registered builtin handler.
+        if phase.runtime.as_deref() == Some("deterministic") {
+            return (self.run_deterministic_phase(phase, task, spec_id), String::new());
+        }
+
         if !phase.requires_claude {
             return (self.run_verify_phase(phase, task, worktree_path, timeout_secs, spec_id), String::new());
         }
@@ -215,6 +231,66 @@ impl PhaseRunner for ClaudePhaseRunner {
 }
 
 impl ClaudePhaseRunner {
+    fn run_deterministic_phase(
+        &self,
+        phase: &PhaseConfig,
+        task: Option<&BoiTask>,
+        spec_id: Option<&str>,
+    ) -> Verdict {
+        let handler = match phase.completion_handler.as_deref() {
+            Some(h) => h,
+            None => {
+                self.telemetry.emit(
+                    "boi.builtin.error",
+                    LogLevel::Error,
+                    &json!({
+                        "phase": phase.name,
+                        "message": "deterministic phase has no completion_handler",
+                    }),
+                );
+                return Verdict::Done {
+                    success: false,
+                    reason: format!("phase '{}' is deterministic but has no completion_handler", phase.name),
+                };
+            }
+        };
+
+        let sid = spec_id.unwrap_or("");
+        let task_title = task.map(|t| t.title.as_str()).unwrap_or("");
+
+        let ctx = BuiltinContext {
+            spec_id: sid,
+            task_title,
+            repo_path: &self.repo_path,
+        };
+
+        self.telemetry.emit(
+            "boi.builtin.run",
+            LogLevel::Debug,
+            &json!({
+                "phase": phase.name,
+                "handler": handler,
+                "spec_id": sid,
+                "message": format!("running builtin {}", handler),
+            }),
+        );
+
+        let result = builtins::run_builtin(handler, &ctx);
+
+        self.telemetry.emit(
+            "boi.builtin.result",
+            LogLevel::Debug,
+            &json!({
+                "phase": phase.name,
+                "handler": handler,
+                "spec_id": sid,
+                "result": format!("{:?}", result),
+            }),
+        );
+
+        result.to_verdict()
+    }
+
     fn run_verify_phase(
         &self,
         _phase: &PhaseConfig,
@@ -402,6 +478,8 @@ mod tests {
             can_add_tasks: false,
             can_fail_spec: false,
             requires_claude,
+            runtime: None,
+            completion_handler: None,
             approve_signal: Some("## Approved".into()),
             reject_signal: Some("[REJECT]".into()),
             on_approve: Some("next".into()),

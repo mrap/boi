@@ -14,7 +14,7 @@ Use `.yaml` or `.yml` extension. BOI detects format by extension:
 | Field | Required | Type | Description |
 |-------|----------|------|-------------|
 | `title` | Yes | string | Human-readable spec title |
-| `mode` | Yes | string | Execution mode: `execute`, `generate`, `challenge`, `discover` |
+| `mode` | Yes | string | Execution mode: `execute`, `generate`, `challenge`, `discover`, `v2` |
 | `context` | No | string | Free-text background information for workers |
 | `workspace` | No | string | Pin spec to a specific worktree path |
 | `blocked_by` | No | list of strings | Spec IDs this spec depends on (e.g. `[SA7F3, SF2B1]`) |
@@ -77,7 +77,7 @@ A task with `depends` is skipped until all listed tasks are `DONE`. Circular dep
 
 ```yaml
 title: string           # required
-mode: execute           # required: execute | generate | challenge | discover
+mode: execute           # required: execute | generate | challenge | discover | v2
 context: |              # optional, free text
   Multi-line context
   about the spec.
