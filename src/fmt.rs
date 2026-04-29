@@ -66,6 +66,10 @@ pub fn elapsed_since(ts: &str) -> String {
 }
 
 pub fn term_width() -> usize {
+    // SAFETY: `ws` is zeroed and passed by mutable reference to `ioctl`. File descriptor 1
+    // (stdout) is always valid in a running process. `TIOCGWINSZ` only reads terminal
+    // dimensions into the provided `winsize` struct; it cannot cause UB. On failure (e.g.
+    // stdout is not a terminal), we fall back to 110 columns.
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
         if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
@@ -96,6 +100,9 @@ pub fn display_width(s: &str) -> usize {
 }
 
 pub fn is_pid_alive(pid: u32) -> bool {
+    // SAFETY: `kill(pid, 0)` is a POSIX existence check. Signal 0 is never delivered;
+    // it only tests whether the caller has permission to signal `pid` and the process
+    // exists. The `pid as i32` cast is safe because valid PIDs fit in i32.
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
