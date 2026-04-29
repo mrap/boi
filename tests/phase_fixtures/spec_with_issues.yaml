@@ -1,0 +1,58 @@
+title: "Broken data pipeline"
+mode: execute
+context: |
+  Process CSV files and store results in a database.
+  This fixture has intentional problems for testing spec-review improvement.
+
+# INTENTIONAL ISSUES IN THIS FIXTURE:
+# 1. t-1: Missing verify command — no way to confirm the work is done
+# 2. t-2: Vague spec — "make it fast" is not actionable
+# 3. t-3: Bad dependency — depends on t-99 which does not exist
+# 4. t-4: Verify command is a no-op (echo ok proves nothing)
+# 5. t-1 spec: no file paths, no function signatures, pure narrative
+
+tasks:
+  - id: t-1
+    title: "Set up CSV ingestion"
+    status: PENDING
+    spec: |
+      Write some code to read CSV files and process them.
+      Make sure it handles errors and works well.
+    # ISSUE: no verify field at all
+
+  - id: t-2
+    title: "Optimize database writes"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Make the database writes faster. Should be good performance.
+      Use batching or something like that if needed.
+    verify: |
+      echo "ok"
+
+  - id: t-3
+    title: "Add reporting module"
+    status: PENDING
+    depends: [t-99]
+    spec: |
+      Create a reporting module that generates summary statistics
+      from the processed data. Include counts, averages, and totals.
+
+      File: src/reporting.py
+      Function: generate_summary(db_path: str) -> dict
+    verify: |
+      python3 -c "from src.reporting import generate_summary; print('PASS')"
+
+  - id: t-4
+    title: "Write integration test"
+    status: PENDING
+    depends: [t-1, t-2, t-3]
+    spec: |
+      Write an integration test that runs the full pipeline on a
+      sample CSV file and verifies the output matches expected values.
+
+      Use tests/fixtures/sample.csv as input.
+      Expected row count: 3
+      Expected total_value: 150.0
+    verify: |
+      true

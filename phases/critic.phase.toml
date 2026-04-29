@@ -1,6 +1,9 @@
 name = "critic"
 description = "Review completed spec for quality issues. Add [CRITIC] tasks if problems found."
 
+[phase]
+level = "spec"
+
 [worker]
 runtime = "claude"
 model = "claude-sonnet-4-6"

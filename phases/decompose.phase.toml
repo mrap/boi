@@ -2,6 +2,9 @@ name = "decompose"
 description = "Decompose a high-level spec into actionable tasks"
 completion_handler = "builtin:decompose"
 
+[phase]
+level = "task"
+
 [worker]
 runtime = "claude"
 model = "claude-opus-4-6"

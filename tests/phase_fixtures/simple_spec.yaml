@@ -1,0 +1,31 @@
+title: "Simple greeting utility"
+mode: execute
+context: |
+  Add a greeting utility module to a minimal Python project.
+  This is a fixture for testing spec-level phases (spec-review, plan-critique).
+
+tasks:
+  - id: t-1
+    title: "Create greeting module"
+    status: PENDING
+    spec: |
+      Create src/greet.py with a single function:
+        def greet(name: str) -> str:
+          return f"Hello, {name}!"
+
+      The file must be importable with no external dependencies.
+    verify: |
+      python3 -c "from src.greet import greet; assert greet('World') == 'Hello, World!'; print('PASS')"
+
+  - id: t-2
+    title: "Add unit test for greeting module"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create tests/test_greet.py with pytest tests covering:
+      1. greet("World") == "Hello, World!"
+      2. greet("") == "Hello, !"  (empty string edge case)
+      3. greet("Alice") == "Hello, Alice!"
+    verify: |
+      python3 -m pytest tests/test_greet.py -v 2>&1 | grep -q "3 passed"
+      echo "PASS"

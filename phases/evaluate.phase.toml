@@ -2,6 +2,9 @@ name = "evaluate"
 description = "Evaluate spec completion and determine next steps"
 completion_handler = "builtin:evaluate"
 
+[phase]
+level = "spec"
+
 [worker]
 runtime = "claude"
 model = "claude-sonnet-4-6"

@@ -1,3 +1,4 @@
+use boi::cli::bench::cmd_bench;
 use boi::cli::cancel::cmd_cancel;
 use boi::cli::config_cmd::cmd_config;
 use boi::cli::daemon::{cmd_daemon, cmd_restart, cmd_start, cmd_stop};
@@ -136,6 +137,18 @@ enum Commands {
     Doctor,
     /// Print version
     Version,
+    /// Compare two pipeline configs on the same spec
+    Bench {
+        /// Path to the spec file
+        #[arg(long)]
+        spec: PathBuf,
+        /// Pipeline A: comma-separated task phases (e.g. "execute,task-verify")
+        #[arg(long = "a")]
+        pipeline_a: String,
+        /// Pipeline B: comma-separated task phases (e.g. "execute,code-review,task-verify")
+        #[arg(long = "b")]
+        pipeline_b: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -278,6 +291,9 @@ fn main() {
         }
         Commands::Version => {
             println!("boi {}", env!("CARGO_PKG_VERSION"));
+        }
+        Commands::Bench { spec, pipeline_a, pipeline_b } => {
+            cmd_bench(&spec, &pipeline_a, &pipeline_b, db_str);
         }
     }
 }

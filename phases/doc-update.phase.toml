@@ -1,6 +1,9 @@
 name = "doc-update"
 description = "Update documentation affected by code changes"
 
+[phase]
+level = "task"
+
 [worker]
 runtime = "claude"
 model = "claude-sonnet-4-6"

@@ -1,10 +1,10 @@
 name = "task-verify"
-description = "Review completed work for quality, correctness, and spec compliance"
+description = "Run verify commands to confirm task work is correct"
 completion_handler = "builtin:task-verify"
 
 [phase]
 name = "task-verify"
-description = "Run verify commands to confirm task work is correct"
+level = "task"
 requires_claude = false
 
 [worker]

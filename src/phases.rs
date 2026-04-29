@@ -115,6 +115,8 @@ struct PhaseSection {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
+    level: Option<PhaseLevel>,
+    #[serde(default)]
     timeout_minutes: Option<u32>,
     #[serde(default)]
     can_add_tasks: Option<bool>,
@@ -194,10 +196,10 @@ impl PhaseConfig {
             .phase.as_ref().and_then(|p| p.timeout_minutes)
             .or_else(|| toml.worker.as_ref().and_then(|w| w.timeout.map(|t| t / 60)));
 
-        // Derive level from name: spec-level phases operate on the whole spec
-        let level = toml.phase.as_ref().and(None).unwrap_or_else(|| {
-            derive_level(&name)
-        });
+        // Read level from [phase] section; fall back to name-based derivation for
+        // user-created phases that don't specify level.
+        let level = toml.phase.as_ref().and_then(|p| p.level)
+            .unwrap_or_else(|| derive_level(&name));
 
         // Derive can_add_tasks: explicit [phase] setting wins, else derive from completion_handler
         let can_add_tasks = toml
@@ -1389,5 +1391,116 @@ approve_signal = ""
             }
             other => panic!("Expected Done with success=false, got {:?}", other),
         }
+    }
+
+    // --- Fixture-based tests (t-4) ---
+
+    #[test]
+    fn test_spec_review_finds_issues() {
+        let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/phase_fixtures");
+        let spec_content = fs::read_to_string(fixtures_dir.join("spec_with_issues.yaml"))
+            .expect("spec_with_issues.yaml must exist");
+
+        let registry = test_registry();
+        let spec_review = registry.get("spec-review").expect("spec-review phase must exist");
+
+        let prompt = build_phase_prompt(spec_review, &spec_content, None, &std::collections::HashMap::new());
+
+        assert!(prompt.contains("Set up CSV ingestion"), "prompt must contain task title from fixture");
+        assert!(prompt.contains("Optimize database writes"), "prompt must contain second task title");
+        assert!(
+            prompt.to_lowercase().contains("verify"),
+            "spec-review prompt must reference verify command validation"
+        );
+    }
+
+    #[test]
+    fn test_phase_level_from_toml() {
+        let registry = PhaseRegistry::from_dir(&repo_root().join("phases"));
+
+        let spec_phases = ["spec-review", "plan-critique", "critic", "evaluate", "review"];
+        for name in &spec_phases {
+            let phase = registry.get(name).unwrap_or_else(|| panic!("phase '{name}' not found"));
+            assert_eq!(
+                phase.level,
+                PhaseLevel::Spec,
+                "phase '{name}' should be Spec-level (from TOML level field)"
+            );
+        }
+
+        let task_phases = ["execute", "task-verify", "code-review", "doc-update", "decompose"];
+        for name in &task_phases {
+            let phase = registry.get(name).unwrap_or_else(|| panic!("phase '{name}' not found"));
+            assert_eq!(
+                phase.level,
+                PhaseLevel::Task,
+                "phase '{name}' should be Task-level (from TOML level field)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipeline_contains_all_levels() {
+        let registry = test_registry();
+
+        for mode in &["execute", "challenge", "discover", "generate"] {
+            let pipeline = fallback_pipeline(mode);
+
+            let has_spec_phase = pipeline.spec_phases.iter().any(|name| {
+                registry.get(name).map(|p| p.level == PhaseLevel::Spec).unwrap_or(false)
+            });
+            assert!(
+                has_spec_phase,
+                "mode '{mode}' pipeline must include at least one Spec-level phase in spec_phases"
+            );
+
+            let has_task_phase = pipeline.task_phases.iter().any(|name| {
+                registry.get(name).map(|p| p.level == PhaseLevel::Task).unwrap_or(false)
+            });
+            assert!(
+                has_task_phase,
+                "mode '{mode}' pipeline must include at least one Task-level phase in task_phases"
+            );
+        }
+    }
+
+    #[test]
+    fn test_user_phase_preserves_level() {
+        let dir = test_utils::test_dir("user-phase-level");
+
+        let toml_content = r#"
+name = "my-custom-phase"
+description = "Custom phase with explicit spec level"
+
+[phase]
+name = "my-custom-phase"
+level = "spec"
+can_add_tasks = false
+can_fail_spec = false
+requires_claude = true
+
+[prompt]
+template = "Do something at the spec level."
+"#;
+        fs::write(dir.join("my-custom-phase.phase.toml"), toml_content).unwrap();
+
+        let mut registry = test_registry();
+        registry.load_user_phases(&dir);
+
+        let phase = registry.get("my-custom-phase").expect("user phase must be loaded");
+        assert_eq!(
+            phase.level,
+            PhaseLevel::Spec,
+            "user phase with level='spec' in TOML must load as PhaseLevel::Spec"
+        );
+
+        // The name alone would derive to Task — this confirms TOML field wins over name derivation
+        assert_eq!(
+            derive_level("my-custom-phase"),
+            PhaseLevel::Task,
+            "name-derived level for 'my-custom-phase' should be Task"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

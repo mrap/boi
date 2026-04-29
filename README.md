@@ -96,6 +96,13 @@ name = "my-phase"                        # optional; derived from filename if om
 description = "What this phase does"     # optional
 completion_handler = "builtin:execute"   # optional — use built-in routing logic
 
+# Phase metadata
+[phase]
+level = "task"                           # "spec" | "task"; falls back to name-based derivation if omitted
+timeout_minutes = 5                      # optional; overrides [worker].timeout
+can_add_tasks = false                    # whether this phase may append tasks to the spec
+can_fail_spec = false                    # whether a rejection from this phase marks the spec failed
+
 # Worker configuration
 [worker]
 prompt_template = "templates/my-prompt.md"  # required — path to prompt template
@@ -316,6 +323,7 @@ boi critic status | run | enable | disable | checks
 boi spec <queue-id> [add|skip|next|block|edit|deps]
 boi dep add|remove|set|clear|show|viz|check
 boi project create|list|status|context|delete
+boi bench --spec FILE --a PIPELINE --b PIPELINE  Compare two pipeline configs on the same spec
 ```
 
 **`dispatch` options:**
