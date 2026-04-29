@@ -69,6 +69,7 @@ pub fn run_verify(verify_cmd: &str, dir: &str) -> bool {
 pub struct ClaudeResult {
     pub success: bool,
     pub output: String,
+    pub stderr: String,
     pub startup_ms: u64,
     pub inference_ms: u64,
     pub total_ms: u64,
@@ -96,18 +97,23 @@ pub fn spawn_claude(
     prompt: &str,
     worktree_path: &str,
     timeout_secs: u64,
+    model: Option<&str>,
     spec_id: Option<&str>,
 ) -> Result<ClaudeResult, Box<dyn std::error::Error>> {
     use std::io::Read;
 
     let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
-    let args = vec![
-        "-p", prompt,
-        "--dangerously-skip-permissions",
-        "--no-session-persistence",
-        "--setting-sources", "user",
+    let mut args = vec![
+        "-p".to_string(), prompt.to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "--no-session-persistence".to_string(),
+        "--setting-sources".to_string(), "user".to_string(),
     ];
-    let flags: Vec<&str> = args.iter().filter(|a| a.starts_with('-')).copied().collect();
+    if let Some(m) = model {
+        args.push("--model".to_string());
+        args.push(m.to_string());
+    }
+    let flags: Vec<&str> = args.iter().filter(|a| a.starts_with('-')).map(|s| s.as_str()).collect();
     boi_log!("spawning claude\n  bin:    {}\n  flags:  {}\n  cwd:    {}\n  prompt: {} chars",
         claude_bin, flags.join(" "), worktree_path, prompt.len());
     let mut child = Command::new(&claude_bin)
@@ -132,6 +138,13 @@ pub fn spawn_claude(
 
     let spawn_time = Instant::now();
     let stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let stderr_pipe = child.stderr.take().expect("stderr was piped");
+
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = std::io::BufReader::new(stderr_pipe).read_to_string(&mut buf);
+        buf
+    });
 
     let reader_handle = std::thread::spawn(move || {
         let mut reader = std::io::BufReader::new(stdout_pipe);
@@ -175,9 +188,14 @@ pub fn spawn_claude(
 
     if timed_out {
         let _ = reader_handle.join();
+        let stderr_output = stderr_handle.join().unwrap_or_default();
+        if !stderr_output.is_empty() {
+            boi_log!("claude stderr (timeout):\n{}", stderr_output);
+        }
         return Ok(ClaudeResult {
             success: false,
             output: "timeout".to_string(),
+            stderr: stderr_output,
             startup_ms: 0,
             inference_ms: 0,
             total_ms,
@@ -186,6 +204,11 @@ pub fn spawn_claude(
 
     let status = child.wait()?;
     let (first_byte_instant, output) = reader_handle.join().unwrap_or((None, String::new()));
+    let stderr_output = stderr_handle.join().unwrap_or_default();
+
+    if !stderr_output.is_empty() {
+        boi_log!("claude stderr:\n{}", stderr_output);
+    }
 
     let startup_ms = first_byte_instant
         .map(|t| t.duration_since(spawn_time).as_millis() as u64)
@@ -195,6 +218,7 @@ pub fn spawn_claude(
     Ok(ClaudeResult {
         success: status.success(),
         output,
+        stderr: stderr_output,
         startup_ms,
         inference_ms,
         total_ms,
@@ -1123,15 +1147,61 @@ pub fn run_worker_with_phases(
 
             WorkerState::Cleanup { success } => {
                 boi_log!("state: Cleanup {{ success: {} }}", success);
-                if success || config.cleanup_on_failure {
+                if success {
+                    if let Some(ws) = &boi_spec.workspace {
+                        let commit_msg = format!("boi({}): completed spec tasks", spec_id);
+                        match crate::worktree::commit_changes(spec_id, &commit_msg) {
+                            Ok(true) => {
+                                boi_log!(" committed changes in worktree");
+                                match crate::worktree::merge_back(spec_id, ws) {
+                                    Ok(output) => {
+                                        boi_log!(" merged worktree branch into source repo");
+                                        telemetry.emit("boi.worktree.merged", LogLevel::Info, &json!({
+                                            "spec_id": spec_id,
+                                            "message": format!("merged boi/{} into source repo", spec_id),
+                                            "merge_output": output.chars().take(200).collect::<String>(),
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        boi_log!(" merge failed: {} — worktree preserved", e);
+                                        telemetry.emit("boi.worktree.merge_failed", LogLevel::Error, &json!({
+                                            "spec_id": spec_id,
+                                            "error": e.to_string(),
+                                        }));
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(false) => {
+                                boi_log!(" no changes to commit in worktree");
+                            }
+                            Err(e) => {
+                                boi_log!(" commit failed: {} — worktree preserved", e);
+                                telemetry.emit("boi.worktree.commit_failed", LogLevel::Error, &json!({
+                                    "spec_id": spec_id,
+                                    "error": e.to_string(),
+                                }));
+                                break;
+                            }
+                        }
+                    }
                     boi_log!("state: Cleanup — removing worktree for spec {}", spec_id);
                     let _ = crate::worktree::cleanup(spec_id);
-                    let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
-                    if tmp.exists() {
-                        let _ = std::fs::remove_dir_all(&tmp);
+                    if let Some(ws) = &boi_spec.workspace {
+                        let _ = crate::worktree::delete_branch(spec_id, ws);
+                    }
+                } else if config.cleanup_on_failure {
+                    boi_log!("state: Cleanup — removing worktree for failed spec {}", spec_id);
+                    let _ = crate::worktree::cleanup(spec_id);
+                    if let Some(ws) = &boi_spec.workspace {
+                        let _ = crate::worktree::delete_branch(spec_id, ws);
                     }
                 } else {
                     boi_log!(" preserving worktree for failed spec {}", spec_id);
+                }
+                let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
+                if tmp.exists() {
+                    let _ = std::fs::remove_dir_all(&tmp);
                 }
                 break;
             }
@@ -1363,11 +1433,22 @@ mod tests {
         assert!(!run_verify("exit 1", "/tmp"));
     }
 
+    fn mock_claude_with_stderr(exit_code: u8, stdout_msg: &str, stderr_msg: &str, suffix: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("boi_mock_claude_{}", suffix));
+        std::fs::write(&path, format!(
+            "#!/bin/sh\necho '{}'\necho '{}' >&2\nexit {}\n",
+            stdout_msg, stderr_msg, exit_code
+        )).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     #[test]
     fn test_spawn_claude_exit_0() {
         let script = mock_claude(0, "exit0");
         with_claude_bin(script.to_str().unwrap(), || {
-            let cr = spawn_claude("prompt", "/tmp", 10, None).unwrap();
+            let cr = spawn_claude("prompt", "/tmp", 10, None, None).unwrap();
             assert!(cr.success);
             assert!(cr.total_ms > 0 || cr.startup_ms == 0);
         });
@@ -1377,8 +1458,29 @@ mod tests {
     fn test_spawn_claude_exit_1() {
         let script = mock_claude(1, "exit1");
         with_claude_bin(script.to_str().unwrap(), || {
-            let cr = spawn_claude("prompt", "/tmp", 10, None).unwrap();
+            let cr = spawn_claude("prompt", "/tmp", 10, None, None).unwrap();
             assert!(!cr.success);
+        });
+    }
+
+    #[test]
+    fn test_spawn_claude_captures_stderr() {
+        let script = mock_claude_with_stderr(1, "stdout-ok", "ERROR: something broke", "stderr_capture");
+        with_claude_bin(script.to_str().unwrap(), || {
+            let cr = spawn_claude("prompt", "/tmp", 10, None, None).unwrap();
+            assert!(!cr.success);
+            assert!(cr.stderr.contains("ERROR: something broke"),
+                "stderr should be captured, got: '{}'", cr.stderr);
+        });
+    }
+
+    #[test]
+    fn test_spawn_claude_stderr_empty_on_success() {
+        let script = mock_claude(0, "stderr_empty");
+        with_claude_bin(script.to_str().unwrap(), || {
+            let cr = spawn_claude("prompt", "/tmp", 10, None, None).unwrap();
+            assert!(cr.success);
+            assert!(cr.stderr.is_empty(), "stderr should be empty on clean exit");
         });
     }
 

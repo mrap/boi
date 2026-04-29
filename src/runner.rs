@@ -79,7 +79,7 @@ impl PhaseRunner for ClaudePhaseRunner {
             "message": "spawning claude...",
         }));
 
-        let result = worker::spawn_claude(&prompt, worktree_path, timeout_secs, spec_id);
+        let result = worker::spawn_claude(&prompt, worktree_path, timeout_secs, phase.model.as_deref(), spec_id);
 
         if let Ok(ref cr) = result {
             let startup_s = cr.startup_ms as f64 / 1000.0;
@@ -101,6 +101,8 @@ impl PhaseRunner for ClaudePhaseRunner {
                     "phase": phase.name,
                     "exit_code": 0,
                     "output_length": cr.output.len(),
+                    "stderr_length": cr.stderr.len(),
+                    "stderr_preview": cr.stderr.chars().take(500).collect::<String>(),
                     "startup_ms": cr.startup_ms,
                     "inference_ms": cr.inference_ms,
                     "total_ms": cr.total_ms,
@@ -112,17 +114,22 @@ impl PhaseRunner for ClaudePhaseRunner {
             Ok(ref cr) => {
                 let inference_s = cr.inference_ms as f64 / 1000.0;
                 let total_s = cr.total_ms as f64 / 1000.0;
-                self.telemetry.emit("boi.claude.exit", LogLevel::Debug, &json!({
+                self.telemetry.emit("boi.claude.exit", LogLevel::Error, &json!({
                     "spec_id": spec_id_hint,
                     "task_id": task_id,
                     "phase": phase.name,
                     "exit_code": 1,
                     "output_length": cr.output.len(),
+                    "stderr_length": cr.stderr.len(),
+                    "stderr_preview": cr.stderr.chars().take(500).collect::<String>(),
                     "startup_ms": cr.startup_ms,
                     "inference_ms": cr.inference_ms,
                     "total_ms": cr.total_ms,
-                    "message": format!("claude exit non-zero, {} chars ({:.1}s inference, {:.1}s total)",
-                        cr.output.len(), inference_s, total_s),
+                    "message": format!("claude exit non-zero, {} chars ({:.1}s inference, {:.1}s total){}",
+                        cr.output.len(), inference_s, total_s,
+                        if cr.stderr.is_empty() { String::new() } else {
+                            format!("\n  stderr: {}", cr.stderr.chars().take(200).collect::<String>())
+                        }),
                 }));
                 if cr.output == "timeout" {
                     Verdict::Done {
@@ -215,7 +222,7 @@ impl ClaudePhaseRunner {
                 "message": format!("verify_prompt: spawning claude ({} chars)", verify_prompt.len()),
             }));
 
-            let result = worker::spawn_claude(verify_prompt, worktree_path, timeout_secs, spec_id);
+            let result = worker::spawn_claude(verify_prompt, worktree_path, timeout_secs, None, spec_id);
 
             match result {
                 Ok(ref cr) if cr.success => {
