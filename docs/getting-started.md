@@ -143,6 +143,7 @@ A tmux-friendly compact view, good for small panes.
 ```bash
 boi log q-001              # tail latest iteration
 boi log q-001 --full       # full output
+boi log q-001 --follow     # live-follow daemon log filtered to this spec
 ```
 
 ### Iteration breakdown

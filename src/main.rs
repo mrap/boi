@@ -95,6 +95,9 @@ enum Commands {
         /// Show debug-level events (claude output, verify results)
         #[arg(long)]
         debug: bool,
+        /// Tail the daemon log file filtered to this spec (live follow)
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
     /// Cancel a queued or running spec
     Cancel { spec_id: String },
@@ -178,9 +181,7 @@ fn main() {
     let db_path = cfg.db_path();
     let db_str = db_path.to_str().unwrap_or("/tmp/boi.db");
 
-    let hook_cfg = hooks::HookConfig {
-        hooks: cfg.hooks.clone(),
-    };
+    let hook_cfg = hooks::load_user_or_default();
 
     match cli.command {
         Commands::Dispatch {
@@ -225,8 +226,8 @@ fn main() {
                 cmd_status(spec_id.as_deref(), all, db_str);
             }
         }
-        Commands::Log { spec_id, full, debug } => {
-            cmd_log(&spec_id, full, debug, db_str);
+        Commands::Log { spec_id, full, debug, follow } => {
+            cmd_log(&spec_id, full, debug, follow, db_str, &cfg);
         }
         Commands::Cancel { spec_id } => {
             cmd_cancel(&spec_id, db_str, &hook_cfg);
