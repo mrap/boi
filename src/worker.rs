@@ -59,14 +59,26 @@ pub fn run_verify(verify_cmd: &str, dir: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Spawn claude with the task prompt. Returns (success, stdout).
-/// Respects timeout: kills the process and returns (false, "timeout") if exceeded.
+pub struct ClaudeResult {
+    pub success: bool,
+    pub output: String,
+    pub startup_ms: u64,
+    pub inference_ms: u64,
+    pub total_ms: u64,
+}
+
+/// Spawn claude with the task prompt. Returns ClaudeResult with timing data.
+/// startup_ms = time from spawn to first stdout byte.
+/// inference_ms = time from first byte to process exit.
+/// Respects timeout: kills the process and returns failure if exceeded.
 /// Override the claude binary via CLAUDE_BIN env var (useful for tests).
 pub fn spawn_claude(
     prompt: &str,
     worktree_path: &str,
     timeout_secs: u64,
-) -> Result<(bool, String), Box<dyn std::error::Error>> {
+) -> Result<ClaudeResult, Box<dyn std::error::Error>> {
+    use std::io::Read;
+
     let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
     let mut child = Command::new(&claude_bin)
         .args(["-p", prompt, "--dangerously-skip-permissions"])
@@ -76,24 +88,70 @@ pub fn spawn_claude(
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let start = Instant::now();
+    let spawn_time = Instant::now();
+    let stdout_pipe = child.stdout.take().expect("stdout was piped");
+
+    let reader_handle = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout_pipe);
+        let mut first_byte = [0u8; 1];
+        match reader.read_exact(&mut first_byte) {
+            Ok(()) => {
+                let first_byte_time = Instant::now();
+                let mut rest = Vec::new();
+                let _ = reader.read_to_end(&mut rest);
+                let mut buf = Vec::with_capacity(1 + rest.len());
+                buf.push(first_byte[0]);
+                buf.extend(rest);
+                (Some(first_byte_time), String::from_utf8_lossy(&buf).to_string())
+            }
+            Err(_) => (None, String::new()),
+        }
+    });
+
+    let mut timed_out = false;
     loop {
         match child.try_wait()? {
             Some(_) => break,
             None => {
-                if start.elapsed().as_secs() >= timeout_secs {
+                if spawn_time.elapsed().as_secs() >= timeout_secs {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Ok((false, "timeout".to_string()));
+                    timed_out = true;
+                    break;
                 }
-                // Claude sessions run for minutes; 2s poll is responsive enough
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
     }
-    let output = child.wait_with_output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    Ok((output.status.success(), stdout))
+
+    let total_ms = spawn_time.elapsed().as_millis() as u64;
+
+    if timed_out {
+        let _ = reader_handle.join();
+        return Ok(ClaudeResult {
+            success: false,
+            output: "timeout".to_string(),
+            startup_ms: 0,
+            inference_ms: 0,
+            total_ms,
+        });
+    }
+
+    let status = child.wait()?;
+    let (first_byte_instant, output) = reader_handle.join().unwrap_or((None, String::new()));
+
+    let startup_ms = first_byte_instant
+        .map(|t| t.duration_since(spawn_time).as_millis() as u64)
+        .unwrap_or(total_ms);
+    let inference_ms = total_ms.saturating_sub(startup_ms);
+
+    Ok(ClaudeResult {
+        success: status.success(),
+        output,
+        startup_ms,
+        inference_ms,
+        total_ms,
+    })
 }
 
 fn record_phase_run(
@@ -1145,6 +1203,7 @@ mod tests {
             depends: None,
             spec: Some("Run cargo init".to_string()),
             verify: Some("test -f Cargo.toml".to_string()),
+            verify_prompt: None,
             phases: None,
         };
         let prompt = build_prompt("title: Test\ntasks: []", &task);
@@ -1173,8 +1232,9 @@ mod tests {
     fn test_spawn_claude_exit_0() {
         let script = mock_claude(0, "exit0");
         with_claude_bin(script.to_str().unwrap(), || {
-            let (ok, _) = spawn_claude("prompt", "/tmp", 10).unwrap();
-            assert!(ok);
+            let cr = spawn_claude("prompt", "/tmp", 10).unwrap();
+            assert!(cr.success);
+            assert!(cr.total_ms > 0 || cr.startup_ms == 0);
         });
     }
 
@@ -1182,8 +1242,8 @@ mod tests {
     fn test_spawn_claude_exit_1() {
         let script = mock_claude(1, "exit1");
         with_claude_bin(script.to_str().unwrap(), || {
-            let (ok, _) = spawn_claude("prompt", "/tmp", 10).unwrap();
-            assert!(!ok);
+            let cr = spawn_claude("prompt", "/tmp", 10).unwrap();
+            assert!(!cr.success);
         });
     }
 

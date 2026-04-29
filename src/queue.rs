@@ -989,6 +989,7 @@ mod tests {
             depends: None,
             spec: None,
             verify: None,
+            verify_prompt: None,
             phases: None,
         }
     }
