@@ -37,7 +37,7 @@ pub fn create(spec_id: &str, repo_path: &str) -> Result<PathBuf, Box<dyn std::er
         .output();
 
     let output = Command::new("git")
-        .args(["worktree", "add", "-b", &branch, dest.to_str().unwrap()])
+        .args(["worktree", "add", "-b", &branch, dest.to_str().ok_or("worktree dest path is not valid UTF-8")?])
         .current_dir(repo_path)
         .output()?;
 
@@ -115,7 +115,7 @@ pub fn cleanup(spec_id: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     if dest.exists() {
         let output = Command::new("git")
-            .args(["worktree", "remove", "--force", dest.to_str().unwrap()])
+            .args(["worktree", "remove", "--force", dest.to_str().ok_or("worktree dest path is not valid UTF-8")?])
             .output()?;
 
         if !output.status.success() {

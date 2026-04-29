@@ -6,6 +6,7 @@ use serde_json::json;
 use std::time::Instant;
 
 /// Trait for running a single phase. Allows mocking in tests.
+#[allow(clippy::too_many_arguments)]
 pub trait PhaseRunner: Send + Sync {
     /// Execute a phase and return the outcome.
     ///
@@ -55,7 +56,7 @@ impl PhaseRunner for ClaudePhaseRunner {
         }
 
         let task_id = task.map(|t| t.id.as_str());
-        let spec_id_hint = "";
+        let spec_id_hint = spec_id.unwrap_or("");
 
         // Build the prompt
         let task_context = task.map(|t| {
@@ -181,8 +182,8 @@ impl ClaudePhaseRunner {
             None => return Verdict::Proceed,
         };
 
-        let has_verify = task.verify.as_deref().map_or(false, |c| !c.is_empty());
-        let has_verify_prompt = task.verify_prompt.as_deref().map_or(false, |p| !p.is_empty());
+        let has_verify = task.verify.as_deref().is_some_and(|c| !c.is_empty());
+        let has_verify_prompt = task.verify_prompt.as_deref().is_some_and(|p| !p.is_empty());
 
         if !has_verify && !has_verify_prompt {
             return Verdict::Proceed;
