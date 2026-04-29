@@ -1,0 +1,19 @@
+name = "doc-update"
+description = "Update documentation affected by code changes"
+
+[worker]
+runtime = "claude"
+model = "claude-sonnet-4-6"
+prompt_template = "templates/doc-update-prompt.md"
+effort = "low"
+timeout = 120
+
+[completion]
+approve_signal = "## Docs Updated"
+reject_signal = ""
+on_approve = "next"
+on_crash = "next"
+
+[hooks]
+pre = []
+post = []
