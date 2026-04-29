@@ -37,7 +37,10 @@ pub struct ClaudePhaseRunner {
 
 impl ClaudePhaseRunner {
     pub fn new(telemetry: Telemetry, claude_bin: String) -> Self {
-        ClaudePhaseRunner { telemetry, claude_bin }
+        ClaudePhaseRunner {
+            telemetry,
+            claude_bin,
+        }
     }
 }
 
@@ -69,31 +72,42 @@ impl PhaseRunner for ClaudePhaseRunner {
                 t.verify.as_deref().unwrap_or("(none)")
             )
         });
-        let prompt = crate::phases::build_phase_prompt(
-            phase,
-            spec_content,
-            task_context.as_deref(),
-            vars,
+        let prompt =
+            crate::phases::build_phase_prompt(phase, spec_content, task_context.as_deref(), vars);
+
+        self.telemetry.emit(
+            "boi.claude.spawn",
+            LogLevel::Debug,
+            &json!({
+                "spec_id": spec_id_hint,
+                "task_id": task_id,
+                "phase": phase.name,
+                "prompt_length": prompt.len(),
+                "message": "spawning claude...",
+            }),
         );
 
-        self.telemetry.emit("boi.claude.spawn", LogLevel::Debug, &json!({
-            "spec_id": spec_id_hint,
-            "task_id": task_id,
-            "phase": phase.name,
-            "prompt_length": prompt.len(),
-            "message": "spawning claude...",
-        }));
-
-        let result = worker::spawn_claude(&prompt, worktree_path, timeout_secs, phase.model.as_deref(), spec_id, &self.claude_bin);
+        let result = worker::spawn_claude(
+            &prompt,
+            worktree_path,
+            timeout_secs,
+            phase.model.as_deref(),
+            spec_id,
+            &self.claude_bin,
+        );
 
         if let Ok(ref cr) = result {
             let startup_s = cr.startup_ms as f64 / 1000.0;
-            self.telemetry.emit("boi.claude.first_output", LogLevel::Debug, &json!({
-                "spec_id": spec_id_hint,
-                "task_id": task_id,
-                "startup_ms": cr.startup_ms,
-                "message": format!("first output after {:.1}s (startup)", startup_s),
-            }));
+            self.telemetry.emit(
+                "boi.claude.first_output",
+                LogLevel::Debug,
+                &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "startup_ms": cr.startup_ms,
+                    "message": format!("first output after {:.1}s (startup)", startup_s),
+                }),
+            );
         }
 
         match result {
@@ -154,12 +168,16 @@ impl PhaseRunner for ClaudePhaseRunner {
                 }
             }
             Err(e) => {
-                self.telemetry.emit("boi.claude.error", LogLevel::Error, &json!({
-                    "spec_id": spec_id_hint,
-                    "task_id": task_id,
-                    "phase": phase.name,
-                    "message": format!("claude spawn error: {}", e),
-                }));
+                self.telemetry.emit(
+                    "boi.claude.error",
+                    LogLevel::Error,
+                    &json!({
+                        "spec_id": spec_id_hint,
+                        "task_id": task_id,
+                        "phase": phase.name,
+                        "message": format!("claude spawn error: {}", e),
+                    }),
+                );
                 Verdict::Done {
                     success: false,
                     reason: format!("Phase {} spawn error: {}", phase.name, e),
@@ -192,13 +210,20 @@ impl ClaudePhaseRunner {
 
         // Shell verify
         if has_verify {
-            let verify_cmd = task.verify.as_deref().unwrap();
+            let verify_cmd = task
+                .verify
+                .as_deref()
+                .expect("has_verify guard ensures verify is Some");
 
-            self.telemetry.emit("boi.verify.run", LogLevel::Debug, &json!({
-                "task_id": task.id,
-                "verify_cmd": verify_cmd,
-                "message": format!("cmd: {}", verify_cmd),
-            }));
+            self.telemetry.emit(
+                "boi.verify.run",
+                LogLevel::Debug,
+                &json!({
+                    "task_id": task.id,
+                    "verify_cmd": verify_cmd,
+                    "message": format!("cmd: {}", verify_cmd),
+                }),
+            );
 
             let start = Instant::now();
             let passed = worker::run_verify(verify_cmd, worktree_path);
@@ -219,7 +244,10 @@ impl ClaudePhaseRunner {
 
         // Claude verify_prompt (only reached if shell verify passed or wasn't set)
         if has_verify_prompt {
-            let verify_prompt = task.verify_prompt.as_deref().unwrap();
+            let verify_prompt = task
+                .verify_prompt
+                .as_deref()
+                .expect("has_verify_prompt guard ensures verify_prompt is Some");
 
             self.telemetry.emit("boi.verify_prompt.run", LogLevel::Debug, &json!({
                 "task_id": task.id,
@@ -227,37 +255,56 @@ impl ClaudePhaseRunner {
                 "message": format!("verify_prompt: spawning claude ({} chars)", verify_prompt.len()),
             }));
 
-            let result = worker::spawn_claude(verify_prompt, worktree_path, timeout_secs, None, spec_id, &self.claude_bin);
+            let result = worker::spawn_claude(
+                verify_prompt,
+                worktree_path,
+                timeout_secs,
+                None,
+                spec_id,
+                &self.claude_bin,
+            );
 
             match result {
                 Ok(ref cr) if cr.success => {
-                    self.telemetry.emit("boi.verify_prompt.result", LogLevel::Debug, &json!({
-                        "task_id": task.id,
-                        "passed": true,
-                        "output_length": cr.output.len(),
-                        "startup_ms": cr.startup_ms,
-                        "inference_ms": cr.inference_ms,
-                        "total_ms": cr.total_ms,
-                        "message": format!("verify_prompt passed ({}ms)", cr.total_ms),
-                    }));
+                    self.telemetry.emit(
+                        "boi.verify_prompt.result",
+                        LogLevel::Debug,
+                        &json!({
+                            "task_id": task.id,
+                            "passed": true,
+                            "output_length": cr.output.len(),
+                            "startup_ms": cr.startup_ms,
+                            "inference_ms": cr.inference_ms,
+                            "total_ms": cr.total_ms,
+                            "message": format!("verify_prompt passed ({}ms)", cr.total_ms),
+                        }),
+                    );
                 }
                 Ok(ref cr) => {
-                    self.telemetry.emit("boi.verify_prompt.result", LogLevel::Debug, &json!({
-                        "task_id": task.id,
-                        "passed": false,
-                        "output_length": cr.output.len(),
-                        "startup_ms": cr.startup_ms,
-                        "inference_ms": cr.inference_ms,
-                        "total_ms": cr.total_ms,
-                        "message": format!("verify_prompt failed ({}ms)", cr.total_ms),
-                    }));
+                    self.telemetry.emit(
+                        "boi.verify_prompt.result",
+                        LogLevel::Debug,
+                        &json!({
+                            "task_id": task.id,
+                            "passed": false,
+                            "output_length": cr.output.len(),
+                            "startup_ms": cr.startup_ms,
+                            "inference_ms": cr.inference_ms,
+                            "total_ms": cr.total_ms,
+                            "message": format!("verify_prompt failed ({}ms)", cr.total_ms),
+                        }),
+                    );
                     return Verdict::Redo { tasks: vec![] };
                 }
                 Err(e) => {
-                    self.telemetry.emit("boi.verify_prompt.error", LogLevel::Error, &json!({
-                        "task_id": task.id,
-                        "message": format!("verify_prompt spawn error: {}", e),
-                    }));
+                    self.telemetry.emit(
+                        "boi.verify_prompt.error",
+                        LogLevel::Error,
+                        &json!({
+                            "task_id": task.id,
+                            "message": format!("verify_prompt spawn error: {}", e),
+                        }),
+                    );
                     return Verdict::Redo { tasks: vec![] };
                 }
             }
@@ -317,7 +364,8 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let db = std::path::PathBuf::from(format!(
             "/tmp/boi-test-runner-{}-{}.db",
-            std::process::id(), n
+            std::process::id(),
+            n
         ));
         let _ = std::fs::remove_file(&db);
         Telemetry::new(db)
@@ -366,7 +414,15 @@ mod tests {
         let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("true");
-        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None, &std::collections::HashMap::new());
+        let outcome = runner.run_phase(
+            &phase,
+            "",
+            Some(&task),
+            "/tmp",
+            10,
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -375,11 +431,16 @@ mod tests {
         let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("false");
-        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None, &std::collections::HashMap::new());
-        assert_eq!(
-            outcome,
-            Verdict::Redo { tasks: vec![] }
+        let outcome = runner.run_phase(
+            &phase,
+            "",
+            Some(&task),
+            "/tmp",
+            10,
+            None,
+            &std::collections::HashMap::new(),
         );
+        assert_eq!(outcome, Verdict::Redo { tasks: vec![] });
     }
 
     #[test]
@@ -396,7 +457,15 @@ mod tests {
             verify_prompt: None,
             phases: None,
         };
-        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None, &std::collections::HashMap::new());
+        let outcome = runner.run_phase(
+            &phase,
+            "",
+            Some(&task),
+            "/tmp",
+            10,
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -405,7 +474,15 @@ mod tests {
         let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
         let phase = make_phase("no-op", false);
         // Spec-level phase with no task → proceed (skip is just proceed)
-        let outcome = runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new());
+        let outcome = runner.run_phase(
+            &phase,
+            "",
+            None,
+            "/tmp",
+            10,
+            None,
+            &std::collections::HashMap::new(),
+        );
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -413,26 +490,70 @@ mod tests {
     fn test_mock_runner_returns_configured_verdicts() {
         let runner = MockPhaseRunner::new(vec![
             Verdict::Proceed,
-            Verdict::Done { success: false, reason: "timeout".into() },
-            Verdict::Done { success: false, reason: "bad".into() },
+            Verdict::Done {
+                success: false,
+                reason: "timeout".into(),
+            },
+            Verdict::Done {
+                success: false,
+                reason: "bad".into(),
+            },
         ]);
         let phase = make_phase("test", true);
 
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new()),
+            runner.run_phase(
+                &phase,
+                "",
+                None,
+                "/tmp",
+                10,
+                None,
+                &std::collections::HashMap::new()
+            ),
             Verdict::Proceed
         );
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new()),
-            Verdict::Done { success: false, reason: "timeout".into() }
+            runner.run_phase(
+                &phase,
+                "",
+                None,
+                "/tmp",
+                10,
+                None,
+                &std::collections::HashMap::new()
+            ),
+            Verdict::Done {
+                success: false,
+                reason: "timeout".into()
+            }
         );
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new()),
-            Verdict::Done { success: false, reason: "bad".into() }
+            runner.run_phase(
+                &phase,
+                "",
+                None,
+                "/tmp",
+                10,
+                None,
+                &std::collections::HashMap::new()
+            ),
+            Verdict::Done {
+                success: false,
+                reason: "bad".into()
+            }
         );
         // Exhausted verdicts → default to Proceed
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10, None, &std::collections::HashMap::new()),
+            runner.run_phase(
+                &phase,
+                "",
+                None,
+                "/tmp",
+                10,
+                None,
+                &std::collections::HashMap::new()
+            ),
             Verdict::Proceed
         );
     }

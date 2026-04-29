@@ -1,8 +1,8 @@
 use crate::cli::daemon::{daemon_heartbeat_path, is_daemon_locked};
 use crate::config;
 use crate::fmt::{
-    display_width, elapsed_since, ensure_db_dir, progress_bar, term_width, time_ago,
-    truncate, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW,
+    display_width, elapsed_since, ensure_db_dir, progress_bar, term_width, time_ago, truncate,
+    BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW,
 };
 use crate::queue;
 use serde_json::json;
@@ -26,7 +26,12 @@ pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
             ));
             out.push_str(&format!(
                 "{}mode: {}  status: {}  iteration: {}/{}{}\n",
-                RESET, st.spec.mode, st.spec.status, st.spec.iteration, st.spec.max_iterations, RESET
+                RESET,
+                st.spec.mode,
+                st.spec.status,
+                st.spec.iteration,
+                st.spec.max_iterations,
+                RESET
             ));
             if let Some(ref p) = st.spec.project {
                 out.push_str(&format!("project: {}\n", p));
@@ -43,7 +48,11 @@ pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
                 };
                 out.push_str(&format!(
                     "  {}{} {:8}{} {} — {}{}\n",
-                    tcolor, ticon, task.id, RESET, task.title,
+                    tcolor,
+                    ticon,
+                    task.id,
+                    RESET,
+                    task.title,
                     if !task.depends.is_empty() && task.depends != "[]" {
                         format!(" {}(depends: {}){}", DIM, task.depends, RESET)
                     } else {
@@ -135,7 +144,10 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
 
             // Build right-side stats string
             let right = if outcomes > 0 {
-                format!("{}/{} \u{b7} {} outcomes  {}", s.completed_tasks, total, outcomes, elapsed)
+                format!(
+                    "{}/{} \u{b7} {} outcomes  {}",
+                    s.completed_tasks, total, outcomes, elapsed
+                )
             } else {
                 format!("{}/{}  {}", s.completed_tasks, total, elapsed)
             };
@@ -149,8 +161,12 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
 
             out.push_str(&format!(
                 "{}\u{25b8} {:<5}{}  {}{}{}\n",
-                YELLOW, s.id, RESET,
-                title_str, " ".repeat(spaces), right,
+                YELLOW,
+                s.id,
+                RESET,
+                title_str,
+                " ".repeat(spaces),
+                right,
             ));
 
             // Show current task
@@ -198,8 +214,12 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
 
             out.push_str(&format!(
                 "{}\u{25e6} {:<5}{}  {}{}{}\n",
-                CYAN, s.id, RESET,
-                title_str, " ".repeat(spaces), right,
+                CYAN,
+                s.id,
+                RESET,
+                title_str,
+                " ".repeat(spaces),
+                right,
             ));
         }
         out.push('\n');
@@ -225,7 +245,10 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
 
             let outcomes = q.outcome_count(&s.id);
             let right = if outcomes > 0 {
-                format!("{}/{} \u{b7} {} outcomes  {}", s.completed_tasks, total, outcomes, ago)
+                format!(
+                    "{}/{} \u{b7} {} outcomes  {}",
+                    s.completed_tasks, total, outcomes, ago
+                )
             } else {
                 format!("{}/{}  {}", s.completed_tasks, total, ago)
             };
@@ -238,8 +261,13 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
 
             out.push_str(&format!(
                 "{}{} {:<5}{}  {}{}{}\n",
-                color, icon, s.id, RESET,
-                title_str, " ".repeat(spaces), right,
+                color,
+                icon,
+                s.id,
+                RESET,
+                title_str,
+                " ".repeat(spaces),
+                right,
             ));
         }
         out.push('\n');
@@ -312,7 +340,10 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
                 if age > 3600 {
                     out.push_str(&format!(
                         "\n{}{}Warning: Daemon may be stuck. No spec updated in {}.{}\n",
-                        BOLD, YELLOW, time_ago(&ts), RESET,
+                        BOLD,
+                        YELLOW,
+                        time_ago(&ts),
+                        RESET,
                     ));
                 }
             }
@@ -374,7 +405,11 @@ pub fn cmd_status_json(spec_id: Option<&str>, all: bool, db_str: &str) {
                     "project": st.spec.project,
                     "tasks": tasks,
                 });
-                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&out)
+                        .expect("json! macro output is always serializable")
+                );
             }
             Ok(None) => {
                 eprintln!("error: spec '{}' not found", id);
@@ -434,5 +469,9 @@ pub fn cmd_status_json(spec_id: Option<&str>, all: bool, db_str: &str) {
         })
         .collect();
 
-    println!("{}", serde_json::to_string_pretty(&json!({ "specs": items })).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "specs": items }))
+            .expect("json! macro output is always serializable")
+    );
 }

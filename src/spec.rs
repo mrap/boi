@@ -39,7 +39,6 @@ pub enum TaskStatus {
     Skipped,
 }
 
-
 impl std::fmt::Display for TaskStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -143,23 +142,21 @@ pub fn validate(spec: &BoiSpec) -> Result<(), ValidationError> {
 /// Returns task IDs in topological order (dependencies before dependents).
 /// Errors if a cycle is detected.
 pub fn topological_sort(spec: &BoiSpec) -> Result<Vec<String>, ValidationError> {
-    let mut in_degree: HashMap<&str, usize> = spec
-        .tasks
-        .iter()
-        .map(|t| (t.id.as_str(), 0usize))
-        .collect();
+    let mut in_degree: HashMap<&str, usize> =
+        spec.tasks.iter().map(|t| (t.id.as_str(), 0usize)).collect();
 
     // adjacency: dep -> [tasks that depend on dep]
-    let mut adj: HashMap<&str, Vec<&str>> = spec
-        .tasks
-        .iter()
-        .map(|t| (t.id.as_str(), vec![]))
-        .collect();
+    let mut adj: HashMap<&str, Vec<&str>> =
+        spec.tasks.iter().map(|t| (t.id.as_str(), vec![])).collect();
 
     for task in &spec.tasks {
         for dep in task.depends.as_deref().unwrap_or(&[]) {
-            adj.get_mut(dep.as_str()).unwrap().push(task.id.as_str());
-            *in_degree.get_mut(task.id.as_str()).unwrap() += 1;
+            adj.get_mut(dep.as_str())
+                .expect("dep validated against task ID set")
+                .push(task.id.as_str());
+            *in_degree
+                .get_mut(task.id.as_str())
+                .expect("task ID validated against task ID set") += 1;
         }
     }
 
@@ -173,7 +170,9 @@ pub fn topological_sort(spec: &BoiSpec) -> Result<Vec<String>, ValidationError> 
     while let Some(id) = queue.pop_front() {
         order.push(id.to_string());
         for &dependent in &adj[id] {
-            let deg = in_degree.get_mut(dependent).unwrap();
+            let deg = in_degree
+                .get_mut(dependent)
+                .expect("dependent from adj must exist in in_degree");
             *deg -= 1;
             if *deg == 0 {
                 queue.push_back(dependent);
@@ -198,8 +197,7 @@ pub fn topological_sort(spec: &BoiSpec) -> Result<Vec<String>, ValidationError> 
 /// Groups are ordered so earlier groups must complete before later ones.
 pub fn parallel_groups(spec: &BoiSpec) -> Result<Vec<Vec<String>>, ValidationError> {
     let order = topological_sort(spec)?;
-    let task_map: HashMap<&str, &BoiTask> =
-        spec.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    let task_map: HashMap<&str, &BoiTask> = spec.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
 
     let mut levels: HashMap<&str, usize> = HashMap::new();
     for id in &order {
@@ -374,8 +372,11 @@ tasks:
 "#;
         let spec = parse(yaml).unwrap();
         let order = topological_sort(&spec).unwrap();
-        let pos: HashMap<&str, usize> =
-            order.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+        let pos: HashMap<&str, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
         assert!(pos["t-1"] < pos["t-2"]);
         assert!(pos["t-2"] < pos["t-3"]);
     }
@@ -490,7 +491,11 @@ tasks:
         let spec = parse(yaml).unwrap();
         assert_eq!(
             spec.spec_phases,
-            Some(vec!["plan-critique".to_string(), "critic".to_string(), "evaluate".to_string()])
+            Some(vec![
+                "plan-critique".to_string(),
+                "critic".to_string(),
+                "evaluate".to_string()
+            ])
         );
         assert_eq!(
             spec.task_phases,

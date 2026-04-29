@@ -45,7 +45,8 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>, cfg: &config::Config) 
             let config_path = config::default_config_path();
             let mut cfg_map: serde_yml::Value = if config_path.exists() {
                 let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-                serde_yml::from_str(&content).unwrap_or(serde_yml::Value::Mapping(Default::default()))
+                serde_yml::from_str(&content)
+                    .unwrap_or(serde_yml::Value::Mapping(Default::default()))
             } else {
                 serde_yml::Value::Mapping(Default::default())
             };
@@ -58,7 +59,16 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>, cfg: &config::Config) 
             if let Some(parent) = config_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            std::fs::write(&config_path, serde_yml::to_string(&cfg_map).unwrap()).unwrap();
+            let yaml_str =
+                serde_yml::to_string(&cfg_map).expect("cfg_map is always serializable to YAML");
+            if let Err(e) = std::fs::write(&config_path, yaml_str) {
+                eprintln!(
+                    "error: failed to write config file {}: {}",
+                    config_path.display(),
+                    e
+                );
+                std::process::exit(1);
+            }
             println!("set {} = {}", k, v);
         }
     }
