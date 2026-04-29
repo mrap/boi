@@ -2,12 +2,13 @@ name = "task-verify"
 description = "Review completed work for quality, correctness, and spec compliance"
 completion_handler = "builtin:task-verify"
 
+[phase]
+name = "task-verify"
+description = "Run verify commands to confirm task work is correct"
+requires_claude = false
+
 [worker]
-runtime = "claude"
-model = "claude-sonnet-4-6"
-prompt_template = "templates/task-verify-worker-prompt.md"
-effort = "low"
-timeout = 120
+timeout = 30
 
 [completion]
 approve_signal = "## Task Verification Approved"

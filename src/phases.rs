@@ -1144,7 +1144,7 @@ approve_signal = ""
         let registry = test_registry();
         let tv = registry.get("task-verify").unwrap();
         assert_eq!(tv.level, PhaseLevel::Task);
-        assert!(tv.requires_claude);
+        assert!(!tv.requires_claude);
         assert!(!tv.can_add_tasks);
         assert!(!tv.can_fail_spec);
     }
