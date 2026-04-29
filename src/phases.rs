@@ -11,6 +11,11 @@ pub enum TemplateVar {
     PendingCount,
     SpecContent,
     WorkspaceHeader,
+    SpecContext,
+    TaskTitle,
+    TaskSpec,
+    TaskVerify,
+    TaskDepends,
 }
 
 impl TemplateVar {
@@ -22,12 +27,17 @@ impl TemplateVar {
             Self::PendingCount => "PENDING_COUNT",
             Self::SpecContent => "SPEC_CONTENT",
             Self::WorkspaceHeader => "WORKSPACE_HEADER",
+            Self::SpecContext => "SPEC_CONTEXT",
+            Self::TaskTitle => "TASK_TITLE",
+            Self::TaskSpec => "TASK_SPEC",
+            Self::TaskVerify => "TASK_VERIFY",
+            Self::TaskDepends => "TASK_DEPENDS",
         }
     }
 
     /// Required vars that must be present for a valid prompt.
     pub fn required() -> &'static [TemplateVar] {
-        &[Self::QueueId, Self::SpecPath, Self::SpecContent]
+        &[Self::QueueId]
     }
 
     /// Validate that all required vars are present. Returns an error if any are missing.
@@ -1010,7 +1020,7 @@ approve_signal = ""
     fn test_core_and_user_names() {
         let registry = test_registry();
         let core = registry.core_names();
-        assert_eq!(core.len(), 9);
+        assert_eq!(core.len(), 10);
         assert!(core.contains(&"execute"));
         assert!(core.contains(&"plan-critique"));
         assert!(core.contains(&"code-review"));
@@ -1027,7 +1037,7 @@ approve_signal = ""
         let nonexistent = test_utils::test_file("nonexistent-dir", "xyz");
         let _ = std::fs::remove_file(&nonexistent);
         registry.load_user_phases(&nonexistent);
-        assert_eq!(registry.list().len(), 9);
+        assert_eq!(registry.list().len(), 10);
     }
 
     // --- Step 1: PhaseLevel tests ---

@@ -807,8 +807,12 @@ pub fn run_worker_with_phases(
                 emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
 
                 // Apply spec-review JSON suggestions to the DB before task execution begins.
+                // IDs are already canonical (loaded from DB), so no YAML-to-DB mapping needed.
                 if phase_name == "spec-review" && matches!(&verdict, Verdict::Proceed) {
-                    apply_spec_review_output(&queue, spec_id, &yaml_to_canonical, &phase_output);
+                    let identity_map: HashMap<String, String> = boi_spec.tasks.iter()
+                        .map(|t| (t.id.clone(), t.id.clone()))
+                        .collect();
+                    apply_spec_review_output(&queue, spec_id, &identity_map, &phase_output);
                 }
 
                 match &verdict {
