@@ -52,7 +52,7 @@ pub fn build_prompt(spec_content: &str, task: &spec::BoiTask) -> String {
         YOUR TASK: {} — {}\n\n\
         SPEC:\n{}\n\n\
         VERIFY:\n{}\n\n\
-        Execute the task completely. Mark it status: DONE in the spec file when done.",
+        Execute the task. Do NOT modify the spec file — status is tracked externally.",
         spec_content, task.id, task.title, task_spec, task_verify
     )
 }
