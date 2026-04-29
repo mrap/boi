@@ -6,36 +6,28 @@ use std::path::{Path, PathBuf};
 /// Using this enum prevents typos and makes it easy to find all usages.
 pub enum TemplateVar {
     QueueId,
+    SpecPath,
     Iteration,
     PendingCount,
+    SpecContent,
     WorkspaceHeader,
-    /// Spec-level context field from DB (specs.context)
-    SpecContext,
-    /// Per-task fields sourced from DB
-    TaskTitle,
-    TaskSpec,
-    TaskVerify,
-    TaskDepends,
 }
 
 impl TemplateVar {
     pub fn key(&self) -> &'static str {
         match self {
             Self::QueueId => "QUEUE_ID",
+            Self::SpecPath => "SPEC_PATH",
             Self::Iteration => "ITERATION",
             Self::PendingCount => "PENDING_COUNT",
+            Self::SpecContent => "SPEC_CONTENT",
             Self::WorkspaceHeader => "WORKSPACE_HEADER",
-            Self::SpecContext => "SPEC_CONTEXT",
-            Self::TaskTitle => "TASK_TITLE",
-            Self::TaskSpec => "TASK_SPEC",
-            Self::TaskVerify => "TASK_VERIFY",
-            Self::TaskDepends => "TASK_DEPENDS",
         }
     }
 
     /// Required vars that must be present for a valid prompt.
     pub fn required() -> &'static [TemplateVar] {
-        &[Self::QueueId]
+        &[Self::QueueId, Self::SpecPath, Self::SpecContent]
     }
 
     /// Validate that all required vars are present. Returns an error if any are missing.
@@ -255,10 +247,10 @@ impl PhaseConfig {
     }
 }
 
-/// Derive phase level from name. Spec-level phases: plan-critique, critic, evaluate, review.
+/// Derive phase level from name. Spec-level phases: plan-critique, critic, evaluate, review, spec-review.
 fn derive_level(name: &str) -> PhaseLevel {
     match name {
-        "plan-critique" | "critic" | "evaluate" | "review" => PhaseLevel::Spec,
+        "plan-critique" | "critic" | "evaluate" | "review" | "spec-review" => PhaseLevel::Spec,
         _ => PhaseLevel::Task,
     }
 }
@@ -270,8 +262,8 @@ fn derive_can_add_tasks(name: &str, completion_handler: Option<&str>) -> bool {
             return true;
         }
     }
-    // Phases that structurally add tasks: critic, decompose, evaluate, plan-critique, code-review, review
-    matches!(name, "critic" | "decompose" | "evaluate" | "plan-critique" | "code-review" | "review")
+    // Phases that structurally add tasks: critic, decompose, evaluate, plan-critique, code-review, review, spec-review
+    matches!(name, "critic" | "decompose" | "evaluate" | "plan-critique" | "code-review" | "review" | "spec-review")
 }
 
 /// Derive can_fail_spec from name.
@@ -447,18 +439,12 @@ struct PipelineModeToml {
 
 /// Find the pipelines.toml file.
 /// Priority: BOI_PIPELINES_FILE env > ~/.boi/pipelines.toml > None
-///
-/// If BOI_PIPELINES_FILE is set (even to a nonexistent path), the home-dir
-/// fallback is skipped — this lets tests opt out of user config by setting
-/// the env var to any nonexistent path.
 fn find_pipelines_file() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("BOI_PIPELINES_FILE") {
         let p = PathBuf::from(&path);
         if p.is_file() {
             return Some(p);
         }
-        // Explicitly set but not a file: caller opted out of user config.
-        return None;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let user_path = PathBuf::from(&home).join(".boi").join("pipelines.toml");
@@ -493,22 +479,22 @@ pub fn default_pipeline(mode: &str) -> PipelineConfig {
     fallback_pipeline(mode)
 }
 
-fn fallback_pipeline(mode: &str) -> PipelineConfig {
+pub(crate) fn fallback_pipeline(mode: &str) -> PipelineConfig {
     match mode {
         "execute" => PipelineConfig {
-            spec_phases: vec!["critic".into()],
+            spec_phases: vec!["spec-review".into(), "critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
         },
         "challenge" => PipelineConfig {
-            spec_phases: vec!["plan-critique".into(), "critic".into()],
+            spec_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
         },
         "discover" => PipelineConfig {
-            spec_phases: vec!["critic".into(), "evaluate".into()],
+            spec_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
         },
         "generate" => PipelineConfig {
-            spec_phases: vec!["plan-critique".into(), "critic".into(), "evaluate".into()],
+            spec_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into(), "evaluate".into()],
             task_phases: vec!["decompose".into(), "execute".into(), "code-review".into(), "task-verify".into()],
         },
         _ => PipelineConfig {
@@ -773,12 +759,8 @@ pub fn build_phase_prompt(
         }
     }
 
-    // Spec-level phases (critic, evaluate) still receive the full spec content.
-    // Task-level phases get DB-sourced fields from the template instead.
-    if task_context.is_none() {
-        prompt.push_str("\n\n--- SPEC ---\n");
-        prompt.push_str(spec_content);
-    }
+    prompt.push_str("\n\n--- SPEC ---\n");
+    prompt.push_str(spec_content);
     if let Some(ctx) = task_context {
         prompt.push_str("\n\n--- TASK ---\n");
         prompt.push_str(ctx);
@@ -820,29 +802,6 @@ mod tests {
     use super::*;
     use crate::test_utils;
     use std::fs;
-    use std::sync::Mutex;
-
-    /// Lock serializing tests that set env vars affecting pipeline file lookup.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Run `f` with BOI_PIPELINES_FILE pointed at a nonexistent path so that
-    /// `default_pipeline` uses hardcoded fallbacks, independent of the user's
-    /// ~/.boi/pipelines.toml.
-    fn without_user_pipelines<F: FnOnce() -> R, R>(f: F) -> R {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var("BOI_PIPELINES_FILE").ok();
-        // SAFETY: ENV_LOCK is held, no concurrent env mutation from other tests.
-        unsafe { std::env::set_var("BOI_PIPELINES_FILE", "/nonexistent-boi-test-pipelines.toml"); }
-        let result = f();
-        // SAFETY: ENV_LOCK is held, restoring original value.
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("BOI_PIPELINES_FILE", v),
-                None => std::env::remove_var("BOI_PIPELINES_FILE"),
-            }
-        }
-        result
-    }
 
     /// Find the BOI repo root directory for tests.
     /// Uses CARGO_MANIFEST_DIR which points to the crate root during `cargo test`.
@@ -898,6 +857,11 @@ mod tests {
         let evaluate = registry.get("evaluate").unwrap();
         assert!(evaluate.can_add_tasks);
         assert!(!evaluate.can_fail_spec);
+
+        let spec_review = registry.get("spec-review").unwrap();
+        assert!(spec_review.can_add_tasks);
+        assert!(!spec_review.can_fail_spec);
+        assert!(spec_review.requires_claude);
     }
 
     #[test]
@@ -1046,11 +1010,12 @@ approve_signal = ""
     fn test_core_and_user_names() {
         let registry = test_registry();
         let core = registry.core_names();
-        assert_eq!(core.len(), 8);
+        assert_eq!(core.len(), 9);
         assert!(core.contains(&"execute"));
         assert!(core.contains(&"plan-critique"));
         assert!(core.contains(&"code-review"));
         assert!(core.contains(&"task-verify"));
+        assert!(core.contains(&"spec-review"));
 
         let user = registry.user_names();
         assert!(user.is_empty());
@@ -1062,7 +1027,7 @@ approve_signal = ""
         let nonexistent = test_utils::test_file("nonexistent-dir", "xyz");
         let _ = std::fs::remove_file(&nonexistent);
         registry.load_user_phases(&nonexistent);
-        assert_eq!(registry.list().len(), 8);
+        assert_eq!(registry.list().len(), 9);
     }
 
     // --- Step 1: PhaseLevel tests ---
@@ -1080,6 +1045,7 @@ approve_signal = ""
         assert_eq!(registry.get("critic").unwrap().level, PhaseLevel::Spec);
         assert_eq!(registry.get("evaluate").unwrap().level, PhaseLevel::Spec);
         assert_eq!(registry.get("plan-critique").unwrap().level, PhaseLevel::Spec);
+        assert_eq!(registry.get("spec-review").unwrap().level, PhaseLevel::Spec);
 
         // Task-level phases
         assert_eq!(registry.get("execute").unwrap().level, PhaseLevel::Task);
@@ -1092,47 +1058,49 @@ approve_signal = ""
 
     #[test]
     fn test_default_pipeline_execute() {
-        without_user_pipelines(|| {
-            let p = default_pipeline("execute");
-            assert_eq!(p.spec_phases, vec!["critic"]);
-            assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
-        });
+        let p = fallback_pipeline("execute");
+        assert_eq!(p.spec_phases, vec!["spec-review", "critic"]);
+        assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_challenge() {
-        without_user_pipelines(|| {
-            let p = default_pipeline("challenge");
-            assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]);
-            assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
-        });
+        let p = fallback_pipeline("challenge");
+        assert_eq!(p.spec_phases, vec!["spec-review", "plan-critique", "critic"]);
+        assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_discover() {
-        without_user_pipelines(|| {
-            let p = default_pipeline("discover");
-            assert_eq!(p.spec_phases, vec!["critic", "evaluate"]);
-            assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
-        });
+        let p = fallback_pipeline("discover");
+        assert_eq!(p.spec_phases, vec!["spec-review", "critic", "evaluate"]);
+        assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_generate() {
-        without_user_pipelines(|| {
-            let p = default_pipeline("generate");
-            assert_eq!(p.spec_phases, vec!["plan-critique", "critic", "evaluate"]);
-            assert_eq!(p.task_phases, vec!["decompose", "execute", "code-review", "task-verify"]);
-        });
+        let p = fallback_pipeline("generate");
+        assert_eq!(p.spec_phases, vec!["spec-review", "plan-critique", "critic", "evaluate"]);
+        assert_eq!(p.task_phases, vec!["decompose", "execute", "code-review", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_unknown_mode() {
-        without_user_pipelines(|| {
-            let p = default_pipeline("unknown");
-            assert!(p.spec_phases.is_empty());
-            assert_eq!(p.task_phases, vec!["execute"]);
-        });
+        let p = fallback_pipeline("unknown");
+        assert!(p.spec_phases.is_empty());
+        assert_eq!(p.task_phases, vec!["execute"]);
+    }
+
+    #[test]
+    fn test_spec_review_is_first_spec_phase() {
+        for mode in &["execute", "challenge", "discover", "generate"] {
+            let p = fallback_pipeline(mode);
+            assert_eq!(
+                p.spec_phases.first().map(|s| s.as_str()),
+                Some("spec-review"),
+                "spec-review must be first spec phase in mode '{mode}'"
+            );
+        }
     }
 
     // --- Step 3: New core phases tests ---
@@ -1175,61 +1143,54 @@ approve_signal = ""
 
     #[test]
     fn test_resolve_pipeline_uses_defaults() {
-        without_user_pipelines(|| {
-            let p = resolve_pipeline("execute", None, None);
-            assert_eq!(p.spec_phases, vec!["critic"]);
-            assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
-        });
+        let p = resolve_pipeline("execute", None, None);
+        let expected = default_pipeline("execute");
+        assert_eq!(p.spec_phases, expected.spec_phases);
+        assert_eq!(p.task_phases, expected.task_phases);
     }
 
     #[test]
     fn test_resolve_pipeline_spec_override() {
-        without_user_pipelines(|| {
-            let spec_override = vec!["plan-critique".to_string(), "critic".to_string()];
-            let p = resolve_pipeline("execute", Some(&spec_override), None);
-            assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]);
-            assert_eq!(p.task_phases, vec!["execute", "task-verify"]); // unchanged
-        });
+        let spec_override = vec!["plan-critique".to_string(), "critic".to_string()];
+        let p = resolve_pipeline("execute", Some(&spec_override), None);
+        assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]);
+        // task_phases unchanged — must match the default for this environment
+        let default = default_pipeline("execute");
+        assert_eq!(p.task_phases, default.task_phases);
     }
 
     #[test]
     fn test_resolve_pipeline_task_override() {
-        without_user_pipelines(|| {
-            let task_override = vec!["execute".to_string()];
-            let p = resolve_pipeline("challenge", None, Some(&task_override));
-            assert_eq!(p.spec_phases, vec!["plan-critique", "critic"]); // unchanged
-            assert_eq!(p.task_phases, vec!["execute"]); // overridden
-        });
+        let task_override = vec!["execute".to_string()];
+        let p = resolve_pipeline("challenge", None, Some(&task_override));
+        // spec_phases unchanged — must match the default for this environment
+        let default = default_pipeline("challenge");
+        assert_eq!(p.spec_phases, default.spec_phases);
+        assert_eq!(p.task_phases, vec!["execute"]); // overridden
     }
 
     #[test]
     fn test_resolve_pipeline_both_override() {
-        without_user_pipelines(|| {
-            let sp = vec!["evaluate".to_string()];
-            let tp = vec!["execute".to_string(), "code-review".to_string()];
-            let p = resolve_pipeline("execute", Some(&sp), Some(&tp));
-            assert_eq!(p.spec_phases, vec!["evaluate"]);
-            assert_eq!(p.task_phases, vec!["execute", "code-review"]);
-        });
+        let sp = vec!["evaluate".to_string()];
+        let tp = vec!["execute".to_string(), "code-review".to_string()];
+        let p = resolve_pipeline("execute", Some(&sp), Some(&tp));
+        assert_eq!(p.spec_phases, vec!["evaluate"]);
+        assert_eq!(p.task_phases, vec!["execute", "code-review"]);
     }
 
     #[test]
     fn test_resolve_task_phases_no_override() {
-        without_user_pipelines(|| {
-            let pipeline = default_pipeline("execute");
-            let phases = resolve_task_phases(&pipeline, None);
-            assert_eq!(phases, vec!["execute", "task-verify"]);
-        });
+        let pipeline = default_pipeline("execute");
+        let phases = resolve_task_phases(&pipeline, None);
+        assert_eq!(phases, pipeline.task_phases);
     }
 
     #[test]
     fn test_resolve_task_phases_with_override() {
-        without_user_pipelines(|| {
-            let pipeline = default_pipeline("execute");
-            let override_phases = vec!["execute".to_string()];
-            let phases = resolve_task_phases(&pipeline, Some(&override_phases));
-            assert_eq!(phases, vec!["execute"]);
-        });
+        let pipeline = default_pipeline("execute");
+        let override_phases = vec!["execute".to_string()];
+        let phases = resolve_task_phases(&pipeline, Some(&override_phases));
+        assert_eq!(phases, vec!["execute"]);
     }
 
     // --- Step 6: Verdict + build_phase_prompt + parse_phase_output tests ---

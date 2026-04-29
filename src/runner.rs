@@ -9,13 +9,6 @@ use std::time::Instant;
 #[allow(clippy::too_many_arguments)]
 pub trait PhaseRunner: Send + Sync {
     /// Execute a phase and return the outcome.
-    ///
-    /// - `phase`: The phase configuration
-    /// - `spec_content`: Full spec YAML
-    /// - `task`: The task being processed (None for spec-level phases)
-    /// - `worktree_path`: Working directory for execution
-    /// - `timeout_secs`: Max seconds before timeout
-    /// - `spec_id`: Spec identifier for PID file tracking (cancel support)
     fn run_phase(
         &self,
         phase: &PhaseConfig,
@@ -26,6 +19,21 @@ pub trait PhaseRunner: Send + Sync {
         spec_id: Option<&str>,
         vars: &std::collections::HashMap<String, String>,
     ) -> Verdict;
+
+    /// Execute a phase and return both the verdict and the raw output text.
+    /// Default delegates to `run_phase` with empty output; override for full output access.
+    fn run_phase_full(
+        &self,
+        phase: &PhaseConfig,
+        spec_content: &str,
+        task: Option<&BoiTask>,
+        worktree_path: &str,
+        timeout_secs: u64,
+        spec_id: Option<&str>,
+        vars: &std::collections::HashMap<String, String>,
+    ) -> (Verdict, String) {
+        (self.run_phase(phase, spec_content, task, worktree_path, timeout_secs, spec_id, vars), String::new())
+    }
 }
 
 /// Production phase runner that spawns claude for requires_claude phases
@@ -44,8 +52,10 @@ impl ClaudePhaseRunner {
     }
 }
 
-impl PhaseRunner for ClaudePhaseRunner {
-    fn run_phase(
+impl ClaudePhaseRunner {
+    /// Inner implementation that returns both the verdict and the raw Claude output.
+    #[allow(clippy::too_many_arguments)]
+    fn run_phase_inner(
         &self,
         phase: &PhaseConfig,
         spec_content: &str,
@@ -54,15 +64,14 @@ impl PhaseRunner for ClaudePhaseRunner {
         timeout_secs: u64,
         spec_id: Option<&str>,
         vars: &std::collections::HashMap<String, String>,
-    ) -> Verdict {
+    ) -> (Verdict, String) {
         if !phase.requires_claude {
-            return self.run_verify_phase(phase, task, worktree_path, timeout_secs, spec_id);
+            return (self.run_verify_phase(phase, task, worktree_path, timeout_secs, spec_id), String::new());
         }
 
         let task_id = task.map(|t| t.id.as_str());
         let spec_id_hint = spec_id.unwrap_or("");
 
-        // Build the prompt
         let task_context = task.map(|t| {
             format!(
                 "Task: {} — {}\nSpec: {}\nVerify: {}",
@@ -128,7 +137,8 @@ impl PhaseRunner for ClaudePhaseRunner {
                     "message": format!("claude exit 0, {} chars ({:.1}s inference, {:.1}s total)",
                         cr.output.len(), inference_s, total_s),
                 }));
-                crate::phases::parse_phase_output(phase, &cr.output)
+                let verdict = crate::phases::parse_phase_output(phase, &cr.output);
+                (verdict, cr.output.clone())
             }
             Ok(ref cr) => {
                 let inference_s = cr.inference_ms as f64 / 1000.0;
@@ -150,22 +160,14 @@ impl PhaseRunner for ClaudePhaseRunner {
                             format!("\n  stderr: {}", cr.stderr.chars().take(200).collect::<String>())
                         }),
                 }));
-                if cr.output == "timeout" {
-                    Verdict::Done {
-                        success: false,
-                        reason: "timeout".into(),
-                    }
+                let verdict = if cr.output == "timeout" {
+                    Verdict::Done { success: false, reason: "timeout".into() }
                 } else if phase.on_crash.as_deref() == Some("retry") {
-                    Verdict::Done {
-                        success: false,
-                        reason: format!("Phase {} claude exited non-zero", phase.name),
-                    }
+                    Verdict::Done { success: false, reason: format!("Phase {} claude exited non-zero", phase.name) }
                 } else {
-                    Verdict::Done {
-                        success: false,
-                        reason: format!("Phase {} failed: {}", phase.name, cr.output),
-                    }
-                }
+                    Verdict::Done { success: false, reason: format!("Phase {} failed: {}", phase.name, cr.output) }
+                };
+                (verdict, cr.output.clone())
             }
             Err(e) => {
                 self.telemetry.emit(
@@ -178,12 +180,37 @@ impl PhaseRunner for ClaudePhaseRunner {
                         "message": format!("claude spawn error: {}", e),
                     }),
                 );
-                Verdict::Done {
-                    success: false,
-                    reason: format!("Phase {} spawn error: {}", phase.name, e),
-                }
+                (Verdict::Done { success: false, reason: format!("Phase {} spawn error: {}", phase.name, e) }, String::new())
             }
         }
+    }
+}
+
+impl PhaseRunner for ClaudePhaseRunner {
+    fn run_phase(
+        &self,
+        phase: &PhaseConfig,
+        spec_content: &str,
+        task: Option<&BoiTask>,
+        worktree_path: &str,
+        timeout_secs: u64,
+        spec_id: Option<&str>,
+        vars: &std::collections::HashMap<String, String>,
+    ) -> Verdict {
+        self.run_phase_inner(phase, spec_content, task, worktree_path, timeout_secs, spec_id, vars).0
+    }
+
+    fn run_phase_full(
+        &self,
+        phase: &PhaseConfig,
+        spec_content: &str,
+        task: Option<&BoiTask>,
+        worktree_path: &str,
+        timeout_secs: u64,
+        spec_id: Option<&str>,
+        vars: &std::collections::HashMap<String, String>,
+    ) -> (Verdict, String) {
+        self.run_phase_inner(phase, spec_content, task, worktree_path, timeout_secs, spec_id, vars)
     }
 }
 

@@ -678,6 +678,22 @@ impl Queue {
         self.update_task(spec_id, task_id, "SKIPPED")
     }
 
+    pub fn update_task_spec_content(&self, spec_id: &str, task_id: &str, content: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET spec_content = ?1 WHERE spec_id = ?2 AND id = ?3",
+            params![content, spec_id, task_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_task_verify_content(&self, spec_id: &str, task_id: &str, content: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE tasks SET verify_content = ?1 WHERE spec_id = ?2 AND id = ?3",
+            params![content, spec_id, task_id],
+        )?;
+        Ok(())
+    }
+
     pub fn block_task(&self, spec_id: &str, task_id: &str, dep_id: &str) -> Result<()> {
         // Read current depends, add the new dep
         let current: String = self.conn.query_row(
