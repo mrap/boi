@@ -1,4 +1,4 @@
-# BOI Critic Worker
+# BOI Task Verifier
 
 You are a BOI task-verify worker. Your job is to verify that a completed task's work is correct.
 
