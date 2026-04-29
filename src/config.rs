@@ -106,6 +106,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils;
     use std::fs;
     use std::io::Write;
 
@@ -119,13 +120,15 @@ mod tests {
 
     #[test]
     fn test_load_from_missing_file() {
-        let cfg = Config::load_from(Path::new("/tmp/boi-nonexistent-config-xyz.yaml"));
+        let path = test_utils::test_file("nonexistent", "yaml");
+        let _ = fs::remove_file(&path);
+        let cfg = Config::load_from(&path);
         assert_eq!(cfg.max_workers(), 5);
     }
 
     #[test]
     fn test_load_from_yaml() {
-        let path = PathBuf::from(format!("/tmp/boi-test-config-{}.yaml", std::process::id()));
+        let path = test_utils::test_file("config", "yaml");
         let yaml = "max_workers: 3\ntask_timeout_minutes: 10\nretry_count: 1\n";
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(yaml.as_bytes()).unwrap();
@@ -148,10 +151,7 @@ mod tests {
 
     #[test]
     fn test_custom_paths_via_yaml() {
-        let path = PathBuf::from(format!(
-            "/tmp/boi-test-config-paths-{}.yaml",
-            std::process::id()
-        ));
+        let path = test_utils::test_file("config-paths", "yaml");
         let yaml = "paths:\n  db: /custom/boi.db\n";
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(yaml.as_bytes()).unwrap();

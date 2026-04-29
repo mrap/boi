@@ -778,6 +778,7 @@ pub fn parse_phase_output(phase: &PhaseConfig, output: &str) -> Verdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils;
     use std::fs;
 
     /// Find the BOI repo root directory for tests.
@@ -859,8 +860,8 @@ mod tests {
 
     #[test]
     fn test_user_phase_override() {
-        let dir = PathBuf::from(format!("/tmp/boi-phase-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = test_utils::test_dir("phase-override");
+
 
         let toml_content = r#"
 name = "execute"
@@ -893,8 +894,8 @@ template = "Custom prompt for execute"
 
     #[test]
     fn test_user_adds_new_phase() {
-        let dir = PathBuf::from(format!("/tmp/boi-phase-new-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = test_utils::test_dir("phase-new");
+
 
         let toml_content = r###"
 name = "custom-lint"
@@ -952,8 +953,8 @@ timeout = 600
 [completion]
 approve_signal = ""
 "#;
-        let dir = PathBuf::from(format!("/tmp/boi-phase-repo-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = test_utils::test_dir("phase-repo");
+
         fs::write(dir.join("execute.phase.toml"), toml_content).unwrap();
 
         let mut registry = test_registry();
@@ -995,7 +996,9 @@ approve_signal = ""
     #[test]
     fn test_load_nonexistent_dir() {
         let mut registry = test_registry();
-        registry.load_user_phases(Path::new("/tmp/boi-nonexistent-dir-xyz"));
+        let nonexistent = test_utils::test_file("nonexistent-dir", "xyz");
+        let _ = std::fs::remove_file(&nonexistent);
+        registry.load_user_phases(&nonexistent);
         assert_eq!(registry.list().len(), 8);
     }
 

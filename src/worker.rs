@@ -1390,42 +1390,21 @@ fn emit_phase_verdict(
 mod tests {
     use super::*;
     use crate::{hooks::HookConfig, queue::Queue, spec};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
+    use crate::test_utils;
+
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-    static TEL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn test_telemetry() -> Telemetry {
-        let n = TEL_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let db = std::path::PathBuf::from(format!(
-            "/tmp/boi-test-worker-tel-{}-{}.db",
-            std::process::id(), n
-        ));
+        let db = test_utils::test_file("worker-tel", "db");
         let _ = std::fs::remove_file(&db);
         Telemetry::new(db)
     }
 
-    /// Run `f` with CLAUDE_BIN set to `bin_path`, holding ENV_LOCK.
-    fn with_claude_bin<F: FnOnce()>(bin_path: &str, f: F) {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let old = std::env::var("CLAUDE_BIN").ok();
-        // SAFETY: We hold ENV_LOCK so no other test thread can read/write env vars
-        // concurrently. This is test-only code; the lock serializes all env access.
-        unsafe { std::env::set_var("CLAUDE_BIN", bin_path) };
-        f();
-        // SAFETY: Same as above -- ENV_LOCK is held, restoring the original value.
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("CLAUDE_BIN", v),
-                None => std::env::remove_var("CLAUDE_BIN"),
-            }
-        }
-    }
-
     /// Run `f` with CLAUDE_BIN and BOI_REPO set, holding ENV_LOCK.
     fn with_test_env<F: FnOnce()>(bin_path: &str, repo_path: &str, f: F) {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_bin = std::env::var("CLAUDE_BIN").ok();
         let old_repo = std::env::var("BOI_REPO").ok();
         // SAFETY: ENV_LOCK is held so no concurrent env access from other test
@@ -1448,33 +1427,12 @@ mod tests {
         }
     }
 
-    /// Create a temporary git repo for worktree testing.
-    fn setup_test_repo(suffix: &str) -> std::path::PathBuf {
-        use std::process::Command;
-        let repo_dir = std::env::temp_dir().join(format!("boi_test_repo_{}", suffix));
-        let _ = std::fs::remove_dir_all(&repo_dir);
-        std::fs::create_dir_all(&repo_dir).unwrap();
-        Command::new("git").args(["init"]).current_dir(&repo_dir).output().unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@boi.test"])
-            .current_dir(&repo_dir).output().unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "BOI Test"])
-            .current_dir(&repo_dir).output().unwrap();
-        std::fs::write(repo_dir.join("README.md"), "test").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&repo_dir).output().unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(&repo_dir).output().unwrap();
-        repo_dir
+    fn setup_test_repo(label: &str) -> std::path::PathBuf {
+        test_utils::test_git_repo(label)
     }
 
-    fn mock_claude(exit_code: u8, suffix: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("boi_mock_claude_{}", suffix));
-        std::fs::write(&path, format!("#!/bin/sh\nexit {}\n", exit_code)).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    fn mock_claude(exit_code: u8, label: &str) -> std::path::PathBuf {
+        test_utils::mock_claude_script(exit_code, label)
     }
 
     #[test]
@@ -1519,15 +1477,8 @@ mod tests {
         assert!(!run_verify("exit 1", "/tmp"));
     }
 
-    fn mock_claude_with_stderr(exit_code: u8, stdout_msg: &str, stderr_msg: &str, suffix: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("boi_mock_claude_{}", suffix));
-        std::fs::write(&path, format!(
-            "#!/bin/sh\necho '{}'\necho '{}' >&2\nexit {}\n",
-            stdout_msg, stderr_msg, exit_code
-        )).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    fn mock_claude_with_stderr(exit_code: u8, stdout_msg: &str, stderr_msg: &str, label: &str) -> std::path::PathBuf {
+        test_utils::mock_claude_script_with_output(exit_code, stdout_msg, stderr_msg, label)
     }
 
     #[test]
@@ -1566,11 +1517,11 @@ mod tests {
         assert!(cr.stderr.is_empty(), "stderr should be empty on clean exit");
     }
 
-    fn setup_test_db(suffix: &str, spec_yaml: &str) -> (Queue, String, String) {
-        let spec_file = std::env::temp_dir().join(format!("boi_test_spec_{}.yaml", suffix));
+    fn setup_test_db(label: &str, spec_yaml: &str) -> (Queue, String, String, String) {
+        let spec_file = test_utils::test_file(label, "yaml");
         std::fs::write(&spec_file, spec_yaml).unwrap();
 
-        let db_file = std::env::temp_dir().join(format!("boi_test_db_{}.db", suffix));
+        let db_file = test_utils::test_file(label, "db");
         let _ = std::fs::remove_file(&db_file);
         let _ = std::fs::remove_file(db_file.with_extension("db-wal"));
         let _ = std::fs::remove_file(db_file.with_extension("db-shm"));
@@ -1578,7 +1529,7 @@ mod tests {
         let boi_spec = spec::parse(spec_yaml).unwrap();
         let spec_id = queue.enqueue(&boi_spec, spec_file.to_str()).unwrap();
 
-        (queue, spec_id, db_file.to_str().unwrap().to_string())
+        (queue, spec_id, db_file.to_str().unwrap().to_string(), spec_file.to_str().unwrap().to_string())
     }
 
     #[test]
@@ -1588,8 +1539,7 @@ mod tests {
         let spec_yaml =
             "title: \"Worker Test\"
 tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it\"\n";
-        let (queue, spec_id, db_path) = setup_test_db("worker_ok", spec_yaml);
-        let spec_file = std::env::temp_dir().join("boi_test_spec_worker_ok.yaml");
+        let (queue, spec_id, db_path, spec_path) = setup_test_db("worker_ok", spec_yaml);
         let config = WorkerConfig {
             max_workers: 1,
             task_timeout_secs: 10,
@@ -1602,7 +1552,7 @@ tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it
         with_test_env(script.to_str().unwrap(), repo.to_str().unwrap(), || {
             run_worker(
                 &spec_id,
-                spec_file.to_str().unwrap(),
+                &spec_path,
                 &db_path,
                 &HookConfig::default(),
                 &config,
@@ -1623,8 +1573,7 @@ tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it
         let spec_yaml =
             "title: \"Fail Test\"
 tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
-        let (queue, spec_id, db_path) = setup_test_db("worker_fail", spec_yaml);
-        let spec_file = std::env::temp_dir().join("boi_test_spec_worker_fail.yaml");
+        let (queue, spec_id, db_path, spec_path) = setup_test_db("worker_fail", spec_yaml);
         let config = WorkerConfig {
             max_workers: 1,
             task_timeout_secs: 10,
@@ -1637,7 +1586,7 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
         with_test_env(script.to_str().unwrap(), repo.to_str().unwrap(), || {
             let _ = run_worker(
                 &spec_id,
-                spec_file.to_str().unwrap(),
+                &spec_path,
                 &db_path,
                 &HookConfig::default(),
                 &config,
@@ -1657,12 +1606,11 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
         // DB is the single source of truth — mark t-1 DONE in DB, not YAML
         let spec_yaml = "title: \"Skip Test\"
 tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    title: \"Pending\"\n    status: PENDING\n    depends: [t-1]\n";
-        let (queue, spec_id, db_path) = setup_test_db("worker_skip", spec_yaml);
+        let (queue, spec_id, db_path, spec_path) = setup_test_db("worker_skip", spec_yaml);
         // Pre-mark t-1 as DONE in the DB so worker skips it
         let pre_st = queue.status(&spec_id).unwrap().unwrap();
         let t1_canonical = pre_st.tasks[0].id.clone();
         queue.update_task(&spec_id, &t1_canonical, "DONE").unwrap();
-        let spec_file = std::env::temp_dir().join("boi_test_spec_worker_skip.yaml");
         let config = WorkerConfig {
             max_workers: 1,
             task_timeout_secs: 10,
@@ -1675,7 +1623,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
         with_test_env(script.to_str().unwrap(), repo.to_str().unwrap(), || {
             run_worker(
                 &spec_id,
-                spec_file.to_str().unwrap(),
+                &spec_path,
                 &db_path,
                 &HookConfig::default(),
                 &config,
@@ -1693,13 +1641,13 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
     // --- Phase pipeline tests using MockPhaseRunner ---
 
     fn setup_phase_test(
-        suffix: &str,
+        label: &str,
         spec_yaml: &str,
     ) -> (Queue, String, String, String, std::path::PathBuf) {
-        let repo = setup_test_repo(suffix);
-        let spec_file = std::env::temp_dir().join(format!("boi_phase_spec_{}.yaml", suffix));
+        let repo = setup_test_repo(label);
+        let spec_file = test_utils::test_file(label, "yaml");
         std::fs::write(&spec_file, spec_yaml).unwrap();
-        let db_file = std::env::temp_dir().join(format!("boi_phase_db_{}.db", suffix));
+        let db_file = test_utils::test_file(label, "db");
         let _ = std::fs::remove_file(&db_file);
         let _ = std::fs::remove_file(db_file.with_extension("db-wal"));
         let _ = std::fs::remove_file(db_file.with_extension("db-shm"));

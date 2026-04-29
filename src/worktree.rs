@@ -181,42 +181,7 @@ pub fn cleanup_stale() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(suffix: &str) -> Self {
-            let p = std::env::temp_dir().join(format!("boi-test-{}-{}", suffix, std::process::id()));
-            std::fs::create_dir_all(&p).unwrap();
-            TempDir(p)
-        }
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn init_git_repo(dir: &std::path::Path) {
-        Command::new("git").args(["init"]).current_dir(dir).output().unwrap();
-        Command::new("git")
-            .args(["config", "user.email", "test@boi.test"])
-            .current_dir(dir).output().unwrap();
-        Command::new("git")
-            .args(["config", "user.name", "BOI Test"])
-            .current_dir(dir).output().unwrap();
-        // Need at least one commit so HEAD exists for `git worktree add --detach`.
-        std::fs::write(dir.join("README.md"), "test").unwrap();
-        Command::new("git").args(["add", "."]).current_dir(dir).output().unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "init"])
-            .current_dir(dir).output().unwrap();
-    }
+    use crate::test_utils;
 
     use std::sync::Mutex;
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -224,14 +189,13 @@ mod tests {
     #[test]
     fn test_create_and_cleanup() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let repo_dir = TempDir::new("repo");
-        init_git_repo(repo_dir.path());
+        let repo_dir = test_utils::test_git_repo("wt-repo");
 
-        let wt_base = TempDir::new("home");
-        std::env::set_var("HOME", wt_base.path().to_str().unwrap());
+        let wt_base = test_utils::test_dir("wt-home");
+        std::env::set_var("HOME", wt_base.to_str().unwrap());
 
         let spec_id = "test-spec-001";
-        let dest = create(spec_id, repo_dir.path().to_str().unwrap()).unwrap();
+        let dest = create(spec_id, repo_dir.to_str().unwrap()).unwrap();
 
         assert!(dest.exists(), "worktree directory should exist after create");
         assert!(dest.join(".git").exists(), "worktree should have .git pointer");
@@ -242,15 +206,14 @@ mod tests {
     #[test]
     fn test_create_idempotent() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let repo_dir = TempDir::new("repo2");
-        init_git_repo(repo_dir.path());
+        let repo_dir = test_utils::test_git_repo("wt-repo2");
 
-        let wt_base = TempDir::new("home2");
-        std::env::set_var("HOME", wt_base.path().to_str().unwrap());
+        let wt_base = test_utils::test_dir("wt-home2");
+        std::env::set_var("HOME", wt_base.to_str().unwrap());
 
         let spec_id = "test-spec-idempotent";
-        let dest1 = create(spec_id, repo_dir.path().to_str().unwrap()).unwrap();
-        let dest2 = create(spec_id, repo_dir.path().to_str().unwrap()).unwrap();
+        let dest1 = create(spec_id, repo_dir.to_str().unwrap()).unwrap();
+        let dest2 = create(spec_id, repo_dir.to_str().unwrap()).unwrap();
         assert_eq!(dest1, dest2);
     }
 
@@ -263,46 +226,39 @@ mod tests {
     #[test]
     fn test_cleanup_stale_empty_base() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let wt_base = TempDir::new("home3");
-        std::env::set_var("HOME", wt_base.path().to_str().unwrap());
+        let wt_base = test_utils::test_dir("wt-home3");
+        std::env::set_var("HOME", wt_base.to_str().unwrap());
         assert!(cleanup_stale().is_ok());
     }
 
     #[test]
     fn test_commit_and_merge_back() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let repo_dir = TempDir::new("merge-repo");
-        init_git_repo(repo_dir.path());
+        let repo_dir = test_utils::test_git_repo("wt-merge-repo");
 
-        let wt_base = TempDir::new("merge-home");
-        std::env::set_var("HOME", wt_base.path().to_str().unwrap());
+        let wt_base = test_utils::test_dir("wt-merge-home");
+        std::env::set_var("HOME", wt_base.to_str().unwrap());
 
         let spec_id = "test-merge-001";
-        let repo = repo_dir.path().to_str().unwrap();
+        let repo = repo_dir.to_str().unwrap();
         let dest = create(spec_id, repo).unwrap();
 
-        // Write a new file in the worktree
         std::fs::write(dest.join("new-feature.txt"), "hello from boi").unwrap();
 
-        // Verify file does NOT exist in source repo yet
-        assert!(!repo_dir.path().join("new-feature.txt").exists(),
+        assert!(!repo_dir.join("new-feature.txt").exists(),
             "file should NOT exist in source repo before merge");
 
-        // Commit changes in worktree
         let committed = commit_changes(spec_id, "boi: add feature").unwrap();
         assert!(committed, "should report changes were committed");
 
-        // Merge back to source repo
         let result = merge_back(spec_id, repo);
         assert!(result.is_ok(), "merge should succeed: {:?}", result.err());
 
-        // Verify file NOW exists in source repo
-        assert!(repo_dir.path().join("new-feature.txt").exists(),
+        assert!(repo_dir.join("new-feature.txt").exists(),
             "file should exist in source repo after merge");
-        let content = std::fs::read_to_string(repo_dir.path().join("new-feature.txt")).unwrap();
+        let content = std::fs::read_to_string(repo_dir.join("new-feature.txt")).unwrap();
         assert_eq!(content, "hello from boi");
 
-        // Cleanup
         cleanup(spec_id).unwrap();
         delete_branch(spec_id, repo).unwrap();
     }
@@ -310,14 +266,13 @@ mod tests {
     #[test]
     fn test_commit_no_changes() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let repo_dir = TempDir::new("no-change-repo");
-        init_git_repo(repo_dir.path());
+        let repo_dir = test_utils::test_git_repo("wt-no-change-repo");
 
-        let wt_base = TempDir::new("no-change-home");
-        std::env::set_var("HOME", wt_base.path().to_str().unwrap());
+        let wt_base = test_utils::test_dir("wt-no-change-home");
+        std::env::set_var("HOME", wt_base.to_str().unwrap());
 
         let spec_id = "test-no-change-001";
-        let _dest = create(spec_id, repo_dir.path().to_str().unwrap()).unwrap();
+        let _dest = create(spec_id, repo_dir.to_str().unwrap()).unwrap();
 
         let committed = commit_changes(spec_id, "no changes").unwrap();
         assert!(!committed, "should report no changes to commit");
@@ -328,29 +283,25 @@ mod tests {
     #[test]
     fn test_branch_deleted_after_cleanup() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let repo_dir = TempDir::new("branch-del-repo");
-        init_git_repo(repo_dir.path());
+        let repo_dir = test_utils::test_git_repo("wt-branch-del-repo");
 
-        let wt_base = TempDir::new("branch-del-home");
-        std::env::set_var("HOME", wt_base.path().to_str().unwrap());
+        let wt_base = test_utils::test_dir("wt-branch-del-home");
+        std::env::set_var("HOME", wt_base.to_str().unwrap());
 
         let spec_id = "test-branch-del-001";
-        let repo = repo_dir.path().to_str().unwrap();
+        let repo = repo_dir.to_str().unwrap();
         let dest = create(spec_id, repo).unwrap();
 
-        // Write, commit, merge
         std::fs::write(dest.join("feature.txt"), "done").unwrap();
         commit_changes(spec_id, "add feature").unwrap();
         merge_back(spec_id, repo).unwrap();
 
-        // Cleanup + delete branch
         cleanup(spec_id).unwrap();
         delete_branch(spec_id, repo).unwrap();
 
-        // Verify branch is gone
-        let output = Command::new("git")
+        let output = std::process::Command::new("git")
             .args(["branch", "--list", &branch_name(spec_id)])
-            .current_dir(repo_dir.path())
+            .current_dir(&repo_dir)
             .output().unwrap();
         let branches = String::from_utf8_lossy(&output.stdout);
         assert!(branches.trim().is_empty(),
@@ -360,23 +311,20 @@ mod tests {
     #[test]
     fn test_source_repo_clean_during_worktree_work() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let repo_dir = TempDir::new("isolation-repo");
-        init_git_repo(repo_dir.path());
+        let repo_dir = test_utils::test_git_repo("wt-isolation-repo");
 
-        let wt_base = TempDir::new("isolation-home");
-        std::env::set_var("HOME", wt_base.path().to_str().unwrap());
+        let wt_base = test_utils::test_dir("wt-isolation-home");
+        std::env::set_var("HOME", wt_base.to_str().unwrap());
 
         let spec_id = "test-isolation-001";
-        let repo = repo_dir.path().to_str().unwrap();
+        let repo = repo_dir.to_str().unwrap();
         let dest = create(spec_id, repo).unwrap();
 
-        // Make changes in worktree
         std::fs::write(dest.join("worktree-only.txt"), "isolated").unwrap();
 
-        // Source repo should be clean (no untracked files from worktree)
-        let status = Command::new("git")
+        let status = std::process::Command::new("git")
             .args(["status", "--porcelain"])
-            .current_dir(repo_dir.path())
+            .current_dir(&repo_dir)
             .output().unwrap();
         let status_text = String::from_utf8_lossy(&status.stdout);
         assert!(!status_text.contains("worktree-only.txt"),

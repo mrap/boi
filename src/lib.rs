@@ -7,5 +7,7 @@ pub mod queue;
 pub mod runner;
 pub mod spec;
 pub mod telemetry;
+#[cfg(test)]
+pub mod test_utils;
 pub mod worker;
 pub mod worktree;

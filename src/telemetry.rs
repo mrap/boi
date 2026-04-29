@@ -206,19 +206,11 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TelemetryEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils;
     use serde_json::json;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_db(name: &str) -> PathBuf {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        PathBuf::from(format!(
-            "/tmp/boi-test-telemetry-{}-{}-{}.db",
-            std::process::id(),
-            name,
-            n
-        ))
+        test_utils::test_file(name, "db")
     }
 
     #[test]

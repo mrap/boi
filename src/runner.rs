@@ -356,17 +356,10 @@ mod tests {
     use super::*;
     use crate::phases::{PhaseConfig, PhaseLevel, Verdict};
     use crate::spec::{BoiTask, TaskStatus};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    use crate::test_utils;
 
     fn test_telemetry() -> Telemetry {
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let db = std::path::PathBuf::from(format!(
-            "/tmp/boi-test-runner-{}-{}.db",
-            std::process::id(),
-            n
-        ));
+        let db = test_utils::test_file("runner-tel", "db");
         let _ = std::fs::remove_file(&db);
         Telemetry::new(db)
     }
