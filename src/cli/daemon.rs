@@ -1,13 +1,56 @@
 use crate::fmt::{ensure_db_dir, is_pid_alive};
 use crate::telemetry::Telemetry;
 use crate::{config, hooks, queue, worker};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
+pub fn daemon_lock_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".boi").join("daemon.lock")
+}
+
+/// Try to acquire an exclusive flock on the daemon lock file.
+/// Returns the held File on success (lock auto-releases when File drops).
+/// Returns None if another daemon holds the lock.
+pub fn try_acquire_daemon_lock() -> Option<std::fs::File> {
+    let lock_path = daemon_lock_path();
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        use std::io::Write;
+        let mut f = file;
+        let _ = f.set_len(0);
+        let _ = write!(f, "{}", std::process::id());
+        Some(f)
+    } else {
+        None
+    }
+}
+
+/// Check if a daemon is running by trying the lock.
+pub fn is_daemon_locked() -> bool {
+    try_acquire_daemon_lock().is_none()
+}
+
+/// Read the PID from the lock file (informational — the lock is the real guard).
+pub fn read_daemon_pid() -> Option<u32> {
+    std::fs::read_to_string(daemon_lock_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
 pub fn cmd_start() {
-    let pid_path = daemon_pid_path();
-    if check_existing_daemon(&pid_path) {
-        if let Ok(content) = std::fs::read_to_string(&pid_path) {
-            eprintln!("daemon already running (pid {})", content.trim());
+    if is_daemon_locked() {
+        if let Some(pid) = read_daemon_pid() {
+            eprintln!("daemon already running (pid {})", pid);
         } else {
             eprintln!("daemon already running");
         }
@@ -63,8 +106,7 @@ pub fn cmd_start() {
 }
 
 pub fn cmd_restart() {
-    let pid_path = daemon_pid_path();
-    if check_existing_daemon(&pid_path) {
+    if is_daemon_locked() {
         cmd_stop();
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -72,8 +114,7 @@ pub fn cmd_restart() {
 }
 
 pub fn daemon_pid_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".boi").join("daemon.pid")
+    daemon_lock_path()
 }
 
 pub fn daemon_heartbeat_path() -> PathBuf {
@@ -81,43 +122,24 @@ pub fn daemon_heartbeat_path() -> PathBuf {
     PathBuf::from(home).join(".boi").join("daemon.heartbeat")
 }
 
-pub fn check_existing_daemon(pid_path: &std::path::Path) -> bool {
-    if let Ok(content) = std::fs::read_to_string(pid_path) {
-        if let Ok(pid) = content.trim().parse::<i32>() {
-            unsafe { libc::kill(pid, 0) == 0 }
-        } else {
-            false
-        }
-    } else {
-        false
-    }
-}
-
 pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Config) {
     ensure_db_dir(db_str);
 
-    // Singleton guard: check if a daemon is already running
-    let pid_path = daemon_pid_path();
-    if check_existing_daemon(&pid_path) {
-        if let Ok(content) = std::fs::read_to_string(&pid_path) {
-            eprintln!(
-                "[boi daemon] error: daemon already running (pid {})",
-                content.trim()
-            );
-        } else {
-            eprintln!("[boi daemon] error: daemon already running");
+    // Singleton guard via flock — atomic, no stale PID files possible.
+    // _lock_file must live for the entire daemon lifetime; dropping it releases the lock.
+    let _lock_file = match try_acquire_daemon_lock() {
+        Some(f) => f,
+        None => {
+            if let Some(pid) = read_daemon_pid() {
+                eprintln!("[boi daemon] error: daemon already running (pid {})", pid);
+            } else {
+                eprintln!("[boi daemon] error: daemon already running");
+            }
+            std::process::exit(1);
         }
-        std::process::exit(1);
-    }
+    };
 
-    // Write PID file
     let pid = std::process::id();
-    if let Some(parent) = pid_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&pid_path, pid.to_string()).unwrap_or_else(|e| {
-        eprintln!("warning: could not write PID file: {}", e);
-    });
 
     // Register SIGTERM handler via atomic flag
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -260,52 +282,34 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         }
     }
 
-    // Clean up pidfile and heartbeat
-    let _ = std::fs::remove_file(&pid_path);
+    // Clean up heartbeat (lock file releases automatically when _lock_file drops)
     let _ = std::fs::remove_file(daemon_heartbeat_path());
 
     eprintln!("[boi daemon] stopped");
 }
 
 pub fn cmd_stop() {
-    let pid_path = daemon_pid_path();
-
-    if !pid_path.exists() {
-        eprintln!("no daemon PID file found at {}", pid_path.display());
-        std::process::exit(1);
-    }
-
-    let pid_str = match std::fs::read_to_string(&pid_path) {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
-            eprintln!("error reading PID file: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let pid: u32 = match pid_str.parse() {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("invalid PID in file: {}", pid_str);
-            std::process::exit(1);
+    let pid = match read_daemon_pid() {
+        Some(p) => p,
+        None => {
+            if is_daemon_locked() {
+                eprintln!("daemon is running but PID unknown");
+                std::process::exit(1);
+            }
+            eprintln!("no daemon running");
+            return;
         }
     };
 
     if !is_pid_alive(pid) {
-        eprintln!("daemon process {} is not running (stale PID file)", pid);
-        let _ = std::fs::remove_file(&pid_path);
+        eprintln!("daemon process {} is not running", pid);
         let _ = std::fs::remove_file(daemon_heartbeat_path());
         return;
     }
 
-    // Send SIGTERM
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-
+    unsafe { libc::kill(pid as i32, libc::SIGTERM); }
     println!("sent SIGTERM to daemon (pid {})", pid);
 
-    // Wait briefly for graceful shutdown
     for _ in 0..20 {
         std::thread::sleep(std::time::Duration::from_millis(500));
         if !is_pid_alive(pid) {
@@ -315,9 +319,6 @@ pub fn cmd_stop() {
     }
 
     println!("daemon still running after 10s — sending SIGKILL");
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
-    let _ = std::fs::remove_file(&pid_path);
+    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
     let _ = std::fs::remove_file(daemon_heartbeat_path());
 }

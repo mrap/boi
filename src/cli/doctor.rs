@@ -1,6 +1,6 @@
-use crate::cli::daemon::{daemon_heartbeat_path, daemon_pid_path};
+use crate::cli::daemon::{daemon_heartbeat_path, is_daemon_locked, read_daemon_pid};
 use crate::config;
-use crate::fmt::{ensure_db_dir, is_pid_alive, time_ago, BOLD, CYAN, GREEN, RED, RESET, YELLOW};
+use crate::fmt::{ensure_db_dir, time_ago, BOLD, CYAN, GREEN, RED, RESET, YELLOW};
 use crate::queue;
 
 pub fn cmd_doctor(db_str: &str, cfg: &config::Config) {
@@ -9,26 +9,14 @@ pub fn cmd_doctor(db_str: &str, cfg: &config::Config) {
     println!("{}{}BOI Doctor{}\n", BOLD, CYAN, RESET);
 
     // 1. Daemon running?
-    let pid_path = daemon_pid_path();
-    if pid_path.exists() {
-        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                if is_pid_alive(pid) {
-                    println!("  {}✓{} Daemon running (pid {})", GREEN, RESET, pid);
-                } else {
-                    println!(
-                        "  {}✗{} Daemon PID file exists but process {} is dead",
-                        RED, RESET, pid
-                    );
-                    issues += 1;
-                }
-            } else {
-                println!("  {}✗{} Invalid PID file content", RED, RESET);
-                issues += 1;
-            }
+    if is_daemon_locked() {
+        if let Some(pid) = read_daemon_pid() {
+            println!("  {}✓{} Daemon running (pid {})", GREEN, RESET, pid);
+        } else {
+            println!("  {}✓{} Daemon running (pid unknown)", GREEN, RESET);
         }
     } else {
-        println!("  {}⊘{} Daemon not running (no PID file)", YELLOW, RESET);
+        println!("  {}⊘{} Daemon not running", YELLOW, RESET);
     }
 
     // 2. Heartbeat fresh?

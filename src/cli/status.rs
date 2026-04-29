@@ -1,4 +1,4 @@
-use crate::cli::daemon::{daemon_heartbeat_path, daemon_pid_path};
+use crate::cli::daemon::{daemon_heartbeat_path, daemon_pid_path, is_daemon_locked};
 use crate::config;
 use crate::fmt::{
     display_width, elapsed_since, ensure_db_dir, is_pid_alive, progress_bar, term_width, time_ago,
@@ -63,19 +63,7 @@ pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
 fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
     ensure_db_dir(db_str);
 
-    // Check daemon status FIRST — loud banner if not running
-    let daemon_running = {
-        let pid_path = daemon_pid_path();
-        if pid_path.exists() {
-            std::fs::read_to_string(&pid_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .map(|pid| is_pid_alive(pid))
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    };
+    let daemon_running = is_daemon_locked();
 
     let mut out = String::new();
     if !daemon_running {
