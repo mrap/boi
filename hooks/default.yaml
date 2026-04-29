@@ -1,13 +1,17 @@
 hooks:
   on_dispatch:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.dispatched '{\"spec_id\": \"$BOI_SPEC_ID\"}'"
+    command: >-
+      python3 ~/.hex-events/hex_emit.py boi.spec.dispatched "{\"spec_id\": \"$BOI_SPEC_ID\"}" boi-hooks
     blocking: false
   on_complete:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.completed '{\"spec_id\": \"$BOI_SPEC_ID\"}'"
+    command: >-
+      python3 ~/.hex-events/hex_emit.py boi.spec.completed "{\"spec_id\": \"$BOI_SPEC_ID\"}" boi-hooks
     blocking: false
   on_fail:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.failed '{\"spec_id\": \"$BOI_SPEC_ID\"}'"
+    command: >-
+      python3 ~/.hex-events/hex_emit.py boi.spec.failed "{\"spec_id\": \"$BOI_SPEC_ID\"}" boi-hooks
     blocking: false
   on_cancel:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.cancelled '{\"spec_id\": \"$BOI_SPEC_ID\"}'"
+    command: >-
+      python3 ~/.hex-events/hex_emit.py boi.spec.cancelled "{\"spec_id\": \"$BOI_SPEC_ID\"}" boi-hooks
     blocking: false
