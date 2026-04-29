@@ -508,6 +508,7 @@ pub fn run_worker_with_phases(
             let deps: Vec<String> = raw_deps.iter()
                 .map(|d| canonical_to_yaml.get(d).cloned().unwrap_or_else(|| d.clone()))
                 .collect();
+            boi_log!("  dep-map: yaml_id={} canonical={} raw_deps={:?} mapped_deps={:?}", yaml_id, dt.id, raw_deps, deps);
             if !deps.is_empty() {
                 db_depends.insert(yaml_id.clone(), deps);
             }
@@ -692,6 +693,7 @@ pub fn run_worker_with_phases(
 
                 // Find next ready task: PENDING, all deps satisfied
                 let mut found = false;
+                boi_log!("state: TaskSelect — order={:?} done={:?} skipped={:?}", order, done_ids, skipped_ids);
                 for task_id in &order {
                     if done_ids.contains(task_id.as_str()) || skipped_ids.contains(task_id.as_str()) {
                         continue;
@@ -716,7 +718,9 @@ pub fn run_worker_with_phases(
                         task.depends.clone().unwrap_or_default()
                     };
 
-                    if effective_deps.iter().any(|d| !done_ids.contains(d)) {
+                    let blocked_by: Vec<&String> = effective_deps.iter().filter(|d| !done_ids.contains(d.as_str())).collect();
+                    if !blocked_by.is_empty() {
+                        boi_log!("state: TaskSelect — {} blocked by {:?}", task_id, blocked_by);
                         continue;
                     }
 

@@ -681,7 +681,7 @@ impl Queue {
 
     pub fn get_tasks(&self, spec_id: &str) -> Result<Vec<TaskRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, spec_id, title, status, depends, started_at, completed_at, error FROM tasks WHERE spec_id = ?1",
+            "SELECT id, spec_id, title, status, depends, started_at, completed_at, error FROM tasks WHERE spec_id = ?1 ORDER BY rowid",
         )?;
         let rows = stmt.query_map(params![spec_id], row_to_task)?;
         let mut tasks = Vec::new();
