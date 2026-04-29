@@ -137,17 +137,26 @@ enum Commands {
     Doctor,
     /// Print version
     Version,
-    /// Compare two pipeline configs on the same spec
+    /// Benchmark N pipelines across a spec or battery of specs
     Bench {
-        /// Path to the spec file
+        /// Benchmark a single phase in isolation (requires --spec; conflicts with --battery and --pipeline)
+        #[arg(long, conflicts_with_all = ["battery", "pipelines"])]
+        phase: Option<String>,
+        /// Single spec file to benchmark
+        #[arg(long, conflicts_with = "battery")]
+        spec: Option<PathBuf>,
+        /// Directory of .yaml spec files (battery mode)
+        #[arg(long, conflicts_with = "spec")]
+        battery: Option<PathBuf>,
+        /// Pipeline config as "name:path/to/pipeline.toml" (repeatable)
+        #[arg(long = "pipeline")]
+        pipelines: Vec<String>,
+        /// Number of runs per (spec, pipeline) pair
+        #[arg(long, default_value = "1")]
+        runs: u32,
+        /// Output results as JSON
         #[arg(long)]
-        spec: PathBuf,
-        /// Pipeline A: comma-separated task phases (e.g. "execute,task-verify")
-        #[arg(long = "a")]
-        pipeline_a: String,
-        /// Pipeline B: comma-separated task phases (e.g. "execute,code-review,task-verify")
-        #[arg(long = "b")]
-        pipeline_b: String,
+        json: bool,
     },
 }
 
@@ -292,8 +301,57 @@ fn main() {
         Commands::Version => {
             println!("boi {}", env!("CARGO_PKG_VERSION"));
         }
-        Commands::Bench { spec, pipeline_a, pipeline_b } => {
-            cmd_bench(&spec, &pipeline_a, &pipeline_b, db_str);
+        Commands::Bench { phase, spec, battery, pipelines, runs, json } => {
+            if let Some(phase_name) = phase {
+                let spec_path = spec.unwrap_or_else(|| {
+                    eprintln!("error: --phase requires --spec <file>");
+                    std::process::exit(1);
+                });
+                boi::cli::bench::cmd_bench_phase(&phase_name, &spec_path, runs);
+                return;
+            }
+
+            let spec_paths: Vec<std::path::PathBuf> = if let Some(dir) = battery {
+                let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
+                    Ok(rd) => rd
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.extension().map(|x| x == "yaml").unwrap_or(false))
+                        .collect(),
+                    Err(e) => {
+                        eprintln!("error: cannot read battery dir: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                paths.sort();
+                paths
+            } else if let Some(p) = spec {
+                vec![p]
+            } else {
+                eprintln!("error: must provide --spec or --battery");
+                std::process::exit(1);
+            };
+
+            let pipeline_entries: Vec<(String, std::path::PathBuf)> = pipelines
+                .iter()
+                .map(|s| {
+                    let mut parts = s.splitn(2, ':');
+                    let name = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("");
+                    if name.is_empty() || path.is_empty() {
+                        eprintln!("error: --pipeline must be name:path, got: {s}");
+                        std::process::exit(1);
+                    }
+                    (name, std::path::PathBuf::from(path))
+                })
+                .collect();
+
+            if pipeline_entries.is_empty() {
+                eprintln!("error: at least one --pipeline name:path required");
+                std::process::exit(1);
+            }
+
+            cmd_bench(&spec_paths, &pipeline_entries, runs, db_str, json);
         }
     }
 }

@@ -1,0 +1,15 @@
+title: "Simple benchmark spec"
+mode: execute
+context: |
+  Baseline benchmark spec with a single task and no dependencies.
+  Used to measure minimum pipeline overhead.
+
+tasks:
+  - id: t-1
+    title: "Echo greeting"
+    status: PENDING
+    spec: |
+      Print "hello from benchmark" to stdout.
+      Command: echo "hello from benchmark"
+    verify: |
+      echo "hello from benchmark" | grep -q "hello" && echo PASS
