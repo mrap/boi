@@ -7,6 +7,7 @@ begins. Review the spec as a whole and output suggested improvements as structur
 
 Target: complete review in under 60 seconds. One pass, not per-task loops.
 
+{{CRITIQUE_FEEDBACK}}
 ---
 
 ## What to Check

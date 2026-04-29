@@ -413,6 +413,19 @@ impl PhaseRegistry {
     pub fn is_user_override(&self, name: &str) -> bool {
         self.user.contains_key(name) && self.core.contains_key(name)
     }
+
+    /// Apply per-phase model overrides from config.yaml.
+    /// config.models entries override the TOML's model field at runtime.
+    pub fn apply_model_overrides(&mut self, models: &HashMap<String, String>) {
+        for (phase_name, model) in models {
+            if let Some(phase) = self.core.get_mut(phase_name) {
+                phase.model = Some(model.clone());
+            }
+            if let Some(phase) = self.user.get_mut(phase_name) {
+                phase.model = Some(model.clone());
+            }
+        }
+    }
 }
 
 pub fn default_phases(mode: &str) -> Vec<String> {
@@ -1348,13 +1361,56 @@ approve_signal = ""
         let registry = test_registry();
         let pc = registry.get("plan-critique").unwrap();
         let outcome = parse_phase_output(pc, "[PLAN-CRITIQUE] Task t-3 has unrealistic dependency");
-        match outcome {
-            Verdict::Done { success, reason } => {
-                assert!(!success);
-                assert!(reason.contains("[PLAN-CRITIQUE]"));
-            }
-            other => panic!("Expected Done with success=false, got {:?}", other),
-        }
+        // on_reject = "requeue:spec-review" → loops back instead of hard-failing
+        assert_eq!(outcome, Verdict::Redo { tasks: vec![] });
+    }
+
+    #[test]
+    fn test_apply_model_overrides() {
+        let mut registry = test_registry();
+
+        // Before override: execute phase may have a model or may not
+        let before = registry.get("execute").unwrap().model.clone();
+
+        let mut overrides = HashMap::new();
+        overrides.insert("execute".to_string(), "claude-opus-4-7".to_string());
+        overrides.insert("spec-review".to_string(), "claude-haiku-4-5-20251001".to_string());
+        overrides.insert("nonexistent-phase".to_string(), "some-model".to_string()); // should not panic
+
+        registry.apply_model_overrides(&overrides);
+
+        assert_eq!(
+            registry.get("execute").unwrap().model.as_deref(),
+            Some("claude-opus-4-7"),
+            "execute model should be overridden"
+        );
+        assert_eq!(
+            registry.get("spec-review").unwrap().model.as_deref(),
+            Some("claude-haiku-4-5-20251001"),
+            "spec-review model should be overridden"
+        );
+
+        // Phase not in overrides should be unchanged
+        let critic_model = registry.get("critic").unwrap().model.clone();
+        // critic model should not have been touched by the overrides above
+        let _ = (before, critic_model); // just ensure we can access them without panic
+    }
+
+    #[test]
+    fn test_apply_model_overrides_preserves_toml_defaults_for_unmentioned_phases() {
+        let mut registry = test_registry();
+        let critic_model_before = registry.get("critic").unwrap().model.clone();
+
+        let mut overrides = HashMap::new();
+        overrides.insert("execute".to_string(), "claude-opus-4-7".to_string());
+        registry.apply_model_overrides(&overrides);
+
+        // critic model must not change
+        assert_eq!(
+            registry.get("critic").unwrap().model,
+            critic_model_before,
+            "phases not in overrides must keep their TOML model"
+        );
     }
 
     #[test]

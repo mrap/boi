@@ -12,7 +12,7 @@ timeout = 300
 approve_signal = "## Plan Approved"
 reject_signal = "[PLAN-CRITIQUE]"
 on_approve = "next"
-on_reject = "fail"
+on_reject = "requeue:spec-review"
 on_crash = "retry"
 
 [hooks]

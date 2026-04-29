@@ -15,6 +15,9 @@ pub struct BoiSpec {
     /// Override task-level phases (replaces default_pipeline().task_phases)
     #[serde(default)]
     pub task_phases: Option<Vec<String>>,
+    /// Context files to inject into every worker prompt for this spec
+    #[serde(default)]
+    pub context_files: Option<Vec<String>>,
     pub tasks: Vec<BoiTask>,
 }
 
@@ -515,6 +518,30 @@ tasks:
         let spec = parse(yaml).unwrap();
         assert_eq!(spec.spec_phases, None);
         assert_eq!(spec.task_phases, None);
+    }
+
+    #[test]
+    fn test_parse_context_files() {
+        let yaml = r#"
+title: "Context Files Spec"
+context_files:
+  - ~/.claude/shared-memory/SHARED.md
+  - ~/notes.md
+tasks:
+  - id: t-1
+    title: "Task"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        let files = spec.context_files.as_ref().expect("context_files should be present");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0], "~/.claude/shared-memory/SHARED.md");
+    }
+
+    #[test]
+    fn test_context_files_defaults_to_none() {
+        let spec = parse(MINIMAL_YAML).unwrap();
+        assert!(spec.context_files.is_none());
     }
 
     #[test]

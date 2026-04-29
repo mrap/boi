@@ -11,6 +11,11 @@ pub struct Paths {
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
+pub struct ContextConfig {
+    pub always_include: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
     pub max_workers: Option<u32>,
     pub task_timeout_minutes: Option<u32>,
@@ -19,6 +24,8 @@ pub struct Config {
     pub hooks: Option<HashMap<String, HookEntry>>,
     pub paths: Option<Paths>,
     pub claude_bin: Option<String>,
+    pub models: Option<HashMap<String, String>>,
+    pub context: Option<ContextConfig>,
 }
 
 pub fn load() -> Config {
@@ -160,5 +167,48 @@ mod tests {
         assert_eq!(cfg.db_path(), PathBuf::from("/custom/boi.db"));
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_models_override_via_yaml() {
+        let path = test_utils::test_file("config-models", "yaml");
+        let yaml = "models:\n  spec-review: claude-opus-4-7\n  execute: claude-haiku-4-5-20251001\n";
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+
+        let cfg = Config::load_from(&path);
+        let models = cfg.models.as_ref().expect("models should be present");
+        assert_eq!(models.get("spec-review").map(|s| s.as_str()), Some("claude-opus-4-7"));
+        assert_eq!(models.get("execute").map(|s| s.as_str()), Some("claude-haiku-4-5-20251001"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_models_none_when_absent() {
+        let cfg = Config::default();
+        assert!(cfg.models.is_none());
+    }
+
+    #[test]
+    fn test_context_always_include_via_yaml() {
+        let path = test_utils::test_file("config-context", "yaml");
+        let yaml = "context:\n  always_include:\n    - ~/.claude/SHARED.md\n    - ~/notes.md\n";
+        let mut f = fs::File::create(&path).unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+
+        let cfg = Config::load_from(&path);
+        let ctx = cfg.context.as_ref().expect("context should be present");
+        let includes = ctx.always_include.as_ref().expect("always_include should be present");
+        assert_eq!(includes.len(), 2);
+        assert_eq!(includes[0], "~/.claude/SHARED.md");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_context_none_when_absent() {
+        let cfg = Config::default();
+        assert!(cfg.context.is_none());
     }
 }

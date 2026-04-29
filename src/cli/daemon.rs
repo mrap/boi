@@ -177,6 +177,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         retry_count: cfg.retry_count(),
         cleanup_on_failure: cfg.cleanup_on_failure(),
         claude_bin: cfg.claude_bin(),
+        models: cfg.models.clone(),
     };
 
     // Crash recovery: reset any specs stuck in 'running' or 'assigning' back to 'queued'
@@ -246,6 +247,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                             let retries = wc.retry_count;
                             let cleanup_fail = wc.cleanup_on_failure;
                             let cbin = wc.claude_bin.clone();
+                            let models = wc.models.clone();
 
                             // Use per-spec timeout if set, otherwise default
                             let spec_timeout = rec
@@ -262,6 +264,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                                     retry_count: retries,
                                     cleanup_on_failure: cleanup_fail,
                                     claude_bin: cbin,
+                                    models,
                                 };
                                 if let Err(e) =
                                     worker::run_worker(&spec_id, &spec_path, &qpath, &hc, &wc, &tel)

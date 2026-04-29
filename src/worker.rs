@@ -34,6 +34,7 @@ pub struct WorkerConfig {
     pub retry_count: u32,
     pub cleanup_on_failure: bool,
     pub claude_bin: String,
+    pub models: Option<HashMap<String, String>>,
 }
 
 impl Default for WorkerConfig {
@@ -44,6 +45,7 @@ impl Default for WorkerConfig {
             retry_count: 3,
             cleanup_on_failure: false,
             claude_bin: std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string()),
+            models: None,
         }
     }
 }
@@ -242,7 +244,10 @@ pub fn run_worker(
     config: &WorkerConfig,
     telemetry: &Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let registry = PhaseRegistry::new();
+    let mut registry = PhaseRegistry::new();
+    if let Some(ref models) = config.models {
+        registry.apply_model_overrides(models);
+    }
     registry_load_user(&registry);
     let runner = Arc::new(ClaudePhaseRunner::new(telemetry.clone(), config.claude_bin.clone()));
     run_worker_with_phases(spec_id, spec_path, queue_path, hook_config, config, &registry, runner.as_ref(), telemetry)
@@ -382,6 +387,7 @@ pub fn run_worker_with_phases(
         outcomes: None,
         spec_phases: None,
         task_phases: None,
+        context_files: None,
         tasks,
     };
 
@@ -492,6 +498,8 @@ pub fn run_worker_with_phases(
     let mut task_select_passes: usize = 0;
     let mut spec_redo_count: usize = 0;
     let max_spec_redos = config.retry_count as usize;
+    // Quality loop counter: how many times plan-critique has looped back to spec-review
+    let mut spec_loop_count: usize = 0;
     let max_task_select_passes = order.len().max(1);
 
     // Template variables for phase prompts
@@ -514,6 +522,11 @@ pub fn run_worker_with_phases(
     prompt_vars.insert(TemplateVar::TaskSpec.key().into(), String::new());
     prompt_vars.insert(TemplateVar::TaskVerify.key().into(), String::new());
     prompt_vars.insert(TemplateVar::TaskDepends.key().into(), String::new());
+    // Populated when plan-critique loops back to spec-review with rejection feedback
+    prompt_vars.insert("CRITIQUE_FEEDBACK".into(), String::new());
+    // Project context injected from config.context.always_include and spec.context_files
+    prompt_vars.insert("PROJECT_CONTEXT".into(),
+        spec_rec.project_context.as_deref().unwrap_or("").to_string());
     TemplateVar::validate(&prompt_vars).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // --- State machine ---
@@ -608,7 +621,7 @@ pub fn run_worker_with_phases(
                     }
                     Verdict::Redo { tasks } => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
-                        // Inject tasks if any, then go to TaskSelect
+                        // Inject tasks if any
                         if !tasks.is_empty() {
                             for t in tasks {
                                 let _ = queue.add_task( // intentional: best-effort task injection during redo
@@ -621,7 +634,35 @@ pub fn run_worker_with_phases(
                                 );
                             }
                         }
-                        state = WorkerState::TaskSelect;
+                        // Quality loop: if this phase has on_reject = "requeue:<target>" and
+                        // <target> is a pre-spec phase, loop back with critique feedback
+                        // rather than jumping to TaskSelect. Cap at 3 loops to prevent deadlock.
+                        let requeue_target = phase.on_reject.as_deref()
+                            .and_then(|a| a.strip_prefix("requeue:"))
+                            .filter(|target| pre_spec_phases.contains(target));
+                        if let Some(target) = requeue_target {
+                            let max_spec_loops = 3usize;
+                            if spec_loop_count < max_spec_loops {
+                                spec_loop_count += 1;
+                                let feedback = format!(
+                                    "## Plan Critique Feedback (loop {})\n\n{}\n\n---\n\n",
+                                    spec_loop_count, phase_output
+                                );
+                                prompt_vars.insert("CRITIQUE_FEEDBACK".into(), feedback);
+                                let target_idx = pre_spec_phases.iter()
+                                    .position(|&n| n == target)
+                                    .unwrap_or(0);
+                                boi_log!("quality loop: '{}' rejected → loop back to '{}' ({}/{})",
+                                    phase_name, target, spec_loop_count, max_spec_loops);
+                                state = WorkerState::SpecPhase { phase_idx: target_idx };
+                            } else {
+                                boi_log!("quality loop: max {} loops exceeded for '{}', proceeding to TaskSelect",
+                                    max_spec_loops, phase_name);
+                                state = WorkerState::TaskSelect;
+                            }
+                        } else {
+                            state = WorkerState::TaskSelect;
+                        }
                     }
                     Verdict::Pause { prompt } => {
                         state = WorkerState::Paused { prompt: prompt.clone() };
@@ -1507,6 +1548,7 @@ tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: script.to_str().unwrap().to_string(),
+            models: None,
         };
 
         let tel = test_telemetry();
@@ -1541,6 +1583,7 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: script.to_str().unwrap().to_string(),
+            models: None,
         };
 
         let tel = test_telemetry();
@@ -1578,6 +1621,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: script.to_str().unwrap().to_string(),
+            models: None,
         };
 
         let tel = test_telemetry();
@@ -1630,6 +1674,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            models: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1668,6 +1713,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            models: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1705,6 +1751,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            models: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1742,6 +1789,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            models: None,
         };
         let registry = PhaseRegistry::new();
         // spec-review runs first (pre-spec phase), then execute times out
@@ -1780,6 +1828,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            models: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1820,6 +1869,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             retry_count: 0,
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
+            models: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -1979,5 +2029,114 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
 
         let tasks = queue.get_tasks(&spec_id).unwrap();
         assert_eq!(tasks.len(), 3, "expected 3 tasks after code-fence JSON split");
+    }
+
+    // --- Quality loop tests ---
+
+    #[test]
+    fn test_quality_loop_plan_critique_loops_back_to_spec_review() {
+        // challenge mode: pre_spec_phases = [spec-review, plan-critique]
+        // plan-critique rejects once → loops back to spec-review → approved on second pass
+        let yaml = "title: \"Quality Loop Test\"\nmode: challenge\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("quality_loop", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+            cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
+            models: None,
+        };
+        let registry = PhaseRegistry::new();
+        // Phase call order:
+        //   spec-review(pre), plan-critique(pre→Redo→loop), spec-review(pre loop1),
+        //   plan-critique(pre loop1), execute, task-verify, spec-review(post), critic(post→exhausted)
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            Verdict::Proceed,                      // spec-review (pre)
+            Verdict::Redo { tasks: vec![] },       // plan-critique rejects → quality loop
+            Verdict::Proceed,                      // spec-review (loop 1)
+            Verdict::Proceed,                      // plan-critique (loop 1 — approved)
+            Verdict::Proceed,                      // execute
+            Verdict::Proceed,                      // task-verify
+            Verdict::Proceed,                      // spec-review (post)
+            // critic (post) → exhausted, MockPhaseRunner returns Proceed automatically
+        ]);
+        let tel = test_telemetry();
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+                &tel,
+            )
+            .unwrap();
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "completed");
+        assert_eq!(st.tasks[0].status, "DONE");
+        // Verify all 7 verdicts were consumed, proving the quality loop ran
+        let remaining = mock.verdicts.lock().unwrap().len();
+        assert_eq!(remaining, 0, "all verdicts should be consumed — quality loop must have run (got {} remaining)", remaining);
+    }
+
+    #[test]
+    fn test_quality_loop_max_exceeded_proceeds_to_task_select() {
+        // plan-critique rejects 3 times — after 3 loops (max), proceed anyway
+        let yaml = "title: \"Max Loop Test\"\nmode: challenge\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("quality_loop_max", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+            cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
+            models: None,
+        };
+        let registry = PhaseRegistry::new();
+        // With max_spec_loops=3: loops 1,2,3 retry; on loop 3's rejection spec_loop_count=3
+        // which is NOT < 3, so proceed to TaskSelect.
+        // Phase call order:
+        //   sr(pre), pc(rej→loop1), sr, pc(rej→loop2), sr, pc(rej→loop3), sr, pc(rej→proceed!),
+        //   execute, task-verify, sr(post), critic(post→exhausted)
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            Verdict::Proceed,                      // spec-review (pre)
+            Verdict::Redo { tasks: vec![] },       // plan-critique → loop 1
+            Verdict::Proceed,                      // spec-review (loop 1)
+            Verdict::Redo { tasks: vec![] },       // plan-critique → loop 2
+            Verdict::Proceed,                      // spec-review (loop 2)
+            Verdict::Redo { tasks: vec![] },       // plan-critique → loop 3
+            Verdict::Proceed,                      // spec-review (loop 3)
+            Verdict::Redo { tasks: vec![] },       // plan-critique → max exceeded, proceed anyway
+            Verdict::Proceed,                      // execute
+            Verdict::Proceed,                      // task-verify
+            Verdict::Proceed,                      // spec-review (post)
+            // critic (post) → exhausted
+        ]);
+        let tel = test_telemetry();
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+                &tel,
+            )
+            .unwrap();
+        });
+
+        let st = queue.status(&spec_id).unwrap().unwrap();
+        // Spec must complete even though plan-critique never approved
+        assert_eq!(st.spec.status, "completed");
+        assert_eq!(st.tasks[0].status, "DONE");
     }
 }

@@ -199,6 +199,7 @@ pub struct BoiSpec {
     pub outcomes: Vec<Outcome>,
     pub tasks: Vec<BoiTask>,
     pub context: Option<String>,
+    pub context_files: Option<Vec<String>>,  // injected into every worker prompt
     pub error_log: Vec<ErrorEntry>,
 }
 
@@ -477,6 +478,15 @@ The hook system is the primary integration point between BOI and external system
 workers: 3
 runtime:
   default: claude
+
+models:
+  spec-review: claude-opus-4-7
+  execute: claude-sonnet-4-6
+  task-verify: claude-haiku-4-5-20251001
+
+context:
+  always_include:
+    - ~/.claude/shared-memory/SHARED.md
 
 hooks:
   on_dispatch:

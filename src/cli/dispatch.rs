@@ -1,5 +1,5 @@
 use crate::fmt::ensure_db_dir;
-use crate::{hooks, queue, spec};
+use crate::{config, hooks, queue, spec};
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -48,8 +48,26 @@ pub fn cmd_dispatch(
         }
     };
 
+    // Build project_context from global config and per-spec context_files
+    let cfg = config::load();
+    let mut context_paths: Vec<String> = cfg
+        .context
+        .as_ref()
+        .and_then(|c| c.always_include.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(ref spec_files) = boi_spec.context_files {
+        context_paths.extend(spec_files.iter().cloned());
+    }
+    let project_context = if context_paths.is_empty() {
+        None
+    } else {
+        let content = queue::read_context_files(&context_paths);
+        if content.is_empty() { None } else { Some(content) }
+    };
+
     let spec_path_str = spec_path.to_str().unwrap_or("");
-    let spec_id = match q.enqueue(&boi_spec, Some(spec_path_str)) {
+    let spec_id = match q.enqueue_with_context(&boi_spec, Some(spec_path_str), project_context.as_deref()) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("error: enqueue failed: {}", e);
