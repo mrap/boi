@@ -330,22 +330,20 @@ pub fn run_worker_with_phases(
     let task_map: HashMap<&str, &spec::BoiTask> =
         boi_spec.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
 
-    // Track which tasks we've completed this run (supplements spec YAML state)
-    let mut done_ids: HashSet<String> = boi_spec
-        .tasks
-        .iter()
-        .filter(|t| t.status == spec::TaskStatus::Done)
-        .map(|t| t.id.clone())
-        .collect();
-
-    // Overlay DB state: tasks may have been SKIPPED or had deps added via `boi spec` mutations
+    // DB is the single source of truth for task status.
+    // YAML defines task specs/verify; DB owns runtime state (status, deps, timestamps).
+    let mut done_ids: HashSet<String> = HashSet::new();
     let mut skipped_ids: HashSet<String> = HashSet::new();
     let mut db_depends: HashMap<String, Vec<String>> = HashMap::new();
     if let Ok(db_tasks) = queue.get_tasks(spec_id) {
         for dt in &db_tasks {
-            if dt.status == "SKIPPED" {
-                skipped_ids.insert(dt.id.clone());
-                done_ids.insert(dt.id.clone());
+            match dt.status.as_str() {
+                "DONE" => { done_ids.insert(dt.id.clone()); }
+                "SKIPPED" => {
+                    skipped_ids.insert(dt.id.clone());
+                    done_ids.insert(dt.id.clone());
+                }
+                _ => {}
             }
             let deps: Vec<String> = serde_json::from_str(&dt.depends).unwrap_or_default();
             if !deps.is_empty() {
@@ -513,9 +511,6 @@ pub fn run_worker_with_phases(
                         Some(t) => t,
                         None => continue,
                     };
-                    if task.status != spec::TaskStatus::Pending {
-                        continue;
-                    }
 
                     // Merge DB-level deps with YAML deps
                     let effective_deps: Vec<String> = if let Some(db_d) = db_depends.get(task_id.as_str()) {
@@ -605,7 +600,6 @@ pub fn run_worker_with_phases(
                 );
 
                 if phase_idx >= task_phases.len() {
-                    // All phases done for this task — mark DONE
                     queue.update_task(spec_id, &task.id, "DONE")?;
                     done_ids.insert(task.id.clone());
                     let task_payload = json!({
@@ -717,7 +711,6 @@ pub fn run_worker_with_phases(
                                 attempt: 1,
                             };
                         } else {
-                            // No retries — fail the task
                             queue.update_task(spec_id, &task.id, "FAILED")?;
                             let task_payload = json!({
                                 "spec_id": spec_id,
@@ -769,7 +762,6 @@ pub fn run_worker_with_phases(
                 let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
 
                 if attempt >= max_attempts {
-                    // Exhausted retries — fail the task
                     queue.update_task(spec_id, &task.id, "FAILED")?;
                     let task_payload = json!({
                         "spec_id": spec_id,
@@ -1057,11 +1049,15 @@ pub fn run_worker_with_phases(
                 }
             }
 
-            WorkerState::Cleanup { success: _ } => {
-                let _ = crate::worktree::cleanup(spec_id);
-                let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
-                if tmp.exists() {
-                    let _ = std::fs::remove_dir_all(&tmp);
+            WorkerState::Cleanup { success } => {
+                if success || config.cleanup_on_failure {
+                    let _ = crate::worktree::cleanup(spec_id);
+                    let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
+                    if tmp.exists() {
+                        let _ = std::fs::remove_dir_all(&tmp);
+                    }
+                } else {
+                    eprintln!("[boi] preserving worktree for failed spec {}", spec_id);
                 }
                 break;
             }
@@ -1396,10 +1392,12 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
     fn test_run_worker_skips_done_tasks() {
         let script = mock_claude(0, "worker_skip");
         let repo = setup_test_repo("worker_skip");
-        // t-1 is already DONE in YAML; only t-2 should be executed
+        // DB is the single source of truth — mark t-1 DONE in DB, not YAML
         let spec_yaml = "title: \"Skip Test\"
-tasks:\n  - id: t-1\n    title: \"Done\"\n    status: DONE\n  - id: t-2\n    title: \"Pending\"\n    status: PENDING\n    depends: [t-1]\n";
+tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    title: \"Pending\"\n    status: PENDING\n    depends: [t-1]\n";
         let (queue, spec_id, db_path) = setup_test_db("worker_skip", spec_yaml);
+        // Pre-mark t-1 as DONE in the DB so worker skips it
+        queue.update_task(&spec_id, "t-1", "DONE").unwrap();
         let spec_file = std::env::temp_dir().join("boi_test_spec_worker_skip.yaml");
         let config = WorkerConfig {
             max_workers: 1,

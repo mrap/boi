@@ -281,11 +281,10 @@ impl Queue {
         for task in &spec.tasks {
             let depends_json = serde_json::to_string(task.depends.as_deref().unwrap_or(&[]))
                 .unwrap_or_else(|_| "[]".to_string());
-            let status_str = task.status.to_string();
             tx.execute(
                 "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![task.id, id, task.title, status_str, depends_json, task.spec, task.verify],
+                 VALUES (?1, ?2, ?3, 'PENDING', ?4, ?5, ?6)",
+                params![task.id, id, task.title, depends_json, task.spec, task.verify],
             )?;
         }
 

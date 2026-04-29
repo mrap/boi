@@ -30,6 +30,11 @@ pub struct PhaseConfig {
     pub on_reject: Option<String>,
     pub on_crash: Option<String>,
     pub min_lines_changed: Option<u32>,
+    pub model: Option<String>,
+    pub code_model: Option<String>,
+    pub effort: Option<String>,
+    pub hooks_pre: Vec<String>,
+    pub hooks_post: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +177,11 @@ impl PhaseConfig {
         let on_reject = completion.and_then(|c| c.on_reject.clone());
         let on_crash = completion.and_then(|c| c.on_crash.clone());
         let min_lines_changed = toml.trigger.as_ref().and_then(|t| t.min_lines_changed);
+        let model = toml.worker.as_ref().and_then(|w| w.model.clone());
+        let code_model = toml.worker.as_ref().and_then(|w| w.code_model.clone());
+        let effort = toml.worker.as_ref().and_then(|w| w.effort.clone());
+        let hooks_pre = toml.hooks.as_ref().and_then(|h| h.pre.clone()).unwrap_or_default();
+        let hooks_post = toml.hooks.as_ref().and_then(|h| h.post.clone()).unwrap_or_default();
 
         Some(PhaseConfig {
             name,
@@ -189,6 +199,11 @@ impl PhaseConfig {
             on_reject,
             on_crash,
             min_lines_changed,
+            model,
+            code_model,
+            effort,
+            hooks_pre,
+            hooks_post,
         })
     }
 }
@@ -568,6 +583,11 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             on_reject: None,
             on_crash: None,
             min_lines_changed: None,
+            model: None,
+            code_model: None,
+            effort: None,
+            hooks_pre: vec![],
+            hooks_post: vec![],
         },
         PhaseConfig {
             name: "task-verify".into(),
@@ -585,6 +605,11 @@ fn fallback_core_phases() -> Vec<PhaseConfig> {
             on_reject: Some("requeue:execute".into()),
             on_crash: None,
             min_lines_changed: None,
+            model: None,
+            code_model: None,
+            effort: None,
+            hooks_pre: vec![],
+            hooks_post: vec![],
         },
     ]
 }
@@ -1085,6 +1110,11 @@ approve_signal = ""
             on_reject: None,
             on_crash: None,
             min_lines_changed: None,
+            model: None,
+            code_model: None,
+            effort: None,
+            hooks_pre: vec![],
+            hooks_post: vec![],
         };
         let prompt = build_phase_prompt(&phase, "title: Test\ntasks: []", None);
         assert!(prompt.contains("Review this spec carefully."));
@@ -1110,6 +1140,11 @@ approve_signal = ""
             on_reject: None,
             on_crash: None,
             min_lines_changed: None,
+            model: None,
+            code_model: None,
+            effort: None,
+            hooks_pre: vec![],
+            hooks_post: vec![],
         };
         let prompt = build_phase_prompt(&phase, "spec content", Some("task t-1 details"));
         assert!(prompt.contains("--- TASK ---"));
@@ -1134,6 +1169,11 @@ approve_signal = ""
             on_reject: None,
             on_crash: None,
             min_lines_changed: None,
+            model: None,
+            code_model: None,
+            effort: None,
+            hooks_pre: vec![],
+            hooks_post: vec![],
         };
         let prompt = build_phase_prompt(&phase, "spec", None);
         assert!(prompt.contains("Phase: task-verify"));
@@ -1180,6 +1220,11 @@ approve_signal = ""
             on_reject: None,
             on_crash: None,
             min_lines_changed: None,
+            model: None,
+            code_model: None,
+            effort: None,
+            hooks_pre: vec![],
+            hooks_post: vec![],
         };
         let outcome = parse_phase_output(&phase, "Task completed successfully.");
         assert_eq!(outcome, Verdict::Proceed);
@@ -1217,6 +1262,11 @@ approve_signal = ""
             on_reject: None, // no requeue action
             on_crash: None,
             min_lines_changed: None,
+            model: None,
+            code_model: None,
+            effort: None,
+            hooks_pre: vec![],
+            hooks_post: vec![],
         };
         let outcome = parse_phase_output(&phase, "Found issue: [FAIL] bad code");
         match outcome {

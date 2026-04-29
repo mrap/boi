@@ -327,6 +327,11 @@ mod tests {
             on_reject: Some("requeue:execute".into()),
             on_crash: None,
             min_lines_changed: None,
+            model: None,
+            code_model: None,
+            effort: None,
+            hooks_pre: vec![],
+            hooks_post: vec![],
         }
     }
 
