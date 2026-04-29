@@ -302,7 +302,7 @@ Phase config accepts either full model IDs or aliases (`opus`, `sonnet`, `haiku`
 ```
 boi dispatch <file.yaml> [options]        Submit a spec to the queue
 boi status [--watch] [--json]             Show queue and worker status
-boi log <queue-id> [--full]              Tail worker output for a spec
+boi log <queue-id> [--full] [-f|--follow] Tail worker output for a spec
 boi cancel <queue-id>                     Cancel a running or queued spec
 boi stop                                  Stop daemon and all workers
 boi install [--workers N]                 One-time setup (run outside Claude Code)

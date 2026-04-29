@@ -13,20 +13,16 @@ The BOI hook interface is the primary extensibility surface of the Rust port. Ho
 1. **Hardcoded hex-events calls** — `cli_ops._emit_dispatched_event()` and `daemon_ops.py` directly invoke `~/.hex-events/hex_emit.py` with no configuration.
 2. **Shell hook scripts** — `~/.boi/hooks/on-complete.sh` and `on-fail.sh` are bare shell scripts invoked with `queue_id spec_path` as positional args.
 
-In the Rust port, both are replaced by a single configurable hook system in `~/.boi/config.yaml`. BOI fires hooks at nine lifecycle points, sending structured JSON on stdin. Zero hex references in BOI source code.
+In the Rust port, both are replaced by a single configurable hook system. BOI ships with a built-in default hook config (`hooks/default.yaml`, embedded at compile time) that emits hex-events for the four main lifecycle points. Users can override by creating `~/.boi/hooks.yaml`. BOI fires hooks at nine lifecycle points, sending structured JSON on stdin. Zero hex references in BOI source code.
 
 ---
 
 ## Configuration Format
 
-Hooks are configured under the `hooks:` key in `~/.boi/config.yaml`. Each hook entry is optional; if absent, that lifecycle point fires silently (no-op).
+Hooks are configured in `~/.boi/hooks.yaml`. BOI loads that file if it exists; otherwise it falls back to the built-in default (`hooks/default.yaml`, compiled into the binary). Each hook entry is optional; if absent, that lifecycle point fires silently (no-op).
 
 ```yaml
-# ~/.boi/config.yaml
-
-workers: 3
-runtime:
-  default: claude
+# ~/.boi/hooks.yaml
 
 hooks:
   on_dispatch:
@@ -622,7 +618,7 @@ SPEC_PATH=$2
 echo "Spec $QUEUE_ID completed" | notify-send "BOI"
 ```
 
-**New config (`~/.boi/config.yaml`):**
+**New config (`~/.boi/hooks.yaml`):**
 ```yaml
 hooks:
   on_complete:
@@ -643,7 +639,7 @@ echo "Spec $BOI_SPEC_ID completed" | notify-send "BOI"
 
 ### Old Hardcoded hex-events Calls → New YAML Hooks
 
-The Python codebase hardcodes three `hex_emit.py` calls. In the Rust port, add these to `~/.boi/config.yaml`:
+The Python codebase hardcodes three `hex_emit.py` calls. In the Rust port, these are covered by the built-in default (`hooks/default.yaml`). To customize, add them to `~/.boi/hooks.yaml`:
 
 ```yaml
 hooks:

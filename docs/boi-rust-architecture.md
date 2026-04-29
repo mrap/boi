@@ -33,7 +33,7 @@ boi/
       dispatch.rs       — boi dispatch (enqueue spec, start daemon if needed)
       status.rs         — boi status [--watch] [--json]
       queue.rs          — boi queue [--json]
-      log.rs            — boi log <id> [--full] [--failures]
+      log.rs            — boi log <id> [--full] [--failures] [-f|--follow]
       cancel.rs         — boi cancel <id>
       resume.rs         — boi resume <id>
       workers.rs        — boi workers [--json]
@@ -75,7 +75,7 @@ boi/
       lock.rs           — fcntl advisory lock on ~/.boi/queue/.lock
     hooks/
       mod.rs            — HookRunner: fire hooks with JSON payload on stdin
-      config.rs         — parse hooks: section from config.yaml
+      config.rs         — load_user_or_default(): ~/.boi/hooks.yaml or built-in default.yaml
     telemetry/
       mod.rs            — write/read per-iteration JSON and aggregated telemetry
       events.rs         — append-only event files in ~/.boi/events/event-NNNNN.json
@@ -804,4 +804,4 @@ The `rusqlite` `bundled` feature compiles SQLite from source, eliminating the sy
 
 5. **`anyhow` throughout, `thiserror` at domain boundaries** — consistent with hex harness patterns; easy propagation without losing context.
 
-6. **Hooks unify the two existing mechanisms** — the old `~/.boi/hooks/*.sh` scripts and the hardcoded hex-events calls both become entries in `config.yaml hooks:`. This is the primary architectural improvement over Python.
+6. **Hooks unify the two existing mechanisms** — the old `~/.boi/hooks/*.sh` scripts and the hardcoded hex-events calls both become entries in `~/.boi/hooks.yaml` (or the built-in `hooks/default.yaml` compiled into the binary). This is the primary architectural improvement over Python.
