@@ -4,6 +4,7 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>, cfg: &config::Config) 
     match (key, value) {
         (None, _) => {
             println!("max_workers:          {}", cfg.max_workers());
+            println!("spawns_per_tick:      {}", cfg.spawns_per_tick());
             println!("task_timeout_minutes: {}", cfg.task_timeout_secs() / 60);
             println!("retry_count:          {}", cfg.retry_count());
             println!("db_path:              {}", cfg.db_path().display());
@@ -21,6 +22,7 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>, cfg: &config::Config) 
         (Some(k), None) => {
             let val = match k {
                 "max_workers" => cfg.max_workers().to_string(),
+                "spawns_per_tick" => cfg.spawns_per_tick().to_string(),
                 "task_timeout_minutes" => (cfg.task_timeout_secs() / 60).to_string(),
                 "retry_count" => cfg.retry_count().to_string(),
                 "db_path" => cfg.db_path().display().to_string(),
@@ -36,9 +38,9 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>, cfg: &config::Config) 
         (Some(k), Some(v)) => {
             // Validate key
             match k {
-                "max_workers" | "task_timeout_minutes" | "retry_count" => {}
+                "max_workers" | "spawns_per_tick" | "task_timeout_minutes" | "retry_count" => {}
                 _ => {
-                    eprintln!("unknown config key: {} (supported: max_workers, task_timeout_minutes, retry_count)", k);
+                    eprintln!("unknown config key: {} (supported: max_workers, spawns_per_tick, task_timeout_minutes, retry_count)", k);
                     std::process::exit(1);
                 }
             }

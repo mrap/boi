@@ -66,6 +66,8 @@ boi critic status | run | enable | disable | checks
 boi spec <queue-id> [add|skip|next|block|edit|deps]
 boi dep add|remove|set|clear|show|viz|check
 boi project create|list|status|context|delete
+boi plan [spec.yaml ...] [--force-refresh]        Build DAG + LLM critique for in-flight and new specs
+boi dispatch-many <spec1.yaml> [spec2.yaml ...]   DAG-ordered multi-spec dispatch with LLM gate
 ```
 
 ## Spec Format
@@ -141,7 +143,9 @@ prompt_template = "path/to/prompt.md"   # required for claude phases
 model = "claude-sonnet-4-6"
 effort = "medium"                        # low | medium | high
 timeout = 300                            # seconds
-runtime = "claude"                       # "claude" (default) | "deterministic"
+runtime = "claude"                       # "claude" (default) | "openrouter" | "deterministic"
+api_key_env = "OPENROUTER_API_KEY"       # openrouter only — env var holding the API key (default: OPENROUTER_API_KEY)
+bare = false                             # true → --bare flag (skips session/MCP/skill loading; ~96% cold-start reduction)
 
 [completion]
 approve_signal = "## Approved"
@@ -293,7 +297,7 @@ Exit 0 = passed. Any non-zero = failed.
 ## Constraints
 
 - `boi install` runs **outside Claude Code** in a terminal.
-- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. Configured globally in `~/.boi/config.json` or per-spec via `**Runtime:** codex` header.
+- Workers are headless, non-interactive CLI agent sessions. Default runtime: `claude -p`. Codex runtime: `codex exec`. OpenRouter runtime: direct HTTP to `openrouter.ai/api/v1/chat/completions` (requires `OPENROUTER_API_KEY`; used for text-only judgment phases). Configured globally in `~/.boi/config.yaml` or per-spec via `**Runtime:** codex` header.
 - Daemon polls every 5 seconds. Status may lag slightly.
 - Default 3 workers, max 5. Set during install.
 - Workers get fresh context each iteration. No memory of previous iterations.
