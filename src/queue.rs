@@ -107,6 +107,19 @@ pub struct SpecStatus {
     pub tasks: Vec<TaskRecord>,
 }
 
+#[derive(Debug)]
+pub struct BenchResultRecord {
+    pub run_id: String,
+    pub pipeline: String,
+    pub spec_file: String,
+    pub run_number: i64,
+    pub status: String,
+    pub total_ms: i64,
+    pub tasks_total: i64,
+    pub tasks_done: i64,
+    pub tasks_failed: i64,
+}
+
 fn gen_id(prefix: char, conn: &Connection) -> String {
     let mut rng = rand::thread_rng();
     let table = if prefix == 'S' { "specs" } else { "tasks" };
@@ -231,7 +244,19 @@ impl Queue {
                 completed_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_phase_runs_spec ON phase_runs(spec_id);
-            CREATE INDEX IF NOT EXISTS idx_phase_runs_phase ON phase_runs(phase);",
+            CREATE INDEX IF NOT EXISTS idx_phase_runs_phase ON phase_runs(phase);
+
+            CREATE TABLE IF NOT EXISTS bench_results (
+                run_id TEXT,
+                pipeline TEXT,
+                spec_file TEXT,
+                run_number INTEGER,
+                status TEXT,
+                total_ms INTEGER,
+                tasks_total INTEGER,
+                tasks_done INTEGER,
+                tasks_failed INTEGER
+            );",
         )?;
 
         // Migrate existing specs tables that lack new columns
@@ -641,6 +666,15 @@ impl Queue {
             |row| row.get(0),
         )?;
         Ok(total)
+    }
+
+    pub fn insert_bench_result(&self, r: &BenchResultRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO bench_results (run_id, pipeline, spec_file, run_number, status, total_ms, tasks_total, tasks_done, tasks_failed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![r.run_id, r.pipeline, r.spec_file, r.run_number, r.status, r.total_ms, r.tasks_total, r.tasks_done, r.tasks_failed],
+        )?;
+        Ok(())
     }
 
     // --- Task management ---

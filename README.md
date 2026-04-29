@@ -188,6 +188,20 @@ To use a shorter pipeline, edit `guardrails.toml`. For example, execute-only:
 default = ["execute"]
 ```
 
+### Pipeline Config Files (for `boi bench`)
+
+`boi bench` accepts named pipeline configs as TOML files:
+
+```toml
+[pipeline]
+name = "v2"
+spec_phases = ["spec-critique", "spec-improve"]   # phases run once on the spec
+task_phases = ["execute", "task-verify"]           # phases run per task
+post_phases = ["doc-update", "critic", "merge"]    # phases run after all tasks complete
+```
+
+Pass them with `--pipeline name:path/to/pipeline.toml` (repeatable for N-way comparisons).
+
 ## Guardrails
 
 Guardrails define quality gates that run at phase transitions. Configured globally in `~/.boi/guardrails.toml`, overridable per spec.
@@ -323,7 +337,8 @@ boi critic status | run | enable | disable | checks
 boi spec <queue-id> [add|skip|next|block|edit|deps]
 boi dep add|remove|set|clear|show|viz|check
 boi project create|list|status|context|delete
-boi bench --spec FILE --a PIPELINE --b PIPELINE  Compare two pipeline configs on the same spec
+boi bench --pipeline name:path [--pipeline ...] --spec FILE | --battery DIR [--runs N]  Benchmark N pipelines
+boi bench --phase <name> --spec FILE [--runs N]  Benchmark a single phase in isolation
 ```
 
 **`dispatch` options:**

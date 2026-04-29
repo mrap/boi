@@ -1,0 +1,29 @@
+title: "Verify quality-gate benchmark spec"
+mode: execute
+context: |
+  Benchmark spec focused on verify command quality gates.
+  Used to test completion rate and verify pass rate metrics.
+
+tasks:
+  - id: t-1
+    title: "Create output file"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_bench_verify_output.txt with content "benchmark_result=42".
+      Command: echo "benchmark_result=42" > /tmp/boi_bench_verify_output.txt
+    verify: |
+      test -f /tmp/boi_bench_verify_output.txt &&
+      grep -q "benchmark_result=42" /tmp/boi_bench_verify_output.txt &&
+      echo PASS
+
+  - id: t-2
+    title: "Validate output value"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Verify the output file contains a valid benchmark_result value.
+      The value must be a positive integer greater than zero.
+    verify: |
+      value=$(grep -oE 'benchmark_result=[0-9]+' /tmp/boi_bench_verify_output.txt | cut -d= -f2) &&
+      test "$value" -gt 0 &&
+      echo "PASS (value=$value)"

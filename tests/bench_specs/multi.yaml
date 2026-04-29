@@ -1,0 +1,38 @@
+title: "Multi-task benchmark spec"
+mode: execute
+context: |
+  Benchmark spec with 3 tasks in a dependency chain.
+  Used to test task ordering and dependency resolution.
+
+tasks:
+  - id: t-1
+    title: "Setup step"
+    status: PENDING
+    spec: |
+      First step in the benchmark chain.
+      Create /tmp/boi_bench_multi.txt with content "step1".
+      Command: echo "step1" > /tmp/boi_bench_multi.txt
+    verify: |
+      test -f /tmp/boi_bench_multi.txt && grep -q step1 /tmp/boi_bench_multi.txt && echo PASS
+
+  - id: t-2
+    title: "Process step"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Second step — depends on t-1.
+      Append "step2" to /tmp/boi_bench_multi.txt.
+      Command: echo "step2" >> /tmp/boi_bench_multi.txt
+    verify: |
+      grep -q step2 /tmp/boi_bench_multi.txt && echo PASS
+
+  - id: t-3
+    title: "Finalize step"
+    status: PENDING
+    depends: [t-2]
+    spec: |
+      Third and final step — depends on t-2.
+      Append "done" to /tmp/boi_bench_multi.txt.
+      Command: echo "done" >> /tmp/boi_bench_multi.txt
+    verify: |
+      grep -q done /tmp/boi_bench_multi.txt && echo PASS
