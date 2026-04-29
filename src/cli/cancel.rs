@@ -30,12 +30,16 @@ pub fn cmd_cancel(spec_id: &str, db_str: &str, hook_cfg: &hooks::HookConfig) {
         if let Ok(content) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = content.trim().parse::<i32>() {
                 eprintln!("[boi] killing claude subprocess (pid {})", pid);
+                // SAFETY: `pid` was read from the spec's PID file written by `spawn_claude`.
+                // Sending SIGTERM to request graceful shutdown of a known child process.
                 unsafe {
                     libc::kill(pid, libc::SIGTERM);
                 }
                 // Wait briefly for graceful shutdown
                 for _ in 0..10 {
                     std::thread::sleep(std::time::Duration::from_millis(200));
+                    // SAFETY: `kill(pid, 0)` is a POSIX existence check -- signal 0 is
+                    // never delivered; it only tests whether the process exists.
                     unsafe {
                         if libc::kill(pid, 0) != 0 {
                             break;
@@ -43,6 +47,9 @@ pub fn cmd_cancel(spec_id: &str, db_str: &str, hook_cfg: &hooks::HookConfig) {
                     }
                 }
                 // Force kill if still alive
+                // SAFETY: Same PID as above. SIGKILL is the last-resort escalation after
+                // the 2s graceful shutdown window. The kill(pid, 0) check confirms the
+                // process still exists before sending SIGKILL.
                 unsafe {
                     if libc::kill(pid, 0) == 0 {
                         eprintln!("[boi] claude pid {} still alive — sending SIGKILL", pid);

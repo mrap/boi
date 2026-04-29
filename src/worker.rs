@@ -1400,8 +1400,11 @@ mod tests {
     fn with_claude_bin<F: FnOnce()>(bin_path: &str, f: F) {
         let _lock = ENV_LOCK.lock().unwrap();
         let old = std::env::var("CLAUDE_BIN").ok();
+        // SAFETY: We hold ENV_LOCK so no other test thread can read/write env vars
+        // concurrently. This is test-only code; the lock serializes all env access.
         unsafe { std::env::set_var("CLAUDE_BIN", bin_path) };
         f();
+        // SAFETY: Same as above -- ENV_LOCK is held, restoring the original value.
         unsafe {
             match old {
                 Some(v) => std::env::set_var("CLAUDE_BIN", v),
@@ -1415,11 +1418,14 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let old_bin = std::env::var("CLAUDE_BIN").ok();
         let old_repo = std::env::var("BOI_REPO").ok();
+        // SAFETY: ENV_LOCK is held so no concurrent env access from other test
+        // threads. Setting vars for the duration of the test closure only.
         unsafe {
             std::env::set_var("CLAUDE_BIN", bin_path);
             std::env::set_var("BOI_REPO", repo_path);
         }
         f();
+        // SAFETY: ENV_LOCK is held, restoring original env values after the test.
         unsafe {
             match old_bin {
                 Some(v) => std::env::set_var("CLAUDE_BIN", v),

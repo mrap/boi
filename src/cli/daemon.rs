@@ -23,6 +23,8 @@ pub fn try_acquire_daemon_lock() -> Option<std::fs::File> {
         .truncate(false)
         .open(&lock_path)
         .ok()?;
+    // SAFETY: `file` is a valid open file descriptor obtained from `File::open` above.
+    // `flock` with LOCK_NB is a standard POSIX call that cannot cause UB with a valid fd.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
         use std::io::Write;
@@ -146,6 +148,9 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
     let r = running.clone();
 
     // Install SIGTERM + SIGINT handler
+    // SAFETY: The registered closures only perform a single atomic store, which is
+    // async-signal-safe. No heap allocation, locking, or non-reentrant calls occur
+    // inside the signal handler. The AtomicBool outlives the handlers (Arc-held).
     unsafe {
         let r2 = running.clone();
         signal_hook::low_level::register(signal_hook::consts::SIGTERM, move || {
@@ -306,6 +311,10 @@ pub fn cmd_stop() {
         return;
     }
 
+    // SAFETY: `pid` was read from the daemon lock file and verified alive via
+    // `is_pid_alive`. Sending SIGTERM to a valid PID is a standard POSIX operation.
+    // Worst case (PID recycled): SIGTERM to an unrelated process, which is the
+    // inherent race in PID-based signaling; the flock guard minimizes this window.
     unsafe { libc::kill(pid as i32, libc::SIGTERM); }
     println!("sent SIGTERM to daemon (pid {})", pid);
 
@@ -318,6 +327,8 @@ pub fn cmd_stop() {
     }
 
     println!("daemon still running after 10s — sending SIGKILL");
+    // SAFETY: Same PID as the SIGTERM above. SIGKILL is the last-resort escalation
+    // after the 10s graceful shutdown window expired.
     unsafe { libc::kill(pid as i32, libc::SIGKILL); }
     let _ = std::fs::remove_file(daemon_heartbeat_path());
 }
