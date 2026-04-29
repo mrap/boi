@@ -119,9 +119,8 @@ pub fn spawn_claude(
         args.push(m.to_string());
     }
     let args_display: Vec<&str> = args.iter().skip(2).map(|s| s.as_str()).collect();
-    boi_log!("spawning claude\n  bin:    {}\n  args:   {}\n  cwd:    {}\n  prompt: {} chars\n  prompt: {}",
-        claude_bin, args_display.join(" "), worktree_path, prompt.len(),
-        prompt.chars().take(500).collect::<String>());
+    boi_log!("spawning claude\n  bin:    {}\n  args:   {}\n  cwd:    {}\n  prompt: {} chars",
+        claude_bin, args_display.join(" "), worktree_path, prompt.len());
 
     let mut cmd = Command::new(claude_bin);
     cmd.args(&args)
@@ -192,17 +191,13 @@ pub fn spawn_claude(
                 match event_type {
                     "assistant" => {
                         if let Some(msg) = event.pointer("/message/content/0/text").and_then(|v| v.as_str()) {
-                            let preview: String = msg.chars().take(120).collect();
-                            boi_log!("  claude: {}", preview);
+                            boi_log!("  claude: {}", msg);
                         }
                         if let Some(tool) = event.pointer("/message/content/0/name").and_then(|v| v.as_str()) {
-                            let input_preview = event.pointer("/message/content/0/input")
-                                .map(|v| {
-                                    let s = v.to_string();
-                                    s.chars().take(150).collect::<String>()
-                                })
+                            let input_str = event.pointer("/message/content/0/input")
+                                .map(|v| v.to_string())
                                 .unwrap_or_default();
-                            boi_log!("  tool: {} {}", tool, input_preview);
+                            boi_log!("  tool: {} {}", tool, input_str);
                         }
                     }
                     "result" => {
