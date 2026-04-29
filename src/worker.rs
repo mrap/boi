@@ -95,7 +95,12 @@ pub fn spawn_claude(
 
     let claude_bin = std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
     let mut child = Command::new(&claude_bin)
-        .args(["-p", prompt, "--dangerously-skip-permissions"])
+        .args([
+            "-p", prompt,
+            "--dangerously-skip-permissions",
+            "--no-session-persistence",
+            "--setting-sources", "user",
+        ])
         .current_dir(worktree_path)
         .env("AGENT_DIR", worktree_path)
         .stdout(Stdio::piped())
