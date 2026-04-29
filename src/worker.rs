@@ -412,6 +412,8 @@ pub fn run_worker_with_phases(
 
     // --- State machine ---
     let mut state = WorkerState::SpecPhase { phase_idx: 0 };
+    boi_log!("state machine start: spec={} mode={} tasks={} pre_spec_phases={} post_spec_phases={}",
+        spec_id, mode, order.len(), pre_spec_phases.len(), post_spec_phases.len());
 
     loop {
         // Validate worktree still exists before every state transition.
@@ -438,10 +440,12 @@ pub fn run_worker_with_phases(
         match state {
             WorkerState::SpecPhase { phase_idx } => {
                 if phase_idx >= pre_spec_phases.len() {
+                    boi_log!("state: SpecPhase -> TaskSelect (all {} pre-spec phases done)", pre_spec_phases.len());
                     state = WorkerState::TaskSelect;
                     continue;
                 }
                 let phase_name = pre_spec_phases[phase_idx];
+                boi_log!("state: SpecPhase {{ phase_idx: {}, phase: '{}' }}", phase_idx, phase_name);
                 let phase = match registry.get(phase_name) {
                     Some(p) => p,
                     None => {
@@ -585,11 +589,17 @@ pub fn run_worker_with_phases(
                         done_ids.contains(id) || skipped_ids.contains(id)
                     });
                     if all_done {
+                        boi_log!("state: TaskSelect -> PostTaskSpecPhase (all {} tasks done)", order.len());
                         state = WorkerState::PostTaskSpecPhase { phase_idx: 0 };
                     } else {
                         // Some tasks are still pending but none are ready — possible deadlock
                         // or DB-level deps not yet satisfied. Re-scan up to max passes.
                         task_select_passes += 1;
+                        let pending: Vec<&String> = order.iter()
+                            .filter(|id| !done_ids.contains(id.as_str()) && !skipped_ids.contains(id.as_str()))
+                            .collect();
+                        boi_log!("state: TaskSelect — deadlock detected (pass {}/{}), pending tasks: {:?}",
+                            task_select_passes, max_task_select_passes, pending);
                         if task_select_passes > max_task_select_passes {
                             state = WorkerState::Failed {
                                 reason: "deadlock: pending tasks but none ready".to_string(),
@@ -610,6 +620,7 @@ pub fn run_worker_with_phases(
                 let task = match task_map.get(task_id_owned.as_str()) {
                     Some(t) => t,
                     None => {
+                        boi_log!("state: TaskPhase -> Failed (task {} not found in task_map)", task_id_owned);
                         state = WorkerState::Failed {
                             reason: format!("task {} not found", task_id_owned),
                         };
@@ -623,6 +634,8 @@ pub fn run_worker_with_phases(
                 );
 
                 if phase_idx >= task_phases.len() {
+                    boi_log!("state: TaskPhase -> TaskSelect (task {} complete, all {} phases passed)",
+                        task.id, task_phases.len());
                     queue.update_task(spec_id, &task.id, "DONE")?;
                     done_ids.insert(task.id.clone());
                     let task_payload = json!({
@@ -656,6 +669,9 @@ pub fn run_worker_with_phases(
                     }
                 };
 
+                boi_log!("state: TaskPhase {{ task: {}, phase_idx: {}, phase: '{}', requeue_attempts: {} }}",
+                    task.id, phase_idx, phase_name, requeue_attempts);
+
                 let phase_payload = json!({
                     "spec_id": spec_id,
                     "task_id": task.id,
@@ -685,6 +701,9 @@ pub fn run_worker_with_phases(
                 record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &verdict, &phase_started_at, elapsed_ms);
 
                 emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &verdict, elapsed_ms);
+
+                boi_log!("state: TaskPhase verdict: task={} phase='{}' -> {:?} ({}ms)",
+                    task.id, phase_name, verdict, elapsed_ms);
 
                 match &verdict {
                     Verdict::Proceed => {
@@ -766,6 +785,7 @@ pub fn run_worker_with_phases(
 
             WorkerState::TaskPhaseRetry { ref task_id, phase_idx, attempt } => {
                 let task_id_owned = task_id.clone();
+                boi_log!("state: TaskPhaseRetry {{ task: {}, phase_idx: {}, attempt: {} }}", task_id_owned, phase_idx, attempt);
                 let task = match task_map.get(task_id_owned.as_str()) {
                     Some(t) => t,
                     None => {
@@ -785,6 +805,8 @@ pub fn run_worker_with_phases(
                 let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
 
                 if attempt >= max_attempts {
+                    boi_log!("state: TaskPhaseRetry -> Failed (max retries {} reached for task {} phase '{}')",
+                        max_attempts, task.id, phase_name);
                     queue.update_task(spec_id, &task.id, "FAILED")?;
                     let task_payload = json!({
                         "spec_id": spec_id,
@@ -823,6 +845,9 @@ pub fn run_worker_with_phases(
                 record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &retry_verdict, &phase_started_at, elapsed_ms);
 
                 emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &retry_verdict, elapsed_ms);
+
+                boi_log!("state: TaskPhaseRetry verdict: task={} phase='{}' attempt={} -> {:?} ({}ms)",
+                    task.id, phase_name, attempt, retry_verdict, elapsed_ms);
 
                 match &retry_verdict {
                     Verdict::Proceed => {
@@ -930,14 +955,17 @@ pub fn run_worker_with_phases(
 
             WorkerState::PostTaskSpecPhase { phase_idx } => {
                 if phase_idx >= post_spec_phases.len() {
+                    boi_log!("state: PostTaskSpecPhase -> Complete (all {} post-spec phases done)", post_spec_phases.len());
                     state = WorkerState::Complete;
                     continue;
                 }
 
                 let phase_name = post_spec_phases[phase_idx];
+                boi_log!("state: PostTaskSpecPhase {{ phase_idx: {}, phase: '{}' }}", phase_idx, phase_name);
                 let phase = match registry.get(phase_name) {
                     Some(p) => p,
                     None => {
+                        boi_log!("state: PostTaskSpecPhase — unknown phase '{}', skipping", phase_name);
                         state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                         continue;
                     }
@@ -994,11 +1022,13 @@ pub fn run_worker_with_phases(
                         }
                         // Re-enter task loop (iterative quality loop), capped
                         spec_redo_count += 1;
+                        boi_log!("spec_redo_count incremented to {} (max={})", spec_redo_count, max_spec_redos);
                         if spec_redo_count > max_spec_redos {
-                            boi_log!(" spec redo limit ({}) exceeded — completing despite critic feedback", max_spec_redos);
+                            boi_log!("state: PostTaskSpecPhase -> Complete (spec redo limit {} exceeded)", max_spec_redos);
                             state = WorkerState::Complete;
                         } else {
-                            boi_log!(" critic requests redo ({}/{})", spec_redo_count, max_spec_redos);
+                            boi_log!("state: PostTaskSpecPhase -> TaskSelect (critic requests redo {}/{})",
+                                spec_redo_count, max_spec_redos);
                             state = WorkerState::TaskSelect;
                         }
                     }
@@ -1044,6 +1074,8 @@ pub fn run_worker_with_phases(
             }
 
             WorkerState::Complete => {
+                boi_log!("state: Complete — spec {} done (tasks={}, spec_redo_count={})",
+                    spec_id, done_ids.len(), spec_redo_count);
                 queue.update_spec(spec_id, "completed")?;
                 let _ = hooks::fire(hook_config, ON_COMPLETE, &json!({ "spec_id": spec_id }));
                 telemetry.emit("boi.spec.completed", LogLevel::Info, &json!({
@@ -1073,7 +1105,9 @@ pub fn run_worker_with_phases(
             }
 
             WorkerState::Cleanup { success } => {
+                boi_log!("state: Cleanup {{ success: {} }}", success);
                 if success || config.cleanup_on_failure {
+                    boi_log!("state: Cleanup — removing worktree for spec {}", spec_id);
                     let _ = crate::worktree::cleanup(spec_id);
                     let tmp = std::env::temp_dir().join(format!("boi-{}", spec_id));
                     if tmp.exists() {
