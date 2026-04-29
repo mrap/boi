@@ -1,6 +1,6 @@
 use boi::cli::cancel::cmd_cancel;
 use boi::cli::config_cmd::cmd_config;
-use boi::cli::daemon::{cmd_daemon, cmd_stop};
+use boi::cli::daemon::{cmd_daemon, cmd_restart, cmd_start, cmd_stop};
 use boi::cli::dispatch::cmd_dispatch;
 use boi::cli::doctor::cmd_doctor;
 use boi::cli::log::cmd_log;
@@ -100,10 +100,10 @@ enum Commands {
     Cancel { spec_id: String },
     /// List output files for a spec
     Outputs { spec_id: String },
-    /// Run the BOI daemon
+    /// Manage the BOI daemon
     Daemon {
-        #[arg(long)]
-        foreground: bool,
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
     },
     /// Show or set config values
     Config {
@@ -133,6 +133,18 @@ enum Commands {
     Doctor,
     /// Print version
     Version,
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon in the background
+    Start,
+    /// Stop the running daemon
+    Stop,
+    /// Restart the daemon (stop + start)
+    Restart,
+    /// Run the daemon in the foreground (default)
+    Foreground,
 }
 
 #[derive(Subcommand)]
@@ -220,11 +232,13 @@ fn main() {
         Commands::Outputs { spec_id } => {
             cmd_outputs(&spec_id, &cfg);
         }
-        Commands::Daemon { foreground } => {
-            if !foreground {
-                eprintln!("[boi] note: daemon always runs in foreground (use LaunchAgent/systemd for background)");
+        Commands::Daemon { action } => {
+            match action.unwrap_or(DaemonAction::Foreground) {
+                DaemonAction::Start => cmd_start(),
+                DaemonAction::Stop => cmd_stop(),
+                DaemonAction::Restart => cmd_restart(),
+                DaemonAction::Foreground => cmd_daemon(db_str, hook_cfg, &cfg),
             }
-            cmd_daemon(db_str, hook_cfg, &cfg);
         }
         Commands::Config { key, value } => {
             cmd_config(key.as_deref(), value.as_deref(), &cfg);
