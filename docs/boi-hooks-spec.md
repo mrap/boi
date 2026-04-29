@@ -130,7 +130,7 @@ Task-scoped hooks (`on_task_start`, `on_task_complete`, `on_task_fail`) addition
 
 The rationale: hooks are observability/notification integrations. A broken hex-events bridge should never stall a spec.
 
-**Exception for blocking hooks:** If `blocking: true` and the hook times out (process still running after `timeout` seconds), BOI sends SIGTERM to the hook process, logs a timeout warning, and continues. This is the only hard kill; non-blocking hooks are never killed.
+**Exception for blocking hooks:** If `blocking: true` and the hook times out (process still running after `timeout` seconds), BOI sends SIGKILL to the hook process by PID, logs a timeout warning, and continues. Non-blocking hooks are never killed.
 
 ---
 

@@ -1,7 +1,8 @@
 use chrono::Utc;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum LogLevel {
@@ -45,6 +46,7 @@ impl LogLevel {
 pub struct Telemetry {
     pub db_path: PathBuf,
     stderr_level: LogLevel,
+    conn: Arc<Mutex<Connection>>,
 }
 
 #[derive(Debug)]
@@ -64,12 +66,8 @@ impl Telemetry {
             Ok(val) => LogLevel::from_str(&val),
             Err(_) => LogLevel::Error,
         };
-        Telemetry { db_path, stderr_level }
-    }
-
-    fn open_conn(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let conn = Connection::open(&db_path).expect("failed to open telemetry DB");
+        conn.execute_batch("PRAGMA journal_mode=WAL;").ok();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS events (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,12 +78,13 @@ impl Telemetry {
                 data TEXT,
                 level TEXT DEFAULT 'info'
             );",
-        )?;
-        Ok(conn)
+        )
+        .ok();
+        Telemetry { db_path, stderr_level, conn: Arc::new(Mutex::new(conn)) }
     }
 
     pub fn emit(&self, event_type: &str, level: LogLevel, detail: &Value) {
-        let conn = match self.open_conn() {
+        let conn = match self.conn.lock() {
             Ok(c) => c,
             Err(_) => return,
         };
@@ -112,7 +111,7 @@ impl Telemetry {
     }
 
     pub fn recent(&self, limit: usize) -> Vec<TelemetryEvent> {
-        let conn = match self.open_conn() {
+        let conn = match self.conn.lock() {
             Ok(c) => c,
             Err(_) => return vec![],
         };
@@ -129,7 +128,7 @@ impl Telemetry {
     }
 
     pub fn by_spec(&self, spec_id: &str) -> Vec<TelemetryEvent> {
-        let conn = match self.open_conn() {
+        let conn = match self.conn.lock() {
             Ok(c) => c,
             Err(_) => return vec![],
         };
@@ -146,7 +145,7 @@ impl Telemetry {
     }
 
     pub fn by_level(&self, level: LogLevel) -> Vec<TelemetryEvent> {
-        let conn = match self.open_conn() {
+        let conn = match self.conn.lock() {
             Ok(c) => c,
             Err(_) => return vec![],
         };
@@ -163,7 +162,7 @@ impl Telemetry {
     }
 
     pub fn by_type(&self, event_type: &str) -> Vec<TelemetryEvent> {
-        let conn = match self.open_conn() {
+        let conn = match self.conn.lock() {
             Ok(c) => c,
             Err(_) => return vec![],
         };
@@ -329,5 +328,27 @@ mod tests {
         assert_eq!(events[1].level, "debug");
 
         let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn test_emit_100_events_under_1_second() {
+        // RED: with per-emit connections this loop should exceed 200ms on any
+        // real filesystem (each emit opens connection + WAL pragma + schema check)
+        let db = temp_db("perf_100");
+        let _ = std::fs::remove_file(&db);
+
+        let t = Telemetry::new(db.clone());
+        let start = std::time::Instant::now();
+        for i in 0..1000 {
+            t.emit("boi.perf.test", LogLevel::Info, &json!({"i": i}));
+        }
+        let elapsed = start.elapsed();
+
+        let _ = std::fs::remove_file(&db);
+        assert!(
+            elapsed.as_millis() < 200,
+            "1000 emits took {}ms — expected < 200ms; per-emit connections are the likely cause",
+            elapsed.as_millis()
+        );
     }
 }

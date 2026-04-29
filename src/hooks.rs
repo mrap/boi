@@ -142,13 +142,13 @@ fn wait_with_timeout(
     timeout: Duration,
     event: &str,
 ) -> Result<std::process::ExitStatus, Box<dyn std::error::Error>> {
-    use std::sync::{mpsc, Arc, Mutex};
-    let (tx, rx) = mpsc::channel();
-    let child_arc = Arc::new(Mutex::new(child));
-    let child_thread = Arc::clone(&child_arc);
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
 
     std::thread::spawn(move || {
-        let result = child_thread.lock().unwrap().wait();
+        // Move child entirely into this thread so wait() never holds a mutex.
+        let mut owned = child;
+        let result = owned.wait();
         let _ = tx.send(result); // intentional: receiver may have dropped on timeout
     });
 
@@ -156,11 +156,9 @@ fn wait_with_timeout(
         Ok(Ok(status)) => Ok(status),
         Ok(Err(e)) => Err(Box::new(e)),
         Err(_) => {
-            // Timeout — kill the child process to prevent zombie
-            if let Ok(mut child_guard) = child_arc.lock() {
-                let _ = child_guard.kill(); // intentional: best-effort kill on timeout
-                let _ = child_guard.wait(); // intentional: reap zombie after kill
-            }
+            // Timeout — kill by PID; the background thread reaps the zombie via wait().
+            // SAFETY: pid is a valid child PID obtained from Child::id() above.
+            let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
             eprintln!("[boi hooks] {} timed out after {:?}", event, timeout);
             Err("hook timed out".into())
         }
@@ -275,6 +273,32 @@ mod tests {
         let config = HookConfig { hooks: Some(hooks) };
         let payload = json!({"spec_id": "s0999", "task_id": "t0005"});
         assert!(fire(&config, ON_TASK_START, &payload).is_ok());
+    }
+
+    #[test]
+    fn test_hook_timeout() {
+        // A blocking hook that sleeps longer than the timeout should be killed
+        // and fire() should return within a few seconds, not hang.
+        let mut hooks = std::collections::HashMap::new();
+        hooks.insert(
+            ON_TASK_START.to_string(),
+            HookEntry {
+                command: "sleep 5".to_string(), // would block 5s without timeout
+                blocking: Some(true),
+                timeout: Some(1), // 1-second timeout
+            },
+        );
+        let config = HookConfig { hooks: Some(hooks) };
+        let payload = serde_json::json!({"spec_id": "s0001"});
+        let start = std::time::Instant::now();
+        let result = fire(&config, ON_TASK_START, &payload);
+        let elapsed = start.elapsed();
+        assert!(result.is_ok(), "fire() must not return Err even on timeout");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "blocking hook should be killed after 1s timeout, took {:?}",
+            elapsed
+        );
     }
 
     #[test]

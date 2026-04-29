@@ -1,8 +1,9 @@
 use crate::fmt::{ensure_db_dir, is_pid_alive};
+use crate::spawn::pid_dir;
 use crate::telemetry::Telemetry;
 use crate::{config, hooks, queue, worker};
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn daemon_lock_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -125,6 +126,33 @@ pub fn daemon_pid_path() -> PathBuf {
     daemon_lock_path()
 }
 
+/// Kill every process group listed in PID files under `dir`, then remove the files.
+/// Handles non-existent processes gracefully (ESRCH is ignored).
+pub fn cleanup_pid_files(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(pid) = content.trim().parse::<i32>() {
+                // SAFETY: kill(-pid, SIGKILL) sends SIGKILL to the entire process group whose
+                // PGID equals `pid`. This is safe: `pid` was read from a file we wrote, and
+                // ESRCH is returned (and ignored) if the process group no longer exists.
+                let rc = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                if rc == 0 {
+                    eprintln!("[boi daemon] killed process group {} ({})", pid, path.display());
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 pub fn daemon_heartbeat_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".boi").join("daemon.heartbeat")
@@ -178,6 +206,9 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         cleanup_on_failure: cfg.cleanup_on_failure(),
         claude_bin: cfg.claude_bin(),
     };
+
+    // Orphan cleanup: kill any setsid'd Claude processes from a previous crash (F-03)
+    cleanup_pid_files(&pid_dir());
 
     // Crash recovery: reset any specs stuck in 'running' or 'assigning' back to 'queued'
     if let Ok(q) = queue::Queue::open(db_str) {
@@ -330,6 +361,9 @@ pub fn cmd_stop() {
         return;
     }
 
+    // Kill all setsid'd Claude subprocesses before stopping the daemon (F-04)
+    cleanup_pid_files(&pid_dir());
+
     // SAFETY: `pid` was read from the daemon lock file and verified alive via
     // `is_pid_alive`. Sending SIGTERM to a valid PID is a standard POSIX operation.
     // Worst case (PID recycled): SIGTERM to an unrelated process, which is the
@@ -352,4 +386,30 @@ pub fn cmd_stop() {
     // after the 10s graceful shutdown window expired.
     unsafe { libc::kill(pid as i32, libc::SIGKILL); }
     let _ = std::fs::remove_file(daemon_heartbeat_path()); // intentional: best-effort heartbeat cleanup
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::test_dir;
+
+    #[test]
+    fn test_pid_dir_returns_correct_path() {
+        let dir = pid_dir();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let expected = PathBuf::from(home).join(".boi").join("pids");
+        assert_eq!(dir, expected);
+    }
+
+    #[test]
+    fn test_cleanup_pid_files_removes_files() {
+        let dir = test_dir("daemon-pid-cleanup");
+        std::fs::write(dir.join("worker-1.pid"), "99999999").unwrap();
+        std::fs::write(dir.join("worker-2.pid"), "99999998").unwrap();
+
+        cleanup_pid_files(&dir);
+
+        assert!(!dir.join("worker-1.pid").exists(), "worker-1.pid should be removed");
+        assert!(!dir.join("worker-2.pid").exists(), "worker-2.pid should be removed");
+    }
 }

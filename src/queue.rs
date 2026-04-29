@@ -1085,6 +1085,77 @@ mod tests {
     }
 
     #[test]
+    fn test_recover_stuck_specs() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+
+        // Create a 'running' spec with a RUNNING task
+        let id1 = q.enqueue(&spec, None).unwrap();
+        q.update_spec(&id1, "running").unwrap();
+        let st = q.status(&id1).unwrap().unwrap();
+        let t1 = st.tasks[0].id.clone();
+        q.update_task(&id1, &t1, "RUNNING").unwrap();
+
+        // Create an 'assigning' spec (no running tasks)
+        let id2 = q.enqueue(&spec, None).unwrap();
+        q.conn
+            .execute(
+                "UPDATE specs SET status = 'assigning' WHERE id = ?1",
+                params![id2],
+            )
+            .unwrap();
+
+        // A completed spec — must NOT be reset
+        let id3 = q.enqueue(&spec, None).unwrap();
+        q.update_spec(&id3, "completed").unwrap();
+
+        let count = q.recover_stuck_specs().unwrap();
+        assert_eq!(count, 2, "should have reset 2 stuck specs");
+
+        let st1 = q.status(&id1).unwrap().unwrap();
+        assert_eq!(st1.spec.status, "queued", "running spec must be reset to queued");
+        assert_eq!(st1.tasks[0].status, "PENDING", "RUNNING task must be reset to PENDING");
+
+        let st2 = q.status(&id2).unwrap().unwrap();
+        assert_eq!(st2.spec.status, "queued", "assigning spec must be reset to queued");
+
+        let st3 = q.status(&id3).unwrap().unwrap();
+        assert_eq!(st3.spec.status, "completed", "completed spec must not be touched");
+    }
+
+    #[test]
+    fn test_gen_id_collision() {
+        let q = open_mem();
+        // Pre-insert a known spec ID to create a collision target.
+        q.conn
+            .execute(
+                "INSERT INTO specs (id, title, mode, status, queued_at)
+                 VALUES ('S0000', 'blocker', 'execute', 'queued', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        // gen_id must return a valid ID that differs from the pre-existing one.
+        let id = gen_id('S', &q.conn);
+        assert_ne!(id, "S0000", "gen_id must not return an already-existing ID");
+        assert!(
+            id.starts_with('S') && id[1..].chars().all(|c| c.is_ascii_hexdigit()),
+            "gen_id returned invalid format: {}",
+            id
+        );
+        // Insert the new ID and try again to ensure repeated calls also avoid collisions.
+        q.conn
+            .execute(
+                "INSERT INTO specs (id, title, mode, status, queued_at)
+                 VALUES (?1, 'X', 'execute', 'queued', '2026-01-01T00:00:00Z')",
+                params![id],
+            )
+            .unwrap();
+        let id2 = gen_id('S', &q.conn);
+        assert_ne!(id2, "S0000", "gen_id returned S0000 after it was inserted");
+        assert_ne!(id2, id, "gen_id returned duplicate on second call");
+    }
+
+    #[test]
     fn test_depends_on_blocks_dequeue() {
         let q = open_mem();
         let spec = make_spec("S", vec![make_task("t-1", "T")]);
