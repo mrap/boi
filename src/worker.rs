@@ -67,15 +67,29 @@ pub struct ClaudeResult {
     pub total_ms: u64,
 }
 
+/// Return the directory where PID files are stored for running specs.
+pub fn pid_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home).join(".boi").join("pids")
+}
+
+/// Return the PID file path for a given spec.
+pub fn pid_file_for(spec_id: &str) -> std::path::PathBuf {
+    pid_dir().join(format!("{}.pid", spec_id))
+}
+
 /// Spawn claude with the task prompt. Returns ClaudeResult with timing data.
 /// startup_ms = time from spawn to first stdout byte.
 /// inference_ms = time from first byte to process exit.
 /// Respects timeout: kills the process and returns failure if exceeded.
 /// Override the claude binary via CLAUDE_BIN env var (useful for tests).
+/// If `spec_id` is provided, writes the child PID to ~/.boi/pids/{spec_id}.pid
+/// so that `boi cancel` can kill it.
 pub fn spawn_claude(
     prompt: &str,
     worktree_path: &str,
     timeout_secs: u64,
+    spec_id: Option<&str>,
 ) -> Result<ClaudeResult, Box<dyn std::error::Error>> {
     use std::io::Read;
 
@@ -87,6 +101,18 @@ pub fn spawn_claude(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
+    // Write PID file so `boi cancel` can kill this subprocess
+    let pid_path = spec_id.map(|sid| {
+        let p = pid_file_for(sid);
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let child_pid = child.id();
+        let _ = std::fs::write(&p, child_pid.to_string());
+        eprintln!("[boi] wrote pid {} to {}", child_pid, p.display());
+        p
+    });
 
     let spawn_time = Instant::now();
     let stdout_pipe = child.stdout.take().expect("stdout was piped");
@@ -125,6 +151,11 @@ pub fn spawn_claude(
     }
 
     let total_ms = spawn_time.elapsed().as_millis() as u64;
+
+    // Clean up PID file — child has exited (or been killed on timeout)
+    if let Some(ref p) = pid_path {
+        let _ = std::fs::remove_file(p);
+    }
 
     if timed_out {
         let _ = reader_handle.join();
@@ -362,6 +393,27 @@ pub fn run_worker_with_phases(
     let mut state = WorkerState::SpecPhase { phase_idx: 0 };
 
     loop {
+        // Validate worktree still exists before every state transition.
+        // If pruned mid-execution, abort cleanly instead of falling back to parent repo.
+        match &state {
+            WorkerState::Cleanup { .. } => {} // Don't check during cleanup
+            _ => {
+                if !std::path::Path::new(&worktree_path).exists() {
+                    eprintln!(
+                        "[boi] ERROR: worktree {} disappeared — aborting spec {}",
+                        worktree_path, spec_id
+                    );
+                    let _ = queue.update_spec(spec_id, "failed");
+                    telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
+                        "spec_id": spec_id,
+                        "status": "failed",
+                        "message": format!("worktree {} no longer exists", worktree_path),
+                    }));
+                    break;
+                }
+            }
+        }
+
         match state {
             WorkerState::SpecPhase { phase_idx } => {
                 if phase_idx >= pre_spec_phases.len() {
@@ -399,6 +451,7 @@ pub fn run_worker_with_phases(
                     None,
                     &worktree_path,
                     config.task_timeout_secs,
+                    Some(spec_id),
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms);
@@ -609,6 +662,7 @@ pub fn run_worker_with_phases(
                     Some(task),
                     &worktree_path,
                     config.task_timeout_secs,
+                    Some(spec_id),
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &verdict, &phase_started_at, elapsed_ms);
@@ -748,6 +802,7 @@ pub fn run_worker_with_phases(
                     Some(task),
                     &worktree_path,
                     config.task_timeout_secs,
+                    Some(spec_id),
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &retry_verdict, &phase_started_at, elapsed_ms);
@@ -895,6 +950,7 @@ pub fn run_worker_with_phases(
                     None,
                     &worktree_path,
                     config.task_timeout_secs,
+                    Some(spec_id),
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
                 record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms);
@@ -1241,7 +1297,7 @@ mod tests {
     fn test_spawn_claude_exit_0() {
         let script = mock_claude(0, "exit0");
         with_claude_bin(script.to_str().unwrap(), || {
-            let cr = spawn_claude("prompt", "/tmp", 10).unwrap();
+            let cr = spawn_claude("prompt", "/tmp", 10, None).unwrap();
             assert!(cr.success);
             assert!(cr.total_ms > 0 || cr.startup_ms == 0);
         });
@@ -1251,7 +1307,7 @@ mod tests {
     fn test_spawn_claude_exit_1() {
         let script = mock_claude(1, "exit1");
         with_claude_bin(script.to_str().unwrap(), || {
-            let cr = spawn_claude("prompt", "/tmp", 10).unwrap();
+            let cr = spawn_claude("prompt", "/tmp", 10, None).unwrap();
             assert!(!cr.success);
         });
     }

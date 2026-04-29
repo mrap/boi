@@ -1,5 +1,5 @@
 use crate::fmt::ensure_db_dir;
-use crate::{hooks, queue, worktree};
+use crate::{hooks, queue, worker};
 use serde_json::json;
 
 pub fn cmd_cancel(spec_id: &str, db_str: &str, hook_cfg: &hooks::HookConfig) {
@@ -24,12 +24,43 @@ pub fn cmd_cancel(spec_id: &str, db_str: &str, hook_cfg: &hooks::HookConfig) {
         Ok(Some(_)) => {}
     }
 
+    // Kill the Claude subprocess if it's running
+    let pid_path = worker::pid_file_for(spec_id);
+    if pid_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = content.trim().parse::<i32>() {
+                eprintln!("[boi] killing claude subprocess (pid {})", pid);
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+                // Wait briefly for graceful shutdown
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    unsafe {
+                        if libc::kill(pid, 0) != 0 {
+                            break;
+                        }
+                    }
+                }
+                // Force kill if still alive
+                unsafe {
+                    if libc::kill(pid, 0) == 0 {
+                        eprintln!("[boi] claude pid {} still alive — sending SIGKILL", pid);
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&pid_path);
+    }
+
     if let Err(e) = q.cancel(spec_id) {
         eprintln!("error: cancel failed: {}", e);
         std::process::exit(1);
     }
 
-    let _ = worktree::cleanup(spec_id);
+    // Do NOT clean up the worktree — preserve for inspection
+    eprintln!("[boi] worktree preserved for inspection");
 
     let payload = json!({ "spec_id": spec_id });
     let _ = hooks::fire(hook_cfg, hooks::ON_CANCEL, &payload);

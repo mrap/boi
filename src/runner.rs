@@ -14,6 +14,7 @@ pub trait PhaseRunner: Send + Sync {
     /// - `task`: The task being processed (None for spec-level phases)
     /// - `worktree_path`: Working directory for execution
     /// - `timeout_secs`: Max seconds before timeout
+    /// - `spec_id`: Spec identifier for PID file tracking (cancel support)
     fn run_phase(
         &self,
         phase: &PhaseConfig,
@@ -21,6 +22,7 @@ pub trait PhaseRunner: Send + Sync {
         task: Option<&BoiTask>,
         worktree_path: &str,
         timeout_secs: u64,
+        spec_id: Option<&str>,
     ) -> Verdict;
 }
 
@@ -44,9 +46,10 @@ impl PhaseRunner for ClaudePhaseRunner {
         task: Option<&BoiTask>,
         worktree_path: &str,
         timeout_secs: u64,
+        spec_id: Option<&str>,
     ) -> Verdict {
         if !phase.requires_claude {
-            return self.run_verify_phase(phase, task, worktree_path, timeout_secs);
+            return self.run_verify_phase(phase, task, worktree_path, timeout_secs, spec_id);
         }
 
         let task_id = task.map(|t| t.id.as_str());
@@ -76,7 +79,7 @@ impl PhaseRunner for ClaudePhaseRunner {
             "message": "spawning claude...",
         }));
 
-        let result = worker::spawn_claude(&prompt, worktree_path, timeout_secs);
+        let result = worker::spawn_claude(&prompt, worktree_path, timeout_secs, spec_id);
 
         if let Ok(ref cr) = result {
             let startup_s = cr.startup_ms as f64 / 1000.0;
@@ -161,6 +164,7 @@ impl ClaudePhaseRunner {
         task: Option<&BoiTask>,
         worktree_path: &str,
         timeout_secs: u64,
+        spec_id: Option<&str>,
     ) -> Verdict {
         let task = match task {
             Some(t) => t,
@@ -211,7 +215,7 @@ impl ClaudePhaseRunner {
                 "message": format!("verify_prompt: spawning claude ({} chars)", verify_prompt.len()),
             }));
 
-            let result = worker::spawn_claude(verify_prompt, worktree_path, timeout_secs);
+            let result = worker::spawn_claude(verify_prompt, worktree_path, timeout_secs, spec_id);
 
             match result {
                 Ok(ref cr) if cr.success => {
@@ -276,6 +280,7 @@ impl PhaseRunner for MockPhaseRunner {
         _task: Option<&BoiTask>,
         _worktree_path: &str,
         _timeout_secs: u64,
+        _spec_id: Option<&str>,
     ) -> Verdict {
         let mut verdicts = self.verdicts.lock().unwrap();
         if verdicts.is_empty() {
@@ -343,7 +348,7 @@ mod tests {
         let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("true");
-        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10);
+        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None);
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -352,7 +357,7 @@ mod tests {
         let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("task-verify", false);
         let task = make_task_with_verify("false");
-        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10);
+        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None);
         assert_eq!(
             outcome,
             Verdict::Redo { tasks: vec![] }
@@ -373,7 +378,7 @@ mod tests {
             verify_prompt: None,
             phases: None,
         };
-        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10);
+        let outcome = runner.run_phase(&phase, "", Some(&task), "/tmp", 10, None);
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -382,7 +387,7 @@ mod tests {
         let runner = ClaudePhaseRunner::new(test_telemetry());
         let phase = make_phase("no-op", false);
         // Spec-level phase with no task → proceed (skip is just proceed)
-        let outcome = runner.run_phase(&phase, "", None, "/tmp", 10);
+        let outcome = runner.run_phase(&phase, "", None, "/tmp", 10, None);
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -396,20 +401,20 @@ mod tests {
         let phase = make_phase("test", true);
 
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10),
+            runner.run_phase(&phase, "", None, "/tmp", 10, None),
             Verdict::Proceed
         );
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10),
+            runner.run_phase(&phase, "", None, "/tmp", 10, None),
             Verdict::Done { success: false, reason: "timeout".into() }
         );
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10),
+            runner.run_phase(&phase, "", None, "/tmp", 10, None),
             Verdict::Done { success: false, reason: "bad".into() }
         );
         // Exhausted verdicts → default to Proceed
         assert_eq!(
-            runner.run_phase(&phase, "", None, "/tmp", 10),
+            runner.run_phase(&phase, "", None, "/tmp", 10, None),
             Verdict::Proceed
         );
     }
