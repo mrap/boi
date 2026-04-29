@@ -109,6 +109,8 @@ pub fn spawn_claude(
         "--dangerously-skip-permissions".to_string(),
         "--no-session-persistence".to_string(),
         "--setting-sources".to_string(), "user".to_string(),
+        "--output-format".to_string(), "stream-json".to_string(),
+        "--verbose".to_string(),
     ];
     if let Some(m) = model {
         args.push("--model".to_string());
@@ -163,20 +165,53 @@ pub fn spawn_claude(
     });
 
     let reader_handle = std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout_pipe);
-        let mut first_byte = [0u8; 1];
-        match reader.read_exact(&mut first_byte) {
-            Ok(()) => {
-                let first_byte_time = Instant::now();
-                let mut rest = Vec::new();
-                let _ = reader.read_to_end(&mut rest);
-                let mut buf = Vec::with_capacity(1 + rest.len());
-                buf.push(first_byte[0]);
-                buf.extend(rest);
-                (Some(first_byte_time), String::from_utf8_lossy(&buf).to_string())
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdout_pipe);
+        let mut first_byte_time: Option<Instant> = None;
+        let mut last_output = String::new();
+        let mut raw_lines = Vec::new();
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if first_byte_time.is_none() {
+                first_byte_time = Some(Instant::now());
             }
-            Err(_) => (None, String::new()),
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match event_type {
+                    "assistant" => {
+                        if let Some(msg) = event.pointer("/message/content/0/text").and_then(|v| v.as_str()) {
+                            let preview: String = msg.chars().take(120).collect();
+                            boi_log!("  claude: {}", preview);
+                        }
+                        if let Some(tool) = event.pointer("/message/content/0/name").and_then(|v| v.as_str()) {
+                            let input_preview = event.pointer("/message/content/0/input")
+                                .map(|v| {
+                                    let s = v.to_string();
+                                    s.chars().take(150).collect::<String>()
+                                })
+                                .unwrap_or_default();
+                            boi_log!("  tool: {} {}", tool, input_preview);
+                        }
+                    }
+                    "result" => {
+                        if let Some(text) = event.get("result").and_then(|v| v.as_str()) {
+                            last_output = text.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                raw_lines.push(line);
+            }
         }
+        if last_output.is_empty() && !raw_lines.is_empty() {
+            last_output = raw_lines.join("\n");
+        }
+        (first_byte_time, last_output)
     });
 
     let mut timed_out = false;
