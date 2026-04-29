@@ -27,6 +27,19 @@ pub struct SpecRecord {
     pub project: Option<String>,
     pub phase: String,
     pub worker_timeout_seconds: Option<i64>,
+    pub context: Option<String>,
+    pub workspace: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct FullTaskRecord {
+    pub id: String,
+    pub spec_id: String,
+    pub title: String,
+    pub status: String,
+    pub depends: String,
+    pub spec_content: Option<String>,
+    pub verify_content: Option<String>,
 }
 
 #[derive(Debug)]
@@ -224,6 +237,8 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "project", "TEXT");
         Self::ensure_column(&conn, "specs", "phase", "TEXT DEFAULT 'execute'");
         Self::ensure_column(&conn, "specs", "worker_timeout_seconds", "INTEGER");
+        Self::ensure_column(&conn, "specs", "context", "TEXT");
+        Self::ensure_column(&conn, "specs", "workspace", "TEXT");
         Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
         Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
 
@@ -265,9 +280,9 @@ impl Queue {
         let total = spec.tasks.len() as i64;
 
         tx.execute(
-            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at)
-             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6)",
-            params![id, spec.title, mode, spec_path, total, now],
+            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8)",
+            params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace],
         )?;
 
         let mut yaml_to_canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -333,7 +348,8 @@ impl Queue {
                         (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id) as total_tasks,
                         completed_tasks,
                         priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
-                        max_iterations, iteration, project, phase, worker_timeout_seconds
+                        max_iterations, iteration, project, phase, worker_timeout_seconds,
+                        context, workspace
                  FROM specs WHERE id = ?1",
             )?;
             stmt.query_row(params![id], row_to_spec)?
@@ -405,7 +421,8 @@ impl Queue {
                     (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id) as total_tasks,
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
-                    max_iterations, iteration, project, phase, worker_timeout_seconds
+                    max_iterations, iteration, project, phase, worker_timeout_seconds,
+                    context, workspace
              FROM specs WHERE id = ?1",
             params![spec_id],
             row_to_spec,
@@ -433,7 +450,8 @@ impl Queue {
                     (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id) as total_tasks,
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
-                    max_iterations, iteration, project, phase, worker_timeout_seconds
+                    max_iterations, iteration, project, phase, worker_timeout_seconds,
+                    context, workspace
              FROM specs
              ORDER BY
                CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
@@ -691,6 +709,27 @@ impl Queue {
         Ok(tasks)
     }
 
+    pub fn get_tasks_full(&self, spec_id: &str) -> Result<Vec<FullTaskRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, spec_id, title, status, depends, spec_content, verify_content
+             FROM tasks WHERE spec_id = ?1 ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![spec_id], |row| {
+                Ok(FullTaskRecord {
+                    id: row.get(0)?,
+                    spec_id: row.get(1)?,
+                    title: row.get(2)?,
+                    status: row.get(3)?,
+                    depends: row.get(4)?,
+                    spec_content: row.get(5)?,
+                    verify_content: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Reset any specs stuck in 'running' or 'assigning' back to 'queued'.
     /// Called on daemon startup to recover from crashes.
     pub fn recover_stuck_specs(&self) -> Result<usize> {
@@ -818,6 +857,8 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
         project: row.get(16)?,
         phase: row.get::<_, Option<String>>(17)?.unwrap_or_else(|| "execute".to_string()),
         worker_timeout_seconds: row.get(18)?,
+        context: row.get(19)?,
+        workspace: row.get(20)?,
     })
 }
 

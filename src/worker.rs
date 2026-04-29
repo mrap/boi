@@ -4,7 +4,7 @@ use crate::{
         ON_WORKER_START, ON_PHASE_START, ON_PHASE_COMPLETE, ON_PHASE_FAIL,
     },
     phases::{self, PhaseLevel, PhaseRegistry, Verdict},
-    queue::{PhaseRunRecord, Queue},
+    queue::{FullTaskRecord, PhaseRunRecord, Queue},
     runner::{ClaudePhaseRunner, PhaseRunner},
     spec,
     telemetry::{LogLevel, Telemetry},
@@ -403,11 +403,14 @@ pub fn run_worker_with_phases(
         "message": format!("worker started for {}", spec_id),
     }));
 
-    let spec_content_raw = std::fs::read_to_string(spec_path)?;
-    let boi_spec = spec::parse_unchecked(&spec_content_raw)?;
+    // Load spec and task data from DB — YAML file is not read at runtime.
+    let spec_rec = queue.status(spec_id)?
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            format!("spec {} not found in DB", spec_id).into()
+        })?
+        .spec;
 
-    // Extract original workspace path before worktree creation (needed for path substitution).
-    let original_workspace = boi_spec.workspace.clone();
+    let original_workspace = spec_rec.workspace.clone();
 
     let worktree_path: String = match &original_workspace {
         Some(ws) if !ws.is_empty() => {
@@ -430,24 +433,65 @@ pub fn run_worker_with_phases(
         }
     };
 
-    // Rewrite workspace paths in spec content AND re-parse so task objects (including verify
-    // commands) also get rewritten paths. Without re-parsing, verify commands would still
-    // reference the original repo path, causing `cd /original/path && ...` to escape the worktree.
-    let (spec_content, boi_spec) = if let Some(ref ws) = original_workspace {
-        let rewritten = spec_content_raw.replace(ws.as_str(), &worktree_path);
-        let rewritten_spec = spec::parse_unchecked(&rewritten)?;
-
-        for task in &rewritten_spec.tasks {
-            if let Some(ref verify) = task.verify {
-                if verify.contains(ws.as_str()) {
-                    boi_log!("WARNING: task {} verify still references original workspace '{}'", task.id, ws);
+    // Load tasks from DB and rewrite workspace paths in spec/verify content.
+    let mut db_tasks_full: Vec<FullTaskRecord> = queue.get_tasks_full(spec_id)?;
+    if let Some(ref ws) = original_workspace {
+        for t in &mut db_tasks_full {
+            if let Some(ref mut s) = t.spec_content {
+                *s = s.replace(ws.as_str(), &worktree_path);
+            }
+            if let Some(ref mut v) = t.verify_content {
+                *v = v.replace(ws.as_str(), &worktree_path);
+                if v.contains(ws.as_str()) {
+                    boi_log!("WARNING: task {} verify still references original workspace '{}'", t.id, ws);
                 }
             }
         }
+    }
 
-        (rewritten, rewritten_spec)
-    } else {
-        (spec_content_raw, boi_spec)
+    // Build BoiTask objects and BoiSpec from DB data.
+    let tasks: Vec<spec::BoiTask> = db_tasks_full.iter().map(|t| spec::BoiTask {
+        id: t.id.clone(),
+        title: t.title.clone(),
+        status: match t.status.as_str() {
+            "DONE" => spec::TaskStatus::Done,
+            "FAILED" => spec::TaskStatus::Failed,
+            "SKIPPED" => spec::TaskStatus::Skipped,
+            "RUNNING" => spec::TaskStatus::Running,
+            _ => spec::TaskStatus::Pending,
+        },
+        depends: {
+            let deps: Vec<String> = serde_json::from_str(&t.depends).unwrap_or_default();
+            if deps.is_empty() { None } else { Some(deps) }
+        },
+        spec: t.spec_content.clone(),
+        verify: t.verify_content.clone(),
+        verify_prompt: None,
+        phases: None,
+    }).collect();
+
+    let boi_spec = spec::BoiSpec {
+        title: spec_rec.title.clone(),
+        mode: Some(spec_rec.mode.clone()),
+        workspace: original_workspace.clone(),
+        initiative: None,
+        context: spec_rec.context.clone(),
+        outcomes: None,
+        spec_phases: None,
+        task_phases: None,
+        tasks,
+    };
+
+    // Reconstruct minimal spec content from DB fields for spec-level phase runners.
+    let spec_content = {
+        let mut s = format!("title: \"{}\"\nmode: {}\n", boi_spec.title, spec_rec.mode);
+        if let Some(ctx) = &spec_rec.context {
+            s.push_str("context: |\n");
+            for line in ctx.lines() {
+                s.push_str(&format!("  {}\n", line));
+            }
+        }
+        s
     };
 
     let order = match spec::topological_sort(&boi_spec) {
@@ -466,52 +510,29 @@ pub fn run_worker_with_phases(
         boi_spec.task_phases.as_deref(),
     );
 
-    // Build mapping from YAML task IDs to canonical DB IDs
-    let mut yaml_to_canonical: HashMap<String, String> = HashMap::new();
-    if let Ok(db_tasks) = queue.get_tasks(spec_id) {
-        for (i, dt) in db_tasks.iter().enumerate() {
-            if i < boi_spec.tasks.len() {
-                yaml_to_canonical.insert(boi_spec.tasks[i].id.clone(), dt.id.clone());
-            }
-        }
-    }
-
-    // task_map keyed by YAML authoring IDs (matching `order` from topological_sort)
+    // All task IDs are canonical (loaded from DB). No YAML-to-DB mapping needed.
     let task_map: HashMap<String, &spec::BoiTask> = boi_spec
         .tasks
         .iter()
         .map(|t| (t.id.clone(), t))
         .collect();
 
-    // Reverse map: canonical DB ID → YAML authoring ID
-    let canonical_to_yaml: HashMap<String, String> = yaml_to_canonical
-        .iter()
-        .map(|(yaml, canonical)| (canonical.clone(), yaml.clone()))
-        .collect();
-
     let mut done_ids: HashSet<String> = HashSet::new();
     let mut skipped_ids: HashSet<String> = HashSet::new();
     let mut db_depends: HashMap<String, Vec<String>> = HashMap::new();
-    if let Ok(db_tasks) = queue.get_tasks(spec_id) {
-        for dt in &db_tasks {
-            // Use YAML IDs internally so they match `order` and `task_map` keys
-            let yaml_id = canonical_to_yaml.get(&dt.id).unwrap_or(&dt.id).clone();
-            match dt.status.as_str() {
-                "DONE" => { done_ids.insert(yaml_id.clone()); }
-                "SKIPPED" => {
-                    skipped_ids.insert(yaml_id.clone());
-                    done_ids.insert(yaml_id.clone());
-                }
-                _ => {}
+    for dt in &db_tasks_full {
+        match dt.status.as_str() {
+            "DONE" => { done_ids.insert(dt.id.clone()); }
+            "SKIPPED" => {
+                skipped_ids.insert(dt.id.clone());
+                done_ids.insert(dt.id.clone());
             }
-            let raw_deps: Vec<String> = serde_json::from_str(&dt.depends).unwrap_or_default();
-            let deps: Vec<String> = raw_deps.iter()
-                .map(|d| canonical_to_yaml.get(d).cloned().unwrap_or_else(|| d.clone()))
-                .collect();
-            boi_log!("  dep-map: yaml_id={} canonical={} raw_deps={:?} mapped_deps={:?}", yaml_id, dt.id, raw_deps, deps);
-            if !deps.is_empty() {
-                db_depends.insert(yaml_id.clone(), deps);
-            }
+            _ => {}
+        }
+        let raw_deps: Vec<String> = serde_json::from_str(&dt.depends).unwrap_or_default();
+        if !raw_deps.is_empty() {
+            boi_log!("  dep-map: id={} deps={:?}", dt.id, raw_deps);
+            db_depends.insert(dt.id.clone(), raw_deps);
         }
     }
 
@@ -555,14 +576,21 @@ pub fn run_worker_with_phases(
     let pending_count = order.len() - done_ids.len();
     let mut prompt_vars: HashMap<String, String> = HashMap::new();
     prompt_vars.insert(TemplateVar::QueueId.key().into(), spec_id.to_string());
-    prompt_vars.insert(TemplateVar::SpecPath.key().into(), spec_path.to_string());
     prompt_vars.insert(TemplateVar::Iteration.key().into(), "1".into());
     prompt_vars.insert(TemplateVar::PendingCount.key().into(), pending_count.to_string());
-    prompt_vars.insert(TemplateVar::SpecContent.key().into(), spec_content.clone());
+    prompt_vars.insert("SPEC_PATH".into(), spec_path.to_string());
+    prompt_vars.insert("SPEC_CONTENT".into(), spec_content.clone());
     prompt_vars.insert(TemplateVar::WorkspaceHeader.key().into(),
         boi_spec.workspace.as_ref()
             .map(|_| format!("Workspace: {}\n", worktree_path))
             .unwrap_or_default());
+    prompt_vars.insert(TemplateVar::SpecContext.key().into(),
+        boi_spec.context.as_deref().unwrap_or("").to_string());
+    // Per-task vars initialized empty; updated before each task phase
+    prompt_vars.insert(TemplateVar::TaskTitle.key().into(), String::new());
+    prompt_vars.insert(TemplateVar::TaskSpec.key().into(), String::new());
+    prompt_vars.insert(TemplateVar::TaskVerify.key().into(), String::new());
+    prompt_vars.insert(TemplateVar::TaskDepends.key().into(), String::new());
     TemplateVar::validate(&prompt_vars).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // --- State machine ---
@@ -730,7 +758,7 @@ pub fn run_worker_with_phases(
                         "task_id": task.id,
                         "task_title": task.title,
                     });
-                    let db_task_id = yaml_to_canonical.get(task_id.as_str()).map(|s| s.as_str()).unwrap_or(task_id.as_str());
+                    let db_task_id = task_id.as_str();
                     queue.update_task(spec_id, db_task_id, "RUNNING")?;
                     let _ = hooks::fire(hook_config, ON_TASK_START, &task_payload); // intentional: best-effort hook notification
 
@@ -782,7 +810,7 @@ pub fn run_worker_with_phases(
 
             WorkerState::TaskPhase { ref task_id, phase_idx, requeue_attempts } => {
                 let task_id_owned = task_id.clone();
-                let db_task_id = yaml_to_canonical.get(&task_id_owned).cloned().unwrap_or_else(|| task_id_owned.clone());
+                let db_task_id = task_id_owned.clone();
                 let task = match task_map.get(task_id_owned.as_str()) {
                     Some(t) => t,
                     None => {
@@ -852,6 +880,15 @@ pub fn run_worker_with_phases(
                     "phase": phase_name,
                     "message": format!("{}: {} phase started", task.id, phase_name),
                 }));
+
+                // Update per-task template vars from DB-stored task fields
+                prompt_vars.insert(TemplateVar::TaskTitle.key().into(), task.title.clone());
+                prompt_vars.insert(TemplateVar::TaskSpec.key().into(),
+                    task.spec.as_deref().unwrap_or("").to_string());
+                prompt_vars.insert(TemplateVar::TaskVerify.key().into(),
+                    task.verify.as_deref().unwrap_or("").to_string());
+                prompt_vars.insert(TemplateVar::TaskDepends.key().into(),
+                    task.depends.as_ref().map(|d| d.join(", ")).unwrap_or_default());
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
@@ -952,7 +989,7 @@ pub fn run_worker_with_phases(
 
             WorkerState::TaskPhaseRetry { ref task_id, phase_idx, attempt } => {
                 let task_id_owned = task_id.clone();
-                let db_task_id = yaml_to_canonical.get(&task_id_owned).cloned().unwrap_or_else(|| task_id_owned.clone());
+                let db_task_id = task_id_owned.clone();
                 boi_log!("state: TaskPhaseRetry {{ task: {}, phase_idx: {}, attempt: {} }}", task_id_owned, phase_idx, attempt);
                 let task = match task_map.get(task_id_owned.as_str()) {
                     Some(t) => t,
@@ -1006,6 +1043,15 @@ pub fn run_worker_with_phases(
                     "[boi] phase '{}' for task {} failed (attempt {}/{}), retrying",
                     phase_name, task.id, attempt, max_attempts
                 );
+
+                // Update per-task template vars for retry
+                prompt_vars.insert(TemplateVar::TaskTitle.key().into(), task.title.clone());
+                prompt_vars.insert(TemplateVar::TaskSpec.key().into(),
+                    task.spec.as_deref().unwrap_or("").to_string());
+                prompt_vars.insert(TemplateVar::TaskVerify.key().into(),
+                    task.verify.as_deref().unwrap_or("").to_string());
+                prompt_vars.insert(TemplateVar::TaskDepends.key().into(),
+                    task.depends.as_ref().map(|d| d.join(", ")).unwrap_or_default());
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
@@ -1071,7 +1117,7 @@ pub fn run_worker_with_phases(
                     let task = task_map.get(task_id_owned.as_str());
                     let task_title = task.map(|t| t.title.as_str()).unwrap_or("unknown");
                     boi_log!(" requeue limit ({}) exceeded for task {}", config.retry_count, task_id_owned);
-                    let db_task_id_rq = yaml_to_canonical.get(&task_id_owned).cloned().unwrap_or_else(|| task_id_owned.clone());
+                    let db_task_id_rq = task_id_owned.clone();
                     queue.update_task(spec_id, &db_task_id_rq, "FAILED")?;
                     let task_payload = json!({
                         "spec_id": spec_id,

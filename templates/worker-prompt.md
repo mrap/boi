@@ -2,9 +2,6 @@
 
 You are a BOI (Beginning of Infinity) worker executing one iteration of a spec. This is a fresh session with no prior context.
 
-## Spec File
-`{{SPEC_PATH}}`
-
 ## Queue ID
 {{QUEUE_ID}}
 
@@ -13,11 +10,25 @@ You are a BOI (Beginning of Infinity) worker executing one iteration of a spec. 
 
 ---
 
-## Full Spec Contents
+## Spec Context
 
-{{WORKSPACE_HEADER}}{{SPEC_CONTENT}}
+{{WORKSPACE_HEADER}}{{SPEC_CONTEXT}}
 
 {{PROJECT_CONTEXT}}
+
+---
+
+## Task
+
+**Title:** {{TASK_TITLE}}
+
+**Spec:**
+{{TASK_SPEC}}
+
+**Verify:**
+{{TASK_VERIFY}}
+
+**Dependencies:** {{TASK_DEPENDS}}
 
 ---
 

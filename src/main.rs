@@ -149,6 +149,8 @@ enum DaemonAction {
 
 #[derive(Subcommand)]
 enum SpecAction {
+    /// Show spec as YAML reconstruction from DB
+    Show,
     /// Add a task to the spec
     Add {
         title: String,
@@ -255,6 +257,7 @@ fn main() {
         Commands::Spec { queue_id, action } => {
             let action_data = match action {
                 None => SpecActionData::Show,
+                Some(SpecAction::Show) => SpecActionData::ShowYaml,
                 Some(SpecAction::Add { title, spec, verify, depends }) => {
                     SpecActionData::Add { title, spec, verify, depends }
                 }
