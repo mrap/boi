@@ -354,7 +354,8 @@ impl Queue {
 
         let rec = {
             let mut stmt = tx.prepare(
-                "SELECT id, title, mode, status, spec_path, total_tasks, completed_tasks,
+                "SELECT id, title, mode, status, spec_path, total_tasks,
+                        (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id AND tasks.status IN ('DONE', 'SKIPPED')) as completed_tasks,
                         priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                         max_iterations, iteration, project, phase, worker_timeout_seconds
                  FROM specs WHERE id = ?1",
@@ -374,10 +375,6 @@ impl Queue {
                     "UPDATE tasks SET status = ?1, completed_at = ?2
                      WHERE spec_id = ?3 AND id = ?4",
                     params![status, now, spec_id, task_id],
-                )?;
-                self.conn.execute(
-                    "UPDATE specs SET completed_tasks = completed_tasks + 1 WHERE id = ?1",
-                    params![spec_id],
                 )?;
             }
             "RUNNING" => {
@@ -424,7 +421,8 @@ impl Queue {
 
     pub fn status(&self, spec_id: &str) -> Result<Option<SpecStatus>> {
         let spec = match self.conn.query_row(
-            "SELECT id, title, mode, status, spec_path, total_tasks, completed_tasks,
+            "SELECT id, title, mode, status, spec_path, total_tasks,
+                        (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id AND tasks.status IN ('DONE', 'SKIPPED')) as completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds
              FROM specs WHERE id = ?1",
@@ -450,7 +448,8 @@ impl Queue {
 
     pub fn status_all(&self) -> Result<Vec<SpecRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, mode, status, spec_path, total_tasks, completed_tasks,
+            "SELECT id, title, mode, status, spec_path, total_tasks,
+                        (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id AND tasks.status IN ('DONE', 'SKIPPED')) as completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds
              FROM specs
