@@ -350,11 +350,28 @@ pub fn run_worker_with_phases(
         boi_spec.task_phases.as_deref(),
     );
 
-    let task_map: HashMap<&str, &spec::BoiTask> =
-        boi_spec.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+    // Build mapping from YAML task IDs to canonical DB IDs
+    let mut yaml_to_canonical: HashMap<String, String> = HashMap::new();
+    if let Ok(db_tasks) = queue.get_tasks(spec_id) {
+        for (i, dt) in db_tasks.iter().enumerate() {
+            if i < boi_spec.tasks.len() {
+                yaml_to_canonical.insert(boi_spec.tasks[i].id.clone(), dt.id.clone());
+            }
+        }
+    }
 
-    // DB is the single source of truth for task status.
-    // YAML defines task specs/verify; DB owns runtime state (status, deps, timestamps).
+    let task_map: HashMap<String, &spec::BoiTask> = boi_spec
+        .tasks
+        .iter()
+        .map(|t| {
+            let canonical = yaml_to_canonical
+                .get(&t.id)
+                .cloned()
+                .unwrap_or_else(|| t.id.clone());
+            (canonical, t)
+        })
+        .collect();
+
     let mut done_ids: HashSet<String> = HashSet::new();
     let mut skipped_ids: HashSet<String> = HashSet::new();
     let mut db_depends: HashMap<String, Vec<String>> = HashMap::new();
@@ -1454,7 +1471,9 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
 tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    title: \"Pending\"\n    status: PENDING\n    depends: [t-1]\n";
         let (queue, spec_id, db_path) = setup_test_db("worker_skip", spec_yaml);
         // Pre-mark t-1 as DONE in the DB so worker skips it
-        queue.update_task(&spec_id, "t-1", "DONE").unwrap();
+        let pre_st = queue.status(&spec_id).unwrap().unwrap();
+        let t1_canonical = pre_st.tasks[0].id.clone();
+        queue.update_task(&spec_id, &t1_canonical, "DONE").unwrap();
         let spec_file = std::env::temp_dir().join("boi_test_spec_worker_skip.yaml");
         let config = WorkerConfig {
             max_workers: 1,
@@ -1478,7 +1497,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
 
         let st = queue.status(&spec_id).unwrap().unwrap();
         assert_eq!(st.spec.status, "completed");
-        let t2 = st.tasks.iter().find(|t| t.id == "t-2").unwrap();
+        let t2 = st.tasks.iter().find(|t| t.title == "Pending").unwrap();
         assert_eq!(t2.status, "DONE");
     }
 
