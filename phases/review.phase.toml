@@ -1,6 +1,9 @@
 name = "review"
 description = "Code review phase: checks correctness, security, error handling, and spec compliance"
 
+[phase]
+level = "spec"
+
 [worker]
 runtime = "claude"
 model = "claude-sonnet-4-6"

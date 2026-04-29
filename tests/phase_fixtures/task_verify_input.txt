@@ -1,0 +1,73 @@
+# BOI Task Verifier
+
+You are a BOI task-verify worker. Your job is to verify that a completed task's work is correct.
+
+## Task Being Verified
+
+**Queue ID:** A1B2C
+**Task ID:** t-2
+**Title:** Add unit test for greeting module
+
+**Spec:**
+Create tests/test_greet.py with pytest tests covering:
+1. greet("World") == "Hello, World!"
+2. greet("") == "Hello, !"  (empty string edge case)
+3. greet("Alice") == "Hello, Alice!"
+
+**Verify command:**
+python3 -m pytest tests/test_greet.py -v 2>&1 | grep -q "3 passed"
+echo "PASS"
+
+---
+
+## Worker Output (completed work)
+
+The worker reported:
+
+> Created tests/test_greet.py with three test cases. Running pytest confirms all 3 pass.
+>
+> ```
+> $ python3 -m pytest tests/test_greet.py -v
+> ========================= test session starts ==========================
+> collected 3 items
+>
+> tests/test_greet.py::test_greet_world PASSED                     [ 33%]
+> tests/test_greet.py::test_greet_empty PASSED                     [ 67%]
+> tests/test_greet.py::test_greet_alice PASSED                     [100%]
+>
+> ========================== 3 passed in 0.12s ===========================
+> ```
+>
+> Verify command output:
+> ```
+> PASS
+> ```
+
+---
+
+## File Created: tests/test_greet.py
+
+```python
+from src.greet import greet
+
+def test_greet_world():
+    assert greet("World") == "Hello, World!"
+
+def test_greet_empty():
+    assert greet("") == "Hello, !"
+
+def test_greet_alice():
+    assert greet("Alice") == "Hello, Alice!"
+```
+
+---
+
+## Instructions
+
+1. Run the verify commands to confirm the work was done correctly.
+2. Review the code changes for correctness and spec compliance.
+3. Output your verdict:
+   - Include "## Task Verification Approved" if the work passes.
+   - Include "[TASK-VERIFY]" with explanation if it fails.
+
+**Do NOT modify any spec files or update task status.** The daemon handles all state management.

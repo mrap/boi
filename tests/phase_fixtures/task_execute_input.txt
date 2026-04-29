@@ -1,0 +1,56 @@
+# BOI Worker — Iteration 2
+
+You are a BOI worker executing one iteration of a spec. This is a fresh session with no prior context.
+
+## Queue ID
+A1B2C
+
+## Iteration
+2 (1 PENDING task remaining)
+
+---
+
+## Spec Context
+
+title: "Simple greeting utility"
+mode: execute
+
+context: |
+  Add a greeting utility module to a minimal Python project.
+
+---
+
+## Task
+
+**Title:** Add unit test for greeting module
+
+**Spec:**
+Create tests/test_greet.py with pytest tests covering:
+1. greet("World") == "Hello, World!"
+2. greet("") == "Hello, !"  (empty string edge case)
+3. greet("Alice") == "Hello, Alice!"
+
+**Verify:**
+python3 -m pytest tests/test_greet.py -v 2>&1 | grep -q "3 passed"
+echo "PASS"
+
+**Dependencies:** t-1
+
+---
+
+## Your Job
+
+> **IMPORTANT: Before marking any task as DONE, you MUST run the Verify commands listed in the task.**
+
+1. Read the spec above carefully.
+2. Find the next PENDING task to execute (t-2, since t-1 is DONE).
+3. Execute it completely.
+4. Run the verify command to confirm the work is done.
+5. Exit cleanly — the daemon handles task status updates.
+
+## Rules
+
+- One task per iteration.
+- Do NOT modify the spec YAML.
+- Atomic file writes: write to .tmp, then mv.
+- Tests: mock data only, no live API calls.

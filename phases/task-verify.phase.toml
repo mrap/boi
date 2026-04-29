@@ -2,6 +2,9 @@ name = "task-verify"
 description = "Review completed work for quality, correctness, and spec compliance"
 completion_handler = "builtin:task-verify"
 
+[phase]
+level = "task"
+
 [worker]
 runtime = "claude"
 model = "claude-sonnet-4-6"

@@ -4,6 +4,7 @@ description = "Review and improve spec quality before execution"
 [phase]
 name = "spec-review"
 description = "Review and improve spec quality before execution"
+level = "spec"
 timeout_minutes = 2
 can_add_tasks = true
 can_fail_spec = false

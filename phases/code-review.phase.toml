@@ -1,6 +1,9 @@
 name = "code-review"
 description = "4-persona code review: quality, testing, security, and architecture -- only runs when >50 lines changed"
 
+[phase]
+level = "task"
+
 [worker]
 runtime = "claude"
 model = "claude-sonnet-4-6"

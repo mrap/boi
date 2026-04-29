@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod cancel;
 pub mod config_cmd;
 pub mod daemon;
