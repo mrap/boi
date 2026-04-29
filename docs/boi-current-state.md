@@ -25,7 +25,7 @@ All commands enter through `boi.sh`, which bootstraps Python and delegates to li
 | `boi resume <id>` | Reset failed/canceled → `queued` | `lib.queue.resume_spec()` |
 | `boi workers [--json]` | List worktrees and availability | `lib.cli_ops.show_workers()` |
 | `boi telemetry <id> [--json]` | Per-iteration breakdown (tasks, cost, duration) | `lib.telemetry.get_telemetry()` |
-| `boi dashboard` | Live 60-char tmux-friendly display (2s refresh) | `dashboard.sh` + Python |
+| `boi dashboard` | Interactive TUI (crossterm): running/queued specs, 2s refresh, keyboard-driven | `src/cli/dashboard.rs` |
 | `boi purge [--all] [--dry-run]` | Remove completed/failed/canceled specs | `lib.cli_ops.purge()` |
 | `boi stop` | Kill daemon and all workers | `lib.daemon_lock.stop_daemon()` |
 | `boi install [--workers N]` | One-time setup: worktrees, config, DB | `install.sh` |

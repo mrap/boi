@@ -1,4 +1,5 @@
 pub mod cancel;
+pub mod dashboard;
 pub mod config_cmd;
 pub mod daemon;
 pub mod dispatch;
