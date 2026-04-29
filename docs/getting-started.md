@@ -81,7 +81,7 @@ Submit your spec to the queue:
 boi dispatch --spec hello-boi.md
 ```
 
-BOI validates the spec, assigns it a queue ID (e.g., `q-001`), and starts the daemon. The daemon assigns the spec to a free worker, which launches a fresh Claude session to execute the first PENDING task.
+BOI validates the spec, assigns it a short hash ID (e.g., `SA7F3`), and starts the daemon. The daemon assigns the spec to a free worker, which launches a fresh Claude session to execute the first PENDING task.
 
 ### Dispatch options
 
@@ -115,7 +115,7 @@ Output:
 BOI
 
 QUEUE                         MODE       WORKER  ITER   TASKS       QUALITY    PROGRESS   STATUS
-q-001  hello-boi              execute    w-1     1/30   0/2 done    ---        0%         running
+SA7F3  hello-boi              execute    w-1     1/30   0/2 done    ---        0%         running
 
 Workers: 1/3 busy  |  Queue: 1 running
 ```
@@ -141,15 +141,15 @@ A tmux-friendly compact view, good for small panes.
 ### View worker output
 
 ```bash
-boi log q-001              # tail latest iteration
-boi log q-001 --full       # full output
-boi log q-001 --follow     # live-follow daemon log filtered to this spec
+boi log SA7F3              # tail latest iteration
+boi log SA7F3 --full       # full output
+boi log SA7F3 --follow     # live-follow daemon log filtered to this spec
 ```
 
 ### Iteration breakdown
 
 ```bash
-boi telemetry q-001
+boi telemetry SA7F3
 ```
 
 Shows tasks completed, time spent, and quality scores per iteration.
@@ -168,7 +168,7 @@ If a worker discovers additional work is needed (in Discover or Generate mode), 
 
 ```bash
 boi queue                  # Show all specs with status
-boi cancel q-001           # Cancel a spec
+boi cancel SA7F3           # Cancel a spec
 boi stop                   # Stop daemon and all workers
 boi workers                # Show worker availability
 boi purge                  # Remove completed/failed specs from queue

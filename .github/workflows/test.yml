@@ -12,24 +12,22 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11", "3.12"]
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Install test dependencies
-        run: python3 -m pip install pytest
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Run unit tests
-        run: python3 -m pytest tests/ -v --ignore=tests/integration_boi.py --ignore=tests/eval_boi.py
-
-      - name: Run integration tests
-        run: python3 -m unittest tests.integration_boi -v
-
-      - name: Run eval tests
-        run: python3 -m unittest tests.eval_boi -v
+        run: cargo test --lib

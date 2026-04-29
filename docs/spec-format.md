@@ -115,7 +115,7 @@ context: |
   Build a CLI tool for managing YAML configuration files.
   Python 3.10+, stdlib only. Must work on Linux and macOS.
 workspace: /path/to/worktree    # optional: pin to a specific worktree
-blocked_by: [q-001]             # optional: wait for another spec
+blocked_by: [SA7F3]             # optional: wait for another spec
 
 outcomes:
   - description: "CLI reads config files"

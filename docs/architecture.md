@@ -162,12 +162,12 @@ Computes quality scores across 18 signals in 4 categories (Code Quality, Test Qu
   daemon.pid                    # Daemon process ID
   boi.db                        # SQLite database (WAL mode)
   queue/                        # Spec queue
-    q-001.spec.yaml               # Copy of spec file
-    q-001.prompt.md             # Generated worker prompt
-    q-001.run.sh                # Worker run script
+    SA7F3.spec.yaml               # Copy of spec file
+    SA7F3.prompt.md             # Generated worker prompt
+    SA7F3.run.sh                # Worker run script
   logs/
     daemon.log                  # Daemon log
-    q-001-iter-1.log            # Worker output per iteration
+    SA7F3-iter-1.log            # Worker output per iteration
   hooks/                        # Optional: on-complete.sh, on-fail.sh
   worktrees/                    # Git worktrees (one per worker)
     boi-worker-1/
@@ -203,7 +203,7 @@ Each worker needs an isolated copy of the codebase. Git worktrees provide this w
 
 ### Worktree Isolation (per-spec worktrees)
 
-By default, workers use shared worktrees assigned at install time. When `--worktree-isolate` is used, each spec gets its own dedicated worktree and branch (`boi/q-{id}`), created at `~/.boi/worktrees/q-{id}`.
+By default, workers use shared worktrees assigned at install time. When `--worktree-isolate` is used, each spec gets its own dedicated worktree and branch (`boi/{id}`), created at `~/.boi/worktrees/{id}`.
 
 **Lifecycle:**
 1. On dispatch with `--worktree-isolate`: `create_spec_worktree()` creates the worktree and branch
