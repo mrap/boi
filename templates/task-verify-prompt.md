@@ -98,30 +98,19 @@ After reviewing all completed tasks against all checks and all three perspective
 ### After producing the JSON
 
 If `approved` is `true`:
-- Append `## Critic Approved` as the last section of the spec file, followed by a blank line and the current date.
+- Output `## Critic Approved` in your response.
 
 If `approved` is `false`:
-- For each issue in the `issues` array, append the `suggested_task` as a new task at the end of the spec's Tasks section.
-- Each new task title must start with `[CRITIC]` so workers and the daemon can identify critic-generated tasks.
-- Use the next available task ID number (scan existing `### t-N:` headings to find the highest N, then increment).
-- **CRITICAL:** Never reuse an existing task ID. Each `### t-N:` must be unique. If the spec has t-1 through t-5, your new task MUST be t-6 (or higher). Reusing a task ID (e.g., adding another t-2 when t-2 already exists) will break the task counter and cause incorrect status display.
+- Output the issues and suggested tasks in your response JSON.
+- The daemon will handle adding new tasks to the DB. Do NOT modify any files.
+
+**Do NOT modify the spec file or any YAML. The daemon manages all state.**
 
 ---
 
-## Self-Evolution Rules
+## Self-Evolution
 
-If you discover work that needs to happen but does not fit any of the 5 issues, you may add additional PENDING tasks. New tasks MUST use this exact format:
-
-```
-### t-N: [CRITIC] Task title
-PENDING
-
-**Spec:** What to do...
-
-**Verify:** How to verify...
-```
-
-Status MUST be on its own line, immediately after the heading.
+If you discover additional work needed, describe it in the `issues` array of your JSON output. The daemon will create the tasks. Do NOT write tasks to any file.
 
 **Task ID requirement:** Always use the next sequential ID after the highest existing task. Example: if tasks t-1 through t-5 exist, new critic tasks must start at t-6. Never reuse an existing task ID (e.g., never add a second t-2).
 

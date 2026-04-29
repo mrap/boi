@@ -109,8 +109,8 @@ pub struct SpecStatus {
 
 fn gen_id(prefix: char, conn: &Connection) -> String {
     let mut rng = rand::thread_rng();
-    let table = if prefix == 's' { "specs" } else { "tasks" };
-    loop {
+    let table = if prefix == 'S' { "specs" } else { "tasks" };
+    for _ in 0..100 {
         let bytes: [u8; 2] = rng.gen();
         let candidate = format!("{}{:02X}{:02X}", prefix, bytes[0], bytes[1]);
         let exists: bool = conn
@@ -124,6 +124,8 @@ fn gen_id(prefix: char, conn: &Connection) -> String {
             return candidate;
         }
     }
+    let bytes: [u8; 4] = rng.gen();
+    format!("{}{:02X}{:02X}{:02X}{:02X}", prefix, bytes[0], bytes[1], bytes[2], bytes[3])
 }
 
 impl Queue {
@@ -132,6 +134,7 @@ impl Queue {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
+            PRAGMA busy_timeout=5000;
 
             CREATE TABLE IF NOT EXISTS specs (
                 id TEXT PRIMARY KEY,
