@@ -1,0 +1,9 @@
+name = "merge"
+description = "Merge spec worktree branch into the target branch (deterministic, no Claude)"
+completion_handler = "builtin:merge"
+
+[phase]
+level = "spec"
+
+[worker]
+runtime = "deterministic"

@@ -1,0 +1,9 @@
+name = "commit"
+description = "Commit staged changes in the spec worktree (deterministic, no Claude)"
+completion_handler = "builtin:commit"
+
+[phase]
+level = "task"
+
+[worker]
+runtime = "deterministic"

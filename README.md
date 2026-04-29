@@ -106,10 +106,11 @@ can_fail_spec = false                    # whether a rejection from this phase m
 
 # Worker configuration
 [worker]
-prompt_template = "templates/my-prompt.md"  # required — path to prompt template
+prompt_template = "templates/my-prompt.md"  # required for claude/default phases
 model = "claude-sonnet-4-6"                  # default: claude-sonnet-4-6
 effort = "medium"                            # low | medium | high
 timeout = 300                                # seconds; must be > 0
+runtime = "claude"                           # "claude" (default) | "deterministic"
 
 # Completion routing
 [completion]
@@ -137,7 +138,9 @@ post = ["diff-is-non-empty"]      # gates to run after this phase completes
 - `retry` — re-run this phase
 - `fail` — mark the spec failed
 
-**`completion_handler`:** Set this top-level field to delegate routing to a built-in handler (e.g. `"builtin:execute"`). Use it when you want a phase to reuse the same routing logic as a built-in phase rather than defining your own `approve_signal`/`reject_signal` strings. When `completion_handler` is set, the daemon calls the named built-in handler and ignores the `[completion]` signals.
+**`completion_handler`:** Used in two contexts:
+- **Claude phases** (default): delegates completion routing to a built-in handler (e.g. `"builtin:execute"`) instead of `approve_signal`/`reject_signal` strings.
+- **Deterministic phases** (`[worker] runtime = "deterministic"`): names the builtin to *execute* directly — no Claude spawn. Built-ins: `builtin:commit`, `builtin:merge`, `builtin:cleanup`. The `[completion]` block is ignored for deterministic phases.
 
 ### Creating a Custom Phase
 
@@ -202,6 +205,35 @@ post_phases = ["doc-update", "critic", "merge"]    # phases run after all tasks 
 ```
 
 Pass them with `--pipeline name:path/to/pipeline.toml` (repeatable for N-way comparisons).
+
+### Pipeline v2 Mode (opt-in)
+
+v2 is a redesigned pipeline with clean phase separation and deterministic steps that skip Claude cold-start. Set `mode: v2` in your spec:
+
+```yaml
+title: My Feature
+mode: v2
+
+tasks:
+  - id: t-1
+    title: Implement the thing
+    status: PENDING
+    spec: |
+      Add X to lib/foo.py following the existing pattern.
+    verify: "python3 -m pytest tests/test_foo.py -x -q"
+```
+
+v2 pipeline layout:
+
+```
+Spec-pre  (loop ≤3): spec-critique ↔ spec-improve
+Per-task:            execute → review → commit     (commit is deterministic)
+Spec-post:           doc-update → critic → merge → cleanup
+                                           ^         ^       ^
+                                           Claude    det.    det.
+```
+
+Deterministic phases (`commit`, `merge`, `cleanup`) run as plain shell operations — no Claude spawn, no cold-start latency. v1 is still the default; v2 is opt-in until A/B benchmarks confirm the speedup. See [docs/pipelines.md](docs/pipelines.md) for a full v1 vs v2 comparison and guidance on when to use each.
 
 ## Guardrails
 

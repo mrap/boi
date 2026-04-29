@@ -29,6 +29,8 @@ pub struct SpecRecord {
     pub worker_timeout_seconds: Option<i64>,
     pub context: Option<String>,
     pub workspace: Option<String>,
+    /// Number of completed critique↔improve loop cycles for this spec.
+    pub phase_loop_count: i64,
 }
 
 #[derive(Debug)]
@@ -267,6 +269,7 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "worker_timeout_seconds", "INTEGER");
         Self::ensure_column(&conn, "specs", "context", "TEXT");
         Self::ensure_column(&conn, "specs", "workspace", "TEXT");
+        Self::ensure_column(&conn, "specs", "phase_loop_count", "INTEGER DEFAULT 0");
         Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
         Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
 
@@ -377,7 +380,7 @@ impl Queue {
                         completed_tasks,
                         priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                         max_iterations, iteration, project, phase, worker_timeout_seconds,
-                        context, workspace
+                        context, workspace, phase_loop_count
                  FROM specs WHERE id = ?1",
             )?;
             stmt.query_row(params![id], row_to_spec)?
@@ -450,7 +453,7 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace
+                    context, workspace, phase_loop_count
              FROM specs WHERE id = ?1",
             params![spec_id],
             row_to_spec,
@@ -479,7 +482,7 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace
+                    context, workspace, phase_loop_count
              FROM specs
              ORDER BY
                CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
@@ -874,6 +877,55 @@ impl Queue {
         }
     }
 
+    /// Increment the critique↔improve loop counter for a spec.
+    /// Returns the new count after incrementing.
+    pub fn increment_phase_loop_count(&self, spec_id: &str) -> Result<i64> {
+        self.conn.execute(
+            "UPDATE specs SET phase_loop_count = phase_loop_count + 1 WHERE id = ?1",
+            params![spec_id],
+        )?;
+        let count: i64 = self.conn.query_row(
+            "SELECT phase_loop_count FROM specs WHERE id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get the current critique↔improve loop counter for a spec.
+    pub fn get_phase_loop_count(&self, spec_id: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COALESCE(phase_loop_count, 0) FROM specs WHERE id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Reset the critique↔improve loop counter to zero.
+    pub fn reset_phase_loop_count(&self, spec_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE specs SET phase_loop_count = 0 WHERE id = ?1",
+            params![spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// Returns true if the critique↔improve loop has reached or exceeded the cap.
+    /// Logs a warning when the cap is hit so the pipeline can proceed to task execution.
+    pub fn phase_loop_capped(&self, spec_id: &str, max_loops: i64) -> bool {
+        let count = self.get_phase_loop_count(spec_id).unwrap_or(0);
+        if count >= max_loops {
+            eprintln!(
+                "[boi] WARN: spec {} reached max critique/improve loops ({}/{}); proceeding to task execution",
+                spec_id, count, max_loops
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// Get the last updated timestamp across all specs (for heartbeat detection)
     pub fn last_spec_update(&self) -> Result<Option<String>> {
         let result: Option<String> = self
@@ -912,6 +964,7 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
         worker_timeout_seconds: row.get(18)?,
         context: row.get(19)?,
         workspace: row.get(20)?,
+        phase_loop_count: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
     })
 }
 
@@ -1212,5 +1265,93 @@ mod tests {
         q.update_spec(&blocker_id, "completed").unwrap();
         let dequeued2 = q.dequeue().unwrap().unwrap();
         assert_eq!(dequeued2.id, id2);
+    }
+
+    // --- spec_improve: loop cap enforcement ---
+
+    #[test]
+    fn test_spec_improve_loop_count_starts_at_zero() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+        assert_eq!(q.get_phase_loop_count(&id).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_spec_improve_loop_count_increments() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        let after_first = q.increment_phase_loop_count(&id).unwrap();
+        assert_eq!(after_first, 1);
+
+        let after_second = q.increment_phase_loop_count(&id).unwrap();
+        assert_eq!(after_second, 2);
+    }
+
+    #[test]
+    fn test_spec_improve_loop_count_resets() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        q.increment_phase_loop_count(&id).unwrap();
+        q.increment_phase_loop_count(&id).unwrap();
+        q.reset_phase_loop_count(&id).unwrap();
+
+        assert_eq!(q.get_phase_loop_count(&id).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_spec_improve_loop_not_capped_below_max() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        q.increment_phase_loop_count(&id).unwrap();
+        q.increment_phase_loop_count(&id).unwrap();
+
+        assert!(!q.phase_loop_capped(&id, 3), "count=2 should not be capped at max=3");
+    }
+
+    #[test]
+    fn test_spec_improve_loop_capped_at_max() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        for _ in 0..3 {
+            q.increment_phase_loop_count(&id).unwrap();
+        }
+
+        assert!(q.phase_loop_capped(&id, 3), "count=3 must be capped at max=3");
+    }
+
+    #[test]
+    fn test_spec_improve_loop_cap_configurable() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        q.increment_phase_loop_count(&id).unwrap();
+
+        // max_loops=1: capped after 1 iteration
+        assert!(q.phase_loop_capped(&id, 1));
+        // max_loops=5: not capped yet
+        assert!(!q.phase_loop_capped(&id, 5));
+    }
+
+    #[test]
+    fn test_spec_improve_loop_count_in_spec_record() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        q.increment_phase_loop_count(&id).unwrap();
+        q.increment_phase_loop_count(&id).unwrap();
+
+        let st = q.status(&id).unwrap().unwrap();
+        assert_eq!(st.spec.phase_loop_count, 2, "phase_loop_count must be readable from SpecRecord");
     }
 }

@@ -335,6 +335,9 @@ pub fn run_worker_with_phases(
                 .to_string()
         }
     };
+    // Tracks whether a builtin:cleanup phase already removed the worktree.
+    // When true, the loop-level worktree-existence check is suppressed.
+    let mut worktree_removed = false;
 
     // Load tasks from DB and rewrite workspace paths in spec/verify content.
     let mut db_tasks_full: Vec<FullTaskRecord> = queue.get_tasks_full(spec_id)?;
@@ -475,36 +478,47 @@ pub fn run_worker_with_phases(
         }
     }
 
-    // Precompute phase lists
-    // Pre-task: spec-review (improves the spec before execution) and plan-critique (gate-checks it)
-    // Post-task: everything else (critic, evaluate, etc.)
-    let pre_spec_phases: Vec<&str> = pipeline
-        .spec_phases
-        .iter()
-        .filter_map(|name| {
-            registry.get(name).and_then(|p| {
-                if p.level == PhaseLevel::Spec && matches!(name.as_str(), "spec-review" | "plan-critique") {
-                    Some(name.as_str())
-                } else {
-                    None
-                }
+    // Precompute phase lists.
+    // v2+ modes declare explicit spec_pre_phases/spec_post_phases; legacy modes derive from spec_phases.
+    let pre_spec_phases: Vec<&str> = if !pipeline.spec_pre_phases.is_empty() {
+        // v2+: use the declared spec_pre_phases directly.
+        pipeline.spec_pre_phases.iter()
+            .filter_map(|name| registry.get(name).map(|_| name.as_str()))
+            .collect()
+    } else {
+        // Legacy: spec-review and plan-critique run before tasks.
+        pipeline.spec_phases.iter()
+            .filter_map(|name| {
+                registry.get(name).and_then(|p| {
+                    if p.level == PhaseLevel::Spec && matches!(name.as_str(), "spec-review" | "plan-critique") {
+                        Some(name.as_str())
+                    } else {
+                        None
+                    }
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
 
-    let post_spec_phases: Vec<&str> = pipeline
-        .spec_phases
-        .iter()
-        .filter_map(|name| {
-            registry.get(name).and_then(|p| {
-                if p.level == PhaseLevel::Spec && name != "plan-critique" {
-                    Some(name.as_str())
-                } else {
-                    None
-                }
+    let post_spec_phases: Vec<&str> = if !pipeline.spec_pre_phases.is_empty() {
+        // v2+: use the declared spec_post_phases directly.
+        pipeline.spec_post_phases.iter()
+            .filter_map(|name| registry.get(name).map(|_| name.as_str()))
+            .collect()
+    } else {
+        // Legacy: everything spec-level except plan-critique runs after tasks.
+        pipeline.spec_phases.iter()
+            .filter_map(|name| {
+                registry.get(name).and_then(|p| {
+                    if p.level == PhaseLevel::Spec && name != "plan-critique" {
+                        Some(name.as_str())
+                    } else {
+                        None
+                    }
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
 
     // Track pass count for deadlock detection in TaskSelect
     let mut task_select_passes: usize = 0;
@@ -545,7 +559,7 @@ pub fn run_worker_with_phases(
         match &state {
             WorkerState::Cleanup { .. } => {} // Don't check during cleanup
             _ => {
-                if !std::path::Path::new(&worktree_path).exists() {
+                if !worktree_removed && !std::path::Path::new(&worktree_path).exists() {
                     eprintln!(
                         "[boi] ERROR: worktree {} disappeared — aborting spec {}",
                         worktree_path, spec_id
@@ -1182,6 +1196,9 @@ pub fn run_worker_with_phases(
                 match &verdict {
                     Verdict::Proceed => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
+                        if phase.completion_handler.as_deref() == Some("builtin:cleanup") {
+                            worktree_removed = true;
+                        }
                         state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
                     }
                     Verdict::Redo { tasks } => {
@@ -1288,41 +1305,46 @@ pub fn run_worker_with_phases(
             WorkerState::Cleanup { success } => {
                 boi_log!("state: Cleanup {{ success: {} }}", success);
                 if success {
+                    // Only attempt commit/merge if the worktree still exists.
+                    // v2 pipelines run builtin:merge+builtin:cleanup as phases, so by the time
+                    // we reach this state the worktree may already be gone.
                     if let Some(ws) = &boi_spec.workspace {
-                        let commit_msg = format!("boi({}): completed spec tasks", spec_id);
-                        match crate::worktree::commit_changes(spec_id, &commit_msg) {
-                            Ok(true) => {
-                                boi_log!(" committed changes in worktree");
-                                match crate::worktree::merge_back(spec_id, ws) {
-                                    Ok(output) => {
-                                        boi_log!(" merged worktree branch into source repo");
-                                        telemetry.emit("boi.worktree.merged", LogLevel::Info, &json!({
-                                            "spec_id": spec_id,
-                                            "message": format!("merged boi/{} into source repo", spec_id),
-                                            "merge_output": output.chars().take(200).collect::<String>(),
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        boi_log!(" merge failed: {} — worktree preserved", e);
-                                        telemetry.emit("boi.worktree.merge_failed", LogLevel::Error, &json!({
-                                            "spec_id": spec_id,
-                                            "error": e.to_string(),
-                                        }));
-                                        let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
-                                        break;
+                        if std::path::Path::new(&worktree_path).exists() {
+                            let commit_msg = format!("boi({}): completed spec tasks", spec_id);
+                            match crate::worktree::commit_changes(spec_id, &commit_msg) {
+                                Ok(true) => {
+                                    boi_log!(" committed changes in worktree");
+                                    match crate::worktree::merge_back(spec_id, ws) {
+                                        Ok(output) => {
+                                            boi_log!(" merged worktree branch into source repo");
+                                            telemetry.emit("boi.worktree.merged", LogLevel::Info, &json!({
+                                                "spec_id": spec_id,
+                                                "message": format!("merged boi/{} into source repo", spec_id),
+                                                "merge_output": output.chars().take(200).collect::<String>(),
+                                            }));
+                                        }
+                                        Err(e) => {
+                                            boi_log!(" merge failed: {} — worktree preserved", e);
+                                            telemetry.emit("boi.worktree.merge_failed", LogLevel::Error, &json!({
+                                                "spec_id": spec_id,
+                                                "error": e.to_string(),
+                                            }));
+                                            let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                            Ok(false) => {
-                                boi_log!(" no changes to commit in worktree");
-                            }
-                            Err(e) => {
-                                boi_log!(" commit failed: {} — worktree preserved", e);
-                                telemetry.emit("boi.worktree.commit_failed", LogLevel::Error, &json!({
-                                    "spec_id": spec_id,
-                                    "error": e.to_string(),
-                                }));
-                                break;
+                                Ok(false) => {
+                                    boi_log!(" no changes to commit in worktree");
+                                }
+                                Err(e) => {
+                                    boi_log!(" commit failed: {} — worktree preserved", e);
+                                    telemetry.emit("boi.worktree.commit_failed", LogLevel::Error, &json!({
+                                        "spec_id": spec_id,
+                                        "error": e.to_string(),
+                                    }));
+                                    break;
+                                }
                             }
                         }
                     }
