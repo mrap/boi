@@ -150,9 +150,16 @@ A keyboard-driven TUI showing running specs with progress bars and queued count.
 ### View worker output
 
 ```bash
-boi log SA7F3              # tail latest iteration
-boi log SA7F3 --full       # full output
+boi log SA7F3              # tail latest iteration + phase invocation summary
+boi log SA7F3 --full       # full output with every PhaseInvocation field
 boi log SA7F3 --follow     # live-follow daemon log filtered to this spec
+```
+
+### Phase invocations
+
+```bash
+boi phases SA7F3           # table: phase, runtime, model, duration, cost
+boi phases SA7F3 --full    # every field for every invocation
 ```
 
 ### Iteration breakdown

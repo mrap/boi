@@ -186,12 +186,18 @@ pub(crate) fn apply_spec_review_output(
 }
 
 pub fn run_verify(verify_cmd: &str, dir: &str) -> bool {
-    Command::new("sh")
-        .args(["-c", verify_cmd])
-        .current_dir(dir)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    run_verify_with_code(verify_cmd, dir).0
+}
+
+/// Returns (success, exit_code). exit_code is None if the process could not be spawned.
+pub fn run_verify_with_code(verify_cmd: &str, dir: &str) -> (bool, Option<i64>) {
+    match Command::new("sh").args(["-c", verify_cmd]).current_dir(dir).output() {
+        Ok(o) => {
+            let code = o.status.code().map(|c| c as i64);
+            (o.status.success(), code)
+        }
+        Err(_) => (false, None),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -204,6 +210,10 @@ fn record_phase_run(
     verdict: &Verdict,
     started_at: &str,
     elapsed_ms: i64,
+    metrics: &crate::runner::PhaseMetrics,
+    attempt: i64,
+    pipeline_id: Option<&str>,
+    loop_iteration: Option<i64>,
 ) {
     let outcome_str = match verdict {
         Verdict::Proceed => "proceed",
@@ -220,11 +230,25 @@ fn record_phase_run(
         level: level.to_string(),
         outcome: outcome_str.to_string(),
         duration_ms: Some(elapsed_ms),
-        cost_usd: None,
-        input_tokens: None,
-        output_tokens: None,
+        cost_usd: metrics.cost_usd,
+        input_tokens: metrics.input_tokens,
+        output_tokens: metrics.output_tokens,
         started_at: started_at.to_string(),
         completed_at: Some(completed_at),
+        model: metrics.model.clone(),
+        runtime: metrics.runtime.clone(),
+        pipeline_id: pipeline_id.map(|s| s.to_string()),
+        attempt,
+        failure_mode: metrics.failure_mode.clone(),
+        cold_start_ms: metrics.cold_start_ms,
+        inference_ms: metrics.inference_ms,
+        cache_read_tokens: metrics.cache_read_tokens,
+        cache_creation_tokens: metrics.cache_creation_tokens,
+        tool_call_count: Some(metrics.tool_call_count),
+        tool_calls_by_type: metrics.tool_calls_by_type.clone(),
+        ttft_ms: metrics.ttft_ms,
+        loop_iteration,
+        verify_exit_code: metrics.verify_exit_code,
     };
     if let Err(e) = queue.insert_phase_run(&rec) {
         eprintln!("[boi] ERROR: failed to insert phase_run for spec={} phase={}: {}", spec_id, phase_name, e);
@@ -623,7 +647,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let (verdict, phase_output) = runner.run_phase_full(
+                let (verdict, phase_output, metrics) = runner.run_phase_full(
                     phase,
                     &spec_content,
                     None,
@@ -633,7 +657,7 @@ pub fn run_worker_with_phases(
                     &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms);
+                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, None, Some((spec_loop_count as i64) + 1));
 
                 emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
 
@@ -899,7 +923,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let verdict = runner.run_phase(
+                let (verdict, _output, metrics) = runner.run_phase_full(
                     phase,
                     &spec_content,
                     Some(task),
@@ -909,7 +933,7 @@ pub fn run_worker_with_phases(
                     &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &verdict, &phase_started_at, elapsed_ms);
+                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, None, Some(1));
 
                 emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &verdict, elapsed_ms);
 
@@ -1064,7 +1088,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let retry_verdict = runner.run_phase(
+                let (retry_verdict, _output, retry_metrics) = runner.run_phase_full(
                     phase,
                     &spec_content,
                     Some(task),
@@ -1074,7 +1098,7 @@ pub fn run_worker_with_phases(
                     &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &retry_verdict, &phase_started_at, elapsed_ms);
+                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &retry_verdict, &phase_started_at, elapsed_ms, &retry_metrics, attempt as i64, None, Some(attempt as i64 + 1));
 
                 emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &retry_verdict, elapsed_ms);
 
@@ -1220,7 +1244,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let verdict = runner.run_phase(
+                let (verdict, _output, metrics) = runner.run_phase_full(
                     phase,
                     &spec_content,
                     None,
@@ -1230,7 +1254,7 @@ pub fn run_worker_with_phases(
                     &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms);
+                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, None, Some((spec_redo_count as i64) + 1));
 
                 emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
 

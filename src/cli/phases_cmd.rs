@@ -1,4 +1,98 @@
+use crate::fmt::{ensure_db_dir, format_duration_ms, BOLD, CYAN, DIM, GREEN, RED, RESET};
 use crate::phases::{self, PhaseLevel, PhaseRegistry};
+use crate::telemetry::Telemetry;
+
+/// Dump all phase invocations for a spec_id as a table.
+pub fn cmd_phase_runs(spec_id: &str, full: bool, db_str: &str) {
+    ensure_db_dir(db_str);
+    let telemetry = Telemetry::new(std::path::PathBuf::from(db_str));
+    let runs = telemetry.phase_runs_by_spec(spec_id);
+
+    if runs.is_empty() {
+        println!("no phase invocations found for {}", spec_id);
+        return;
+    }
+
+    println!("{}{}Phase invocations for {}{}\n", BOLD, CYAN, spec_id, RESET);
+
+    if !full {
+        println!(
+            "  {:<20} {:<12} {:<28} {:<9} {:<10}",
+            "PHASE", "RUNTIME", "MODEL", "DURATION", "COST"
+        );
+        println!("  {}", "-".repeat(82));
+        for r in &runs {
+            let runtime = r.runtime.as_deref().unwrap_or("?");
+            let model = r.model.as_deref().unwrap_or("?");
+            let duration = r.duration_ms
+                .map(format_duration_ms)
+                .unwrap_or_else(|| "—".to_string());
+            let cost = r.cost_usd
+                .map(|c| format!("${:.4}", c))
+                .unwrap_or_else(|| "—".to_string());
+            let exit_color = match r.exit_status.as_deref() {
+                Some("success") => GREEN,
+                Some("timeout") | Some("nonzero") | Some("crashed") => RED,
+                _ => DIM,
+            };
+            println!(
+                "  {}{:<20}{} {:<12} {:<28} {:<9} {:<10}",
+                exit_color, r.phase_name, RESET, runtime, model, duration, cost
+            );
+        }
+        println!();
+        return;
+    }
+
+    // Full view
+    for (i, r) in runs.iter().enumerate() {
+        if i > 0 { println!("  {}", "-".repeat(60)); }
+        let phase_color = match r.exit_status.as_deref() {
+            Some("success") => GREEN,
+            Some(_) => RED,
+            None => DIM,
+        };
+        println!("  {}phase:         {}{}{}", BOLD, phase_color, r.phase_name, RESET);
+        println!("  inv_id:        {}{}{}", DIM, r.invocation_id, RESET);
+        if let Some(ref v) = r.spec_id         { println!("  spec_id:       {}", v); }
+        if let Some(ref v) = r.task_id         { println!("  task_id:       {}", v); }
+        if let Some(ref v) = r.phase_level     { println!("  level:         {}", v); }
+        if let Some(ref v) = r.mode            { println!("  mode:          {}", v); }
+        if let Some(ref v) = r.runtime         { println!("  runtime:       {}", v); }
+        if let Some(ref v) = r.model           { println!("  model:         {}", v); }
+        if let Some(ref v) = r.effort          { println!("  effort:        {}", v); }
+        if let Some(v) = r.thinking_enabled    { println!("  thinking:      {}", v); }
+        if let Some(v) = r.thinking_budget_tokens { println!("  think_tokens:  {}", v); }
+        if let Some(v) = r.extended_thinking   { println!("  ext_thinking:  {}", v); }
+        if let Some(ref v) = r.prompt_template_path { println!("  prompt_tmpl:   {}", v); }
+        if let Some(v) = r.prompt_length_chars  { println!("  prompt_chars:  {}", v); }
+        if let Some(v) = r.prompt_length_tokens { println!("  prompt_tokens: {}", v); }
+        if let Some(v) = r.timeout_secs         { println!("  timeout:       {}s", v); }
+        println!("  bare_flag:     {}", r.bare_flag);
+        if let Some(ref v) = r.brain_dir        { println!("  brain_dir:     {}", v); }
+        if let Some(ref v) = r.api_key_env_used { println!("  api_key_env:   {}", v); }
+        if let Some(ref args) = r.cli_args      { println!("  cli_args:      {:?}", args); }
+        if let Some(ref v) = r.http_endpoint    { println!("  http_endpoint: {}", v); }
+        if let Some(ref v) = r.started_at       { println!("  started_at:    {}", v); }
+        if let Some(ref v) = r.completed_at     { println!("  completed_at:  {}", v); }
+        if let Some(v) = r.duration_ms  { println!("  duration:      {}", format_duration_ms(v)); }
+        if let Some(v) = r.startup_ms   { println!("  startup_ms:    {}ms", v); }
+        if let Some(v) = r.inference_ms { println!("  inference_ms:  {}ms", v); }
+        if let Some(v) = r.input_tokens          { println!("  in_tokens:     {}", v); }
+        if let Some(v) = r.output_tokens         { println!("  out_tokens:    {}", v); }
+        if let Some(v) = r.cache_read_tokens     { println!("  cache_read:    {}", v); }
+        if let Some(v) = r.cache_creation_tokens { println!("  cache_create:  {}", v); }
+        if let Some(v) = r.cost_usd              { println!("  cost_usd:      ${:.6}", v); }
+        if let Some(ref v) = r.exit_status       { println!("  exit_status:   {}", v); }
+        if let Some(ref v) = r.exit_reason       { println!("  exit_reason:   {}", v); }
+        if let Some(v) = r.retry_index           { println!("  retry_index:   {}", v); }
+        if let Some(ref v) = r.branch_sha        { println!("  branch_sha:    {}", v); }
+        if let Some(ref v) = r.host_os           { println!("  host_os:       {}", v); }
+        if let Some(ref v) = r.host_arch         { println!("  host_arch:     {}", v); }
+        if let Some(ref v) = r.daemon_version    { println!("  daemon_ver:    {}", v); }
+    }
+    println!();
+}
 
 /// List all registered phases (core + user).
 pub fn cmd_phases_list() {

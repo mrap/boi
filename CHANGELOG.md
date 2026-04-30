@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - Unreleased
 
 ### Added
+- Per-phase telemetry: `PhaseInvocation` struct captures runtime, model, effort, thinking config, prompt length, timeout, auth env var, CLI args, git SHA, and host fingerprint for every phase invocation
+- `phase_runs` SQLite table: append-only log of every phase invocation with full completion fields (duration_ms, startup_ms, inference_ms, tokens, cost, exit_status, exit_reason)
+- `boi.phase.invoked` / `boi.phase.completed` events emitted to `~/.hex/audit/boi-phase-runs.jsonl` (audit log) and daemon stderr on every phase entry/exit
+- `boi phases <spec_id> [--full]`: new subcommand — dump all phase invocations for a spec as a table (default: phase, runtime, model, duration, cost; `--full`: every field)
+- `boi log <spec_id> [--full]`: now appends a phase invocations table after the event log; `--full` renders every `PhaseInvocation` field
+- `boi status -v`: phase rows now show runtime + model alongside phase name
 - `boi resume <queue-id>` / `boi resume --all`: Resume failed or canceled specs with progress preserved
 - `boi dep` commands for inter-spec dependency DAG management:
   - `boi dep add <spec> --on <dep>`: Add dependency between specs

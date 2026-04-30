@@ -403,6 +403,7 @@ boi resume <queue-id> | --all            Resume failed or canceled specs
 boi cleanup                               Kill orphaned worker processes
 boi workers [--json]                      Show worktree health
 boi telemetry <queue-id> [--json]        Per-iteration metrics
+boi phases <queue-id> [--full]           Phase invocations table (runtime, model, duration, cost)
 boi outputs <queue-id>                    Show files produced by a completed spec
 boi outputs --recent                      Show last 10 completed specs with output counts
 boi critic status | run | enable | disable | checks

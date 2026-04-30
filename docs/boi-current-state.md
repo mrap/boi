@@ -764,7 +764,7 @@ The following aspects are important for the Rust port:
 
 2. **Only 3 of 9 planned hook lifecycle points exist** — `on_dispatch`, `on_complete`, `on_fail` fire today. `on_worker_start`, `on_task_start`, `on_task_complete`, `on_task_fail`, `on_cancel`, `on_stall` do not.
 
-3. **No per-task telemetry** — The current system tracks tasks-done counts but not per-task timing or cost.
+3. **No per-task telemetry** — The current system tracks tasks-done counts but not per-task timing or cost. _(Resolved in Rust port: `PhaseInvocation` struct + `phase_runs` table now captures runtime, model, tokens, cost, duration, and exit status for every phase invocation. Events emitted to `~/.hex/audit/boi-phase-runs.jsonl` and daemon stderr.)_
 
 4. **Queue IDs are sequential strings** (`q-NNN`) — The Rust port will redesign to `SNNNNNN` (specs) and `TNNNNNN` (tasks).
 

@@ -157,6 +157,10 @@ fn run_one(
         tasks_total: 0,
         tasks_done: 0,
         tasks_failed: 0,
+        total_cost_usd: None,
+        total_input_tokens: None,
+        total_output_tokens: None,
+        tasks_skipped: 0,
     };
 
     if let Err(e) = std::fs::write(&tmp_path, &modified) {
@@ -216,6 +220,14 @@ fn run_one(
                 })
                 .unwrap_or(0);
 
+            let tasks_skipped = st
+                .as_ref()
+                .map(|s| s.tasks.iter().filter(|t| t.status == "SKIPPED").count() as i64)
+                .unwrap_or(0);
+
+            let (total_cost_usd, total_input_tokens, total_output_tokens) =
+                q.aggregate_spec_cost(&spec_id).unwrap_or((None, None, None));
+
             println!(" {status_str} ({:.1}s)", elapsed_ms as f64 / 1000.0);
             let _ = std::fs::remove_file(&tmp_path);
             return queue::BenchResultRecord {
@@ -228,6 +240,10 @@ fn run_one(
                 tasks_total,
                 tasks_done,
                 tasks_failed,
+                total_cost_usd,
+                total_input_tokens,
+                total_output_tokens,
+                tasks_skipped,
             };
         }
 
