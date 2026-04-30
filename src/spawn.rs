@@ -60,6 +60,7 @@ pub fn spawn_claude(
         "--setting-sources".to_string(), "user".to_string(),
         "--output-format".to_string(), "stream-json".to_string(),
         "--verbose".to_string(),
+        "--strict-mcp-config".to_string(),
     ];
     if let Some(m) = model {
         args.push("--model".to_string());
