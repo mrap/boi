@@ -8,6 +8,7 @@ use boi::cli::doctor::cmd_doctor;
 use boi::cli::log::cmd_log;
 use boi::cli::outputs::cmd_outputs;
 use boi::cli::phases_cmd::{cmd_phase_runs, cmd_phases_list, cmd_phases_show};
+use boi::cli::providers::cmd_providers_list;
 use boi::cli::spec_mgmt::{cmd_spec, SpecActionData};
 use boi::cli::status::{cmd_status, cmd_status_json, cmd_status_watch};
 use boi::cli::telemetry_cmd::cmd_telemetry;
@@ -17,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "boi", about = "Beginning of Infinity — self-evolving agent fleet")]
+#[command(name = "boi", about = "Beginning of Infinity — self-evolving agent fleet", version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -143,6 +144,11 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
+    /// Manage and inspect runtime providers
+    Providers {
+        #[command(subcommand)]
+        action: Option<ProvidersAction>,
+    },
     /// Health check
     Doctor,
     /// Print version
@@ -170,6 +176,12 @@ enum Commands {
     },
     /// Launch interactive TUI dashboard
     Dashboard,
+}
+
+#[derive(Subcommand)]
+enum ProvidersAction {
+    /// List registered and disabled providers
+    List,
 }
 
 #[derive(Subcommand)]
@@ -310,6 +322,11 @@ fn main() {
                     Some(n) => cmd_phases_show(&n),
                     None => cmd_phases_list(),
                 }
+            }
+        }
+        Commands::Providers { action } => {
+            match action.unwrap_or(ProvidersAction::List) {
+                ProvidersAction::List => cmd_providers_list(),
             }
         }
         Commands::Doctor => {

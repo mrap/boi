@@ -34,6 +34,7 @@ WORKER_COUNT="${DEFAULT_WORKERS}"
 DRY_RUN=false
 SKIP_WORKTREES=false
 NO_PLUGIN=false
+FORCE=false
 WORKTREE_PATHS=""
 REPO_PATH=""
 RUNTIME=""
@@ -49,6 +50,7 @@ usage() {
     echo "  --dry-run                Show what would happen without doing it"
     echo "  --skip-worktrees         Skip worktree creation (use pre-existing worktrees)"
     echo "  --no-plugin              Skip installing Claude Code plugin"
+    echo "  --force                  Bypass CLAUDECODE env check (for automated upgrades inside Claude Code)"
     echo "  -h, --help               Show this help"
 }
 
@@ -88,6 +90,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-plugin)
             NO_PLUGIN=true
+            shift
+            ;;
+        --force)
+            FORCE=true
             shift
             ;;
         --worktree-paths|--checkout-paths)
@@ -176,9 +182,9 @@ detect_environment() {
 }
 
 check_not_in_claude() {
-    if [[ -n "${CLAUDECODE:-}" ]]; then
+    if [[ -n "${CLAUDECODE:-}" ]] && [[ "${FORCE}" != "true" ]]; then
         log_error "install.sh must run OUTSIDE Claude Code."
-        log_error "Run this from a terminal instead."
+        log_error "Run this from a terminal instead, or pass --force for automated upgrades."
         exit 1
     fi
 }
@@ -261,6 +267,14 @@ create_worktrees() {
     # Ensure the worktree parent directory exists
     if [[ "${DRY_RUN}" == "false" ]]; then
         mkdir -p "${WORKTREE_DIR}"
+    fi
+
+    # Prune stale worktree metadata and delete orphaned boi-worker-* branches
+    if [[ "${DRY_RUN}" == "false" ]]; then
+        git -C "${REPO_PATH}" worktree prune 2>/dev/null || true
+        for branch in $(git -C "${REPO_PATH}" branch --list 'boi-worker-*' 2>/dev/null); do
+            git -C "${REPO_PATH}" branch -D "${branch}" 2>/dev/null || true
+        done
     fi
 
     local failed=0
