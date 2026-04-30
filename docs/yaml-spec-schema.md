@@ -19,7 +19,49 @@ Use `.yaml` or `.yml` extension. BOI detects format by extension:
 | `workspace` | No | string | Pin spec to a specific worktree path |
 | `blocked_by` | No | list of strings | Spec IDs this spec depends on (e.g. `[SA7F3, SF2B1]`) |
 | `outcomes` | Recommended | list of outcome objects | Spec-level declarations of what this spec delivers. Verified after all tasks DONE. |
+| `hypothesis` | Required for `discover`/`generate` | string | What you expect to learn or produce. Pre-registration field validated at dispatch. |
+| `success_criteria` | Required for `discover`/`generate` | string | What result means the spec worked. Evaluated alongside `key_artifacts`. |
+| `key_artifacts` | Required for `discover`/`generate` | list of artifact objects | Files that must exist, be non-empty, and pass validation for the spec to reach COMPLETED. Missing or invalid artifacts → INCONCLUSIVE. |
+| `preconditions` | No (optional for `discover`/`generate`) | list of precondition objects | Pre-checks that run before any tasks. If any fail, the spec ends INCONCLUSIVE immediately. |
 | `tasks` | Yes | list of task objects | Ordered list of tasks |
+
+## Key Artifact Object Fields
+
+The `key_artifacts` field gates completion for `discover` and `generate` mode specs. After all tasks finish and post-spec phases run, each artifact is checked before the spec is marked `completed`. If any check fails, the spec transitions to `inconclusive` instead.
+
+| Field | Required | Type | Description |
+|-------|----------|------|-------------|
+| `path` | Yes | string | File path to check. Absolute, `~/`-prefixed (expands `$HOME`), or relative to the worktree. |
+| `validate` | No | string | Shell command run as additional validation. Must exit 0. If omitted, only existence and non-emptiness are checked. |
+
+```yaml
+key_artifacts:
+  - path: "projects/exp-2-compiled.json"
+    validate: "python3 -c \"import json; d=json.load(open('projects/exp-2-compiled.json')); assert 'accuracy' in d\""
+  - path: "projects/exp-2-results.md"
+    validate: "grep -q 'Baseline' projects/exp-2-results.md"
+```
+
+**INCONCLUSIVE state:** When one or more key artifacts fail, the spec status is set to `inconclusive` (not `failed`). This means tasks ran, phases completed, but the spec did not produce its declared answer. A structured diagnosis naming which artifacts failed and why is persisted to the DB error field and shown by `boi status <id>`.
+
+## Precondition Object Fields
+
+The `preconditions` field is optional for `discover` and `generate` mode specs. Each precondition runs as a t-0 check — before any tasks start. If any precondition's `verify` command exits non-zero, the spec immediately transitions to `inconclusive` with a diagnosis naming which checks failed.
+
+| Field | Required | Type | Description |
+|-------|----------|------|-------------|
+| `description` | Yes | string | Human-readable name for the check |
+| `verify` | Yes | string | Shell command that must exit 0 for the precondition to pass |
+
+```yaml
+preconditions:
+  - description: "Baseline data file exists"
+    verify: "test -f projects/dspy-baseline.json"
+  - description: "DSPy installed"
+    verify: "python3 -c 'import dspy'"
+```
+
+**Why use preconditions:** Guard against running an expensive multi-task experiment when the environment isn't ready. A failed precondition produces `INCONCLUSIVE` (not `FAILED`), signaling that the spec didn't run rather than that it ran and produced a wrong answer.
 
 ## Outcome Object Fields
 
@@ -52,6 +94,8 @@ outcomes:
 | `spec` | Yes | string | Full instructions for the worker (multi-line OK) |
 | `verify` | Yes | string | Shell command or steps to prove the task is complete |
 | `depends` | No | list of strings | Task IDs this task waits for (intra-spec DAG) |
+| `phases` | No | list of strings | Override the task-level phase list for this specific task |
+| `containerized` | No | bool | Run this task's verify step inside a remote container (e.g. Fly.io). Requires `FLY_API_TOKEN` and `BOI_FLY_IMAGE`. |
 | `self_evolution` | No | string | Guidance for what new tasks to add if unexpected work is discovered |
 
 ### Status Values
@@ -84,6 +128,16 @@ context: |              # optional, free text
 workspace: /path        # optional
 blocked_by:             # optional
   - SA7F3
+hypothesis: |           # required for discover/generate — what you expect to learn
+  We believe DSPy compiled prompts will reduce token cost by 30%.
+success_criteria: |     # required for discover/generate — what "worked" means
+  Compiled prompt achieves >= baseline accuracy with < 70% token usage.
+key_artifacts:          # required for discover/generate — gates COMPLETED vs INCONCLUSIVE
+  - path: "projects/exp-results.md"
+    validate: "grep -q 'accuracy' projects/exp-results.md"
+preconditions:          # optional for discover/generate — t-0 checks before any tasks run
+  - description: "Baseline data exists"
+    verify: "test -f projects/baseline.json"
 outcomes:               # recommended — verified after all tasks DONE
   - description: "Artifact exists and is correct"
     verify: "test -f /path/to/artifact"
@@ -96,6 +150,8 @@ tasks:                  # required, list of task objects
     verify: |           # required, shell command or steps
       test -f output.txt
     depends: []         # optional, list of task IDs
+    phases: []          # optional, override task-level phase list
+    containerized: false  # optional, run verify inside a remote container
     self_evolution: |   # optional, discovery guidance
       If X happens, add a task to handle Y.
 ```
@@ -193,6 +249,11 @@ This spec has a gather phase (t-1), parallel research tasks (t-2, t-3, t-4 all d
 ```yaml
 title: Research state management options for the iOS app
 mode: discover
+hypothesis: "TCA will give the best testability-to-boilerplate ratio for the existing codebase."
+success_criteria: "A decision document compares TCA, Redux-style, and vanilla SwiftUI with a concrete recommendation."
+key_artifacts:
+  - path: "~/mrap-hex/me/decisions/ios-state-management-2026-04-22.md"
+    validate: "grep -q 'recommendation' ~/mrap-hex/me/decisions/ios-state-management-2026-04-22.md"
 context: |
   The iOS app currently uses a mix of @StateObject and singletons. We're
   evaluating TCA, Redux-like patterns, and vanilla SwiftUI state for a

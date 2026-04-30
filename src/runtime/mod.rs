@@ -240,10 +240,6 @@ impl ProviderRegistry {
             "openai/gpt-4o",
         )));
 
-        // CodexProvider validates OPENAI_API_KEY at registration time;
-        // auto-disabled if the key is absent.
-        registry.register(Box::new(codex::CodexProvider::default()));
-
         registry.register(Box::new(DeterministicProvider));
 
         registry
@@ -411,7 +407,6 @@ mod provider_registry {
         let reg = ProviderRegistry::new();
         let names: Vec<&str> = reg.list().iter().map(|(n, _)| *n).collect();
         assert!(names.contains(&"claude"), "claude missing: {:?}", names);
-        assert!(names.contains(&"codex"), "codex missing: {:?}", names);
         assert!(names.contains(&"deterministic"), "deterministic missing: {:?}", names);
         assert!(names.contains(&"openrouter"), "openrouter missing: {:?}", names);
     }

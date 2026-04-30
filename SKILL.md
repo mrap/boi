@@ -290,20 +290,6 @@ Exit 0 = passed. Any non-zero = failed.
 - Queue ID invalid: relay the CLI error message.
 - Spec validation fails: show validation errors and help fix the spec format.
 
-## Remote Dispatch (`--remote=fly`)
-
-`boi bench` can dispatch containers to **Fly.io Machines** instead of local Docker:
-
-```sh
-boi bench --remote=fly --spec tests/bench_specs/simple.yaml --runs 3
-```
-
-Useful for: parallel bench batteries, clean-room E2E verification, CI/CD, or when
-local Docker is unavailable. Requires `FLY_API_TOKEN` in `~/.boi/.env` and a one-time
-app setup (`fly apps create boi-workers --org personal`).
-
-See [docs/fly-io-setup.md](docs/fly-io-setup.md) and [docs/remote-dispatch.md](docs/remote-dispatch.md).
-
 ## Constraints
 
 - `boi install` runs **outside Claude Code** in a terminal.

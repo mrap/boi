@@ -30,6 +30,7 @@ mod tests {
             verify: Some("test -f Cargo.toml".to_string()),
             verify_prompt: None,
             phases: None,
+            containerized: None,
         };
         let prompt = build_prompt("title: Test\ntasks: []", &task);
         assert!(prompt.contains("t-1"));

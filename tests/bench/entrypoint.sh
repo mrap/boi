@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Container entrypoint: initialize BOI, start daemon, run bench or run-spec.
-#
-# Two modes:
-#   Default (CMD not overridden): boi bench --battery ...
-#   Remote dispatch (cmd=["boi","run-spec"]): boi run-spec — reads BOI_SPEC_B64
+# Container entrypoint: initialize BOI, start daemon, run bench, emit results.
+# All args are forwarded to `boi bench`.
 #
 # Expected mounts:
 #   /opt/boi  (RO) — BOI source: phases/, pipelines/, bench_specs/
@@ -35,19 +32,11 @@ boi daemon start
 # Give the daemon poll loop time to initialize before enqueuing work
 sleep 3
 
-# ── Dispatch mode ─────────────────────────────────────────────────────────────
-# When Fly.io overrides CMD with ["boi", "run-spec"], the ENTRYPOINT receives
-# ["boi", "run-spec"] as $@.  Detect this and forward to `boi run-spec`.
-if [[ "${1:-}" == "boi" && "${2:-}" == "run-spec" ]]; then
-    boi run-spec
-    rc=$?
-    boi daemon stop 2>/dev/null || true
-    exit $rc
-fi
-
-# ── Default: bench mode ───────────────────────────────────────────────────────
-boi bench "$@"
+# ── Run bench with caller-supplied args ──────────────────────────────────────
+boi bench --db /out/bench.db "$@"
 rc=$?
 
+# ── Teardown ──────────────────────────────────────────────────────────────────
 boi daemon stop 2>/dev/null || true
+
 exit $rc

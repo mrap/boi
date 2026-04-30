@@ -1,10 +1,5 @@
-use super::{
-    Capabilities, InvocationContext, Provider, ProviderConfig, ProviderError, ProviderOutput,
-    RuntimeOutput, SpecProvider,
-};
-use crate::phases::PhaseConfig;
+use super::{ProviderConfig, ProviderError, ProviderOutput, SpecProvider};
 use crate::spawn::ClaudeResult;
-use rust_decimal::Decimal;
 use std::io::ErrorKind;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
@@ -200,61 +195,6 @@ impl SpecProvider for CodexProvider {
     }
 }
 
-impl Provider for CodexProvider {
-    fn name(&self) -> &str {
-        "codex"
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            tool_use: true,
-            streaming: false,
-            vision: false,
-            thinking: true,
-            max_tokens_in: 128_000,
-            max_tokens_out: 8_096,
-        }
-    }
-
-    fn validate_config(&self, _phase: &PhaseConfig) -> Result<(), ProviderError> {
-        resolve_openai_api_key(None).map(|_| ())
-    }
-
-    fn invoke(&self, ctx: InvocationContext) -> Result<RuntimeOutput, ProviderError> {
-        let timeout_secs = ctx.timeout.as_secs();
-        let model = if ctx.model.is_empty() { None } else { Some(ctx.model.to_string()) };
-        let codex_bin = std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
-        let config = ProviderConfig {
-            model,
-            timeout_secs,
-            bin: Some(codex_bin),
-            api_key: None,
-        };
-        let out = self.execute(ctx.prompt, &config)?;
-        Ok(RuntimeOutput {
-            output: out.output,
-            success: out.success,
-            startup_ms: out.startup_ms,
-            inference_ms: out.inference_ms,
-            total_ms: out.total_ms,
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_creation_tokens: None,
-            cost_usd: None,
-            tool_call_count: 0,
-        })
-    }
-
-    fn cost_estimate(&self, _ctx: &InvocationContext) -> Option<Decimal> {
-        None
-    }
-
-    fn actual_cost(&self, _response: &RuntimeOutput) -> Option<Decimal> {
-        None
-    }
-}
-
 /// Spawn codex for use from the runner. Wraps CodexProvider and returns the
 /// same ClaudeResult type used by spawn_claude so runner.rs needs minimal changes.
 pub fn spawn_codex(
@@ -294,80 +234,9 @@ pub fn spawn_codex(
 }
 
 #[cfg(test)]
-mod codex_provider {
+mod tests {
     use super::*;
-    use crate::phases::{PhaseConfig, PhaseLevel};
     use std::os::unix::fs::PermissionsExt;
-
-    fn stub_phase() -> PhaseConfig {
-        PhaseConfig {
-            name: "test".into(),
-            level: PhaseLevel::Task,
-            description: String::new(),
-            prompt_template: String::new(),
-            timeout_minutes: None,
-            retry_count: None,
-            can_add_tasks: false,
-            can_fail_spec: false,
-            requires_claude: false,
-            runtime: Some("codex".into()),
-            completion_handler: None,
-            approve_signal: None,
-            reject_signal: None,
-            on_approve: None,
-            on_reject: None,
-            on_crash: None,
-            min_lines_changed: None,
-            model: None,
-            code_model: None,
-            effort: None,
-            hooks_pre: vec![],
-            hooks_post: vec![],
-        }
-    }
-
-    #[test]
-    fn test_codex_provider_name() {
-        let p = CodexProvider::default();
-        assert_eq!(p.name(), "codex");
-    }
-
-    #[test]
-    fn test_codex_provider_capabilities() {
-        let p = CodexProvider::default();
-        let caps = p.capabilities();
-        assert!(caps.tool_use, "codex must support tool_use");
-        assert!(caps.thinking, "codex must support thinking");
-        assert!(!caps.streaming);
-        assert_eq!(caps.max_tokens_in, 128_000);
-        assert_eq!(caps.max_tokens_out, 8_096);
-    }
-
-    #[test]
-    fn test_codex_provider_validate_config_no_key() {
-        // Only assert failure when we know the key is absent.
-        let key_set = std::env::var("OPENAI_API_KEY")
-            .map(|k| !k.is_empty())
-            .unwrap_or(false);
-        if !key_set {
-            let p = CodexProvider::default();
-            let phase = stub_phase();
-            assert!(
-                p.validate_config(&phase).is_err(),
-                "validate_config must fail when OPENAI_API_KEY is not set"
-            );
-        }
-    }
-
-    #[test]
-    fn test_codex_provider_validate_config_with_key() {
-        // If the key happens to be set, validate_config must pass.
-        if std::env::var("OPENAI_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
-            let p = CodexProvider::default();
-            let phase = stub_phase();
-            assert!(p.validate_config(&phase).is_ok());
-        }
-    }
 
     fn make_fake_codex(script: &str) -> String {
         let path = format!("/tmp/boi-test-fake-codex-{}", std::process::id());

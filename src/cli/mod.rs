@@ -9,7 +9,6 @@ pub mod log;
 pub mod outputs;
 pub mod phases_cmd;
 pub mod providers;
-pub mod run_spec;
 pub mod spec_mgmt;
 pub mod status;
 pub mod telemetry_cmd;

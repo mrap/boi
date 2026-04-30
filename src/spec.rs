@@ -18,11 +18,35 @@ pub struct BoiSpec {
     /// Context files to inject into every worker prompt for this spec
     #[serde(default)]
     pub context_files: Option<Vec<String>>,
+    /// Required for discover/generate mode: what we expect to learn
+    #[serde(default)]
+    pub hypothesis: Option<String>,
+    /// Required for discover/generate mode: what result means this worked
+    #[serde(default)]
+    pub success_criteria: Option<String>,
+    /// Files that must exist, be non-empty, and pass validation for the spec to be COMPLETED
+    #[serde(default)]
+    pub key_artifacts: Option<Vec<KeyArtifact>>,
+    /// Pre-checks that must pass before any tasks run (discover/generate only)
+    #[serde(default)]
+    pub preconditions: Option<Vec<Precondition>>,
     pub tasks: Vec<BoiTask>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Outcome {
+    pub description: String,
+    pub verify: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct KeyArtifact {
+    pub path: String,
+    pub validate: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Precondition {
     pub description: String,
     pub verify: String,
 }
@@ -68,6 +92,10 @@ pub struct BoiTask {
     /// Override task-level phases for this specific task
     #[serde(default)]
     pub phases: Option<Vec<String>>,
+    /// Run this task's verify phase inside a remote container (e.g., Fly.io machine).
+    /// When true, the verify command executes remotely instead of on the host.
+    #[serde(default)]
+    pub containerized: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -77,6 +105,7 @@ pub enum ValidationError {
     DuplicateTaskId(String),
     UnknownDependency { task_id: String, dep_id: String },
     CircularDependency(Vec<String>),
+    ExperimentFieldsMissing { mode: String, missing: Vec<String> },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -90,6 +119,9 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::CircularDependency(cycle) => {
                 write!(f, "circular dependency: {}", cycle.join(", "))
+            }
+            ValidationError::ExperimentFieldsMissing { mode, missing } => {
+                write!(f, "mode={} requires experiment fields: {}", mode, missing.join(", "))
             }
         }
     }
@@ -133,6 +165,27 @@ pub fn validate(spec: &BoiSpec) -> Result<(), ValidationError> {
                 return Err(ValidationError::UnknownDependency {
                     task_id: task.id.clone(),
                     dep_id: dep.clone(),
+                });
+            }
+        }
+    }
+
+    if let Some(ref mode) = spec.mode {
+        if mode == "discover" || mode == "generate" {
+            let mut missing: Vec<String> = Vec::new();
+            if spec.hypothesis.as_deref().map(str::is_empty).unwrap_or(true) {
+                missing.push("hypothesis".to_string());
+            }
+            if spec.success_criteria.as_deref().map(str::is_empty).unwrap_or(true) {
+                missing.push("success_criteria".to_string());
+            }
+            if spec.key_artifacts.as_ref().map(|a| a.is_empty()).unwrap_or(true) {
+                missing.push("key_artifacts".to_string());
+            }
+            if !missing.is_empty() {
+                return Err(ValidationError::ExperimentFieldsMissing {
+                    mode: mode.clone(),
+                    missing,
                 });
             }
         }
