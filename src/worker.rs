@@ -28,6 +28,18 @@ use std::{
 };
 
 pub use crate::spawn::{ClaudeResult, pid_dir, pid_file_for, spawn_claude};
+
+/// Resolve an artifact path: absolute stays as-is, `~/` expands to $HOME, relative joins worktree.
+fn resolve_artifact_path(path: &str, worktree_path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else if path.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{}/{}", home, &path[2..])
+    } else {
+        format!("{}/{}", worktree_path, path)
+    }
+}
 pub use crate::prompt::build_prompt;
 
 pub struct WorkerConfig {
@@ -202,6 +214,48 @@ pub fn run_verify_with_code(verify_cmd: &str, dir: &str) -> (bool, Option<i64>) 
     }
 }
 
+/// Run verify command inside a Fly.io container (remote fly verify path).
+/// Used when a task has `containerized: true` or the spec runs with `--remote=fly`.
+/// The verify_cmd runs as `sh -c <verify_cmd>` inside the container; exit code flows back.
+pub fn run_verify_remote_fly(verify_cmd: &str, fly_image: &str) -> (bool, Option<i64>) {
+    let dispatcher = match crate::remote::FlyDispatcher::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[boi] remote fly verify: FlyDispatcher init failed: {e}");
+            return (false, None);
+        }
+    };
+    match dispatcher.run_container(
+        fly_image,
+        std::collections::HashMap::new(),
+        vec!["sh".to_string(), "-c".to_string(), verify_cmd.to_string()],
+        120,
+    ) {
+        Ok(cr) => (cr.exit_code == 0, Some(cr.exit_code as i64)),
+        Err(e) => {
+            eprintln!("[boi] remote fly verify: container error: {e}");
+            (false, None)
+        }
+    }
+}
+
+/// Dispatch a verify command: routes to Fly.io when containerized_fly is true
+/// (task has `containerized: true` or the runner is configured with `remote=fly`),
+/// otherwise runs locally via shell. This is the single call site for all verify dispatch.
+pub fn run_verify_dispatched(
+    verify_cmd: &str,
+    dir: &str,
+    containerized_fly: bool,
+) -> (bool, Option<i64>) {
+    if containerized_fly {
+        let image = std::env::var("BOI_FLY_IMAGE")
+            .unwrap_or_else(|_| "registry.fly.io/boi-workers:latest".to_string());
+        run_verify_remote_fly(verify_cmd, &image)
+    } else {
+        run_verify_with_code(verify_cmd, dir)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_phase_run(
     queue: &Queue,
@@ -275,7 +329,19 @@ pub fn run_worker(
         registry.apply_model_overrides(models);
     }
     registry_load_user(&registry);
-    let runner = Arc::new(ClaudePhaseRunner::new(telemetry.clone(), config.claude_bin.clone()));
+    // Read remote dispatch provider from the spec record so `--remote=fly` on
+    // `boi dispatch` routes task-verify to Fly.io without touching WorkerConfig.
+    let remote_provider = crate::queue::Queue::open(queue_path)
+        .ok()
+        .and_then(|q| q.get_spec_remote(spec_id).ok().flatten());
+    let runner: Arc<ClaudePhaseRunner> = {
+        let base = ClaudePhaseRunner::new(telemetry.clone(), config.claude_bin.clone());
+        if let Some(ref r) = remote_provider {
+            Arc::new(base.with_remote(r.clone()))
+        } else {
+            Arc::new(base)
+        }
+    };
     run_worker_with_phases(spec_id, spec_path, queue_path, hook_config, config, &registry, runner.as_ref(), telemetry)
 }
 
@@ -410,6 +476,7 @@ pub fn run_worker_with_phases(
         verify: t.verify_content.clone(),
         verify_prompt: None,
         phases: None,
+        containerized: None,
     }).collect();
 
     let mut boi_spec = spec::BoiSpec {
@@ -422,6 +489,9 @@ pub fn run_worker_with_phases(
         spec_phases: None,
         task_phases: None,
         context_files: None,
+        hypothesis: None,
+        success_criteria: None,
+        key_artifacts: None,
         tasks,
     };
 
@@ -464,9 +534,9 @@ pub fn run_worker_with_phases(
     };
 
     // Resolve the pipeline for this spec
-    let mode = boi_spec.mode.as_deref().unwrap_or("execute");
+    let mode: String = boi_spec.mode.as_deref().unwrap_or("execute").to_string();
     let pipeline = phases::resolve_pipeline(
-        mode,
+        &mode,
         boi_spec.spec_phases.as_deref(),
         boi_spec.task_phases.as_deref(),
     );
@@ -1354,6 +1424,50 @@ pub fn run_worker_with_phases(
             WorkerState::Complete => {
                 boi_log!("state: Complete — spec {} done (tasks={}, spec_redo_count={})",
                     spec_id, done_ids.len(), spec_redo_count);
+
+                // Artifact guard: for discover/generate specs, validate key_artifacts before
+                // marking COMPLETED. Specs that ran but produced no signal → INCONCLUSIVE.
+                if mode == "discover" || mode == "generate" {
+                    let file_spec = std::fs::read_to_string(spec_path)
+                        .ok()
+                        .and_then(|content| spec::parse_unchecked(&content).ok());
+                    if let Some(ref fs) = file_spec {
+                        if let Some(ref artifacts) = fs.key_artifacts {
+                            let mut failures: Vec<String> = Vec::new();
+                            for artifact in artifacts {
+                                let resolved = resolve_artifact_path(&artifact.path, &worktree_path);
+                                let p = std::path::Path::new(&resolved);
+                                if !p.exists() {
+                                    failures.push(format!("  - {}: file not found", artifact.path));
+                                } else if p.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+                                    failures.push(format!("  - {}: file is empty", artifact.path));
+                                } else if let Some(ref cmd) = artifact.validate {
+                                    let (ok, _) = run_verify_with_code(cmd, &worktree_path);
+                                    if !ok {
+                                        failures.push(format!("  - {}: validate command failed: {}", artifact.path, cmd));
+                                    }
+                                }
+                            }
+                            if !failures.is_empty() {
+                                let diagnosis = format!(
+                                    "INCONCLUSIVE: {} of {} key_artifact(s) failed:\n{}",
+                                    failures.len(), artifacts.len(), failures.join("\n")
+                                );
+                                boi_log!(" {}", diagnosis);
+                                queue.update_spec(spec_id, "inconclusive")?;
+                                telemetry.emit("boi.spec.inconclusive", LogLevel::Info, &json!({
+                                    "spec_id": spec_id,
+                                    "status": "inconclusive",
+                                    "message": diagnosis,
+                                }));
+                                let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id })); // intentional: best-effort
+                                state = WorkerState::Cleanup { success: false };
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 queue.update_spec(spec_id, "completed")?;
                 let _ = hooks::fire(hook_config, ON_COMPLETE, &json!({ "spec_id": spec_id })); // intentional: best-effort hook notification
                 telemetry.emit("boi.spec.completed", LogLevel::Info, &json!({
@@ -1505,6 +1619,7 @@ fn refresh_task_state(
                 verify: t.verify_content.clone(),
                 verify_prompt: None,
                 phases: None,
+                containerized: None,
             }).collect();
             match spec::topological_sort(boi_spec) {
                 Ok(new_order) => {
@@ -2083,6 +2198,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             verify: None,
             verify_prompt: None,
             phases: None,
+            containerized: None,
         };
         // First call (execute phase for t-1) returns Redo with a new task.
         // All subsequent calls return Proceed (MockPhaseRunner default when list exhausted).

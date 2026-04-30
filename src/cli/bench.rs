@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use crate::fmt::{ensure_db_dir, BOLD, CYAN, GREEN, RESET};
 use crate::remote::FlyDispatcher;
 use crate::{queue, spec};
@@ -678,11 +679,23 @@ fn run_one_remote(
     }
 
     let mut env = HashMap::new();
-    env.insert("BOI_SPEC_B64".to_string(), encode_base64(modified.as_bytes()));
+    env.insert("BOI_SPEC_B64".to_string(), base64::engine::general_purpose::STANDARD.encode(modified.as_bytes()));
     env.insert("BOI_PIPELINE_NAME".to_string(), item.pipeline_name.clone());
     env.insert("BOI_RUN_NUMBER".to_string(), item.run_num.to_string());
+    // Forward API keys so the container can call LLM providers
+    for key in ["ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"] {
+        if let Ok(val) = std::env::var(key) {
+            if !val.is_empty() {
+                env.insert(key.to_string(), val);
+            }
+        }
+    }
 
-    let cmd = vec!["boi".to_string(), "run-spec".to_string()];
+    let cmd = vec![
+        "/usr/local/bin/entrypoint.sh".to_string(),
+        "boi".to_string(),
+        "run-spec".to_string(),
+    ];
 
     eprintln!(
         "  [fly] dispatching [{pipeline}] {spec} run {run}...",
@@ -752,31 +765,6 @@ fn parse_remote_result(stdout: &str) -> Option<serde_json::Value> {
         }
     }
     None
-}
-
-fn encode_base64(input: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
-    let mut i = 0;
-    while i < input.len() {
-        let b0 = input[i];
-        let b1 = if i + 1 < input.len() { input[i + 1] } else { 0 };
-        let b2 = if i + 2 < input.len() { input[i + 2] } else { 0 };
-        out.push(TABLE[((b0 >> 2) & 0x3f) as usize] as char);
-        out.push(TABLE[(((b0 & 0x3) << 4) | (b1 >> 4)) as usize] as char);
-        if i + 1 < input.len() {
-            out.push(TABLE[(((b1 & 0xf) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if i + 2 < input.len() {
-            out.push(TABLE[(b2 & 0x3f) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        i += 3;
-    }
-    out
 }
 
 /// Benchmark a single phase in isolation across N runs.

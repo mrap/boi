@@ -1,0 +1,5 @@
+[pipeline]
+name = "default"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

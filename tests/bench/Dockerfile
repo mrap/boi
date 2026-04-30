@@ -2,7 +2,7 @@
 # Usage: docker build -t boi-bench -f tests/bench/Dockerfile .
 
 # ── Stage 1: compile BOI binary ───────────────────────────────────────────────
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.86-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev \
@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
+COPY hooks/ ./hooks/
 RUN cargo build --release 2>&1
 
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
@@ -47,12 +48,17 @@ RUN useradd -m -s /bin/bash bench \
 COPY tests/bench/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# Bake phases and templates so containers work without /opt/boi volume mount
+COPY --chown=bench:bench phases/ /home/bench/.boi/phases/
+COPY --chown=bench:bench templates/ /home/bench/.boi/templates/
+COPY --chown=bench:bench phases/pipelines.toml /home/bench/.boi/pipelines.toml
+
 USER bench
 
 ENV HOME=/home/bench
 ENV BOI_HOME=/home/bench/.boi
-# Use phases from the RO-mounted source at runtime
-ENV BOI_PHASES_DIR=/opt/boi/phases
+# Prefer user-baked phases over /opt/boi volume (still works when mounted)
+ENV BOI_PHASES_DIR=/home/bench/.boi/phases
 # claude CLI reads API keys from environment
 ENV ANTHROPIC_API_KEY=""
 ENV OPENROUTER_API_KEY=""

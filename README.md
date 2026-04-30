@@ -236,6 +236,29 @@ Spec-post:           doc-update → critic → merge → cleanup
 
 Deterministic phases (`commit`, `merge`, `cleanup`) run as plain shell operations — no Claude spawn, no cold-start latency. v1 is still the default; v2 is opt-in until A/B benchmarks confirm the speedup. See [docs/pipelines.md](docs/pipelines.md) for a full v1 vs v2 comparison and guidance on when to use each.
 
+## Remote Bench Dispatch (`--remote=fly`)
+
+`boi bench` can run containers on **Fly.io Machines** instead of local Docker:
+
+```sh
+boi bench --remote=fly \
+  --pipeline smoke:pipelines/smoke.toml \
+  --spec tests/bench_specs/simple.yaml \
+  --runs 3
+```
+
+Each run creates a Fly.io machine, executes the bench inside it, and cleans up. Machines
+scale to zero when idle — ~$14–23/month at 900 runs/month, per-second billing.
+
+| Flag | Description |
+|------|-------------|
+| `--remote fly\|local` | `local` (default) or `fly` |
+| `--concurrency N` | Max parallel Fly.io machines (default: 4) |
+| `--max-cost N` | Refuse dispatch if estimated cost > $N (default: 10.0) |
+
+Prerequisites: one-time setup in [docs/fly-io-setup.md](docs/fly-io-setup.md).
+Architecture and cost model: [docs/remote-dispatch.md](docs/remote-dispatch.md).
+
 ## Guardrails
 
 Guardrails define quality gates that run at phase transitions. Configured globally in `~/.boi/guardrails.toml`, overridable per spec.
@@ -400,27 +423,30 @@ Both lists are merged at dispatch time. File contents are read once and stored i
 ## CLI Reference
 
 ```
-boi dispatch <file.yaml> [options]        Submit a spec to the queue
-boi status [--watch] [--json]             Show queue and worker status
-boi dashboard                             Interactive TUI dashboard (keyboard-driven)
-boi log <queue-id> [--full] [-f|--follow] Tail worker output for a spec
-boi cancel <queue-id>                     Cancel a running or queued spec
+boi dispatch <file.yaml> [options]        Submit a spec to the queue             (alias: d, dis)
+boi status [--watch] [--json]             Show queue and worker status            (alias: s, st)
+boi dashboard                             Interactive TUI dashboard (keyboard-driven) (alias: dash)
+boi log <queue-id> [--full] [-f|--follow] Tail worker output for a spec          (alias: l)
+boi cancel <queue-id>                     Cancel a running or queued spec         (alias: can)
 boi stop                                  Stop daemon and all workers
 boi install [--workers N]                 One-time setup (run outside Claude Code)
 boi resume <queue-id> | --all            Resume failed or canceled specs
 boi cleanup                               Kill orphaned worker processes
-boi workers [--json]                      Show worktree health
-boi telemetry <queue-id> [--json]        Per-iteration metrics
-boi phases <queue-id> [--full]           Phase invocations table (runtime, model, duration, cost)
-boi outputs <queue-id>                    Show files produced by a completed spec
+boi workers [--json]                      Show worktree health                    (alias: w)
+boi telemetry <queue-id> [--json]        Per-iteration metrics                   (alias: tel)
+boi phases <queue-id> [--full]           Phase invocations table (runtime, model, duration, cost) (alias: ph)
+boi outputs <queue-id>                    Show files produced by a completed spec  (alias: out)
 boi outputs --recent                      Show last 10 completed specs with output counts
+boi spec <queue-id> [add|skip|next|block|edit|deps]                               (alias: sp)
 boi critic status | run | enable | disable | checks
-boi spec <queue-id> [add|skip|next|block|edit|deps]
 boi dep add|remove|set|clear|show|viz|check
 boi project create|list|status|context|delete
-boi bench --pipeline name:path [--pipeline ...] --spec FILE | --battery DIR [--runs N]  Benchmark N pipelines
+boi providers list                        List registered and disabled runtime providers (alias: prov)
+boi doctor                                Health check                            (alias: doc)
+boi config [key] [value]                  Show or set config values               (alias: cfg)
+boi bench --pipeline name:path [--pipeline ...] --spec FILE | --battery DIR [--runs N] [--remote fly|local] [--concurrency N]  Benchmark N pipelines (alias: b)
 boi bench --phase <name> --spec FILE [--runs N]  Benchmark a single phase in isolation
-boi providers list                            List registered and disabled runtime providers
+boi version                               Print version                           (alias: v, ver)
 ```
 
 **`dispatch` options:**

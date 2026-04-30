@@ -9,6 +9,7 @@ use boi::cli::log::cmd_log;
 use boi::cli::outputs::cmd_outputs;
 use boi::cli::phases_cmd::{cmd_phase_runs, cmd_phases_list, cmd_phases_show};
 use boi::cli::providers::cmd_providers_list;
+use boi::cli::run_spec::cmd_run_spec;
 use boi::cli::spec_mgmt::{cmd_spec, SpecActionData};
 use boi::cli::status::{cmd_status, cmd_status_json, cmd_status_watch};
 use boi::cli::telemetry_cmd::cmd_telemetry;
@@ -50,6 +51,7 @@ impl std::fmt::Display for SpecMode {
 #[derive(Subcommand)]
 enum Commands {
     /// Dispatch a spec to the queue
+    #[command(aliases = ["d", "dis"])]
     Dispatch {
         spec_path: PathBuf,
         #[arg(long)]
@@ -77,8 +79,12 @@ enum Commands {
         /// Override workspace path for spec
         #[arg(long)]
         workspace: Option<String>,
+        /// Run task-verify inside a remote container (fly | local)
+        #[arg(long)]
+        remote: Option<String>,
     },
     /// Show queue status
+    #[command(aliases = ["s", "st"])]
     Status {
         spec_id: Option<String>,
         #[arg(long)]
@@ -94,6 +100,7 @@ enum Commands {
         verbose: bool,
     },
     /// View worker output log
+    #[command(alias = "l")]
     Log {
         spec_id: String,
         #[arg(long)]
@@ -106,8 +113,10 @@ enum Commands {
         follow: bool,
     },
     /// Cancel a queued or running spec
+    #[command(alias = "can")]
     Cancel { spec_id: String },
     /// List output files for a spec
+    #[command(alias = "out")]
     Outputs { spec_id: String },
     /// Manage the BOI daemon
     Daemon {
@@ -115,25 +124,30 @@ enum Commands {
         action: Option<DaemonAction>,
     },
     /// Show or set config values
+    #[command(alias = "cfg")]
     Config {
         key: Option<String>,
         value: Option<String>,
     },
     /// Show worktree status for each worker slot
+    #[command(alias = "w")]
     Workers,
     /// Stop the daemon and all worker subprocesses
     Stop,
     /// Show per-iteration telemetry for a spec
+    #[command(alias = "tel")]
     Telemetry {
         spec_id: String,
     },
     /// Manage tasks within a spec
+    #[command(alias = "sp")]
     Spec {
         queue_id: String,
         #[command(subcommand)]
         action: Option<SpecAction>,
     },
     /// List or inspect phases, or show phase invocations for a spec
+    #[command(alias = "ph")]
     Phases {
         /// Phase name to show details for (omit to list all)
         name: Option<String>,
@@ -145,15 +159,19 @@ enum Commands {
         full: bool,
     },
     /// Manage and inspect runtime providers
+    #[command(alias = "prov")]
     Providers {
         #[command(subcommand)]
         action: Option<ProvidersAction>,
     },
     /// Health check
+    #[command(alias = "doc")]
     Doctor,
     /// Print version
+    #[command(aliases = ["v", "ver"])]
     Version,
     /// Benchmark N pipelines across a spec or battery of specs
+    #[command(alias = "b")]
     Bench {
         /// Benchmark a single phase in isolation (requires --spec; conflicts with --battery and --pipeline)
         #[arg(long, conflicts_with_all = ["battery", "pipelines"])]
@@ -181,7 +199,11 @@ enum Commands {
         concurrency: u32,
     },
     /// Launch interactive TUI dashboard
+    #[command(alias = "dash")]
     Dashboard,
+    /// Run a spec from BOI_SPEC_B64 env (used by remote container dispatch)
+    #[command(name = "run-spec", hide = true)]
+    RunSpec,
 }
 
 #[derive(Subcommand)]
@@ -247,6 +269,7 @@ fn main() {
             project,
             dry_run,
             workspace,
+            remote,
         } => {
             let mode_str = mode.map(|m| m.to_string());
             cmd_dispatch(
@@ -260,6 +283,7 @@ fn main() {
                 project.as_deref(),
                 dry_run,
                 workspace.as_deref(),
+                remote.as_deref(),
                 db_str,
                 &hook_cfg,
             );
@@ -395,6 +419,9 @@ fn main() {
         }
         Commands::Dashboard => {
             run_dashboard(db_str);
+        }
+        Commands::RunSpec => {
+            cmd_run_spec();
         }
     }
 }

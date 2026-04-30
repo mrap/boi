@@ -1,0 +1,5 @@
+[pipeline]
+name = "v-fail-test"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []
