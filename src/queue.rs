@@ -32,6 +32,8 @@ pub struct SpecRecord {
     /// Number of completed critique↔improve loop cycles for this spec.
     pub phase_loop_count: i64,
     pub project_context: Option<String>,
+    /// Remote dispatch provider for this spec ("fly" or None for local).
+    pub remote: Option<String>,
 }
 
 #[derive(Debug)]
@@ -291,6 +293,7 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "workspace", "TEXT");
         Self::ensure_column(&conn, "specs", "phase_loop_count", "INTEGER DEFAULT 0");
         Self::ensure_column(&conn, "specs", "project_context", "TEXT");
+        Self::ensure_column(&conn, "specs", "remote", "TEXT");
         Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
         Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
 
@@ -434,7 +437,7 @@ impl Queue {
                         completed_tasks,
                         priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                         max_iterations, iteration, project, phase, worker_timeout_seconds,
-                        context, workspace, phase_loop_count, project_context
+                        context, workspace, phase_loop_count, project_context, remote
                  FROM specs WHERE id = ?1",
             )?;
             stmt.query_row(params![id], row_to_spec)?
@@ -490,6 +493,14 @@ impl Queue {
                     params![status, now, spec_id],
                 )?;
             }
+            "inconclusive" => {
+                // When a diagnosis is available, callers use update_spec_with_error to also
+                // set the error column. This arm handles the no-diagnosis fallback path.
+                self.conn.execute(
+                    "UPDATE specs SET status = ?1, completed_at = ?2 WHERE id = ?3",
+                    params![status, now, spec_id],
+                )?;
+            }
             _ => {
                 self.conn.execute(
                     "UPDATE specs SET status = ?1 WHERE id = ?2",
@@ -500,6 +511,15 @@ impl Queue {
         Ok(())
     }
 
+    pub fn update_spec_with_error(&self, spec_id: &str, status: &str, error: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE specs SET status = ?1, completed_at = ?2, error = ?3 WHERE id = ?4",
+            params![status, now, error, spec_id],
+        )?;
+        Ok(())
+    }
+
     pub fn status(&self, spec_id: &str) -> Result<Option<SpecStatus>> {
         let spec = match self.conn.query_row(
             "SELECT id, title, mode, status, spec_path,
@@ -507,7 +527,7 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace, phase_loop_count, project_context
+                    context, workspace, phase_loop_count, project_context, remote
              FROM specs WHERE id = ?1",
             params![spec_id],
             row_to_spec,
@@ -536,7 +556,7 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace, phase_loop_count, project_context
+                    context, workspace, phase_loop_count, project_context, remote
              FROM specs
              ORDER BY
                CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
@@ -602,6 +622,26 @@ impl Queue {
             params![depends_on, spec_id],
         )?;
         Ok(())
+    }
+
+    pub fn set_remote(&self, spec_id: &str, remote: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE specs SET remote = ?1 WHERE id = ?2",
+            params![remote, spec_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_spec_remote(&self, spec_id: &str) -> Result<Option<String>> {
+        match self.conn.query_row(
+            "SELECT remote FROM specs WHERE id = ?1",
+            params![spec_id],
+            |row| row.get(0),
+        ) {
+            Ok(r) => Ok(r),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn get_iterations(&self, spec_id: &str) -> Result<Vec<IterationRecord>> {
@@ -1073,6 +1113,7 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
         workspace: row.get(20)?,
         phase_loop_count: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
         project_context: row.get(22)?,
+        remote: row.get(23)?,
     })
 }
 
@@ -1105,6 +1146,10 @@ mod tests {
             spec_phases: None,
             task_phases: None,
             context_files: None,
+            hypothesis: None,
+            success_criteria: None,
+            key_artifacts: None,
+            preconditions: None,
             tasks,
         }
     }
@@ -1119,6 +1164,7 @@ mod tests {
             verify: None,
             verify_prompt: None,
             phases: None,
+            containerized: None,
         }
     }
 

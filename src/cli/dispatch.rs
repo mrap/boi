@@ -15,6 +15,7 @@ pub fn cmd_dispatch(
     project: Option<&str>,
     dry_run: bool,
     _workspace: Option<&str>,
+    remote: Option<&str>,
     db_str: &str,
     hook_cfg: &hooks::HookConfig,
 ) {
@@ -94,6 +95,14 @@ pub fn cmd_dispatch(
     if priority != 100 {
         if let Err(e) = q.set_priority(&spec_id, priority) {
             eprintln!("[boi] ERROR: failed to set priority for {}: {}", spec_id, e);
+        }
+    }
+
+    if let Some(r) = remote {
+        if r != "local" {
+            if let Err(e) = q.set_remote(&spec_id, r) {
+                eprintln!("[boi] ERROR: failed to set remote for {}: {}", spec_id, e);
+            }
         }
     }
 

@@ -102,6 +102,8 @@ pub struct ClaudePhaseRunner {
     /// Empty string disables merge/cleanup builtins.
     pub repo_path: String,
     pub provider_registry: ProviderRegistry,
+    /// Remote dispatch provider. "fly" routes task-verify to Fly.io machines.
+    pub remote: Option<String>,
 }
 
 impl ClaudePhaseRunner {
@@ -114,11 +116,17 @@ impl ClaudePhaseRunner {
             claude_bin,
             repo_path: String::new(),
             provider_registry,
+            remote: None,
         }
     }
 
     pub fn with_repo_path(mut self, repo_path: impl Into<String>) -> Self {
         self.repo_path = repo_path.into();
+        self
+    }
+
+    pub fn with_remote(mut self, remote: impl Into<String>) -> Self {
+        self.remote = Some(remote.into());
         self
     }
 }
@@ -676,8 +684,10 @@ impl ClaudePhaseRunner {
                 }),
             );
 
+            let containerized_fly = task.containerized.unwrap_or(false)
+                || self.remote.as_deref() == Some("fly");
             let start = Instant::now();
-            let (passed, exit_code) = worker::run_verify_with_code(verify_cmd, worktree_path);
+            let (passed, exit_code) = worker::run_verify_dispatched(verify_cmd, worktree_path, containerized_fly);
             let duration_ms = start.elapsed().as_millis() as u64;
 
             self.telemetry.emit("boi.verify.result", LogLevel::Debug, &json!({
@@ -853,6 +863,7 @@ mod tests {
             verify: Some(verify.into()),
             verify_prompt: None,
             phases: None,
+            containerized: None,
         }
     }
 
@@ -903,6 +914,7 @@ mod tests {
             verify: None,
             verify_prompt: None,
             phases: None,
+            containerized: None,
         };
         let outcome = runner.run_phase(
             &phase,
@@ -1074,6 +1086,7 @@ mod tests {
         let task = BoiTask {
             id: "t-1".into(), title: "No verify".into(), status: TaskStatus::Pending,
             depends: None, spec: None, verify: None, verify_prompt: None, phases: None,
+            containerized: None,
         };
         let (verdict, _, metrics) = runner.run_phase_full(
             &phase, "", Some(&task), "/tmp", 10, None,

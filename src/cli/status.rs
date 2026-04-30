@@ -17,6 +17,7 @@ pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
                 "running" => ("▸", YELLOW),
                 "completed" => ("✓", GREEN),
                 "failed" => ("✗", RED),
+                "inconclusive" => ("⚠", YELLOW),
                 "queued" => ("◦", CYAN),
                 _ => ("?", RESET),
             };
@@ -36,6 +37,9 @@ pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
             ));
             if let Some(ref p) = st.spec.project {
                 out.push_str(&format!("project: {}\n", p));
+            }
+            if let Some(ref e) = st.spec.error {
+                out.push_str(&format!("{}diagnosis: {}{}\n", YELLOW, e, RESET));
             }
             out.push('\n');
 
@@ -117,7 +121,7 @@ fn render_status(spec_id: Option<&str>, all: bool, verbose: bool, db_str: &str) 
     let mut finished: Vec<&queue::SpecRecord> = specs
         .iter()
         .filter(|s| {
-            (s.status == "completed" || s.status == "failed" || s.status == "cancelled")
+            (s.status == "completed" || s.status == "failed" || s.status == "cancelled" || s.status == "inconclusive")
                 && (all
                     || s.completed_at.as_ref().is_some_and(|ts| {
                         chrono::DateTime::parse_from_rfc3339(ts)
@@ -266,6 +270,7 @@ fn render_status(spec_id: Option<&str>, all: bool, verbose: bool, db_str: &str) 
                 "completed" => ("\u{2713}", GREEN),
                 "failed" => ("\u{2717}", RED),
                 "cancelled" => ("\u{2298}", DIM),
+                "inconclusive" => ("\u{26a0}", YELLOW),
                 _ => ("?", RESET),
             };
 

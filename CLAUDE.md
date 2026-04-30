@@ -63,19 +63,23 @@ Hook points: `on_dispatch`, `on_worker_start`, `on_task_start`, `on_task_complet
 ### CLI
 
 ```
-boi dispatch <spec.yaml> [--mode e|c|d|g] [--after q-N] [--priority N] [--max-iter N] [--timeout N] [--project X] [--dry-run]
-boi status [spec-id] [--all] [--watch] [--json]
-boi log <spec-id> [--full]
-boi cancel <spec-id>
-boi outputs <spec-id>
+boi dispatch (d, dis) <spec.yaml> [--mode e|c|d|g] [--after q-N] [--priority N] [--max-iter N] [--timeout N] [--project X] [--dry-run]
+boi status (s, st) [spec-id] [--all] [--watch] [--json]
+boi log (l) <spec-id> [--full]
+boi cancel (can) <spec-id>
+boi outputs (out) <spec-id>
 boi daemon [--foreground]
-boi config [key] [value]
-boi workers
+boi config (cfg) [key] [value]
+boi workers (w)
 boi stop
-boi telemetry <spec-id>
-boi spec <spec-id> [add|skip|block]
-boi doctor
-boi version
+boi telemetry (tel) <spec-id>
+boi spec (sp) <spec-id> [add|skip|block]
+boi phases (ph) [name] [--spec <spec-id>]
+boi providers (prov) list
+boi doctor (doc)
+boi version (v, ver)
+boi bench (b) --pipeline name:path [--pipeline ...] --spec FILE | --battery DIR [--runs N]
+boi dashboard (dash)
 ```
 
 ### Spec format (YAML)
@@ -84,11 +88,18 @@ boi version
 title: "Feature name"
 mode: execute          # execute | challenge | discover | generate
 workspace: /path/to   # optional, override workspace
+# discover/generate mode only:
+hypothesis: "What we expect to learn"
+success_criteria: "What result means this worked"
+key_artifacts:         # files that must exist, be non-empty, and pass validate for COMPLETED
+  - path: relative/or/~/absolute
+    validate: "command that returns 0 on success"  # optional extra check
 tasks:
   - id: t-1
     title: "Task name"
     status: PENDING    # PENDING | DONE | FAILED | SKIPPED | RUNNING
     depends: [t-N]     # optional dependency list
+    containerized: false  # true → run verify inside Fly.io container ($BOI_FLY_IMAGE)
     spec: |
       What to do.
     verify: "command that returns 0 on success"

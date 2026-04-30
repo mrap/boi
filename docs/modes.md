@@ -82,6 +82,8 @@ Execute the task AND handle what you find. Workers can add new PENDING tasks whe
 boi dispatch --spec spec.yaml -m d
 ```
 
+**Required fields at dispatch:** `hypothesis`, `success_criteria`, `key_artifacts` (same as generate mode). Missing any of these causes an immediate rejection. `key_artifacts` also gates completion — if any declared file is missing or fails validation after all tasks finish, the spec ends `inconclusive`. Optionally add `preconditions` for t-0 environment checks that run before any tasks.
+
 **Worker rules:**
 - Execute the current task
 - Add new PENDING tasks when discovering necessary work
@@ -125,17 +127,24 @@ boi dispatch --spec goal-spec.yaml -m g
 
 ### Goal-Only Spec Format
 
-Generate mode specs define a goal and success criteria instead of tasks:
+Generate mode specs define a goal, required experiment fields, and key artifacts instead of tasks:
 
 ```yaml
 title: Config Management CLI
 mode: generate
+hypothesis: "A stdlib-only Python CLI can handle YAML config management with full schema validation."
+success_criteria: "CLI reads, validates, and applies YAML config files with env var interpolation and dry-run mode."
+key_artifacts:
+  - path: "projects/config-cli/cli.py"
+    validate: "python3 projects/config-cli/cli.py --help | grep -q 'dry-run'"
+  - path: "projects/config-cli/tests/test_cli.py"
+    validate: "python3 -m pytest projects/config-cli/tests/ -q 2>&1 | grep -q 'passed'"
 context: |
   Build a CLI tool that reads, validates, and applies YAML configuration files
   with schema validation, environment variable interpolation, and dry-run mode.
   Python 3.10+, stdlib only. Must work on Linux and macOS.
 
-success_criteria:
+  Evaluation criteria (for the evaluate phase):
   - CLI reads and parses YAML config files
   - Schema validation catches malformed configs
   - Environment variables are interpolated in config values
@@ -143,6 +152,8 @@ success_criteria:
   - Help text is complete and accurate
   - Unit tests cover all core functions
 ```
+
+`hypothesis`, `success_criteria`, and `key_artifacts` are required for `generate` (and `discover`) mode. They are validated at dispatch time — missing fields cause an immediate rejection. `key_artifacts` also gates completion: if any declared file is missing, empty, or fails its validate command after all tasks and post-spec phases finish, the spec ends `inconclusive` instead of `completed`.
 
 ### Three-Phase Lifecycle
 

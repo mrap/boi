@@ -127,22 +127,26 @@ tasks:
 
 The `mode` field sets the execution mode (overrides the `--mode` CLI flag).
 
-## Generate Mode Specs
+## Discover and Generate Mode Specs
 
-Generate mode uses a goal-only format. No pre-defined tasks required:
+`discover` and `generate` mode specs must include three pre-registration fields validated at dispatch time: `hypothesis`, `success_criteria`, and `key_artifacts`. Missing any of these causes an immediate rejection.
 
 ```yaml
 title: Config Management CLI
 mode: generate
+hypothesis: "A stdlib-only Python CLI can handle YAML config management with full schema validation."
+success_criteria: "CLI reads, validates, and applies YAML config files with env var interpolation and dry-run mode."
+key_artifacts:
+  - path: "projects/config-cli/cli.py"
+    validate: "python3 projects/config-cli/cli.py --help | grep -q 'dry-run'"
+  - path: "projects/config-cli/tests/test_cli.py"
+    validate: "python3 -m pytest projects/config-cli/tests/ -q 2>&1 | grep -q 'passed'"
 context: |
   Build a CLI tool that reads, validates, and applies YAML configuration files
   with schema validation, environment variable interpolation, and dry-run mode.
+  Python 3.10+, stdlib only. Must work on Linux and macOS.
 
-constraints:
-  - Python 3.10+, stdlib only
-  - Must work on Linux and macOS
-
-success_criteria:
+  Evaluation criteria:
   - CLI reads and parses YAML config files
   - Schema validation catches malformed configs
   - Environment variables are interpolated in config values
@@ -151,7 +155,12 @@ success_criteria:
   - Unit tests cover all core functions
 ```
 
-A decomposition worker breaks the goal into 5-15 concrete tasks before execution begins. See [modes.md](modes.md) for details.
+- `hypothesis` and `success_criteria` are single strings (pre-registration annotations).
+- `key_artifacts` gates completion: if any declared file is missing, empty, or fails its `validate` command, the spec ends `inconclusive` instead of `completed`.
+- `preconditions` (optional) lists t-0 checks that run before any tasks. If any check fails, the spec ends `inconclusive` immediately with a diagnosis.
+- Evaluation criteria (for the evaluate phase) belong in `context`.
+
+A decomposition worker (for `generate` mode) breaks the goal into 5-15 concrete tasks before execution begins. See [modes.md](modes.md) for details.
 
 ## Validation
 

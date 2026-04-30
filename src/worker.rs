@@ -30,6 +30,53 @@ use std::{
 pub use crate::spawn::{ClaudeResult, pid_dir, pid_file_for, spawn_claude};
 pub use crate::prompt::build_prompt;
 
+fn resolve_artifact_path(path: &str, worktree_path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else if path.starts_with("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{}/{}", home, &path[2..])
+    } else {
+        format!("{}/{}", worktree_path, path)
+    }
+}
+
+pub fn run_verify_remote_fly(verify_cmd: &str, fly_image: &str) -> (bool, Option<i64>) {
+    let dispatcher = match crate::remote::FlyDispatcher::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[boi] remote fly verify: FlyDispatcher init failed: {e}");
+            return (false, None);
+        }
+    };
+    match dispatcher.run_container(
+        fly_image,
+        std::collections::HashMap::new(),
+        vec!["sh".to_string(), "-c".to_string(), verify_cmd.to_string()],
+        120,
+    ) {
+        Ok(cr) => (cr.exit_code == 0, Some(cr.exit_code as i64)),
+        Err(e) => {
+            eprintln!("[boi] remote fly verify: container error: {e}");
+            (false, None)
+        }
+    }
+}
+
+pub fn run_verify_dispatched(
+    verify_cmd: &str,
+    dir: &str,
+    containerized_fly: bool,
+) -> (bool, Option<i64>) {
+    if containerized_fly {
+        let image = std::env::var("BOI_FLY_IMAGE")
+            .unwrap_or_else(|_| "registry.fly.io/boi-workers:latest".to_string());
+        run_verify_remote_fly(verify_cmd, &image)
+    } else {
+        run_verify_with_code(verify_cmd, dir)
+    }
+}
+
 pub struct WorkerConfig {
     pub max_workers: u32,
     pub task_timeout_secs: u64,
@@ -293,6 +340,8 @@ fn registry_load_user(registry: &PhaseRegistry) {
 /// TaskRequeue state, not as a mutable variable.
 #[derive(Debug, Clone)]
 enum WorkerState {
+    /// Run precondition checks before any tasks (discover/generate specs)
+    PreconditionCheck,
     /// Run a pre-task spec-level phase (plan-critique)
     SpecPhase { phase_idx: usize },
     /// Select the next ready task from the DAG
@@ -410,6 +459,7 @@ pub fn run_worker_with_phases(
         verify: t.verify_content.clone(),
         verify_prompt: None,
         phases: None,
+        containerized: None,
     }).collect();
 
     let mut boi_spec = spec::BoiSpec {
@@ -422,6 +472,10 @@ pub fn run_worker_with_phases(
         spec_phases: None,
         task_phases: None,
         context_files: None,
+        hypothesis: None,
+        success_criteria: None,
+        key_artifacts: None,
+        preconditions: None,
         tasks,
     };
 
@@ -464,9 +518,9 @@ pub fn run_worker_with_phases(
     };
 
     // Resolve the pipeline for this spec
-    let mode = boi_spec.mode.as_deref().unwrap_or("execute");
+    let mode = boi_spec.mode.as_deref().unwrap_or("execute").to_owned();
     let pipeline = phases::resolve_pipeline(
-        mode,
+        &mode,
         boi_spec.spec_phases.as_deref(),
         boi_spec.task_phases.as_deref(),
     );
@@ -601,7 +655,7 @@ pub fn run_worker_with_phases(
     TemplateVar::validate(&prompt_vars).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // --- State machine ---
-    let mut state = WorkerState::SpecPhase { phase_idx: 0 };
+    let mut state = WorkerState::PreconditionCheck;
     boi_log!("state machine start: spec={} mode={} tasks={} pre_spec_phases={} post_spec_phases={}",
         spec_id, mode, order.len(), pre_spec_phases.len(), post_spec_phases.len());
 
@@ -630,6 +684,41 @@ pub fn run_worker_with_phases(
         }
 
         match state {
+            WorkerState::PreconditionCheck => {
+                if mode == "discover" || mode == "generate" {
+                    let file_spec = std::fs::read_to_string(spec_path)
+                        .ok()
+                        .and_then(|content| spec::parse_unchecked(&content).ok());
+                    if let Some(ref fs) = file_spec {
+                        if let Some(ref preconditions) = fs.preconditions {
+                            let mut failures: Vec<String> = Vec::new();
+                            for pc in preconditions {
+                                let (ok, _) = run_verify_with_code(&pc.verify, &worktree_path);
+                                if !ok {
+                                    failures.push(format!("  - {}: verify failed: {}", pc.description, pc.verify));
+                                }
+                            }
+                            if !failures.is_empty() {
+                                let diagnosis = format!(
+                                    "PRECONDITION_FAILED: {} of {} precondition(s) failed:\n{}",
+                                    failures.len(), preconditions.len(), failures.join("\n")
+                                );
+                                boi_log!(" {}", diagnosis);
+                                queue.update_spec_with_error(spec_id, "inconclusive", &diagnosis)?;
+                                telemetry.emit("boi.spec.inconclusive", LogLevel::Info, &json!({
+                                    "spec_id": spec_id,
+                                    "status": "inconclusive",
+                                    "message": diagnosis,
+                                }));
+                                let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id }));
+                                state = WorkerState::Cleanup { success: false };
+                                continue;
+                            }
+                        }
+                    }
+                }
+                state = WorkerState::SpecPhase { phase_idx: 0 };
+            }
             WorkerState::SpecPhase { phase_idx } => {
                 if phase_idx >= pre_spec_phases.len() {
                     boi_log!("state: SpecPhase -> TaskSelect (all {} pre-spec phases done)", pre_spec_phases.len());
@@ -1354,6 +1443,51 @@ pub fn run_worker_with_phases(
             WorkerState::Complete => {
                 boi_log!("state: Complete — spec {} done (tasks={}, spec_redo_count={})",
                     spec_id, done_ids.len(), spec_redo_count);
+
+                // Artifact guard: for discover/generate specs, validate key_artifacts before
+                // marking COMPLETED. Specs that ran but produced no signal → INCONCLUSIVE.
+                if mode == "discover" || mode == "generate" {
+                    let file_spec = std::fs::read_to_string(spec_path)
+                        .ok()
+                        .and_then(|content| spec::parse_unchecked(&content).ok());
+                    if let Some(ref fs) = file_spec {
+                        if let Some(ref artifacts) = fs.key_artifacts {
+                            let mut failures: Vec<String> = Vec::new();
+                            for artifact in artifacts {
+                                let resolved = resolve_artifact_path(&artifact.path, &worktree_path);
+                                let p = std::path::Path::new(&resolved);
+                                if !p.exists() {
+                                    failures.push(format!("  - {}: file not found", artifact.path));
+                                } else if p.metadata().map(|m| m.len() == 0).unwrap_or(true) {
+                                    failures.push(format!("  - {}: file is empty", artifact.path));
+                                } else if let Some(ref cmd) = artifact.validate {
+                                    let (ok, _) = run_verify_with_code(cmd, &worktree_path);
+                                    if !ok {
+                                        failures.push(format!("  - {}: validate command failed: {}", artifact.path, cmd));
+                                    }
+                                }
+                            }
+                            if !failures.is_empty() {
+                                let diagnosis = format!(
+                                    "INCONCLUSIVE: {} of {} key_artifact(s) failed:\n{}",
+                                    failures.len(), artifacts.len(), failures.join("\n")
+                                );
+                                boi_log!(" {}", diagnosis);
+                                queue.update_spec_with_error(spec_id, "inconclusive", &diagnosis)?;
+                                telemetry.emit("boi.spec.inconclusive", LogLevel::Info, &json!({
+                                    "spec_id": spec_id,
+                                    "status": "inconclusive",
+                                    "message": diagnosis,
+                                }));
+                                let _ = hooks::fire(hook_config, ON_FAIL, &json!({ "spec_id": spec_id })); // intentional: best-effort
+                                state = WorkerState::Cleanup { success: false };
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+
                 queue.update_spec(spec_id, "completed")?;
                 let _ = hooks::fire(hook_config, ON_COMPLETE, &json!({ "spec_id": spec_id })); // intentional: best-effort hook notification
                 telemetry.emit("boi.spec.completed", LogLevel::Info, &json!({
@@ -1505,6 +1639,7 @@ fn refresh_task_state(
                 verify: t.verify_content.clone(),
                 verify_prompt: None,
                 phases: None,
+                containerized: None,
             }).collect();
             match spec::topological_sort(boi_spec) {
                 Ok(new_order) => {
@@ -2083,6 +2218,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             verify: None,
             verify_prompt: None,
             phases: None,
+            containerized: None,
         };
         // First call (execute phase for t-1) returns Redo with a new task.
         // All subsequent calls return Proceed (MockPhaseRunner default when list exhausted).

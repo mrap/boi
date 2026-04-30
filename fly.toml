@@ -1,0 +1,12 @@
+# Fly.io config for BOI worker image builds.
+# This app is not continuously running — machines are created on-demand
+# via the Machines API. This file exists only for image registry access.
+app = "boi-workers"
+primary_region = "iad"
+
+[build]
+  dockerfile = "tests/bench/Dockerfile"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

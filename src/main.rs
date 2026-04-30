@@ -254,6 +254,7 @@ fn main() {
                 project.as_deref(),
                 dry_run,
                 workspace.as_deref(),
+                None,
                 db_str,
                 &hook_cfg,
             );

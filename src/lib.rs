@@ -6,6 +6,7 @@ pub mod hooks;
 pub mod phases;
 pub mod prompt;
 pub mod queue;
+pub mod remote;
 pub mod runner;
 pub mod runtime;
 pub mod spawn;

@@ -1,0 +1,8 @@
+[pipeline]
+name = "v-20260430-100000"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []
+
+[pipeline.config]
+effort_level = "fast"
