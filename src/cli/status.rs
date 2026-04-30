@@ -113,7 +113,7 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
     let queued: Vec<&queue::SpecRecord> = specs.iter().filter(|s| s.status == "queued").collect();
 
     let six_hours_ago = chrono::Utc::now() - chrono::Duration::hours(6);
-    let finished: Vec<&queue::SpecRecord> = specs
+    let mut finished: Vec<&queue::SpecRecord> = specs
         .iter()
         .filter(|s| {
             (s.status == "completed" || s.status == "failed" || s.status == "cancelled")
@@ -125,6 +125,7 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
                     }))
         })
         .collect();
+    finished.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
 
     // Layout constants (display column widths, not byte widths)
     // "▸ sa7f3  " = icon(1) + space(1) + id(5) + gap(2) = 9 display cols before title
