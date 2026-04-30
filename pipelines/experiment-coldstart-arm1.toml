@@ -1,0 +1,10 @@
+# Experiment 1: Cold-Start Runtime Swap — Arm 1
+# IV: Runtime dispatch method
+# Config: Claude CLI, bare=true + --system-prompt-file
+# Override: Set system_prompt_file on phase TOMLs
+
+[pipeline]
+name = "experiment-coldstart-arm1"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

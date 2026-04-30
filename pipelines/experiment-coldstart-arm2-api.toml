@@ -1,0 +1,10 @@
+# Experiment 1: Cold-Start Runtime Swap — Arm 2 (treatment)
+# IV: Runtime dispatch method
+# Config: Anthropic Messages API direct (streaming)
+# Override: Set runtime="api" on all phase TOMLs
+
+[pipeline]
+name = "experiment-coldstart-arm2-api"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

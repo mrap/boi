@@ -45,19 +45,20 @@ impl Provider for ClaudeCLIProvider {
     }
 
     fn invoke(&self, ctx: InvocationContext) -> Result<RuntimeOutput, ProviderError> {
+        let timeout_secs = ctx.timeout.as_secs();
         let model = if ctx.model.is_empty() { None } else { Some(ctx.model) };
         let result = crate::spawn::spawn_claude(
             ctx.prompt,
             ctx.worktree_path,
-            ctx.timeout.as_secs(),
+            timeout_secs,
             model,
             ctx.spec_id,
             &self.claude_bin,
         )
-        .map_err(|e| ProviderError::ExecutionFailed(e.to_string()))?;
+        .map_err(|e| ProviderError::Other(anyhow::anyhow!("{}", e)))?;
 
         if result.output == "timeout" {
-            return Err(ProviderError::Timeout);
+            return Err(ProviderError::Timeout { secs: timeout_secs });
         }
 
         Ok(RuntimeOutput {

@@ -316,7 +316,7 @@ Exit 0 = passed. Any non-zero exit = failed. Stdout/stderr are captured as the f
 
 ## Runtime Configuration
 
-BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) is also supported.
+BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) and `openrouter` (requires `OPENROUTER_API_KEY`) are also supported. Use `boi providers list` to see which providers are active on your machine.
 
 ### Global Default
 
@@ -412,6 +412,7 @@ boi dep add|remove|set|clear|show|viz|check
 boi project create|list|status|context|delete
 boi bench --pipeline name:path [--pipeline ...] --spec FILE | --battery DIR [--runs N]  Benchmark N pipelines
 boi bench --phase <name> --spec FILE [--runs N]  Benchmark a single phase in isolation
+boi providers list                            List registered and disabled runtime providers
 ```
 
 **`dispatch` options:**

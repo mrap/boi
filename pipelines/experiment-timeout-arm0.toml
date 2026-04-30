@@ -1,0 +1,10 @@
+# Experiment 8: Adaptive Timeout + Early Kill — Arm 0 (control/baseline)
+# IV: Timeout policy
+# Config: Fixed 300s timeout for all phases
+# Override: None — uses current default timeout
+
+[pipeline]
+name = "experiment-timeout-arm0"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

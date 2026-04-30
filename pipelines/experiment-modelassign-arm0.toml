@@ -1,0 +1,10 @@
+# Experiment 2: Per-Phase Model Assignment — Arm 0 (current default)
+# IV: Model assignment policy
+# Config: Sonnet for execute/critic-bare; gemini-flash for plan-critique/spec-critique
+# Override: None — uses current production config
+
+[pipeline]
+name = "experiment-modelassign-arm0"
+spec_phases = ["plan-critique", "spec-critique", "critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

@@ -2419,4 +2419,56 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
         assert_eq!(st.spec.status, "completed");
         assert_eq!(st.tasks[0].status, "DONE");
     }
+
+    #[test]
+    fn test_pipeline_id_populated_in_phase_runs() {
+        let yaml = "title: \"Pipeline ID Test\"\nmode: execute\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
+        let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("pipeline_id_test", yaml);
+        let config = WorkerConfig {
+            max_workers: 1,
+            task_timeout_secs: 10,
+            retry_count: 0,
+            cleanup_on_failure: false,
+            claude_bin: "true".to_string(),
+            models: None,
+        };
+        let registry = PhaseRegistry::new();
+        let mock = crate::runner::MockPhaseRunner::new(vec![
+            Verdict::Proceed, // spec-review
+            Verdict::Proceed, // execute
+            Verdict::Proceed, // task-verify
+            Verdict::Proceed, // post spec-review / critic
+        ]);
+        let tel = test_telemetry();
+
+        with_test_env("true", repo.to_str().unwrap(), || {
+            run_worker_with_phases(
+                &spec_id,
+                &spec_path,
+                &db_path,
+                &HookConfig::default(),
+                &config,
+                &registry,
+                &mock,
+                &tel,
+            )
+            .unwrap();
+        });
+
+        // Open a direct connection to verify phase_run rows (queue.conn is private)
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        let null_count: i64 = raw.query_row(
+            "SELECT COUNT(*) FROM phase_runs WHERE spec_id = ?1 AND pipeline_id IS NULL",
+            rusqlite::params![spec_id],
+            |r| r.get::<_, i64>(0),
+        ).unwrap();
+        let total_count: i64 = raw.query_row(
+            "SELECT COUNT(*) FROM phase_runs WHERE spec_id = ?1",
+            rusqlite::params![spec_id],
+            |r| r.get::<_, i64>(0),
+        ).unwrap();
+        drop(raw);
+        assert!(total_count > 0, "phase_runs must exist after worker run");
+        assert_eq!(null_count, 0, "all phase_run rows must have a non-NULL pipeline_id; {} of {} were NULL", null_count, total_count);
+    }
 }

@@ -25,9 +25,9 @@ You → boi dispatch --spec spec.yaml → Spec Queue (priority-sorted)
 
 ## Components
 
-### CLI (`boi.sh`)
+### CLI (`boi.sh` → Rust binary)
 
-The entry point. Routes subcommands to their implementations. Handles argument parsing, validation, and output formatting. Calls into Python libraries in `lib/` for business logic.
+`boi.sh` is a thin wrapper that execs `~/.boi/bin/boi` (the compiled Rust binary) when it exists. All subcommand routing, argument parsing, and business logic lives in the Rust binary (`src/main.rs`, `src/cli/`).
 
 ### Daemon (`daemon.py`)
 
@@ -221,6 +221,6 @@ For specs dispatched without isolation, BOI parses `**Spec:**` and `**Files:**` 
 
 YAML is human-readable, version-controllable, and machine-parseable without fragile regex. Workers can edit specs with standard file I/O. Users can read and modify specs in any text editor. The schema-level structure means validation errors are typed and precise, not "missing blank line after heading". No databases, no APIs, no custom serialization.
 
-### Why Python stdlib only?
+### Why minimal dependencies?
 
-Zero external dependencies means BOI works on any machine with Python 3.10+. No `pip install`, no virtual environments, no version conflicts. This is critical for a tool that runs on diverse machines.
+The Rust binary ships as a single static-linked executable with no runtime dependencies beyond `git`, `tmux`, and the Claude Code CLI. No Python, no `pip install`, no virtual environments. This is critical for a tool that runs on diverse machines.

@@ -1,0 +1,10 @@
+# Experiment 6: Fork-and-Vote — Arm 0 (control/baseline)
+# IV: Judgment strategy
+# Config: Single Sonnet 4.6 run per judgment phase
+# Override: None — standard single-run judgment
+
+[pipeline]
+name = "experiment-forkvote-arm0"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

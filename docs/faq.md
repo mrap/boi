@@ -16,13 +16,12 @@ Long sessions degrade. Context fills up, instructions get lost, and the agent st
 
 ### What do I need to run BOI?
 
-- Python 3.10+
 - Git
 - tmux
 - Claude Code CLI
 - Bash
 
-No pip packages, no Docker (optional), no cloud services.
+No Python, no pip packages, no Docker (optional), no cloud services.
 
 ## Installation
 

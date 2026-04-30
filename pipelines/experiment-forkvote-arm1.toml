@@ -1,0 +1,11 @@
+# Experiment 6: Fork-and-Vote — Arm 1 (treatment)
+# IV: Judgment strategy
+# Config: 3x Sonnet 4.6 runs per judgment phase, majority vote
+# Override: Set judgment_replicas=3, vote_strategy="majority",
+#   model="claude-sonnet-4-6" for all 3 replicas
+
+[pipeline]
+name = "experiment-forkvote-arm1"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

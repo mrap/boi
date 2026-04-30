@@ -1,0 +1,12 @@
+# Experiment 4: Prompt Hygiene Bundle — Arm S (strawman)
+# IV: Prompt content policy
+# Config: Maximally verbose prompts — duplicate spec content,
+#   include all tool descriptions twice, verbose instructions
+# Override: Enable verbose_prompts=true, duplicate_tools=true
+# Purpose: Expected to increase tokens; validates measurement sensitivity
+
+[pipeline]
+name = "experiment-hygiene-armS"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

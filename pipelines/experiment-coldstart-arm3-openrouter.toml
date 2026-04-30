@@ -1,0 +1,10 @@
+# Experiment 1: Cold-Start Runtime Swap — Arm 3 (treatment)
+# IV: Runtime dispatch method
+# Config: OpenRouter API
+# Override: Set runtime="openrouter" on all phase TOMLs
+
+[pipeline]
+name = "experiment-coldstart-arm3-openrouter"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

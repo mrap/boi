@@ -4,7 +4,6 @@ This guide walks you through installing BOI, writing your first spec, dispatchin
 
 ## Prerequisites
 
-- **Python 3.10+** (check with `python3 --version`)
 - **Git** (check with `git --version`)
 - **tmux** (check with `tmux -V`)
 - **Claude Code CLI** (check with `claude --version`)

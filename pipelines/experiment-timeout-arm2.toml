@@ -1,0 +1,12 @@
+# Experiment 8: Adaptive Timeout + Early Kill — Arm 2 (treatment)
+# IV: Timeout policy
+# Config: Adaptive timeout (2x p95) + early kill (no stdout for 30s -> terminate)
+# Override: Set timeout_policy="adaptive", timeout_multiplier=2.0,
+#   early_kill_silence_threshold_s=30
+# Exemptions: cargo build/test phases (legitimately silent >30s)
+
+[pipeline]
+name = "experiment-timeout-arm2"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

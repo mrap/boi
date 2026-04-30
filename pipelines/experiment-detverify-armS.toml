@@ -1,0 +1,12 @@
+# Experiment 7: Deterministic Pre-Verification — Arm S (strawman)
+# IV: Verification pipeline
+# Config: Deterministic checks ONLY, no LLM judge ever
+# Override: Set pre_verify_commands=["cargo build", "cargo test", "cargo clippy"],
+#   skip_llm_judge=true
+# Purpose: Calibrates LLM judge value beyond deterministic checks
+
+[pipeline]
+name = "experiment-detverify-armS"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

@@ -1,0 +1,12 @@
+# Experiment 6: Fork-and-Vote — Arm S (strawman)
+# IV: Judgment strategy
+# Config: 3x Sonnet 4.6 at temperature=0, identical prompts, majority vote
+# Override: Set judgment_replicas=3, vote_strategy="majority",
+#   temperature=0.0, identical_prompts=true
+# Purpose: Near-zero diversity — validates that diversity drives voting benefit
+
+[pipeline]
+name = "experiment-forkvote-armS"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

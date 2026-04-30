@@ -1,0 +1,11 @@
+# Experiment 8: Adaptive Timeout + Early Kill — Arm S (strawman)
+# IV: Timeout policy
+# Config: Fixed 60s timeout for all phases (aggressively short)
+# Override: Set phase_timeout_s=60
+# Purpose: Expected high false-kill rate; validates timeout tuning matters
+
+[pipeline]
+name = "experiment-timeout-armS"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

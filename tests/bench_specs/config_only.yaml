@@ -1,0 +1,62 @@
+title: "Config-only benchmark spec — TOML and config changes"
+mode: execute
+context: |
+  Benchmark spec where all tasks modify only config/TOML files.
+  Experiment 5 control: should trigger code-review skip rule
+  (all tasks are config/TOML-only changes).
+
+tasks:
+  - id: t-1
+    title: "Create config directory"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_bench_config/ directory.
+      Command: mkdir -p /tmp/boi_bench_config
+    verify: |
+      test -d /tmp/boi_bench_config && echo PASS
+
+  - id: t-2
+    title: "Write application config"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create /tmp/boi_bench_config/app.toml with application settings.
+      Command: printf '[app]\nname = "bench-app"\nversion = "1.0.0"\ndebug = false\n\n[server]\nhost = "0.0.0.0"\nport = 8080\n' > /tmp/boi_bench_config/app.toml
+    verify: |
+      test -f /tmp/boi_bench_config/app.toml &&
+      grep -q 'name = "bench-app"' /tmp/boi_bench_config/app.toml &&
+      grep -q "port = 8080" /tmp/boi_bench_config/app.toml && echo PASS
+
+  - id: t-3
+    title: "Write database config"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create /tmp/boi_bench_config/database.toml with DB connection settings.
+      Command: printf '[database]\ndriver = "sqlite"\npath = "/tmp/app.db"\npool_size = 5\n' > /tmp/boi_bench_config/database.toml
+    verify: |
+      test -f /tmp/boi_bench_config/database.toml &&
+      grep -q 'driver = "sqlite"' /tmp/boi_bench_config/database.toml && echo PASS
+
+  - id: t-4
+    title: "Write logging config"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create /tmp/boi_bench_config/logging.toml with log settings.
+      Command: printf '[logging]\nlevel = "info"\nformat = "json"\noutput = "stdout"\n' > /tmp/boi_bench_config/logging.toml
+    verify: |
+      test -f /tmp/boi_bench_config/logging.toml &&
+      grep -q 'level = "info"' /tmp/boi_bench_config/logging.toml && echo PASS
+
+  - id: t-5
+    title: "Generate unified config index"
+    status: PENDING
+    depends: [t-2, t-3, t-4]
+    spec: |
+      Create /tmp/boi_bench_config/config_index.txt listing all config files.
+      Command: ls /tmp/boi_bench_config/*.toml > /tmp/boi_bench_config/config_index.txt
+    verify: |
+      test -f /tmp/boi_bench_config/config_index.txt &&
+      count=$(wc -l < /tmp/boi_bench_config/config_index.txt | tr -d ' ') &&
+      test "$count" -eq 3 && echo PASS

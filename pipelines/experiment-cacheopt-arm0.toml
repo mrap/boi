@@ -1,0 +1,11 @@
+# Experiment 3: Prompt Cache Optimization — Arm 0 (control/baseline)
+# IV: Prompt structure
+# Config: Current prompt structure, no cache optimization
+# Override: None — uses current prompts
+# Prerequisite: Requires API dispatch (Experiment 1 Arm 2 or 3)
+
+[pipeline]
+name = "experiment-cacheopt-arm0"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

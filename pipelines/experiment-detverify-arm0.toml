@@ -1,0 +1,10 @@
+# Experiment 7: Deterministic Pre-Verification — Arm 0 (control/baseline)
+# IV: Verification pipeline
+# Config: LLM judge only (current task-verify behavior)
+# Override: None — standard LLM-based verification
+
+[pipeline]
+name = "experiment-detverify-arm0"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

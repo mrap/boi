@@ -1,0 +1,10 @@
+# Experiment 1: Cold-Start Runtime Swap — Arm 0-historical
+# IV: Runtime dispatch method
+# Config: Claude CLI, bare=false (pre-2026-04-29 baseline)
+# Override: Set bare=false on all phase TOMLs
+
+[pipeline]
+name = "experiment-coldstart-arm0-historical"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

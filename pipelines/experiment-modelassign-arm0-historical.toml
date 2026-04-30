@@ -1,0 +1,10 @@
+# Experiment 2: Per-Phase Model Assignment — Arm 0-historical (reference)
+# IV: Model assignment policy
+# Config: Sonnet 4.6 for ALL phases (pre-2026-04-29 baseline)
+# Override: Set model="claude-sonnet-4-6" on all phase TOMLs
+
+[pipeline]
+name = "experiment-modelassign-arm0-historical"
+spec_phases = ["plan-critique", "spec-critique", "critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

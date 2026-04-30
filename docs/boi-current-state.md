@@ -253,7 +253,7 @@ class Outcome:
 
 | Tool | Invocation | Purpose | Fallback |
 |------|-----------|---------|----------|
-| `claude` | `claude -p "$(cat prompt.md)" --model M --effort E --dangerously-skip-permissions --output-format stream-json --verbose` | Primary worker runtime | Fails hard; required for default runtime |
+| `claude` | `claude -p "$(cat prompt.md)" --model M --effort E --dangerously-skip-permissions --output-format stream-json --verbose --strict-mcp-config` | Primary worker runtime | Fails hard; required for default runtime |
 | `tmux` | `tmux -L boi new-session -d -s boi-q-001 bash run.sh` | Process isolation for workers | `BOI_NO_TMUX=1` → direct `subprocess.run()` |
 | `git` | `git -C <worktree> diff`, `git status`, `git add`, `git commit` | Workspace boundary checking, output tracking | Graceful skip with warning |
 | `python3` | `python3 daemon.py`, `python3 worker.py` | Core runtime | Hard failure if missing |
@@ -468,6 +468,7 @@ claude -p "$(cat q-001.prompt.md)" \
   --add-dir /path/to/context \
   --output-format stream-json \
   --verbose \
+  --strict-mcp-config \
   > ~/.boi/logs/q-001-iter-2.log 2>&1
 
 _AGENT_EXIT=$?
@@ -636,6 +637,7 @@ claude -p "$(cat prompt.md)"
   --add-dir /path/to/context
   --output-format stream-json
   --verbose
+  --strict-mcp-config
 ```
 
 Model aliases: `opus` → `claude-opus-4-6`, `sonnet` → `claude-sonnet-4-6`, `haiku` → `claude-haiku-4-5-20251001`

@@ -1,0 +1,38 @@
+title: "Simple generate-mode spec — 3 tasks with verify"
+mode: generate
+context: |
+  Minimal generate-mode spec with 3 tasks. All tasks have verify commands.
+  Experiment 5 control: should trigger spec-critique skip rule
+  (mode=generate AND <=5 tasks AND all tasks have verify).
+
+tasks:
+  - id: t-1
+    title: "Create output directory"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_bench_simple_gen/ directory.
+      Command: mkdir -p /tmp/boi_bench_simple_gen
+    verify: |
+      test -d /tmp/boi_bench_simple_gen && echo PASS
+
+  - id: t-2
+    title: "Generate greeting module"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create /tmp/boi_bench_simple_gen/greet.sh that prints "Hello, BOI!".
+      Make it executable.
+      Command: echo '#!/bin/sh' > /tmp/boi_bench_simple_gen/greet.sh && echo 'echo "Hello, BOI!"' >> /tmp/boi_bench_simple_gen/greet.sh && chmod +x /tmp/boi_bench_simple_gen/greet.sh
+    verify: |
+      test -x /tmp/boi_bench_simple_gen/greet.sh &&
+      /tmp/boi_bench_simple_gen/greet.sh | grep -q "Hello, BOI!" && echo PASS
+
+  - id: t-3
+    title: "Generate version file"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create /tmp/boi_bench_simple_gen/VERSION with content "0.1.0".
+      Command: echo "0.1.0" > /tmp/boi_bench_simple_gen/VERSION
+    verify: |
+      grep -q "0.1.0" /tmp/boi_bench_simple_gen/VERSION && echo PASS

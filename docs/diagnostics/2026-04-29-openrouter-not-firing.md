@@ -3,7 +3,7 @@
 **Date:** 2026-04-29  
 **Spec:** boi-comprehensive-phase-logging (S9CE3)  
 **Task:** T5FAA  
-**Status:** Root cause identified — two compounding bugs. Fix is a separate dispatch.
+**Status:** Resolved in v1.3.0 — `ProviderRegistry` refactor replaced the ad-hoc `requires_claude` gate with a proper provider dispatch table. OpenRouter is now a first-class provider; `boi providers list` shows active/disabled state.
 
 ---
 

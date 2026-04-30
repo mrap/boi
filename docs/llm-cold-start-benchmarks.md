@@ -100,11 +100,12 @@ The 183ms floor breaks down approximately:
 
 ## BOI Context Notes
 
-These benchmarks were run without the flags BOI daemon uses (`--verbose`, system prompts, MCP configs). In production BOI workers:
+These benchmarks were run without the flags BOI daemon uses (`--verbose`, system prompts). In production BOI workers:
 - System prompt is injected (spec + CLAUDE.md + shared memory = 10-30K tokens)
 - `--verbose` is set
 - Hooks execute at startup
 - Plugin sync runs
+- MCP servers are explicitly disabled via `--strict-mcp-config` (zero MCP processes per worker)
 
 These add additional cold start overhead beyond the 5.2s baseline measured here, which explains the 6-200s range observed in production. The BOI spec context injection alone adds ~2-10s of network upload time for large specs.
 

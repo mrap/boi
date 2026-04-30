@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod log;
 pub mod outputs;
 pub mod phases_cmd;
+pub mod providers;
 pub mod spec_mgmt;
 pub mod status;
 pub mod telemetry_cmd;

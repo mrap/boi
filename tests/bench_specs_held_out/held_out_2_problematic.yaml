@@ -1,0 +1,57 @@
+title: "Held-out fixture 2: spec with deliberate issues (expected critic verdict: REJECT)"
+mode: execute
+context: |
+  Held-out validation fixture for Experiment 6 (fork-and-vote reliability).
+  This spec contains deliberate quality issues designed to trigger critic rejection:
+    - Task t-2 spec says "update all configs" but only specifies one file (scope leak)
+    - Task t-3 has no verify command (un-verifiable completion)
+    - Task t-4's verify command doesn't actually check the stated goal
+
+  Expected critic verdict: REJECT (missing verify, scope ambiguity, verify mismatch).
+
+  LOCKED: 2026-04-29. Do not modify after this date.
+
+tasks:
+  - id: t-1
+    title: "Initialize output directory"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_held_out_2/ directory.
+      Command: mkdir -p /tmp/boi_held_out_2
+    verify: |
+      test -d /tmp/boi_held_out_2 && echo PASS
+
+  - id: t-2
+    title: "Update all application configs to use new database URL"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Update all configs to use the new database URL postgres://db:5432/app.
+      Write /tmp/boi_held_out_2/db_config.txt with the new URL.
+      Command: echo "DATABASE_URL=postgres://db:5432/app" > /tmp/boi_held_out_2/db_config.txt
+    verify: |
+      test -f /tmp/boi_held_out_2/db_config.txt &&
+      grep -q "postgres://db:5432/app" /tmp/boi_held_out_2/db_config.txt && echo PASS
+
+  - id: t-3
+    title: "Notify all downstream services of the config change"
+    status: PENDING
+    depends: [t-2]
+    spec: |
+      Send a notification to all downstream services about the database URL change.
+      Log the notification to /tmp/boi_held_out_2/notifications.log.
+      Command: echo "$(date -u): DB URL updated to postgres://db:5432/app" >> /tmp/boi_held_out_2/notifications.log
+
+  - id: t-4
+    title: "Generate migration summary report"
+    status: PENDING
+    depends: [t-3]
+    spec: |
+      Generate a summary report of the database migration changes at
+      /tmp/boi_held_out_2/migration_report.md with the following sections:
+        - Changes Made
+        - Services Affected
+        - Rollback Instructions
+      Command: echo "# Migration Report\n\n## Changes Made\n- DB URL updated" > /tmp/boi_held_out_2/migration_report.md
+    verify: |
+      test -f /tmp/boi_held_out_2/migration_report.md && echo PASS

@@ -1,0 +1,15 @@
+# Experiment 5: Conditional Phase Execution — Arm 1 (treatment)
+# IV: Phase skip policy
+# Config: Conditional skipping based on metadata rules:
+#   - Skip spec-critique if mode=generate AND <=5 tasks AND all have verify
+#   - Skip commit if git status --porcelain is empty after execute
+#   - Skip doc-update if no .md files changed
+#   - Skip code-review if all tasks are config/TOML-only changes
+# Override: Enable conditional_phase_router=true
+# Note: Same phase list as Arm 0; router decides at runtime which to skip
+
+[pipeline]
+name = "experiment-condphase-arm1"
+spec_phases = ["plan-critique", "spec-critique", "critic"]
+task_phases = ["execute", "code-review", "task-verify", "commit"]
+post_phases = ["doc-update"]

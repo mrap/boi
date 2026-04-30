@@ -1,0 +1,13 @@
+# Experiment 7: Deterministic Pre-Verification — Arm 1 (treatment)
+# IV: Verification pipeline
+# Config: Deterministic checks first (cargo build + cargo test + cargo clippy);
+#   if any fail, mark task as failed without invoking LLM judge.
+#   If all pass, invoke LLM judge for semantic review.
+# Override: Set pre_verify_commands=["cargo build", "cargo test", "cargo clippy"],
+#   gate_on_pre_verify=true
+
+[pipeline]
+name = "experiment-detverify-arm1"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

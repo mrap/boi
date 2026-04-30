@@ -1,0 +1,13 @@
+# Experiment 4: Prompt Hygiene Bundle — Arm 1
+# IV: Prompt content policy
+# Config: Per-phase tool allowlist only
+#   execute: full toolset
+#   critic/review: Read+Grep only
+#   spec-critique: none
+# Override: Set tool_allowlist per phase TOML
+
+[pipeline]
+name = "experiment-hygiene-arm1"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

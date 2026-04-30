@@ -1,0 +1,10 @@
+# Experiment 5: Conditional Phase Execution — Arm 0 (control/baseline)
+# IV: Phase skip policy
+# Config: All phases execute for every spec (current behavior)
+# Override: None — full pipeline runs unconditionally
+
+[pipeline]
+name = "experiment-condphase-arm0"
+spec_phases = ["plan-critique", "spec-critique", "critic"]
+task_phases = ["execute", "code-review", "task-verify", "commit"]
+post_phases = ["doc-update"]

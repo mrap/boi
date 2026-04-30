@@ -1,5 +1,7 @@
 use crate::builtins::{self, BuiltinContext};
 use crate::phases::{PhaseConfig, Verdict};
+use crate::runtime::{self, InvocationContext, ProviderError, ProviderRegistry};
+use crate::runtime::claude::ClaudeCLIProvider;
 use crate::spec::BoiTask;
 use crate::telemetry::{
     generate_invocation_id, LogLevel, PhaseCompletionFields, PhaseInvocation, Telemetry,
@@ -7,7 +9,7 @@ use crate::telemetry::{
 use crate::worker;
 use chrono::Utc;
 use serde_json::json;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Telemetry metrics collected during a single phase execution.
 /// Populated from ClaudeResult data when available.
@@ -92,23 +94,26 @@ pub trait PhaseRunner: Send + Sync {
     }
 }
 
-/// Production phase runner that spawns claude for requires_claude phases,
-/// runs verify commands for non-claude phases, and dispatches deterministic
-/// builtin handlers without any Claude cold-start.
+/// Production phase runner that dispatches phases through the provider registry.
 pub struct ClaudePhaseRunner {
     pub telemetry: Telemetry,
     pub claude_bin: String,
     /// Source repo path for deterministic builtins that need to merge/cleanup.
     /// Empty string disables merge/cleanup builtins.
     pub repo_path: String,
+    pub provider_registry: ProviderRegistry,
 }
 
 impl ClaudePhaseRunner {
     pub fn new(telemetry: Telemetry, claude_bin: String) -> Self {
+        let mut provider_registry = ProviderRegistry::new();
+        // Override the default Claude provider with the configured binary.
+        provider_registry.register(Box::new(ClaudeCLIProvider::new(claude_bin.clone())));
         ClaudePhaseRunner {
             telemetry,
             claude_bin,
             repo_path: String::new(),
+            provider_registry,
         }
     }
 
@@ -157,7 +162,7 @@ impl ClaudePhaseRunner {
             )
         });
         let prompt_opt: Option<String> =
-            if resolved_runtime == "claude" || resolved_runtime == "openrouter" {
+            if resolved_runtime != "deterministic" && resolved_runtime != "verify" {
                 Some(crate::phases::build_phase_prompt(
                     phase,
                     spec_content,
@@ -265,31 +270,9 @@ impl ClaudePhaseRunner {
             );
         };
 
-        // Enhanced emit that includes usage data from ClaudeResult.
-        let emit_done_with_usage = |start: &Instant,
-                                     exit_status: &str,
-                                     cr: &worker::ClaudeResult| {
-            self.telemetry.emit_phase_completed(
-                &invocation_id,
-                &PhaseCompletionFields {
-                    completed_at: Utc::now().to_rfc3339(),
-                    duration_ms: start.elapsed().as_millis() as i64,
-                    startup_ms: Some(cr.startup_ms as i64),
-                    inference_ms: Some(cr.inference_ms as i64),
-                    input_tokens: cr.input_tokens,
-                    output_tokens: cr.output_tokens,
-                    cache_read_tokens: cr.cache_read_tokens,
-                    cache_creation_tokens: cr.cache_creation_tokens,
-                    cost_usd: cr.cost_usd,
-                    exit_status: exit_status.to_string(),
-                    exit_reason: None,
-                },
-            );
-        };
-
         // ── branch to runtime ─────────────────────────────────────────────────
 
-        // Deterministic phases: skip Claude entirely, run a registered builtin handler.
+        // Deterministic phases: skip LLM entirely, run a registered builtin handler.
         if phase.runtime.as_deref() == Some("deterministic") {
             let verdict = self.run_deterministic_phase(phase, task, spec_id);
             let exit_status = verdict_to_exit_status(&verdict);
@@ -313,12 +296,14 @@ impl ClaudePhaseRunner {
             return (verdict, String::new(), metrics);
         }
 
-        // Claude phase — use the pre-built prompt.
+        // LLM phase — dispatch through the provider registry.
         let task_id = task.map(|t| t.id.as_str());
         let spec_id_hint = spec_id.unwrap_or("");
         let prompt = prompt_opt.unwrap_or_else(|| {
             crate::phases::build_phase_prompt(phase, spec_content, task_context.as_deref(), vars)
         });
+
+        let provider_name = phase.runtime.as_deref().unwrap_or("claude");
 
         self.telemetry.emit(
             "boi.claude.spawn",
@@ -327,129 +312,20 @@ impl ClaudePhaseRunner {
                 "spec_id": spec_id_hint,
                 "task_id": task_id,
                 "phase": phase.name,
+                "provider": provider_name,
                 "prompt_length": prompt.len(),
-                "message": "spawning claude...",
+                "message": format!("spawning {}...", provider_name),
             }),
         );
 
-        let result = worker::spawn_claude(
-            &prompt,
-            worktree_path,
-            timeout_secs,
-            phase.model.as_deref(),
-            spec_id,
-            &self.claude_bin,
-        );
-
-        if let Ok(ref cr) = result {
-            let startup_s = cr.startup_ms as f64 / 1000.0;
-            self.telemetry.emit(
-                "boi.claude.first_output",
-                LogLevel::Debug,
-                &json!({
-                    "spec_id": spec_id_hint,
-                    "task_id": task_id,
-                    "startup_ms": cr.startup_ms,
-                    "message": format!("first output after {:.1}s (startup)", startup_s),
-                }),
-            );
-        }
-
-        let build_metrics = |cr: &worker::ClaudeResult, verdict: &Verdict| -> PhaseMetrics {
-            let tool_types_json = if cr.tool_calls_by_type.is_empty() {
-                None
-            } else {
-                serde_json::to_string(&cr.tool_calls_by_type).ok()
-            };
-            PhaseMetrics {
-                cost_usd: cr.cost_usd,
-                input_tokens: cr.input_tokens,
-                output_tokens: cr.output_tokens,
-                cache_read_tokens: cr.cache_read_tokens,
-                cache_creation_tokens: cr.cache_creation_tokens,
-                cold_start_ms: Some(cr.startup_ms as i64),
-                inference_ms: Some(cr.inference_ms as i64),
-                ttft_ms: Some(cr.startup_ms as i64),
-                tool_call_count: cr.tool_call_count,
-                tool_calls_by_type: tool_types_json,
-                model: phase.model.clone(),
-                runtime: Some(resolved_runtime.to_string()),
-                failure_mode: classify_failure_mode(verdict, &cr.output),
-                verify_exit_code: None,
-            }
-        };
-
-        match result {
-            Ok(ref cr) if cr.success => {
-                let inference_s = cr.inference_ms as f64 / 1000.0;
-                let total_s = cr.total_ms as f64 / 1000.0;
-                self.telemetry.emit("boi.claude.exit", LogLevel::Debug, &json!({
-                    "spec_id": spec_id_hint,
-                    "task_id": task_id,
-                    "phase": phase.name,
-                    "exit_code": 0,
-                    "output_length": cr.output.len(),
-                    "stderr_length": cr.stderr.len(),
-                    "stderr_preview": cr.stderr.chars().take(500).collect::<String>(),
-                    "startup_ms": cr.startup_ms,
-                    "inference_ms": cr.inference_ms,
-                    "total_ms": cr.total_ms,
-                    "cost_usd": cr.cost_usd,
-                    "input_tokens": cr.input_tokens,
-                    "output_tokens": cr.output_tokens,
-                    "tool_call_count": cr.tool_call_count,
-                    "message": format!("claude exit 0, {} chars ({:.1}s inference, {:.1}s total)",
-                        cr.output.len(), inference_s, total_s),
-                }));
-                let verdict = crate::phases::parse_phase_output(phase, &cr.output);
-                emit_done_with_usage(&start_instant, "success", cr);
-                let metrics = build_metrics(cr, &verdict);
-                (verdict, cr.output.clone(), metrics)
-            }
-            Ok(ref cr) => {
-                let inference_s = cr.inference_ms as f64 / 1000.0;
-                let total_s = cr.total_ms as f64 / 1000.0;
-                self.telemetry.emit("boi.claude.exit", LogLevel::Error, &json!({
-                    "spec_id": spec_id_hint,
-                    "task_id": task_id,
-                    "phase": phase.name,
-                    "exit_code": 1,
-                    "output_length": cr.output.len(),
-                    "stderr_length": cr.stderr.len(),
-                    "stderr_preview": cr.stderr.chars().take(500).collect::<String>(),
-                    "startup_ms": cr.startup_ms,
-                    "inference_ms": cr.inference_ms,
-                    "total_ms": cr.total_ms,
-                    "cost_usd": cr.cost_usd,
-                    "input_tokens": cr.input_tokens,
-                    "output_tokens": cr.output_tokens,
-                    "tool_call_count": cr.tool_call_count,
-                    "message": format!("claude exit non-zero, {} chars ({:.1}s inference, {:.1}s total){}",
-                        cr.output.len(), inference_s, total_s,
-                        if cr.stderr.is_empty() { String::new() } else {
-                            format!("\n  stderr: {}", cr.stderr.chars().take(200).collect::<String>())
-                        }),
-                }));
-                let exit_status =
-                    if cr.output == "timeout" { "timeout" } else { "nonzero" };
-                let verdict = if cr.output == "timeout" {
-                    Verdict::Done { success: false, reason: "timeout".into() }
-                } else if phase.on_crash.as_deref() == Some("retry") {
-                    Verdict::Done {
-                        success: false,
-                        reason: format!("Phase {} claude exited non-zero", phase.name),
-                    }
-                } else {
-                    Verdict::Done {
-                        success: false,
-                        reason: format!("Phase {} failed: {}", phase.name, cr.output),
-                    }
-                };
-                emit_done_with_usage(&start_instant, exit_status, cr);
-                let metrics = build_metrics(cr, &verdict);
-                (verdict, cr.output.clone(), metrics)
-            }
-            Err(e) => {
+        // Validation point 3: pre-invocation check.
+        let provider = match self.provider_registry.get(provider_name) {
+            Some(p) => p,
+            None => {
+                let error_msg = format!(
+                    "provider '{}' not configured: not registered or disabled",
+                    provider_name
+                );
                 self.telemetry.emit(
                     "boi.claude.error",
                     LogLevel::Error,
@@ -457,23 +333,212 @@ impl ClaudePhaseRunner {
                         "spec_id": spec_id_hint,
                         "task_id": task_id,
                         "phase": phase.name,
-                        "message": format!("claude spawn error: {}", e),
+                        "provider": provider_name,
+                        "message": &error_msg,
                     }),
                 );
-                let error_msg = e.to_string();
-                emit_done(
-                    &start_instant,
-                    "crashed",
-                    Some(error_msg.clone()),
-                    None,
-                    None,
+                emit_done(&start_instant, "crashed", Some(error_msg.clone()), None, None);
+                return (
+                    Verdict::Done { success: false, reason: format!("Phase {} {}", phase.name, error_msg) },
+                    String::new(),
+                    PhaseMetrics {
+                        runtime: Some(provider_name.to_string()),
+                        model: phase.model.clone(),
+                        failure_mode: Some("crash".to_string()),
+                        ..Default::default()
+                    },
                 );
+            }
+        };
+
+        if let Err(e) = provider.validate_config(phase) {
+            let error_msg = format!("provider '{}' validation failed: {}", provider_name, e);
+            self.telemetry.emit(
+                "boi.claude.error",
+                LogLevel::Error,
+                &json!({
+                    "spec_id": spec_id_hint,
+                    "task_id": task_id,
+                    "phase": phase.name,
+                    "provider": provider_name,
+                    "message": &error_msg,
+                }),
+            );
+            emit_done(&start_instant, "crashed", Some(error_msg.clone()), None, None);
+            return (
+                Verdict::Done { success: false, reason: format!("Phase {} {}", phase.name, error_msg) },
+                String::new(),
+                PhaseMetrics {
+                    runtime: Some(provider_name.to_string()),
+                    model: phase.model.clone(),
+                    failure_mode: Some("crash".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let ctx = InvocationContext {
+            phase,
+            prompt: &prompt,
+            model: phase.model.as_deref().unwrap_or(""),
+            timeout: Duration::from_secs(timeout_secs),
+            spec_id,
+            task_id: task.map(|t| t.id.as_str()),
+            worktree_path,
+        };
+
+        let build_metrics_from_output =
+            |ro: &runtime::RuntimeOutput, verdict: &Verdict| -> PhaseMetrics {
+                PhaseMetrics {
+                    cost_usd: ro.cost_usd,
+                    input_tokens: ro.input_tokens,
+                    output_tokens: ro.output_tokens,
+                    cache_read_tokens: ro.cache_read_tokens,
+                    cache_creation_tokens: ro.cache_creation_tokens,
+                    cold_start_ms: Some(ro.startup_ms as i64),
+                    inference_ms: Some(ro.inference_ms as i64),
+                    ttft_ms: Some(ro.startup_ms as i64),
+                    tool_call_count: ro.tool_call_count,
+                    tool_calls_by_type: None,
+                    model: phase.model.clone(),
+                    runtime: Some(provider_name.to_string()),
+                    failure_mode: classify_failure_mode(verdict, &ro.output),
+                    verify_exit_code: None,
+                }
+            };
+
+        let emit_done_with_output =
+            |start: &Instant, exit_status: &str, ro: &runtime::RuntimeOutput| {
+                self.telemetry.emit_phase_completed(
+                    &invocation_id,
+                    &PhaseCompletionFields {
+                        completed_at: Utc::now().to_rfc3339(),
+                        duration_ms: start.elapsed().as_millis() as i64,
+                        startup_ms: Some(ro.startup_ms as i64),
+                        inference_ms: Some(ro.inference_ms as i64),
+                        input_tokens: ro.input_tokens,
+                        output_tokens: ro.output_tokens,
+                        cache_read_tokens: ro.cache_read_tokens,
+                        cache_creation_tokens: ro.cache_creation_tokens,
+                        cost_usd: ro.cost_usd,
+                        exit_status: exit_status.to_string(),
+                        exit_reason: None,
+                    },
+                );
+            };
+
+        match provider.invoke(ctx) {
+            Ok(ro) if ro.success => {
+                let inference_s = ro.inference_ms as f64 / 1000.0;
+                let total_s = ro.total_ms as f64 / 1000.0;
+                self.telemetry.emit(
+                    "boi.claude.exit",
+                    LogLevel::Debug,
+                    &json!({
+                        "spec_id": spec_id_hint,
+                        "task_id": task_id,
+                        "phase": phase.name,
+                        "provider": provider_name,
+                        "exit_code": 0,
+                        "output_length": ro.output.len(),
+                        "startup_ms": ro.startup_ms,
+                        "inference_ms": ro.inference_ms,
+                        "total_ms": ro.total_ms,
+                        "cost_usd": ro.cost_usd,
+                        "input_tokens": ro.input_tokens,
+                        "output_tokens": ro.output_tokens,
+                        "tool_call_count": ro.tool_call_count,
+                        "message": format!("{} exit 0, {} chars ({:.1}s inference, {:.1}s total)",
+                            provider_name, ro.output.len(), inference_s, total_s),
+                    }),
+                );
+                let verdict = crate::phases::parse_phase_output(phase, &ro.output);
+                emit_done_with_output(&start_instant, "success", &ro);
+                let metrics = build_metrics_from_output(&ro, &verdict);
+                (verdict, ro.output, metrics)
+            }
+            Ok(ro) => {
+                let inference_s = ro.inference_ms as f64 / 1000.0;
+                let total_s = ro.total_ms as f64 / 1000.0;
+                self.telemetry.emit(
+                    "boi.claude.exit",
+                    LogLevel::Error,
+                    &json!({
+                        "spec_id": spec_id_hint,
+                        "task_id": task_id,
+                        "phase": phase.name,
+                        "provider": provider_name,
+                        "exit_code": 1,
+                        "output_length": ro.output.len(),
+                        "startup_ms": ro.startup_ms,
+                        "inference_ms": ro.inference_ms,
+                        "total_ms": ro.total_ms,
+                        "cost_usd": ro.cost_usd,
+                        "input_tokens": ro.input_tokens,
+                        "output_tokens": ro.output_tokens,
+                        "tool_call_count": ro.tool_call_count,
+                        "message": format!("{} exit non-zero, {} chars ({:.1}s inference, {:.1}s total)",
+                            provider_name, ro.output.len(), inference_s, total_s),
+                    }),
+                );
+                let verdict = if phase.on_crash.as_deref() == Some("retry") {
+                    Verdict::Done {
+                        success: false,
+                        reason: format!("Phase {} {} exited non-zero", phase.name, provider_name),
+                    }
+                } else {
+                    Verdict::Done {
+                        success: false,
+                        reason: format!("Phase {} failed: {}", phase.name, ro.output),
+                    }
+                };
+                emit_done_with_output(&start_instant, "nonzero", &ro);
+                let metrics = build_metrics_from_output(&ro, &verdict);
+                (verdict, ro.output, metrics)
+            }
+            Err(ProviderError::Timeout { secs }) => {
+                let error_msg = format!("timeout after {}s", secs);
+                self.telemetry.emit(
+                    "boi.claude.error",
+                    LogLevel::Error,
+                    &json!({
+                        "spec_id": spec_id_hint,
+                        "task_id": task_id,
+                        "phase": phase.name,
+                        "provider": provider_name,
+                        "message": &error_msg,
+                    }),
+                );
+                emit_done(&start_instant, "timeout", Some(error_msg), None, None);
+                let verdict = Verdict::Done { success: false, reason: "timeout".into() };
+                let metrics = PhaseMetrics {
+                    runtime: Some(provider_name.to_string()),
+                    model: phase.model.clone(),
+                    failure_mode: Some("timeout".to_string()),
+                    ..Default::default()
+                };
+                (verdict, String::new(), metrics)
+            }
+            Err(e) => {
+                let error_msg = e.to_string();
+                self.telemetry.emit(
+                    "boi.claude.error",
+                    LogLevel::Error,
+                    &json!({
+                        "spec_id": spec_id_hint,
+                        "task_id": task_id,
+                        "phase": phase.name,
+                        "provider": provider_name,
+                        "message": format!("provider invoke error: {}", error_msg),
+                    }),
+                );
+                emit_done(&start_instant, "crashed", Some(error_msg.clone()), None, None);
                 let verdict = Verdict::Done {
                     success: false,
                     reason: format!("Phase {} spawn error: {}", phase.name, error_msg),
                 };
                 let metrics = PhaseMetrics {
-                    runtime: Some(resolved_runtime.to_string()),
+                    runtime: Some(provider_name.to_string()),
                     model: phase.model.clone(),
                     failure_mode: Some("crash".to_string()),
                     ..Default::default()
@@ -973,5 +1038,48 @@ mod tests {
         assert_eq!(m.tool_call_count, 0);
         assert!(m.cost_usd.is_none());
         assert!(m.model.is_none());
+    }
+
+    #[test]
+    fn test_verify_exit_code_populated_in_metrics_on_success() {
+        let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
+        let phase = make_phase("task-verify", false);
+        let task = make_task_with_verify("true");
+        let (verdict, _, metrics) = runner.run_phase_full(
+            &phase, "", Some(&task), "/tmp", 10, None,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(verdict, Verdict::Proceed);
+        assert_eq!(metrics.verify_exit_code, Some(0), "exit code 0 must be recorded for passing verify");
+        assert_eq!(metrics.runtime.as_deref(), Some("verify"), "runtime must be 'verify' for non-claude phase");
+    }
+
+    #[test]
+    fn test_verify_exit_code_populated_in_metrics_on_failure() {
+        let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
+        let phase = make_phase("task-verify", false);
+        let task = make_task_with_verify("false");
+        let (verdict, _, metrics) = runner.run_phase_full(
+            &phase, "", Some(&task), "/tmp", 10, None,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(verdict, Verdict::Redo { tasks: vec![] });
+        assert_eq!(metrics.verify_exit_code, Some(1), "exit code 1 must be recorded for failing verify");
+    }
+
+    #[test]
+    fn test_verify_exit_code_none_when_no_verify_cmd() {
+        let runner = ClaudePhaseRunner::new(test_telemetry(), "claude".to_string());
+        let phase = make_phase("task-verify", false);
+        let task = BoiTask {
+            id: "t-1".into(), title: "No verify".into(), status: TaskStatus::Pending,
+            depends: None, spec: None, verify: None, verify_prompt: None, phases: None,
+        };
+        let (verdict, _, metrics) = runner.run_phase_full(
+            &phase, "", Some(&task), "/tmp", 10, None,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(verdict, Verdict::Proceed);
+        assert_eq!(metrics.verify_exit_code, None, "no verify cmd → exit code must be None");
     }
 }

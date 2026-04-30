@@ -1,0 +1,98 @@
+title: "Medium benchmark spec — 8-task data pipeline"
+mode: execute
+context: |
+  Benchmark spec with 8 tasks simulating a data processing pipeline.
+  Tests dependency resolution, multi-step execution, and verify chains.
+  Used for medium-complexity benchmarks across experiments 1-8.
+
+tasks:
+  - id: t-1
+    title: "Create workspace directory"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_bench_medium/ directory.
+      Command: mkdir -p /tmp/boi_bench_medium
+    verify: |
+      test -d /tmp/boi_bench_medium && echo PASS
+
+  - id: t-2
+    title: "Generate input data"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create /tmp/boi_bench_medium/input.csv with 10 rows of sample data.
+      Format: id,value,category
+      Command: printf "id,value,category\n1,42,A\n2,17,B\n3,88,A\n4,5,C\n5,63,B\n6,31,A\n7,99,C\n8,12,B\n9,45,A\n10,78,C\n" > /tmp/boi_bench_medium/input.csv
+    verify: |
+      test -f /tmp/boi_bench_medium/input.csv &&
+      line_count=$(wc -l < /tmp/boi_bench_medium/input.csv) &&
+      test "$line_count" -eq 11 && echo PASS
+
+  - id: t-3
+    title: "Validate input schema"
+    status: PENDING
+    depends: [t-2]
+    spec: |
+      Verify input.csv has the expected header and all rows have 3 columns.
+      Command: head -1 /tmp/boi_bench_medium/input.csv | grep -q "id,value,category" && awk -F, 'NR>1{if(NF!=3)exit 1}' /tmp/boi_bench_medium/input.csv
+    verify: |
+      head -1 /tmp/boi_bench_medium/input.csv | grep -q "id,value,category" && echo PASS
+
+  - id: t-4
+    title: "Filter category A records"
+    status: PENDING
+    depends: [t-3]
+    spec: |
+      Extract rows with category=A from input.csv into category_a.csv.
+      Include the header row.
+      Command: head -1 /tmp/boi_bench_medium/input.csv > /tmp/boi_bench_medium/category_a.csv && grep ",A$" /tmp/boi_bench_medium/input.csv >> /tmp/boi_bench_medium/category_a.csv
+    verify: |
+      test -f /tmp/boi_bench_medium/category_a.csv &&
+      count=$(tail -n +2 /tmp/boi_bench_medium/category_a.csv | wc -l | tr -d ' ') &&
+      test "$count" -eq 4 && echo PASS
+
+  - id: t-5
+    title: "Compute category statistics"
+    status: PENDING
+    depends: [t-3]
+    spec: |
+      Compute per-category sum of values and write to stats.txt.
+      Format: CATEGORY: SUM
+      Command: awk -F, 'NR>1{a[$3]+=$2}END{for(k in a)print k": "a[k]}' /tmp/boi_bench_medium/input.csv | sort > /tmp/boi_bench_medium/stats.txt
+    verify: |
+      test -f /tmp/boi_bench_medium/stats.txt &&
+      grep -q "A:" /tmp/boi_bench_medium/stats.txt && echo PASS
+
+  - id: t-6
+    title: "Generate summary report"
+    status: PENDING
+    depends: [t-4, t-5]
+    spec: |
+      Combine category_a.csv row count and stats.txt into a summary report.
+      Command: echo "=== Pipeline Summary ===" > /tmp/boi_bench_medium/report.txt && echo "Category A records: $(tail -n +2 /tmp/boi_bench_medium/category_a.csv | wc -l | tr -d ' ')" >> /tmp/boi_bench_medium/report.txt && echo "--- Statistics ---" >> /tmp/boi_bench_medium/report.txt && cat /tmp/boi_bench_medium/stats.txt >> /tmp/boi_bench_medium/report.txt
+    verify: |
+      test -f /tmp/boi_bench_medium/report.txt &&
+      grep -q "Pipeline Summary" /tmp/boi_bench_medium/report.txt &&
+      grep -q "Category A records:" /tmp/boi_bench_medium/report.txt && echo PASS
+
+  - id: t-7
+    title: "Archive results"
+    status: PENDING
+    depends: [t-6]
+    spec: |
+      Create a tar archive of the results directory.
+      Command: tar cf /tmp/boi_bench_medium/results.tar -C /tmp/boi_bench_medium category_a.csv stats.txt report.txt
+    verify: |
+      test -f /tmp/boi_bench_medium/results.tar &&
+      tar tf /tmp/boi_bench_medium/results.tar | grep -q report.txt && echo PASS
+
+  - id: t-8
+    title: "Write completion marker"
+    status: PENDING
+    depends: [t-7]
+    spec: |
+      Write a completion marker with timestamp.
+      Command: echo "completed_at=$(date +%s)" > /tmp/boi_bench_medium/done.marker
+    verify: |
+      test -f /tmp/boi_bench_medium/done.marker &&
+      grep -q "completed_at=" /tmp/boi_bench_medium/done.marker && echo PASS

@@ -14,14 +14,14 @@ macro_rules! boi_log {
 /// Resolve the API key from config override or OPENAI_API_KEY environment variable.
 /// An empty override string is treated as "not set".
 pub fn resolve_openai_api_key(config_key: Option<&str>) -> Result<String, ProviderError> {
+    let auth_err = || ProviderError::AuthFailed {
+        provider: "codex".into(),
+        env_var: "OPENAI_API_KEY".into(),
+    };
     match config_key {
         Some(k) if !k.is_empty() => Ok(k.to_string()),
-        Some(_) => Err(ProviderError::MissingApiKey(
-            "OPENAI_API_KEY override is empty".to_string(),
-        )),
-        None => std::env::var("OPENAI_API_KEY").map_err(|_| {
-            ProviderError::MissingApiKey("OPENAI_API_KEY is not set".to_string())
-        }),
+        Some(_) => Err(auth_err()),  // empty override = explicitly no key
+        None => std::env::var("OPENAI_API_KEY").map_err(|_| auth_err()),
     }
 }
 
@@ -95,12 +95,12 @@ impl SpecProvider for CodexProvider {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) if e.kind() == ErrorKind::NotFound => {
-                return Err(ProviderError::BinaryNotFound(format!(
-                    "{}: {}",
-                    codex_bin, e
-                )));
+                return Err(ProviderError::NotConfigured {
+                    provider: "codex".into(),
+                    reason: format!("binary '{}' not found: {}", codex_bin, e),
+                });
             }
-            Err(e) => return Err(ProviderError::ExecutionFailed(e.to_string())),
+            Err(e) => return Err(ProviderError::Other(anyhow::anyhow!("{}", e))),
         };
 
         let pgid = child.id() as i32;
@@ -166,7 +166,7 @@ impl SpecProvider for CodexProvider {
 
         if timed_out {
             let _ = std::fs::remove_file(&tmp_output);
-            return Err(ProviderError::Timeout);
+            return Err(ProviderError::Timeout { secs: timeout_secs });
         }
 
         // Read the output from the temp file written by --output-last-message.
@@ -256,8 +256,8 @@ mod tests {
         };
         let result = provider.execute("test prompt", &config);
         assert!(
-            matches!(result, Err(ProviderError::BinaryNotFound(_))),
-            "expected BinaryNotFound, got {:?}",
+            matches!(result, Err(ProviderError::NotConfigured { .. })),
+            "expected NotConfigured (binary not found), got {:?}",
             result
         );
     }
@@ -274,8 +274,8 @@ mod tests {
         };
         let result = provider.execute("test prompt", &config);
         assert!(
-            matches!(result, Err(ProviderError::MissingApiKey(_))),
-            "expected MissingApiKey, got {:?}",
+            matches!(result, Err(ProviderError::AuthFailed { .. })),
+            "expected AuthFailed (missing API key), got {:?}",
             result
         );
     }
@@ -325,6 +325,6 @@ exit 0
     #[test]
     fn test_resolve_openai_api_key_empty_is_missing() {
         let result = resolve_openai_api_key(Some(""));
-        assert!(matches!(result, Err(ProviderError::MissingApiKey(_))));
+        assert!(matches!(result, Err(ProviderError::AuthFailed { .. })));
     }
 }

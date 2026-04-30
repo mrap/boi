@@ -1,0 +1,162 @@
+title: "Large benchmark spec — 15-task build system"
+mode: execute
+context: |
+  Benchmark spec with 15 tasks simulating a multi-stage build system.
+  Tests complex dependency graphs, parallel task opportunities, and
+  pipeline throughput at scale. Used for large-complexity benchmarks.
+
+tasks:
+  - id: t-1
+    title: "Initialize build directory"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_bench_large/ with subdirectories src/, build/, dist/.
+      Command: mkdir -p /tmp/boi_bench_large/{src,build,dist}
+    verify: |
+      test -d /tmp/boi_bench_large/src &&
+      test -d /tmp/boi_bench_large/build &&
+      test -d /tmp/boi_bench_large/dist && echo PASS
+
+  - id: t-2
+    title: "Generate source module A"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create src/module_a.txt with content "module_a_v1".
+      Command: echo "module_a_v1" > /tmp/boi_bench_large/src/module_a.txt
+    verify: |
+      grep -q "module_a_v1" /tmp/boi_bench_large/src/module_a.txt && echo PASS
+
+  - id: t-3
+    title: "Generate source module B"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create src/module_b.txt with content "module_b_v1".
+      Command: echo "module_b_v1" > /tmp/boi_bench_large/src/module_b.txt
+    verify: |
+      grep -q "module_b_v1" /tmp/boi_bench_large/src/module_b.txt && echo PASS
+
+  - id: t-4
+    title: "Generate source module C"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create src/module_c.txt with content "module_c_v1".
+      Command: echo "module_c_v1" > /tmp/boi_bench_large/src/module_c.txt
+    verify: |
+      grep -q "module_c_v1" /tmp/boi_bench_large/src/module_c.txt && echo PASS
+
+  - id: t-5
+    title: "Generate configuration"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create src/config.toml with build settings.
+      Command: printf '[build]\noptimize = true\ntarget = "release"\n' > /tmp/boi_bench_large/src/config.toml
+    verify: |
+      grep -q "optimize = true" /tmp/boi_bench_large/src/config.toml && echo PASS
+
+  - id: t-6
+    title: "Lint module A"
+    status: PENDING
+    depends: [t-2]
+    spec: |
+      Validate module_a.txt is non-empty and write lint result.
+      Command: test -s /tmp/boi_bench_large/src/module_a.txt && echo "lint_a=pass" > /tmp/boi_bench_large/build/lint_a.txt
+    verify: |
+      grep -q "lint_a=pass" /tmp/boi_bench_large/build/lint_a.txt && echo PASS
+
+  - id: t-7
+    title: "Lint module B"
+    status: PENDING
+    depends: [t-3]
+    spec: |
+      Validate module_b.txt is non-empty and write lint result.
+      Command: test -s /tmp/boi_bench_large/src/module_b.txt && echo "lint_b=pass" > /tmp/boi_bench_large/build/lint_b.txt
+    verify: |
+      grep -q "lint_b=pass" /tmp/boi_bench_large/build/lint_b.txt && echo PASS
+
+  - id: t-8
+    title: "Lint module C"
+    status: PENDING
+    depends: [t-4]
+    spec: |
+      Validate module_c.txt is non-empty and write lint result.
+      Command: test -s /tmp/boi_bench_large/src/module_c.txt && echo "lint_c=pass" > /tmp/boi_bench_large/build/lint_c.txt
+    verify: |
+      grep -q "lint_c=pass" /tmp/boi_bench_large/build/lint_c.txt && echo PASS
+
+  - id: t-9
+    title: "Compile module A"
+    status: PENDING
+    depends: [t-6, t-5]
+    spec: |
+      Compile module A with config settings.
+      Command: echo "compiled:$(cat /tmp/boi_bench_large/src/module_a.txt):$(grep target /tmp/boi_bench_large/src/config.toml | cut -d'"' -f2)" > /tmp/boi_bench_large/build/module_a.o
+    verify: |
+      grep -q "compiled:module_a_v1:release" /tmp/boi_bench_large/build/module_a.o && echo PASS
+
+  - id: t-10
+    title: "Compile module B"
+    status: PENDING
+    depends: [t-7, t-5]
+    spec: |
+      Compile module B with config settings.
+      Command: echo "compiled:$(cat /tmp/boi_bench_large/src/module_b.txt):$(grep target /tmp/boi_bench_large/src/config.toml | cut -d'"' -f2)" > /tmp/boi_bench_large/build/module_b.o
+    verify: |
+      grep -q "compiled:module_b_v1:release" /tmp/boi_bench_large/build/module_b.o && echo PASS
+
+  - id: t-11
+    title: "Compile module C"
+    status: PENDING
+    depends: [t-8, t-5]
+    spec: |
+      Compile module C with config settings.
+      Command: echo "compiled:$(cat /tmp/boi_bench_large/src/module_c.txt):$(grep target /tmp/boi_bench_large/src/config.toml | cut -d'"' -f2)" > /tmp/boi_bench_large/build/module_c.o
+    verify: |
+      grep -q "compiled:module_c_v1:release" /tmp/boi_bench_large/build/module_c.o && echo PASS
+
+  - id: t-12
+    title: "Link modules"
+    status: PENDING
+    depends: [t-9, t-10, t-11]
+    spec: |
+      Link all compiled modules into a single binary.
+      Command: cat /tmp/boi_bench_large/build/module_a.o /tmp/boi_bench_large/build/module_b.o /tmp/boi_bench_large/build/module_c.o > /tmp/boi_bench_large/build/linked.bin
+    verify: |
+      test -f /tmp/boi_bench_large/build/linked.bin &&
+      line_count=$(wc -l < /tmp/boi_bench_large/build/linked.bin) &&
+      test "$line_count" -eq 3 && echo PASS
+
+  - id: t-13
+    title: "Run test suite"
+    status: PENDING
+    depends: [t-12]
+    spec: |
+      Verify the linked binary contains all expected modules.
+      Command: grep -c "compiled:" /tmp/boi_bench_large/build/linked.bin | xargs test 3 -eq && echo "tests=3/3 passed" > /tmp/boi_bench_large/build/test_results.txt
+    verify: |
+      grep -q "tests=3/3 passed" /tmp/boi_bench_large/build/test_results.txt && echo PASS
+
+  - id: t-14
+    title: "Package distribution"
+    status: PENDING
+    depends: [t-13]
+    spec: |
+      Copy linked binary to dist/ with version metadata.
+      Command: cp /tmp/boi_bench_large/build/linked.bin /tmp/boi_bench_large/dist/app.bin && echo "version=1.0.0" > /tmp/boi_bench_large/dist/manifest.txt && echo "modules=3" >> /tmp/boi_bench_large/dist/manifest.txt
+    verify: |
+      test -f /tmp/boi_bench_large/dist/app.bin &&
+      grep -q "version=1.0.0" /tmp/boi_bench_large/dist/manifest.txt && echo PASS
+
+  - id: t-15
+    title: "Generate build report"
+    status: PENDING
+    depends: [t-14]
+    spec: |
+      Write final build report with all artifact checksums.
+      Command: echo "=== Build Report ===" > /tmp/boi_bench_large/dist/build_report.txt && echo "artifacts:" >> /tmp/boi_bench_large/dist/build_report.txt && wc -c /tmp/boi_bench_large/dist/app.bin >> /tmp/boi_bench_large/dist/build_report.txt && echo "status: SUCCESS" >> /tmp/boi_bench_large/dist/build_report.txt
+    verify: |
+      test -f /tmp/boi_bench_large/dist/build_report.txt &&
+      grep -q "status: SUCCESS" /tmp/boi_bench_large/dist/build_report.txt && echo PASS

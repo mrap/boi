@@ -1,0 +1,11 @@
+# Experiment 5: Conditional Phase Execution — Arm S (strawman)
+# IV: Phase skip policy
+# Config: Skip ALL optional phases — only execute + task-verify remain
+# Override: None — pipeline TOML defines the minimal set directly
+# Purpose: Expected to dramatically reduce invocations but degrade quality
+
+[pipeline]
+name = "experiment-condphase-armS"
+spec_phases = []
+task_phases = ["execute", "task-verify"]
+post_phases = []

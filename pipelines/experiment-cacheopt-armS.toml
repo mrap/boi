@@ -1,0 +1,11 @@
+# Experiment 3: Prompt Cache Optimization — Arm S (strawman)
+# IV: Prompt structure
+# Config: Cache-eligible prefix with RANDOMIZED content (guarantees 0% cache hits)
+# Override: Enable cache annotation but randomize prefix per invocation
+# Purpose: Validates TTFT improvement comes from actual cache hits
+
+[pipeline]
+name = "experiment-cacheopt-armS"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

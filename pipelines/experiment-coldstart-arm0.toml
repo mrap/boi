@@ -1,0 +1,10 @@
+# Experiment 1: Cold-Start Runtime Swap — Arm 0 (current default)
+# IV: Runtime dispatch method
+# Config: Claude CLI, bare=true (deployed 2026-04-29)
+# Override: None — uses current production config
+
+[pipeline]
+name = "experiment-coldstart-arm0"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

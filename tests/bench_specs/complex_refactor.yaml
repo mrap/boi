@@ -1,0 +1,141 @@
+title: "Complex refactor benchmark spec — 12-task restructuring"
+mode: execute
+context: |
+  Benchmark spec simulating a complex refactoring operation.
+  Mixes code, config, and documentation changes. No phase should be skipped.
+  Experiment 5 control: should NOT trigger any skip rules (full pipeline required).
+  Also used for experiments 7 and 8 to exercise failure-prone scenarios.
+
+tasks:
+  - id: t-1
+    title: "Create refactor workspace"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_bench_refactor/ with old/ and new/ subdirectories.
+      Command: mkdir -p /tmp/boi_bench_refactor/{old,new,docs}
+    verify: |
+      test -d /tmp/boi_bench_refactor/old &&
+      test -d /tmp/boi_bench_refactor/new &&
+      test -d /tmp/boi_bench_refactor/docs && echo PASS
+
+  - id: t-2
+    title: "Create legacy module"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create old/legacy.sh simulating legacy code.
+      Command: printf '#!/bin/sh\n# Legacy implementation\nprocess() {\n  echo "legacy_result=$1"\n}\nprocess "$@"\n' > /tmp/boi_bench_refactor/old/legacy.sh && chmod +x /tmp/boi_bench_refactor/old/legacy.sh
+    verify: |
+      test -x /tmp/boi_bench_refactor/old/legacy.sh &&
+      /tmp/boi_bench_refactor/old/legacy.sh test | grep -q "legacy_result=test" && echo PASS
+
+  - id: t-3
+    title: "Create legacy config"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create old/config.ini with legacy configuration format.
+      Command: printf '[settings]\nmode=legacy\nverbose=true\nmax_retries=3\n' > /tmp/boi_bench_refactor/old/config.ini
+    verify: |
+      test -f /tmp/boi_bench_refactor/old/config.ini &&
+      grep -q "mode=legacy" /tmp/boi_bench_refactor/old/config.ini && echo PASS
+
+  - id: t-4
+    title: "Analyze legacy code"
+    status: PENDING
+    depends: [t-2, t-3]
+    spec: |
+      Generate an analysis report of the legacy module.
+      Count functions, config keys, and total lines.
+      Command: echo "functions=$(grep -c '()' /tmp/boi_bench_refactor/old/legacy.sh)" > /tmp/boi_bench_refactor/analysis.txt && echo "config_keys=$(grep -c '=' /tmp/boi_bench_refactor/old/config.ini)" >> /tmp/boi_bench_refactor/analysis.txt && echo "total_lines=$(cat /tmp/boi_bench_refactor/old/legacy.sh /tmp/boi_bench_refactor/old/config.ini | wc -l | tr -d ' ')" >> /tmp/boi_bench_refactor/analysis.txt
+    verify: |
+      test -f /tmp/boi_bench_refactor/analysis.txt &&
+      grep -q "functions=" /tmp/boi_bench_refactor/analysis.txt && echo PASS
+
+  - id: t-5
+    title: "Create new module"
+    status: PENDING
+    depends: [t-4]
+    spec: |
+      Create new/processor.sh as the refactored replacement.
+      Command: printf '#!/bin/sh\n# Refactored implementation\nprocess() {\n  local input="$1"\n  local mode="${2:-default}"\n  echo "result=${input}_${mode}"\n}\nprocess "$@"\n' > /tmp/boi_bench_refactor/new/processor.sh && chmod +x /tmp/boi_bench_refactor/new/processor.sh
+    verify: |
+      test -x /tmp/boi_bench_refactor/new/processor.sh &&
+      /tmp/boi_bench_refactor/new/processor.sh test | grep -q "result=test_default" && echo PASS
+
+  - id: t-6
+    title: "Convert config format"
+    status: PENDING
+    depends: [t-3]
+    spec: |
+      Convert old/config.ini to new/config.toml format.
+      Command: printf '[settings]\nmode = "modern"\nverbose = true\nmax_retries = 3\n' > /tmp/boi_bench_refactor/new/config.toml
+    verify: |
+      test -f /tmp/boi_bench_refactor/new/config.toml &&
+      grep -q 'mode = "modern"' /tmp/boi_bench_refactor/new/config.toml && echo PASS
+
+  - id: t-7
+    title: "Create compatibility adapter"
+    status: PENDING
+    depends: [t-5, t-2]
+    spec: |
+      Create new/compat.sh that wraps the new processor with the legacy interface.
+      Command: printf '#!/bin/sh\n# Compatibility wrapper\n/tmp/boi_bench_refactor/new/processor.sh "$1" legacy | sed "s/result=/legacy_result=/"\n' > /tmp/boi_bench_refactor/new/compat.sh && chmod +x /tmp/boi_bench_refactor/new/compat.sh
+    verify: |
+      test -x /tmp/boi_bench_refactor/new/compat.sh &&
+      /tmp/boi_bench_refactor/new/compat.sh test | grep -q "legacy_result=test_legacy" && echo PASS
+
+  - id: t-8
+    title: "Run regression tests"
+    status: PENDING
+    depends: [t-7]
+    spec: |
+      Verify the compatibility adapter produces the same output pattern as legacy.
+      Command: legacy=$(/tmp/boi_bench_refactor/old/legacy.sh foo) && compat=$(/tmp/boi_bench_refactor/new/compat.sh foo) && echo "legacy=$legacy" > /tmp/boi_bench_refactor/regression.txt && echo "compat=$compat" >> /tmp/boi_bench_refactor/regression.txt && echo "match=$(test "$legacy" = "$compat" && echo true || echo false)" >> /tmp/boi_bench_refactor/regression.txt
+    verify: |
+      test -f /tmp/boi_bench_refactor/regression.txt &&
+      grep -q "match=" /tmp/boi_bench_refactor/regression.txt && echo PASS
+
+  - id: t-9
+    title: "Write migration guide"
+    status: PENDING
+    depends: [t-5, t-6]
+    spec: |
+      Create docs/migration.md documenting the refactoring changes.
+      Include: what changed, new config format, new API.
+    verify: |
+      test -f /tmp/boi_bench_refactor/docs/migration.md &&
+      grep -q "migration\|Migration\|refactor\|Refactor" /tmp/boi_bench_refactor/docs/migration.md && echo PASS
+
+  - id: t-10
+    title: "Update changelog"
+    status: PENDING
+    depends: [t-5, t-6, t-7]
+    spec: |
+      Create docs/CHANGELOG.md with an entry for the refactoring.
+      Command: printf '# Changelog\n\n## 2.0.0\n\n- Refactored legacy module to new processor\n- Converted config from INI to TOML\n- Added compatibility adapter\n' > /tmp/boi_bench_refactor/docs/CHANGELOG.md
+    verify: |
+      test -f /tmp/boi_bench_refactor/docs/CHANGELOG.md &&
+      grep -q "2.0.0" /tmp/boi_bench_refactor/docs/CHANGELOG.md && echo PASS
+
+  - id: t-11
+    title: "Generate deprecation notices"
+    status: PENDING
+    depends: [t-4, t-9]
+    spec: |
+      Add deprecation headers to legacy files.
+      Command: sed -i.bak '1a\# DEPRECATED: Use new/processor.sh instead. See docs/migration.md' /tmp/boi_bench_refactor/old/legacy.sh && sed -i.bak '1a\# DEPRECATED: Use new/config.toml instead' /tmp/boi_bench_refactor/old/config.ini
+    verify: |
+      grep -q "DEPRECATED" /tmp/boi_bench_refactor/old/legacy.sh &&
+      grep -q "DEPRECATED" /tmp/boi_bench_refactor/old/config.ini && echo PASS
+
+  - id: t-12
+    title: "Final validation and summary"
+    status: PENDING
+    depends: [t-8, t-10, t-11]
+    spec: |
+      Generate final refactor summary with counts of files changed.
+      Command: echo "=== Refactor Summary ===" > /tmp/boi_bench_refactor/summary.txt && echo "old_files=$(ls /tmp/boi_bench_refactor/old/ | wc -l | tr -d ' ')" >> /tmp/boi_bench_refactor/summary.txt && echo "new_files=$(ls /tmp/boi_bench_refactor/new/ | wc -l | tr -d ' ')" >> /tmp/boi_bench_refactor/summary.txt && echo "doc_files=$(ls /tmp/boi_bench_refactor/docs/ | wc -l | tr -d ' ')" >> /tmp/boi_bench_refactor/summary.txt && echo "status=COMPLETE" >> /tmp/boi_bench_refactor/summary.txt
+    verify: |
+      test -f /tmp/boi_bench_refactor/summary.txt &&
+      grep -q "status=COMPLETE" /tmp/boi_bench_refactor/summary.txt && echo PASS

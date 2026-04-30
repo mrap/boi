@@ -1,0 +1,10 @@
+# Experiment 2: Per-Phase Model Assignment — Arm S (strawman)
+# IV: Model assignment policy
+# Config: Haiku 4.5 for ALL phases including execute
+# Override: Set model="claude-haiku-4-5" on ALL phase TOMLs
+
+[pipeline]
+name = "experiment-modelassign-armS"
+spec_phases = ["plan-critique", "spec-critique", "critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

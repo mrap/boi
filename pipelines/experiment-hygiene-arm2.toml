@@ -1,0 +1,11 @@
+# Experiment 4: Prompt Hygiene Bundle — Arm 2
+# IV: Prompt content policy
+# Config: Tool allowlist + spec content compression
+#   Only pass relevant spec fields per phase
+# Override: Set tool_allowlist + enable spec_compression per phase
+
+[pipeline]
+name = "experiment-hygiene-arm2"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

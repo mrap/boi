@@ -1,0 +1,11 @@
+# Experiment 8: Adaptive Timeout + Early Kill — Arm 1 (treatment)
+# IV: Timeout policy
+# Config: Adaptive timeout = 2x historical p95 duration per phase type
+#   Computed from past 100 phase_runs of each type
+# Override: Set timeout_policy="adaptive", timeout_multiplier=2.0
+
+[pipeline]
+name = "experiment-timeout-arm1"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

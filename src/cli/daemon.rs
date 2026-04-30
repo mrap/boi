@@ -1,7 +1,7 @@
 use crate::fmt::{ensure_db_dir, is_pid_alive};
 use crate::spawn::pid_dir;
 use crate::telemetry::Telemetry;
-use crate::{config, hooks, queue, worker};
+use crate::{config, hooks, phases, queue, runtime, worker};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -234,6 +234,16 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         "[boi daemon] started (pid {}), max_workers={}",
         pid, wc.max_workers
     );
+
+    // Validation point 2: warn loudly at startup for any phase whose `runtime`
+    // field names a provider that is disabled or missing (e.g. no API key).
+    // This surfaces the OpenRouter-runtime-drop class of bugs at daemon start
+    // instead of silently falling through to Claude at invocation time.
+    {
+        let provider_registry = runtime::ProviderRegistry::new();
+        let phase_registry = phases::PhaseRegistry::new();
+        provider_registry.validate_phases(phase_registry.list().into_iter());
+    }
 
     let active: std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

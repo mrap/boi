@@ -1,0 +1,53 @@
+title: "No-file-change benchmark spec — read-only analysis"
+mode: execute
+context: |
+  Benchmark spec where tasks only read and analyze existing data without
+  modifying tracked files. All output goes to /tmp/ (outside workspace).
+  Experiment 5 control: should trigger commit + doc-update skip rules
+  (no workspace files changed).
+
+tasks:
+  - id: t-1
+    title: "Analyze system environment"
+    status: PENDING
+    spec: |
+      Capture system info to /tmp/boi_bench_readonly/.
+      Command: mkdir -p /tmp/boi_bench_readonly && uname -a > /tmp/boi_bench_readonly/sysinfo.txt
+    verify: |
+      test -f /tmp/boi_bench_readonly/sysinfo.txt &&
+      test -s /tmp/boi_bench_readonly/sysinfo.txt && echo PASS
+
+  - id: t-2
+    title: "Count files in workspace"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Count total files in the current workspace (read-only operation).
+      Write count to /tmp/boi_bench_readonly/file_count.txt.
+      Command: find . -type f 2>/dev/null | wc -l | tr -d ' ' > /tmp/boi_bench_readonly/file_count.txt
+    verify: |
+      test -f /tmp/boi_bench_readonly/file_count.txt &&
+      count=$(cat /tmp/boi_bench_readonly/file_count.txt) &&
+      test "$count" -ge 0 && echo PASS
+
+  - id: t-3
+    title: "Compute directory structure hash"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Compute a hash of the directory listing (read-only snapshot).
+      Command: ls -laR . 2>/dev/null | shasum -a 256 | cut -d' ' -f1 > /tmp/boi_bench_readonly/dir_hash.txt
+    verify: |
+      test -f /tmp/boi_bench_readonly/dir_hash.txt &&
+      test "$(wc -c < /tmp/boi_bench_readonly/dir_hash.txt | tr -d ' ')" -ge 64 && echo PASS
+
+  - id: t-4
+    title: "Generate analysis report"
+    status: PENDING
+    depends: [t-2, t-3]
+    spec: |
+      Combine analysis results into a report.
+      Command: echo "=== Read-Only Analysis ===" > /tmp/boi_bench_readonly/report.txt && cat /tmp/boi_bench_readonly/sysinfo.txt >> /tmp/boi_bench_readonly/report.txt && echo "Files: $(cat /tmp/boi_bench_readonly/file_count.txt)" >> /tmp/boi_bench_readonly/report.txt && echo "Hash: $(cat /tmp/boi_bench_readonly/dir_hash.txt)" >> /tmp/boi_bench_readonly/report.txt && echo "status=COMPLETE" >> /tmp/boi_bench_readonly/report.txt
+    verify: |
+      test -f /tmp/boi_bench_readonly/report.txt &&
+      grep -q "status=COMPLETE" /tmp/boi_bench_readonly/report.txt && echo PASS

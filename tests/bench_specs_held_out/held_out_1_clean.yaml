@@ -1,0 +1,44 @@
+title: "Held-out fixture 1: clean spec (expected critic verdict: APPROVE)"
+mode: execute
+context: |
+  Held-out validation fixture for Experiment 6 (fork-and-vote reliability).
+  This spec is designed to produce a clean successful execution with no
+  quality issues. Expected critic verdict: APPROVE.
+
+  LOCKED: 2026-04-29. Do not modify after this date.
+
+tasks:
+  - id: t-1
+    title: "Create scratch directory"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_held_out_1/ directory.
+      Command: mkdir -p /tmp/boi_held_out_1
+    verify: |
+      test -d /tmp/boi_held_out_1 && echo PASS
+
+  - id: t-2
+    title: "Write versioned data file"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Write a JSON file at /tmp/boi_held_out_1/data.json with keys:
+        version: "1.0"
+        name: "held-out-fixture"
+        created: "2026-04-29"
+      Command: printf '{"version":"1.0","name":"held-out-fixture","created":"2026-04-29"}\n' > /tmp/boi_held_out_1/data.json
+    verify: |
+      test -f /tmp/boi_held_out_1/data.json &&
+      python3 -c "import json,sys; d=json.load(open('/tmp/boi_held_out_1/data.json')); assert d['version']=='1.0'; assert d['name']=='held-out-fixture'; print('PASS')"
+
+  - id: t-3
+    title: "Write checksum file"
+    status: PENDING
+    depends: [t-2]
+    spec: |
+      Compute the SHA-256 checksum of /tmp/boi_held_out_1/data.json and write
+      it to /tmp/boi_held_out_1/data.json.sha256.
+      Command: shasum -a 256 /tmp/boi_held_out_1/data.json > /tmp/boi_held_out_1/data.json.sha256
+    verify: |
+      test -f /tmp/boi_held_out_1/data.json.sha256 &&
+      shasum -a 256 -c /tmp/boi_held_out_1/data.json.sha256 2>&1 | grep -q "OK" && echo PASS

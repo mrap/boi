@@ -1,0 +1,86 @@
+title: "Held-out fixture 3: edge case spec (expected critic verdict: AMBIGUOUS)"
+mode: execute
+context: |
+  Held-out validation fixture for Experiment 6 (fork-and-vote reliability).
+  This spec represents an edge case: tasks are individually well-defined but
+  there is a logical gap — t-3 claims to verify t-2's output, but t-2 produces
+  a probabilistic result (file size depends on runtime timing). The spec is
+  technically correct but has a latent correctness risk.
+
+  Expected critic verdict: AMBIGUOUS — could approve (individual tasks pass)
+  or flag (systemic verify fragility).
+
+  LOCKED: 2026-04-29. Do not modify after this date.
+
+tasks:
+  - id: t-1
+    title: "Create output directory"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_held_out_3/ directory.
+      Command: mkdir -p /tmp/boi_held_out_3
+    verify: |
+      test -d /tmp/boi_held_out_3 && echo PASS
+
+  - id: t-2
+    title: "Collect process snapshot"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Write a snapshot of current running processes to /tmp/boi_held_out_3/procs.txt.
+      Include PID, CPU, and command name.
+      Command: ps aux | head -20 > /tmp/boi_held_out_3/procs.txt
+    verify: |
+      test -f /tmp/boi_held_out_3/procs.txt &&
+      test "$(wc -l < /tmp/boi_held_out_3/procs.txt)" -gt 5 && echo PASS
+
+  - id: t-3
+    title: "Summarize process count by state"
+    status: PENDING
+    depends: [t-2]
+    spec: |
+      Parse /tmp/boi_held_out_3/procs.txt and count processes grouped by state
+      (R=running, S=sleeping, D=disk wait, Z=zombie).
+      Write counts to /tmp/boi_held_out_3/state_counts.json as {"R": N, "S": N, ...}.
+      Command: python3 -c "
+import json
+counts = {}
+with open('/tmp/boi_held_out_3/procs.txt') as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) >= 8 and parts[7] != 'STAT':
+            state = parts[7][0]
+            counts[state] = counts.get(state, 0) + 1
+with open('/tmp/boi_held_out_3/state_counts.json', 'w') as f:
+    json.dump(counts, f)
+print('done')
+"
+    verify: |
+      test -f /tmp/boi_held_out_3/state_counts.json &&
+      python3 -c "import json; d=json.load(open('/tmp/boi_held_out_3/state_counts.json')); assert isinstance(d, dict); assert len(d) > 0; print('PASS')"
+
+  - id: t-4
+    title: "Write final audit file"
+    status: PENDING
+    depends: [t-3]
+    spec: |
+      Write /tmp/boi_held_out_3/audit.txt summarizing the process snapshot:
+        Line 1: "snapshot_time: <ISO8601 timestamp>"
+        Line 2: "total_processes: <count from procs.txt>"
+        Line 3: "state_breakdown: <one-line JSON from state_counts.json>"
+      Command: python3 -c "
+from datetime import datetime, timezone
+import json
+total = sum(1 for _ in open('/tmp/boi_held_out_3/procs.txt')) - 1
+states = json.load(open('/tmp/boi_held_out_3/state_counts.json'))
+with open('/tmp/boi_held_out_3/audit.txt', 'w') as f:
+    f.write(f'snapshot_time: {datetime.now(timezone.utc).isoformat()}\n')
+    f.write(f'total_processes: {total}\n')
+    f.write(f'state_breakdown: {json.dumps(states)}\n')
+print('done')
+"
+    verify: |
+      test -f /tmp/boi_held_out_3/audit.txt &&
+      grep -q "^snapshot_time:" /tmp/boi_held_out_3/audit.txt &&
+      grep -q "^total_processes:" /tmp/boi_held_out_3/audit.txt &&
+      grep -q "^state_breakdown:" /tmp/boi_held_out_3/audit.txt && echo PASS

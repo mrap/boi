@@ -1,0 +1,10 @@
+# Experiment 4: Prompt Hygiene Bundle — Arm 0 (control/baseline)
+# IV: Prompt content policy
+# Config: Current prompts, all tools available to all phases
+# Override: None
+
+[pipeline]
+name = "experiment-hygiene-arm0"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []

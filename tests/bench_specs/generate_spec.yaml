@@ -1,0 +1,75 @@
+title: "Generate-mode benchmark spec — 5-task code generator"
+mode: generate
+context: |
+  Benchmark spec using generate mode with 5 tasks.
+  Exercises the full generate pipeline: decompose + execute + code-review + task-verify.
+  Used for benchmarking generate-mode-specific behavior across experiments 1-5.
+
+tasks:
+  - id: t-1
+    title: "Create project structure"
+    status: PENDING
+    spec: |
+      Create /tmp/boi_bench_generate/ with lib/ and tests/ subdirectories.
+      Create lib/__init__.py (empty) and tests/__init__.py (empty).
+      Command: mkdir -p /tmp/boi_bench_generate/{lib,tests} && touch /tmp/boi_bench_generate/lib/__init__.py /tmp/boi_bench_generate/tests/__init__.py
+    verify: |
+      test -d /tmp/boi_bench_generate/lib &&
+      test -d /tmp/boi_bench_generate/tests &&
+      test -f /tmp/boi_bench_generate/lib/__init__.py && echo PASS
+
+  - id: t-2
+    title: "Generate data model"
+    status: PENDING
+    depends: [t-1]
+    spec: |
+      Create lib/model.py with a simple Item dataclass.
+      Content:
+        from dataclasses import dataclass
+        @dataclass
+        class Item:
+            name: str
+            value: int
+            active: bool = True
+    verify: |
+      test -f /tmp/boi_bench_generate/lib/model.py &&
+      grep -q "class Item" /tmp/boi_bench_generate/lib/model.py &&
+      grep -q "dataclass" /tmp/boi_bench_generate/lib/model.py && echo PASS
+
+  - id: t-3
+    title: "Generate storage module"
+    status: PENDING
+    depends: [t-2]
+    spec: |
+      Create lib/store.py with an in-memory ItemStore class.
+      Methods: add(item: Item), get(name: str) -> Item | None, list_all() -> list[Item]
+      Uses a dict internally keyed by name.
+    verify: |
+      test -f /tmp/boi_bench_generate/lib/store.py &&
+      grep -q "class ItemStore" /tmp/boi_bench_generate/lib/store.py &&
+      grep -q "def add" /tmp/boi_bench_generate/lib/store.py &&
+      grep -q "def get" /tmp/boi_bench_generate/lib/store.py && echo PASS
+
+  - id: t-4
+    title: "Generate test suite"
+    status: PENDING
+    depends: [t-3]
+    spec: |
+      Create tests/test_store.py with unit tests for ItemStore.
+      Test: add + get returns same item, get missing returns None, list_all returns all items.
+      Use unittest.TestCase.
+    verify: |
+      test -f /tmp/boi_bench_generate/tests/test_store.py &&
+      grep -q "class.*TestCase" /tmp/boi_bench_generate/tests/test_store.py &&
+      grep -q "def test_" /tmp/boi_bench_generate/tests/test_store.py && echo PASS
+
+  - id: t-5
+    title: "Generate README"
+    status: PENDING
+    depends: [t-2, t-3]
+    spec: |
+      Create README.md at project root describing the generated module.
+      Include: project title, module description, usage example.
+    verify: |
+      test -f /tmp/boi_bench_generate/README.md &&
+      grep -q "Item" /tmp/boi_bench_generate/README.md && echo PASS

@@ -1,0 +1,12 @@
+# Experiment 3: Prompt Cache Optimization — Arm 1 (treatment)
+# IV: Prompt structure
+# Config: Restructured prompts with stable >=1024-token system prefix,
+#         cache_control: {"type": "ephemeral"} on prefix blocks
+# Override: Enable cache-optimized prompt templates on all phases
+# Prerequisite: Requires API dispatch (Experiment 1 Arm 2 or 3)
+
+[pipeline]
+name = "experiment-cacheopt-arm1"
+spec_phases = ["critic"]
+task_phases = ["execute", "task-verify"]
+post_phases = []
