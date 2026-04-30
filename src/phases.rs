@@ -219,13 +219,12 @@ impl PhaseConfig {
         let completion_handler = toml.completion_handler.clone();
 
         // Derive requires_claude: explicit [phase] setting wins, else derive from worker.runtime.
-        // "deterministic" and any non-"claude" value → false.
+        // Only "deterministic" skips LLM dispatch; all other runtimes (claude, openrouter,
+        // codex, None) need provider dispatch.
         let requires_claude = toml
             .phase.as_ref().and_then(|p| p.requires_claude)
             .unwrap_or_else(|| {
-                runtime.as_deref()
-                    .map(|r| r == "claude")
-                    .unwrap_or(true)
+                runtime.as_deref() != Some("deterministic")
             });
 
         let completion = toml.completion.as_ref();
