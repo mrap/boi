@@ -55,7 +55,7 @@ ClaudePhaseRunner::run_phase_inner() -> PhaseMetrics
   Adds: model (from PhaseConfig), runtime (resolved), failure_mode (classified)
 
 worker::record_phase_run()
-  Adds: attempt (from retry loop), pipeline_id (from bench context)
+  Adds: attempt (from retry loop), pipeline_id (NOT YET WIRED — all call sites pass None; see B1 in design-review gate)
   Writes: INSERT INTO phase_runs with all columns
 ```
 

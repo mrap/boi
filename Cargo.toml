@@ -16,6 +16,8 @@ signal-hook = "0.3"
 libc = "0.2"
 rand = "0.8"
 crossterm = "0.28"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+rust_decimal = "1"
 
 [profile.release]
 strip = true

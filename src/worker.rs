@@ -11,6 +11,8 @@ use crate::{
 };
 use chrono::Utc;
 use serde_json::json;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 macro_rules! boi_log {
     ($($arg:tt)*) => {
@@ -469,6 +471,19 @@ pub fn run_worker_with_phases(
         boi_spec.task_phases.as_deref(),
     );
 
+    // Compute a short pipeline fingerprint: hash(mode + phase lists + binary version).
+    // This lets telemetry attribute phase_run rows to a specific pipeline configuration.
+    let pipeline_id: String = {
+        let mut h = DefaultHasher::new();
+        mode.hash(&mut h);
+        pipeline.spec_pre_phases.hash(&mut h);
+        pipeline.spec_phases.hash(&mut h);
+        pipeline.spec_post_phases.hash(&mut h);
+        pipeline.task_phases.hash(&mut h);
+        env!("CARGO_PKG_VERSION").hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+
     // All task IDs are canonical (loaded from DB). No YAML-to-DB mapping needed.
     let mut task_map: HashMap<String, spec::BoiTask> = boi_spec
         .tasks
@@ -657,7 +672,7 @@ pub fn run_worker_with_phases(
                     &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, None, Some((spec_loop_count as i64) + 1));
+                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, Some(&pipeline_id), Some((spec_loop_count as i64) + 1));
 
                 emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
 
@@ -933,7 +948,7 @@ pub fn run_worker_with_phases(
                     &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, None, Some(1));
+                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, Some(&pipeline_id), Some(1));
 
                 emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &verdict, elapsed_ms);
 
@@ -1098,7 +1113,7 @@ pub fn run_worker_with_phases(
                     &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &retry_verdict, &phase_started_at, elapsed_ms, &retry_metrics, attempt as i64, None, Some(attempt as i64 + 1));
+                record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &retry_verdict, &phase_started_at, elapsed_ms, &retry_metrics, attempt as i64, Some(&pipeline_id), Some(attempt as i64 + 1));
 
                 emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &retry_verdict, elapsed_ms);
 
@@ -1254,7 +1269,7 @@ pub fn run_worker_with_phases(
                     &prompt_vars,
                 );
                 let elapsed_ms = phase_start.elapsed().as_millis() as i64;
-                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, None, Some((spec_redo_count as i64) + 1));
+                record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, Some(&pipeline_id), Some((spec_redo_count as i64) + 1));
 
                 emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
 
