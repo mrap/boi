@@ -173,6 +173,12 @@ enum Commands {
         /// Output results as JSON
         #[arg(long)]
         json: bool,
+        /// Run containers remotely (fly | local)
+        #[arg(long, default_value = "local")]
+        remote: String,
+        /// Max parallel remote containers when --remote=fly
+        #[arg(long, default_value = "4")]
+        concurrency: u32,
     },
     /// Launch interactive TUI dashboard
     Dashboard,
@@ -335,7 +341,7 @@ fn main() {
         Commands::Version => {
             println!("boi {}", env!("CARGO_PKG_VERSION"));
         }
-        Commands::Bench { phase, spec, battery, pipelines, runs, json } => {
+        Commands::Bench { phase, spec, battery, pipelines, runs, json, remote, concurrency } => {
             if let Some(phase_name) = phase {
                 let spec_path = spec.unwrap_or_else(|| {
                     eprintln!("error: --phase requires --spec <file>");
@@ -385,7 +391,7 @@ fn main() {
                 std::process::exit(1);
             }
 
-            cmd_bench(&spec_paths, &pipeline_entries, runs, db_str, json);
+            cmd_bench(&spec_paths, &pipeline_entries, runs, db_str, json, &remote, concurrency);
         }
         Commands::Dashboard => {
             run_dashboard(db_str);

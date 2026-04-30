@@ -30,6 +30,7 @@ boi (Rust binary)
 | Config | `src/config.rs` | Load ~/.boi/config.yaml, defaults for everything |
 | Telemetry | `src/telemetry.rs` | Append-only JSONL at ~/.boi/telemetry/boi.jsonl |
 | Worktree | `src/worktree.rs` | Git worktree create/cleanup/prune |
+| Runtime | `src/runtime/` | Provider trait, ProviderRegistry, built-in providers (claude, openrouter, codex, deterministic) |
 
 ### Flow
 
@@ -76,6 +77,7 @@ boi telemetry <spec-id>
 boi spec <spec-id> [add|skip|block]
 boi doctor
 boi version
+boi providers list
 ```
 
 ### Spec format (YAML)
@@ -93,6 +95,20 @@ tasks:
       What to do.
     verify: "command that returns 0 on success"
 ```
+
+### Provider Architecture
+
+Every LLM phase is dispatched through the `Provider` trait in `src/runtime/`. The runner does a single `registry.get(provider_name)` lookup — no if/else chains on runtime strings.
+
+Built-in providers (registered at startup):
+- `claude` — ClaudeCLIProvider, always active, wraps `claude -p`
+- `openrouter` — requires `OPENROUTER_API_KEY`; auto-disabled at startup if absent
+- `codex` — requires `OPENAI_API_KEY`; auto-disabled at startup if absent
+- `deterministic` — builtin handler executor for commit/merge/cleanup phases; no LLM
+
+Validation fires at three points: registration time, phase TOML load time (loud WARN to stderr if a phase's `runtime` is disabled), and pre-invocation. This makes misconfigured providers surface loudly at startup rather than silently falling through.
+
+`boi providers list` shows which providers are active vs. disabled and why. See [docs/providers.md](docs/providers.md) for the full architecture, how to add a new provider, and the ProviderError taxonomy.
 
 ### Python archive
 

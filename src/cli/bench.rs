@@ -1,8 +1,10 @@
 use crate::fmt::{ensure_db_dir, BOLD, CYAN, GREEN, RESET};
+use crate::remote::FlyDispatcher;
 use crate::{queue, spec};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(serde::Deserialize)]
 struct PipelineTomlFile {
@@ -18,6 +20,15 @@ pub struct PipelineToml {
     pub task_phases: Vec<String>,
     #[serde(default)]
     pub post_phases: Vec<String>,
+}
+
+struct RemoteWorkItem {
+    spec_path: PathBuf,
+    spec_content: String,
+    pipeline_name: String,
+    pipeline_cfg: PipelineToml,
+    run_num: i64,
+    run_id: String,
 }
 
 pub fn load_pipeline_config(path: &Path) -> PipelineToml {
@@ -43,6 +54,8 @@ pub fn cmd_bench(
     runs: u32,
     db_str: &str,
     json: bool,
+    remote: &str,
+    concurrency: u32,
 ) {
     let pipeline_configs: Vec<(String, PipelineToml)> = pipelines
         .iter()
@@ -50,13 +63,19 @@ pub fn cmd_bench(
         .collect();
 
     let total_runs = spec_paths.len() * pipeline_configs.len() * runs as usize;
+    let mode_label = if remote == "fly" { " [remote:fly]" } else { "" };
     println!(
-        "{BOLD}BATTERY: {} specs × {} pipelines × {} runs = {} total runs{RESET}",
+        "{BOLD}BATTERY{mode_label}: {} specs × {} pipelines × {} runs = {} total runs{RESET}",
         spec_paths.len(),
         pipeline_configs.len(),
         runs,
         total_runs
     );
+
+    if remote == "fly" {
+        cmd_bench_fly(spec_paths, &pipeline_configs, runs, concurrency, db_str, json);
+        return;
+    }
 
     ensure_db_dir(db_str);
     let q = match queue::Queue::open(db_str) {
@@ -512,6 +531,253 @@ fn fmt_ms(ms: i64) -> String {
     }
 }
 
+
+// ── Fly.io remote dispatch ────────────────────────────────────────────────────
+
+fn cmd_bench_fly(
+    spec_paths: &[PathBuf],
+    pipeline_configs: &[(String, PipelineToml)],
+    runs: u32,
+    concurrency: u32,
+    db_str: &str,
+    json: bool,
+) {
+    let dispatcher = match FlyDispatcher::new() {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let total_runs = (spec_paths.len() * pipeline_configs.len() * runs as usize) as u32;
+    if let Err(e) = dispatcher.check_cost_guard(total_runs, 10.0) {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+
+    let image = std::env::var("FLY_IMAGE")
+        .unwrap_or_else(|_| "registry.fly.io/boi-workers:latest".to_string());
+
+    let run_id = {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        format!("bench-fly-{ts}")
+    };
+
+    let mut work_items: Vec<RemoteWorkItem> = Vec::new();
+    for spec_path in spec_paths {
+        let content = match std::fs::read_to_string(spec_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warning: skipping {:?}: {e}", spec_path);
+                continue;
+            }
+        };
+        for (pipeline_name, pipeline_cfg) in pipeline_configs {
+            for run_num in 1..=runs {
+                work_items.push(RemoteWorkItem {
+                    spec_path: spec_path.clone(),
+                    spec_content: content.clone(),
+                    pipeline_name: pipeline_name.clone(),
+                    pipeline_cfg: pipeline_cfg.clone(),
+                    run_num: run_num as i64,
+                    run_id: run_id.clone(),
+                });
+            }
+        }
+    }
+
+    let sem = Arc::new((Mutex::new(concurrency as usize), Condvar::new()));
+    let collected: Arc<Mutex<Vec<queue::BenchResultRecord>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let handles: Vec<_> = work_items
+        .into_iter()
+        .map(|item| {
+            let sem = Arc::clone(&sem);
+            let dispatcher = Arc::clone(&dispatcher);
+            let collected = Arc::clone(&collected);
+            let image = image.clone();
+
+            std::thread::spawn(move || {
+                {
+                    let (lock, cvar) = &*sem;
+                    let mut count = lock.lock().unwrap();
+                    while *count == 0 {
+                        count = cvar.wait(count).unwrap();
+                    }
+                    *count -= 1;
+                }
+
+                let result = run_one_remote(&dispatcher, &image, item);
+                collected.lock().unwrap().push(result);
+
+                let (lock, cvar) = &*sem;
+                *lock.lock().unwrap() += 1;
+                cvar.notify_one();
+            })
+        })
+        .collect();
+
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let mut results = Arc::try_unwrap(collected).unwrap().into_inner().unwrap();
+    results.sort_by_key(|r| r.run_number);
+
+    ensure_db_dir(db_str);
+    if let Ok(q) = queue::Queue::open(db_str) {
+        for r in &results {
+            let _ = q.insert_bench_result(r);
+        }
+    }
+
+    println!();
+    print_summary(
+        &results,
+        &pipeline_configs.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        json,
+    );
+}
+
+fn run_one_remote(
+    dispatcher: &FlyDispatcher,
+    image: &str,
+    item: RemoteWorkItem,
+) -> queue::BenchResultRecord {
+    let spec_file = item.spec_path.to_string_lossy().to_string();
+
+    let fail = |status: &str, elapsed_ms: i64| queue::BenchResultRecord {
+        run_id: item.run_id.clone(),
+        pipeline: item.pipeline_name.clone(),
+        spec_file: spec_file.clone(),
+        run_number: item.run_num,
+        status: status.to_string(),
+        total_ms: elapsed_ms,
+        tasks_total: 0,
+        tasks_done: 0,
+        tasks_failed: 0,
+        total_cost_usd: None,
+        total_input_tokens: None,
+        total_output_tokens: None,
+        tasks_skipped: 0,
+    };
+
+    let mut modified = item.spec_content.clone();
+    if !item.pipeline_cfg.spec_phases.is_empty() {
+        modified = inject_yaml_list(&modified, "spec_phases", &item.pipeline_cfg.spec_phases);
+    }
+    if !item.pipeline_cfg.task_phases.is_empty() {
+        modified = inject_yaml_list(&modified, "task_phases", &item.pipeline_cfg.task_phases);
+    }
+    if !item.pipeline_cfg.post_phases.is_empty() {
+        modified = inject_yaml_list(&modified, "post_phases", &item.pipeline_cfg.post_phases);
+    }
+
+    let mut env = HashMap::new();
+    env.insert("BOI_SPEC_B64".to_string(), encode_base64(modified.as_bytes()));
+    env.insert("BOI_PIPELINE_NAME".to_string(), item.pipeline_name.clone());
+    env.insert("BOI_RUN_NUMBER".to_string(), item.run_num.to_string());
+
+    let cmd = vec!["boi".to_string(), "run-spec".to_string()];
+
+    eprintln!(
+        "  [fly] dispatching [{pipeline}] {spec} run {run}...",
+        pipeline = item.pipeline_name,
+        spec = item.spec_path.file_name().unwrap_or_default().to_string_lossy(),
+        run = item.run_num,
+    );
+
+    let cr = match dispatcher.run_container(image, env, cmd, 7200) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  [fly] error: {e}");
+            return fail("remote-error", 0);
+        }
+    };
+
+    let elapsed_ms = cr.duration_ms as i64;
+    eprintln!(
+        "  [fly] done: machine={} duration={:.1}s cost=${:.4}",
+        cr.machine_id,
+        elapsed_ms as f64 / 1000.0,
+        cr.cost_usd.unwrap_or(0.0),
+    );
+
+    let parsed = parse_remote_result(&cr.stdout);
+
+    let status = parsed
+        .as_ref()
+        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+        .unwrap_or_else(|| {
+            if cr.exit_code == 0 { "completed".to_string() } else { "failed".to_string() }
+        });
+
+    let tasks_total = parsed.as_ref().and_then(|v| v.get("tasks_total").and_then(|n| n.as_i64())).unwrap_or(0);
+    let tasks_done = parsed.as_ref().and_then(|v| v.get("tasks_done").and_then(|n| n.as_i64())).unwrap_or(0);
+    let tasks_failed = parsed.as_ref().and_then(|v| v.get("tasks_failed").and_then(|n| n.as_i64())).unwrap_or(0);
+    let tasks_skipped = parsed.as_ref().and_then(|v| v.get("tasks_skipped").and_then(|n| n.as_i64())).unwrap_or(0);
+    let total_cost_usd = parsed.as_ref().and_then(|v| v.get("total_cost_usd").and_then(|n| n.as_f64())).or(cr.cost_usd);
+    let total_input_tokens = parsed.as_ref().and_then(|v| v.get("total_input_tokens").and_then(|n| n.as_i64()));
+    let total_output_tokens = parsed.as_ref().and_then(|v| v.get("total_output_tokens").and_then(|n| n.as_i64()));
+
+    queue::BenchResultRecord {
+        run_id: item.run_id,
+        pipeline: item.pipeline_name,
+        spec_file,
+        run_number: item.run_num,
+        status,
+        total_ms: elapsed_ms,
+        tasks_total,
+        tasks_done,
+        tasks_failed,
+        total_cost_usd,
+        total_input_tokens,
+        total_output_tokens,
+        tasks_skipped,
+    }
+}
+
+/// Scan stdout lines in reverse for the last JSON object — the container's result payload.
+fn parse_remote_result(stdout: &str) -> Option<serde_json::Value> {
+    for line in stdout.lines().rev() {
+        let t = line.trim();
+        if t.starts_with('{') {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut i = 0;
+    while i < input.len() {
+        let b0 = input[i];
+        let b1 = if i + 1 < input.len() { input[i + 1] } else { 0 };
+        let b2 = if i + 2 < input.len() { input[i + 2] } else { 0 };
+        out.push(TABLE[((b0 >> 2) & 0x3f) as usize] as char);
+        out.push(TABLE[(((b0 & 0x3) << 4) | (b1 >> 4)) as usize] as char);
+        if i + 1 < input.len() {
+            out.push(TABLE[(((b1 & 0xf) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < input.len() {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
+}
 
 /// Benchmark a single phase in isolation across N runs.
 pub fn cmd_bench_phase(phase_name: &str, spec_path: &Path, runs: u32) {

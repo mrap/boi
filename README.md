@@ -316,7 +316,15 @@ Exit 0 = passed. Any non-zero exit = failed. Stdout/stderr are captured as the f
 
 ## Runtime Configuration
 
-BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) and `openrouter` (requires `OPENROUTER_API_KEY`) are also supported. Use `boi providers list` to see which providers are active on your machine.
+BOI dispatches every LLM phase through a unified `Provider` trait. The registry holds
+all known providers; the runner does a single `registry.get(provider_name)` lookup —
+no branching on name strings. Providers that fail credential validation at startup are
+auto-disabled, causing a loud warning rather than a silent fallback.
+
+Built-in providers: `claude` (always active), `openrouter` (requires `OPENROUTER_API_KEY`),
+`codex` (requires `OPENAI_API_KEY`), `deterministic` (builtin handler, no LLM). Use
+`boi providers list` to see which are active on your machine. See [docs/providers.md](docs/providers.md)
+for the full architecture and how to add a new provider.
 
 ### Global Default
 
