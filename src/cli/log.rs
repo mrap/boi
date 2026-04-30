@@ -1,10 +1,94 @@
 use crate::config::Config;
-use crate::fmt::{ensure_db_dir, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
+use crate::fmt::{ensure_db_dir, format_duration_ms, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use crate::telemetry::{LogLevel, Telemetry};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-pub fn cmd_log(spec_id: &str, _full: bool, debug: bool, follow: bool, db_str: &str, cfg: &Config) {
+fn render_phase_runs_table(telemetry: &Telemetry, spec_id: &str, full: bool) {
+    let runs = telemetry.phase_runs_by_spec(spec_id);
+    if runs.is_empty() {
+        return;
+    }
+
+    println!("\n{}{}Phase invocations{}\n", BOLD, CYAN, RESET);
+
+    if !full {
+        println!(
+            "  {:<20} {:<12} {:<28} {:<9} {:<10}",
+            "PHASE", "RUNTIME", "MODEL", "DURATION", "COST"
+        );
+        println!("  {}", "-".repeat(82));
+        for r in &runs {
+            let phase = &r.phase_name;
+            let runtime = r.runtime.as_deref().unwrap_or("?");
+            let model = r.model.as_deref().unwrap_or("?");
+            let duration = r.duration_ms
+                .map(format_duration_ms)
+                .unwrap_or_else(|| "—".to_string());
+            let cost = r.cost_usd
+                .map(|c| format!("${:.4}", c))
+                .unwrap_or_else(|| "—".to_string());
+            let exit_color = match r.exit_status.as_deref() {
+                Some("success") => GREEN,
+                Some("timeout") | Some("nonzero") | Some("crashed") => RED,
+                _ => DIM,
+            };
+            println!(
+                "  {}{:<20}{} {:<12} {:<28} {:<9} {:<10}",
+                exit_color, phase, RESET, runtime, model, duration, cost
+            );
+        }
+    } else {
+        for (i, r) in runs.iter().enumerate() {
+            if i > 0 { println!("  {}", "-".repeat(60)); }
+            let phase_color = match r.exit_status.as_deref() {
+                Some("success") => GREEN,
+                Some(_) => RED,
+                None => YELLOW,
+            };
+            println!("  {}phase:         {}{}{}", BOLD, phase_color, r.phase_name, RESET);
+            println!("  inv_id:        {}{}{}", DIM, r.invocation_id, RESET);
+            if let Some(ref v) = r.task_id        { println!("  task_id:       {}", v); }
+            if let Some(ref v) = r.phase_level    { println!("  level:         {}", v); }
+            if let Some(ref v) = r.mode           { println!("  mode:          {}", v); }
+            if let Some(ref v) = r.runtime        { println!("  runtime:       {}", v); }
+            if let Some(ref v) = r.model          { println!("  model:         {}", v); }
+            if let Some(ref v) = r.effort         { println!("  effort:        {}", v); }
+            if let Some(v) = r.thinking_enabled   { println!("  thinking:      {}", v); }
+            if let Some(v) = r.thinking_budget_tokens { println!("  think_tokens:  {}", v); }
+            if let Some(v) = r.extended_thinking  { println!("  ext_thinking:  {}", v); }
+            if let Some(ref v) = r.prompt_template_path { println!("  prompt_tmpl:   {}", v); }
+            if let Some(v) = r.prompt_length_chars  { println!("  prompt_chars:  {}", v); }
+            if let Some(v) = r.prompt_length_tokens { println!("  prompt_tokens: {}", v); }
+            if let Some(v) = r.timeout_secs       { println!("  timeout:       {}s", v); }
+            println!("  bare_flag:     {}", r.bare_flag);
+            if let Some(ref v) = r.brain_dir      { println!("  brain_dir:     {}", v); }
+            if let Some(ref v) = r.api_key_env_used { println!("  api_key_env:   {}", v); }
+            if let Some(ref args) = r.cli_args    { println!("  cli_args:      {:?}", args); }
+            if let Some(ref v) = r.http_endpoint  { println!("  http_endpoint: {}", v); }
+            if let Some(ref v) = r.started_at     { println!("  started_at:    {}", v); }
+            if let Some(ref v) = r.completed_at   { println!("  completed_at:  {}", v); }
+            if let Some(v) = r.duration_ms  { println!("  duration:      {}", format_duration_ms(v)); }
+            if let Some(v) = r.startup_ms   { println!("  startup_ms:    {}", v); }
+            if let Some(v) = r.inference_ms { println!("  inference_ms:  {}", v); }
+            if let Some(v) = r.input_tokens         { println!("  in_tokens:     {}", v); }
+            if let Some(v) = r.output_tokens        { println!("  out_tokens:    {}", v); }
+            if let Some(v) = r.cache_read_tokens    { println!("  cache_read:    {}", v); }
+            if let Some(v) = r.cache_creation_tokens{ println!("  cache_create:  {}", v); }
+            if let Some(v) = r.cost_usd { println!("  cost_usd:      ${:.6}", v); }
+            if let Some(ref v) = r.exit_status  { println!("  exit_status:   {}", v); }
+            if let Some(ref v) = r.exit_reason  { println!("  exit_reason:   {}", v); }
+            if let Some(v) = r.retry_index      { println!("  retry_index:   {}", v); }
+            if let Some(ref v) = r.branch_sha   { println!("  branch_sha:    {}", v); }
+            if let Some(ref v) = r.host_os      { println!("  host_os:       {}", v); }
+            if let Some(ref v) = r.host_arch    { println!("  host_arch:     {}", v); }
+            if let Some(ref v) = r.daemon_version { println!("  daemon_ver:    {}", v); }
+        }
+    }
+    println!();
+}
+
+pub fn cmd_log(spec_id: &str, full: bool, debug: bool, follow: bool, db_str: &str, cfg: &Config) {
     if follow {
         cmd_log_follow(spec_id, cfg);
         return;
@@ -45,7 +129,7 @@ pub fn cmd_log(spec_id: &str, _full: bool, debug: bool, follow: bool, db_str: &s
                         "boi.claude.exit" => {
                             if let Some(output_len) = parsed.get("output_length") {
                                 let duration = parsed.get("duration_ms")
-                                    .and_then(|v| v.as_u64())
+                                    .and_then(|v| v.as_i64())
                                     .map(format_duration_ms)
                                     .unwrap_or_else(|| "?".to_string());
                                 let exit_code = parsed.get("exit_code")
@@ -75,7 +159,7 @@ pub fn cmd_log(spec_id: &str, _full: bool, debug: bool, follow: bool, db_str: &s
                             );
                         }
                         "boi.phase.outcome" => {
-                            if let Some(duration_ms) = parsed.get("duration_ms").and_then(|v| v.as_u64()) {
+                            if let Some(duration_ms) = parsed.get("duration_ms").and_then(|v| v.as_i64()) {
                                 let outcome = parsed.get("outcome")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("?");
@@ -93,6 +177,8 @@ pub fn cmd_log(spec_id: &str, _full: bool, debug: bool, follow: bool, db_str: &s
     }
 
     println!();
+
+    render_phase_runs_table(&telemetry, spec_id, full);
 }
 
 fn cmd_log_follow(spec_id: &str, cfg: &Config) {
@@ -172,15 +258,6 @@ fn level_prefix(level: LogLevel) -> String {
     }
 }
 
-fn format_duration_ms(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{}ms", ms)
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{:.1}m", ms as f64 / 60_000.0)
-    }
-}
 
 #[cfg(test)]
 mod tests {

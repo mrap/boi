@@ -1,10 +1,65 @@
 use crate::builtins::{self, BuiltinContext};
 use crate::phases::{PhaseConfig, Verdict};
 use crate::spec::BoiTask;
-use crate::telemetry::{LogLevel, Telemetry};
+use crate::telemetry::{
+    generate_invocation_id, LogLevel, PhaseCompletionFields, PhaseInvocation, Telemetry,
+};
 use crate::worker;
+use chrono::Utc;
 use serde_json::json;
 use std::time::Instant;
+
+/// Telemetry metrics collected during a single phase execution.
+/// Populated from ClaudeResult data when available.
+#[derive(Debug, Clone, Default)]
+pub struct PhaseMetrics {
+    pub cost_usd: Option<f64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub cold_start_ms: Option<i64>,
+    pub inference_ms: Option<i64>,
+    pub ttft_ms: Option<i64>,
+    pub tool_call_count: i64,
+    pub tool_calls_by_type: Option<String>,
+    pub model: Option<String>,
+    pub runtime: Option<String>,
+    pub failure_mode: Option<String>,
+    pub verify_exit_code: Option<i64>,
+}
+
+fn verdict_to_exit_status(v: &Verdict) -> String {
+    match v {
+        Verdict::Proceed => "success".to_string(),
+        Verdict::Done { success: true, .. } => "success".to_string(),
+        Verdict::Done { success: false, reason } if reason == "timeout" => "timeout".to_string(),
+        Verdict::Done { success: false, .. } => "nonzero".to_string(),
+        Verdict::Redo { .. } => "nonzero".to_string(),
+        Verdict::Pause { .. } => "success".to_string(),
+    }
+}
+
+fn classify_failure_mode(verdict: &Verdict, cr_output: &str) -> Option<String> {
+    match verdict {
+        Verdict::Proceed | Verdict::Pause { .. } => None,
+        Verdict::Done { success: true, .. } => None,
+        Verdict::Redo { .. } => Some("validation_fail".to_string()),
+        Verdict::Done { success: false, reason } => {
+            if reason.contains("timeout") || cr_output == "timeout" {
+                Some("timeout".to_string())
+            } else if reason.contains("spawn error") {
+                Some("crash".to_string())
+            } else if reason.contains("rate limit") || reason.contains("429") {
+                Some("rate_limit".to_string())
+            } else if reason.contains("context") && reason.contains("overflow") {
+                Some("context_overflow".to_string())
+            } else {
+                Some("unknown".to_string())
+            }
+        }
+    }
+}
 
 /// Trait for running a single phase. Allows mocking in tests.
 #[allow(clippy::too_many_arguments)]
@@ -21,8 +76,8 @@ pub trait PhaseRunner: Send + Sync {
         vars: &std::collections::HashMap<String, String>,
     ) -> Verdict;
 
-    /// Execute a phase and return both the verdict and the raw output text.
-    /// Default delegates to `run_phase` with empty output; override for full output access.
+    /// Execute a phase and return the verdict, raw output text, and telemetry metrics.
+    /// Default delegates to `run_phase` with empty output and default metrics.
     fn run_phase_full(
         &self,
         phase: &PhaseConfig,
@@ -32,8 +87,8 @@ pub trait PhaseRunner: Send + Sync {
         timeout_secs: u64,
         spec_id: Option<&str>,
         vars: &std::collections::HashMap<String, String>,
-    ) -> (Verdict, String) {
-        (self.run_phase(phase, spec_content, task, worktree_path, timeout_secs, spec_id, vars), String::new())
+    ) -> (Verdict, String, PhaseMetrics) {
+        (self.run_phase(phase, spec_content, task, worktree_path, timeout_secs, spec_id, vars), String::new(), PhaseMetrics::default())
     }
 }
 
@@ -64,7 +119,8 @@ impl ClaudePhaseRunner {
 }
 
 impl ClaudePhaseRunner {
-    /// Inner implementation that returns both the verdict and the raw Claude output.
+    /// Inner implementation that returns the verdict, raw output, and telemetry metrics.
+    /// Emits `boi.phase.invoked` before branching and `boi.phase.completed` on every exit path.
     #[allow(clippy::too_many_arguments)]
     fn run_phase_inner(
         &self,
@@ -75,19 +131,22 @@ impl ClaudePhaseRunner {
         timeout_secs: u64,
         spec_id: Option<&str>,
         vars: &std::collections::HashMap<String, String>,
-    ) -> (Verdict, String) {
-        // Deterministic phases: skip Claude entirely, run a registered builtin handler.
-        if phase.runtime.as_deref() == Some("deterministic") {
-            return (self.run_deterministic_phase(phase, task, spec_id), String::new());
-        }
+    ) -> (Verdict, String, PhaseMetrics) {
+        let start_instant = Instant::now();
+        let started_at = Utc::now().to_rfc3339();
+        let invocation_id = generate_invocation_id();
 
-        if !phase.requires_claude {
-            return (self.run_verify_phase(phase, task, worktree_path, timeout_secs, spec_id), String::new());
-        }
+        // Determine the resolved runtime before any branching.
+        let resolved_runtime = if phase.runtime.as_deref() == Some("deterministic") {
+            "deterministic"
+        } else if !phase.requires_claude {
+            "verify"
+        } else {
+            phase.runtime.as_deref().unwrap_or("claude")
+        };
 
-        let task_id = task.map(|t| t.id.as_str());
-        let spec_id_hint = spec_id.unwrap_or("");
-
+        // Pre-build the prompt for Claude phases so we can include its length in the invocation
+        // record. For deterministic/verify phases this stays None (no prompt is sent).
         let task_context = task.map(|t| {
             format!(
                 "Task: {} — {}\nSpec: {}\nVerify: {}",
@@ -97,8 +156,169 @@ impl ClaudePhaseRunner {
                 t.verify.as_deref().unwrap_or("(none)")
             )
         });
-        let prompt =
-            crate::phases::build_phase_prompt(phase, spec_content, task_context.as_deref(), vars);
+        let prompt_opt: Option<String> =
+            if resolved_runtime == "claude" || resolved_runtime == "openrouter" {
+                Some(crate::phases::build_phase_prompt(
+                    phase,
+                    spec_content,
+                    task_context.as_deref(),
+                    vars,
+                ))
+            } else {
+                None
+            };
+
+        // Which API key env var was actually read for auth?
+        let api_key_env_used = match resolved_runtime {
+            "claude" => ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
+                .iter()
+                .find(|v| std::env::var(v).is_ok())
+                .map(|v| v.to_string()),
+            "openrouter" => std::env::var("OPENROUTER_API_KEY")
+                .ok()
+                .map(|_| "OPENROUTER_API_KEY".to_string()),
+            _ => None,
+        };
+
+        // Full CLI args vector (omitting the prompt itself — too large for telemetry).
+        let cli_args: Option<Vec<String>> = if resolved_runtime == "claude" {
+            let mut args = vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--no-session-persistence".to_string(),
+                "--setting-sources".to_string(),
+                "user".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+            ];
+            if let Some(m) = &phase.model {
+                args.push("--model".to_string());
+                args.push(m.clone());
+            }
+            Some(args)
+        } else {
+            None
+        };
+
+        // Git HEAD at start (best-effort).
+        let branch_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(worktree_path)
+            .output()
+            .ok()
+            .and_then(|o| if o.status.success() { String::from_utf8(o.stdout).ok() } else { None })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        // ── emit boi.phase.invoked ────────────────────────────────────────────
+        let inv = PhaseInvocation {
+            invocation_id: invocation_id.clone(),
+            spec_id: spec_id.map(String::from),
+            task_id: task.map(|t| t.id.clone()),
+            phase_name: phase.name.clone(),
+            phase_level: format!("{:?}", phase.level).to_lowercase(),
+            mode: None, // not available at this call site
+            runtime: Some(resolved_runtime.to_string()),
+            model: phase.model.clone(),
+            effort: phase.effort.clone(),
+            thinking_enabled: None,
+            thinking_budget_tokens: None,
+            extended_thinking: None,
+            prompt_template_path: None,
+            prompt_length_chars: prompt_opt.as_ref().map(|p| p.len() as i64),
+            prompt_length_tokens: prompt_opt.as_ref().map(|p| p.len() as i64 / 4),
+            timeout_secs: timeout_secs as i64,
+            bare_flag: false,
+            brain_dir: None,
+            api_key_env_used,
+            cli_args,
+            http_endpoint: None,
+            started_at,
+            branch_sha,
+            host_os: Some(std::env::consts::OS.to_string()),
+            host_arch: Some(std::env::consts::ARCH.to_string()),
+            daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        };
+        self.telemetry.emit_phase_invoked(&inv);
+
+        // Helper: emit boi.phase.completed with timing + outcome + usage.
+        let emit_done = |start: &Instant,
+                         exit_status: &str,
+                         exit_reason: Option<String>,
+                         startup_ms: Option<i64>,
+                         inference_ms: Option<i64>| {
+            self.telemetry.emit_phase_completed(
+                &invocation_id,
+                &PhaseCompletionFields {
+                    completed_at: Utc::now().to_rfc3339(),
+                    duration_ms: start.elapsed().as_millis() as i64,
+                    startup_ms,
+                    inference_ms,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                    cost_usd: None,
+                    exit_status: exit_status.to_string(),
+                    exit_reason,
+                },
+            );
+        };
+
+        // Enhanced emit that includes usage data from ClaudeResult.
+        let emit_done_with_usage = |start: &Instant,
+                                     exit_status: &str,
+                                     cr: &worker::ClaudeResult| {
+            self.telemetry.emit_phase_completed(
+                &invocation_id,
+                &PhaseCompletionFields {
+                    completed_at: Utc::now().to_rfc3339(),
+                    duration_ms: start.elapsed().as_millis() as i64,
+                    startup_ms: Some(cr.startup_ms as i64),
+                    inference_ms: Some(cr.inference_ms as i64),
+                    input_tokens: cr.input_tokens,
+                    output_tokens: cr.output_tokens,
+                    cache_read_tokens: cr.cache_read_tokens,
+                    cache_creation_tokens: cr.cache_creation_tokens,
+                    cost_usd: cr.cost_usd,
+                    exit_status: exit_status.to_string(),
+                    exit_reason: None,
+                },
+            );
+        };
+
+        // ── branch to runtime ─────────────────────────────────────────────────
+
+        // Deterministic phases: skip Claude entirely, run a registered builtin handler.
+        if phase.runtime.as_deref() == Some("deterministic") {
+            let verdict = self.run_deterministic_phase(phase, task, spec_id);
+            let exit_status = verdict_to_exit_status(&verdict);
+            emit_done(&start_instant, &exit_status, None, None, None);
+            let metrics = PhaseMetrics {
+                runtime: Some("deterministic".to_string()),
+                ..Default::default()
+            };
+            return (verdict, String::new(), metrics);
+        }
+
+        if !phase.requires_claude {
+            let (verdict, verify_exit_code) = self.run_verify_phase(phase, task, worktree_path, timeout_secs, spec_id);
+            let exit_status = verdict_to_exit_status(&verdict);
+            emit_done(&start_instant, &exit_status, None, None, None);
+            let metrics = PhaseMetrics {
+                runtime: Some("verify".to_string()),
+                verify_exit_code,
+                ..Default::default()
+            };
+            return (verdict, String::new(), metrics);
+        }
+
+        // Claude phase — use the pre-built prompt.
+        let task_id = task.map(|t| t.id.as_str());
+        let spec_id_hint = spec_id.unwrap_or("");
+        let prompt = prompt_opt.unwrap_or_else(|| {
+            crate::phases::build_phase_prompt(phase, spec_content, task_context.as_deref(), vars)
+        });
 
         self.telemetry.emit(
             "boi.claude.spawn",
@@ -135,6 +355,30 @@ impl ClaudePhaseRunner {
             );
         }
 
+        let build_metrics = |cr: &worker::ClaudeResult, verdict: &Verdict| -> PhaseMetrics {
+            let tool_types_json = if cr.tool_calls_by_type.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&cr.tool_calls_by_type).ok()
+            };
+            PhaseMetrics {
+                cost_usd: cr.cost_usd,
+                input_tokens: cr.input_tokens,
+                output_tokens: cr.output_tokens,
+                cache_read_tokens: cr.cache_read_tokens,
+                cache_creation_tokens: cr.cache_creation_tokens,
+                cold_start_ms: Some(cr.startup_ms as i64),
+                inference_ms: Some(cr.inference_ms as i64),
+                ttft_ms: Some(cr.startup_ms as i64),
+                tool_call_count: cr.tool_call_count,
+                tool_calls_by_type: tool_types_json,
+                model: phase.model.clone(),
+                runtime: Some(resolved_runtime.to_string()),
+                failure_mode: classify_failure_mode(verdict, &cr.output),
+                verify_exit_code: None,
+            }
+        };
+
         match result {
             Ok(ref cr) if cr.success => {
                 let inference_s = cr.inference_ms as f64 / 1000.0;
@@ -150,11 +394,17 @@ impl ClaudePhaseRunner {
                     "startup_ms": cr.startup_ms,
                     "inference_ms": cr.inference_ms,
                     "total_ms": cr.total_ms,
+                    "cost_usd": cr.cost_usd,
+                    "input_tokens": cr.input_tokens,
+                    "output_tokens": cr.output_tokens,
+                    "tool_call_count": cr.tool_call_count,
                     "message": format!("claude exit 0, {} chars ({:.1}s inference, {:.1}s total)",
                         cr.output.len(), inference_s, total_s),
                 }));
                 let verdict = crate::phases::parse_phase_output(phase, &cr.output);
-                (verdict, cr.output.clone())
+                emit_done_with_usage(&start_instant, "success", cr);
+                let metrics = build_metrics(cr, &verdict);
+                (verdict, cr.output.clone(), metrics)
             }
             Ok(ref cr) => {
                 let inference_s = cr.inference_ms as f64 / 1000.0;
@@ -170,20 +420,34 @@ impl ClaudePhaseRunner {
                     "startup_ms": cr.startup_ms,
                     "inference_ms": cr.inference_ms,
                     "total_ms": cr.total_ms,
+                    "cost_usd": cr.cost_usd,
+                    "input_tokens": cr.input_tokens,
+                    "output_tokens": cr.output_tokens,
+                    "tool_call_count": cr.tool_call_count,
                     "message": format!("claude exit non-zero, {} chars ({:.1}s inference, {:.1}s total){}",
                         cr.output.len(), inference_s, total_s,
                         if cr.stderr.is_empty() { String::new() } else {
                             format!("\n  stderr: {}", cr.stderr.chars().take(200).collect::<String>())
                         }),
                 }));
+                let exit_status =
+                    if cr.output == "timeout" { "timeout" } else { "nonzero" };
                 let verdict = if cr.output == "timeout" {
                     Verdict::Done { success: false, reason: "timeout".into() }
                 } else if phase.on_crash.as_deref() == Some("retry") {
-                    Verdict::Done { success: false, reason: format!("Phase {} claude exited non-zero", phase.name) }
+                    Verdict::Done {
+                        success: false,
+                        reason: format!("Phase {} claude exited non-zero", phase.name),
+                    }
                 } else {
-                    Verdict::Done { success: false, reason: format!("Phase {} failed: {}", phase.name, cr.output) }
+                    Verdict::Done {
+                        success: false,
+                        reason: format!("Phase {} failed: {}", phase.name, cr.output),
+                    }
                 };
-                (verdict, cr.output.clone())
+                emit_done_with_usage(&start_instant, exit_status, cr);
+                let metrics = build_metrics(cr, &verdict);
+                (verdict, cr.output.clone(), metrics)
             }
             Err(e) => {
                 self.telemetry.emit(
@@ -196,7 +460,25 @@ impl ClaudePhaseRunner {
                         "message": format!("claude spawn error: {}", e),
                     }),
                 );
-                (Verdict::Done { success: false, reason: format!("Phase {} spawn error: {}", phase.name, e) }, String::new())
+                let error_msg = e.to_string();
+                emit_done(
+                    &start_instant,
+                    "crashed",
+                    Some(error_msg.clone()),
+                    None,
+                    None,
+                );
+                let verdict = Verdict::Done {
+                    success: false,
+                    reason: format!("Phase {} spawn error: {}", phase.name, error_msg),
+                };
+                let metrics = PhaseMetrics {
+                    runtime: Some(resolved_runtime.to_string()),
+                    model: phase.model.clone(),
+                    failure_mode: Some("crash".to_string()),
+                    ..Default::default()
+                };
+                (verdict, String::new(), metrics)
             }
         }
     }
@@ -225,7 +507,7 @@ impl PhaseRunner for ClaudePhaseRunner {
         timeout_secs: u64,
         spec_id: Option<&str>,
         vars: &std::collections::HashMap<String, String>,
-    ) -> (Verdict, String) {
+    ) -> (Verdict, String, PhaseMetrics) {
         self.run_phase_inner(phase, spec_content, task, worktree_path, timeout_secs, spec_id, vars)
     }
 }
@@ -291,6 +573,7 @@ impl ClaudePhaseRunner {
         result.to_verdict()
     }
 
+    /// Returns (Verdict, verify_exit_code).
     fn run_verify_phase(
         &self,
         _phase: &PhaseConfig,
@@ -298,17 +581,17 @@ impl ClaudePhaseRunner {
         worktree_path: &str,
         timeout_secs: u64,
         spec_id: Option<&str>,
-    ) -> Verdict {
+    ) -> (Verdict, Option<i64>) {
         let task = match task {
             Some(t) => t,
-            None => return Verdict::Proceed,
+            None => return (Verdict::Proceed, None),
         };
 
         let has_verify = task.verify.as_deref().is_some_and(|c| !c.is_empty());
         let has_verify_prompt = task.verify_prompt.as_deref().is_some_and(|p| !p.is_empty());
 
         if !has_verify && !has_verify_prompt {
-            return Verdict::Proceed;
+            return (Verdict::Proceed, None);
         }
 
         // Shell verify
@@ -329,19 +612,20 @@ impl ClaudePhaseRunner {
             );
 
             let start = Instant::now();
-            let passed = worker::run_verify(verify_cmd, worktree_path);
+            let (passed, exit_code) = worker::run_verify_with_code(verify_cmd, worktree_path);
             let duration_ms = start.elapsed().as_millis() as u64;
 
             self.telemetry.emit("boi.verify.result", LogLevel::Debug, &json!({
                 "task_id": task.id,
                 "verify_cmd": verify_cmd,
                 "passed": passed,
+                "exit_code": exit_code,
                 "duration_ms": duration_ms,
-                "message": format!("exit {} ({}ms)", if passed { "0 (passed)" } else { "non-zero (failed)" }, duration_ms),
+                "message": format!("exit {} ({}ms)", exit_code.map(|c| c.to_string()).unwrap_or_else(|| "?".to_string()), duration_ms),
             }));
 
             if !passed {
-                return Verdict::Redo { tasks: vec![] };
+                return (Verdict::Redo { tasks: vec![] }, exit_code);
             }
         }
 
@@ -397,7 +681,7 @@ impl ClaudePhaseRunner {
                             "message": format!("verify_prompt failed ({}ms)", cr.total_ms),
                         }),
                     );
-                    return Verdict::Redo { tasks: vec![] };
+                    return (Verdict::Redo { tasks: vec![] }, None);
                 }
                 Err(e) => {
                     self.telemetry.emit(
@@ -408,12 +692,12 @@ impl ClaudePhaseRunner {
                             "message": format!("verify_prompt spawn error: {}", e),
                         }),
                     );
-                    return Verdict::Redo { tasks: vec![] };
+                    return (Verdict::Redo { tasks: vec![] }, None);
                 }
             }
         }
 
-        Verdict::Proceed
+        (Verdict::Proceed, Some(0))
     }
 }
 
@@ -654,5 +938,40 @@ mod tests {
             ),
             Verdict::Proceed
         );
+    }
+
+    #[test]
+    fn test_classify_failure_mode_timeout() {
+        let v = Verdict::Done { success: false, reason: "timeout".into() };
+        assert_eq!(classify_failure_mode(&v, "timeout"), Some("timeout".to_string()));
+    }
+
+    #[test]
+    fn test_classify_failure_mode_crash() {
+        let v = Verdict::Done { success: false, reason: "Phase X spawn error: os error".into() };
+        assert_eq!(classify_failure_mode(&v, ""), Some("crash".to_string()));
+    }
+
+    #[test]
+    fn test_classify_failure_mode_success_is_none() {
+        let v = Verdict::Proceed;
+        assert_eq!(classify_failure_mode(&v, ""), None);
+
+        let v2 = Verdict::Done { success: true, reason: "done".into() };
+        assert_eq!(classify_failure_mode(&v2, ""), None);
+    }
+
+    #[test]
+    fn test_classify_failure_mode_redo_is_validation_fail() {
+        let v = Verdict::Redo { tasks: vec![] };
+        assert_eq!(classify_failure_mode(&v, ""), Some("validation_fail".to_string()));
+    }
+
+    #[test]
+    fn test_phase_metrics_default() {
+        let m = PhaseMetrics::default();
+        assert_eq!(m.tool_call_count, 0);
+        assert!(m.cost_usd.is_none());
+        assert!(m.model.is_none());
     }
 }

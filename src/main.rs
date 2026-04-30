@@ -7,7 +7,7 @@ use boi::cli::dispatch::cmd_dispatch;
 use boi::cli::doctor::cmd_doctor;
 use boi::cli::log::cmd_log;
 use boi::cli::outputs::cmd_outputs;
-use boi::cli::phases_cmd::{cmd_phases_list, cmd_phases_show};
+use boi::cli::phases_cmd::{cmd_phase_runs, cmd_phases_list, cmd_phases_show};
 use boi::cli::spec_mgmt::{cmd_spec, SpecActionData};
 use boi::cli::status::{cmd_status, cmd_status_json, cmd_status_watch};
 use boi::cli::telemetry_cmd::cmd_telemetry;
@@ -88,6 +88,9 @@ enum Commands {
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
+        /// Verbose: show runtime + model for running phase
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// View worker output log
     Log {
@@ -129,10 +132,16 @@ enum Commands {
         #[command(subcommand)]
         action: Option<SpecAction>,
     },
-    /// List or inspect phases
+    /// List or inspect phases, or show phase invocations for a spec
     Phases {
         /// Phase name to show details for (omit to list all)
         name: Option<String>,
+        /// Show all phase invocations for the given spec_id
+        #[arg(long)]
+        spec: Option<String>,
+        /// Show all fields in phase invocation table (requires --spec)
+        #[arg(long)]
+        full: bool,
     },
     /// Health check
     Doctor,
@@ -242,13 +251,14 @@ fn main() {
             all,
             watch,
             json,
+            verbose,
         } => {
             if watch {
-                cmd_status_watch(spec_id.as_deref(), all, db_str);
+                cmd_status_watch(spec_id.as_deref(), all, verbose, db_str);
             } else if json {
                 cmd_status_json(spec_id.as_deref(), all, db_str);
             } else {
-                cmd_status(spec_id.as_deref(), all, db_str);
+                cmd_status(spec_id.as_deref(), all, verbose, db_str);
             }
         }
         Commands::Log { spec_id, full, debug, follow } => {
@@ -292,10 +302,14 @@ fn main() {
             };
             cmd_spec(&queue_id, action_data, db_str);
         }
-        Commands::Phases { name } => {
-            match name {
-                Some(n) => cmd_phases_show(&n),
-                None => cmd_phases_list(),
+        Commands::Phases { name, spec, full } => {
+            if let Some(sid) = spec {
+                cmd_phase_runs(&sid, full, db_str);
+            } else {
+                match name {
+                    Some(n) => cmd_phases_show(&n),
+                    None => cmd_phases_list(),
+                }
             }
         }
         Commands::Doctor => {

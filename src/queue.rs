@@ -83,6 +83,20 @@ pub struct PhaseRunRecord {
     pub output_tokens: Option<i64>,
     pub started_at: String,
     pub completed_at: Option<String>,
+    pub model: Option<String>,
+    pub runtime: Option<String>,
+    pub pipeline_id: Option<String>,
+    pub attempt: i64,
+    pub failure_mode: Option<String>,
+    pub cold_start_ms: Option<i64>,
+    pub inference_ms: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub tool_call_count: Option<i64>,
+    pub tool_calls_by_type: Option<String>,
+    pub ttft_ms: Option<i64>,
+    pub loop_iteration: Option<i64>,
+    pub verify_exit_code: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -121,6 +135,10 @@ pub struct BenchResultRecord {
     pub tasks_total: i64,
     pub tasks_done: i64,
     pub tasks_failed: i64,
+    pub total_cost_usd: Option<f64>,
+    pub total_input_tokens: Option<i64>,
+    pub total_output_tokens: Option<i64>,
+    pub tasks_skipped: i64,
 }
 
 fn gen_id(prefix: char, conn: &Connection) -> String {
@@ -275,6 +293,27 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "project_context", "TEXT");
         Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
         Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
+
+        // Telemetry columns for experiment instrumentation (Gap 1-16, 19)
+        Self::ensure_column(&conn, "phase_runs", "model", "TEXT");
+        Self::ensure_column(&conn, "phase_runs", "runtime", "TEXT");
+        Self::ensure_column(&conn, "phase_runs", "pipeline_id", "TEXT");
+        Self::ensure_column(&conn, "phase_runs", "attempt", "INTEGER DEFAULT 1");
+        Self::ensure_column(&conn, "phase_runs", "failure_mode", "TEXT");
+        Self::ensure_column(&conn, "phase_runs", "cold_start_ms", "INTEGER");
+        Self::ensure_column(&conn, "phase_runs", "inference_ms", "INTEGER");
+        Self::ensure_column(&conn, "phase_runs", "cache_read_tokens", "INTEGER");
+        Self::ensure_column(&conn, "phase_runs", "cache_creation_tokens", "INTEGER");
+        Self::ensure_column(&conn, "phase_runs", "tool_call_count", "INTEGER");
+        Self::ensure_column(&conn, "phase_runs", "tool_calls_by_type", "TEXT");
+        Self::ensure_column(&conn, "phase_runs", "ttft_ms", "INTEGER");
+        Self::ensure_column(&conn, "phase_runs", "loop_iteration", "INTEGER");
+        Self::ensure_column(&conn, "phase_runs", "verify_exit_code", "INTEGER");
+
+        Self::ensure_column(&conn, "bench_results", "total_cost_usd", "REAL");
+        Self::ensure_column(&conn, "bench_results", "total_input_tokens", "INTEGER");
+        Self::ensure_column(&conn, "bench_results", "total_output_tokens", "INTEGER");
+        Self::ensure_column(&conn, "bench_results", "tasks_skipped", "INTEGER DEFAULT 0");
 
         Ok(Queue { conn })
     }
@@ -636,8 +675,12 @@ impl Queue {
     pub fn insert_phase_run(&self, rec: &PhaseRunRecord) -> Result<()> {
         self.conn.execute(
             "INSERT INTO phase_runs (spec_id, task_id, phase, level, outcome,
-             duration_ms, cost_usd, input_tokens, output_tokens, started_at, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             duration_ms, cost_usd, input_tokens, output_tokens, started_at, completed_at,
+             model, runtime, pipeline_id, attempt, failure_mode,
+             cold_start_ms, inference_ms, cache_read_tokens, cache_creation_tokens,
+             tool_call_count, tool_calls_by_type, ttft_ms, loop_iteration, verify_exit_code)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 rec.spec_id,
                 rec.task_id,
@@ -650,6 +693,20 @@ impl Queue {
                 rec.output_tokens,
                 rec.started_at,
                 rec.completed_at,
+                rec.model,
+                rec.runtime,
+                rec.pipeline_id,
+                rec.attempt,
+                rec.failure_mode,
+                rec.cold_start_ms,
+                rec.inference_ms,
+                rec.cache_read_tokens,
+                rec.cache_creation_tokens,
+                rec.tool_call_count,
+                rec.tool_calls_by_type,
+                rec.ttft_ms,
+                rec.loop_iteration,
+                rec.verify_exit_code,
             ],
         )?;
         Ok(())
@@ -688,11 +745,26 @@ impl Queue {
 
     pub fn insert_bench_result(&self, r: &BenchResultRecord) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO bench_results (run_id, pipeline, spec_file, run_number, status, total_ms, tasks_total, tasks_done, tasks_failed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![r.run_id, r.pipeline, r.spec_file, r.run_number, r.status, r.total_ms, r.tasks_total, r.tasks_done, r.tasks_failed],
+            "INSERT INTO bench_results (run_id, pipeline, spec_file, run_number, status, total_ms,
+             tasks_total, tasks_done, tasks_failed, total_cost_usd, total_input_tokens,
+             total_output_tokens, tasks_skipped)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![r.run_id, r.pipeline, r.spec_file, r.run_number, r.status, r.total_ms,
+                    r.tasks_total, r.tasks_done, r.tasks_failed, r.total_cost_usd,
+                    r.total_input_tokens, r.total_output_tokens, r.tasks_skipped],
         )?;
         Ok(())
+    }
+
+    /// Aggregate cost and token totals from phase_runs for a given spec.
+    pub fn aggregate_spec_cost(&self, spec_id: &str) -> Result<(Option<f64>, Option<i64>, Option<i64>)> {
+        let result: (Option<f64>, Option<i64>, Option<i64>) = self.conn.query_row(
+            "SELECT SUM(cost_usd), SUM(input_tokens), SUM(output_tokens)
+             FROM phase_runs WHERE spec_id = ?1",
+            params![spec_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(result)
     }
 
     // --- Task management ---
@@ -1425,5 +1497,343 @@ mod tests {
 
         let st = q.status(&id).unwrap().unwrap();
         assert_eq!(st.spec.phase_loop_count, 2, "phase_loop_count must be readable from SpecRecord");
+    }
+
+    // --- Telemetry column tests ---
+
+    #[test]
+    fn test_phase_run_new_columns_stored() {
+        let q = open_mem();
+        let rec = PhaseRunRecord {
+            spec_id: "S0001".to_string(),
+            task_id: Some("T0001".to_string()),
+            phase: "execute".to_string(),
+            level: "task".to_string(),
+            outcome: "proceed".to_string(),
+            duration_ms: Some(5000),
+            cost_usd: Some(0.045),
+            input_tokens: Some(1500),
+            output_tokens: Some(800),
+            started_at: "2026-04-29T00:00:00Z".to_string(),
+            completed_at: Some("2026-04-29T00:00:05Z".to_string()),
+            model: Some("claude-sonnet-4-6".to_string()),
+            runtime: Some("claude".to_string()),
+            pipeline_id: Some("v1-abc123".to_string()),
+            attempt: 2,
+            failure_mode: None,
+            cold_start_ms: Some(200),
+            inference_ms: Some(4800),
+            cache_read_tokens: Some(500),
+            cache_creation_tokens: Some(300),
+            tool_call_count: Some(12),
+            tool_calls_by_type: Some(r#"{"Read":5,"Edit":4,"Bash":3}"#.to_string()),
+            ttft_ms: Some(200),
+            loop_iteration: Some(2),
+            verify_exit_code: Some(0),
+        };
+        q.insert_phase_run(&rec).unwrap();
+
+        let row: (
+            Option<String>, Option<String>, Option<String>, i64,
+            Option<String>, Option<i64>, Option<i64>, Option<i64>,
+            Option<i64>, Option<i64>, Option<String>, Option<i64>,
+            Option<f64>, Option<i64>, Option<i64>,
+        ) = q.conn.query_row(
+            "SELECT model, runtime, pipeline_id, attempt,
+                    failure_mode, cold_start_ms, inference_ms,
+                    cache_read_tokens, cache_creation_tokens,
+                    tool_call_count, tool_calls_by_type, ttft_ms,
+                    cost_usd, input_tokens, output_tokens
+             FROM phase_runs WHERE spec_id = 'S0001'",
+            [],
+            |r| Ok((
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+                r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+                r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+                r.get(12)?, r.get(13)?, r.get(14)?,
+            )),
+        ).unwrap();
+
+        assert_eq!(row.0, Some("claude-sonnet-4-6".to_string()));
+        assert_eq!(row.1, Some("claude".to_string()));
+        assert_eq!(row.2, Some("v1-abc123".to_string()));
+        assert_eq!(row.3, 2);
+        assert_eq!(row.4, None); // no failure_mode on success
+        assert_eq!(row.5, Some(200));
+        assert_eq!(row.6, Some(4800));
+        assert_eq!(row.7, Some(500));
+        assert_eq!(row.8, Some(300));
+        assert_eq!(row.9, Some(12));
+        assert!(row.10.as_ref().unwrap().contains("Read"));
+        assert_eq!(row.11, Some(200));
+        assert!((row.12.unwrap() - 0.045).abs() < 1e-6);
+        assert_eq!(row.13, Some(1500));
+        assert_eq!(row.14, Some(800));
+    }
+
+    #[test]
+    fn test_phase_run_failure_mode_stored() {
+        let q = open_mem();
+        let rec = PhaseRunRecord {
+            spec_id: "S0002".to_string(),
+            task_id: None,
+            phase: "critic".to_string(),
+            level: "spec".to_string(),
+            outcome: "failed".to_string(),
+            duration_ms: Some(30000),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            started_at: "2026-04-29T00:00:00Z".to_string(),
+            completed_at: Some("2026-04-29T00:00:30Z".to_string()),
+            model: Some("claude-opus-4-7".to_string()),
+            runtime: Some("openrouter".to_string()),
+            pipeline_id: None,
+            attempt: 1,
+            failure_mode: Some("timeout".to_string()),
+            cold_start_ms: None,
+            inference_ms: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            tool_call_count: Some(0),
+            tool_calls_by_type: None,
+            ttft_ms: None,
+            loop_iteration: None,
+            verify_exit_code: None,
+        };
+        q.insert_phase_run(&rec).unwrap();
+
+        let failure_mode: Option<String> = q.conn.query_row(
+            "SELECT failure_mode FROM phase_runs WHERE spec_id = 'S0002'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(failure_mode, Some("timeout".to_string()));
+    }
+
+    #[test]
+    fn test_bench_result_cost_columns() {
+        let q = open_mem();
+        let rec = BenchResultRecord {
+            run_id: "bench-001".to_string(),
+            pipeline: "v1".to_string(),
+            spec_file: "test.yaml".to_string(),
+            run_number: 1,
+            status: "completed".to_string(),
+            total_ms: 60000,
+            tasks_total: 5,
+            tasks_done: 4,
+            tasks_failed: 0,
+            total_cost_usd: Some(0.23),
+            total_input_tokens: Some(15000),
+            total_output_tokens: Some(8000),
+            tasks_skipped: 1,
+        };
+        q.insert_bench_result(&rec).unwrap();
+
+        let row: (Option<f64>, Option<i64>, Option<i64>, i64) = q.conn.query_row(
+            "SELECT total_cost_usd, total_input_tokens, total_output_tokens, tasks_skipped
+             FROM bench_results WHERE run_id = 'bench-001'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+
+        assert!((row.0.unwrap() - 0.23).abs() < 1e-6);
+        assert_eq!(row.1, Some(15000));
+        assert_eq!(row.2, Some(8000));
+        assert_eq!(row.3, 1);
+    }
+
+    #[test]
+    fn test_aggregate_spec_cost() {
+        let q = open_mem();
+        for i in 0..3 {
+            let rec = PhaseRunRecord {
+                spec_id: "S0010".to_string(),
+                task_id: Some(format!("T{:04}", i)),
+                phase: "execute".to_string(),
+                level: "task".to_string(),
+                outcome: "proceed".to_string(),
+                duration_ms: Some(1000),
+                cost_usd: Some(0.01 * (i + 1) as f64),
+                input_tokens: Some(100 * (i + 1) as i64),
+                output_tokens: Some(50 * (i + 1) as i64),
+                started_at: "2026-04-29T00:00:00Z".to_string(),
+                completed_at: Some("2026-04-29T00:00:01Z".to_string()),
+                model: None,
+                runtime: None,
+                pipeline_id: None,
+                attempt: 1,
+                failure_mode: None,
+                cold_start_ms: None,
+                inference_ms: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                tool_call_count: None,
+                tool_calls_by_type: None,
+                ttft_ms: None,
+                loop_iteration: None,
+                verify_exit_code: None,
+            };
+            q.insert_phase_run(&rec).unwrap();
+        }
+
+        let (cost, input, output) = q.aggregate_spec_cost("S0010").unwrap();
+        assert!((cost.unwrap() - 0.06).abs() < 1e-6, "cost={:?}", cost);
+        assert_eq!(input, Some(600));
+        assert_eq!(output, Some(300));
+    }
+
+    #[test]
+    fn test_phase_run_columns_migrated() {
+        let q = open_mem();
+        let has_col = |table: &str, col: &str| -> bool {
+            q.conn.prepare(&format!("PRAGMA table_info({})", table))
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([], |row| {
+                        let name: String = row.get(1)?;
+                        Ok(name)
+                    })?;
+                    Ok(rows.filter_map(|r| r.ok()).any(|n| n == col))
+                })
+                .unwrap_or(false)
+        };
+
+        assert!(has_col("phase_runs", "model"), "model column should exist");
+        assert!(has_col("phase_runs", "runtime"), "runtime column should exist");
+        assert!(has_col("phase_runs", "pipeline_id"), "pipeline_id column should exist");
+        assert!(has_col("phase_runs", "attempt"), "attempt column should exist");
+        assert!(has_col("phase_runs", "failure_mode"), "failure_mode column should exist");
+        assert!(has_col("phase_runs", "cold_start_ms"), "cold_start_ms column should exist");
+        assert!(has_col("phase_runs", "inference_ms"), "inference_ms column should exist");
+        assert!(has_col("phase_runs", "cache_read_tokens"), "cache_read_tokens column should exist");
+        assert!(has_col("phase_runs", "cache_creation_tokens"), "cache_creation_tokens column should exist");
+        assert!(has_col("phase_runs", "tool_call_count"), "tool_call_count column should exist");
+        assert!(has_col("phase_runs", "tool_calls_by_type"), "tool_calls_by_type column should exist");
+        assert!(has_col("phase_runs", "ttft_ms"), "ttft_ms column should exist");
+        assert!(has_col("phase_runs", "loop_iteration"), "loop_iteration column should exist");
+        assert!(has_col("phase_runs", "verify_exit_code"), "verify_exit_code column should exist");
+
+        assert!(has_col("bench_results", "total_cost_usd"), "total_cost_usd column should exist");
+        assert!(has_col("bench_results", "total_input_tokens"), "total_input_tokens column should exist");
+        assert!(has_col("bench_results", "total_output_tokens"), "total_output_tokens column should exist");
+        assert!(has_col("bench_results", "tasks_skipped"), "tasks_skipped column should exist");
+    }
+
+    #[test]
+    fn test_phase_run_loop_iteration_stored() {
+        let q = open_mem();
+        let rec = PhaseRunRecord {
+            spec_id: "S0020".to_string(),
+            task_id: None,
+            phase: "spec-critique".to_string(),
+            level: "spec".to_string(),
+            outcome: "redo".to_string(),
+            duration_ms: Some(2000),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            started_at: "2026-04-29T00:00:00Z".to_string(),
+            completed_at: Some("2026-04-29T00:00:02Z".to_string()),
+            model: Some("gemini-flash".to_string()),
+            runtime: Some("openrouter".to_string()),
+            pipeline_id: Some("exp5-cond-v1".to_string()),
+            attempt: 1,
+            failure_mode: None,
+            cold_start_ms: None,
+            inference_ms: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            tool_call_count: None,
+            tool_calls_by_type: None,
+            ttft_ms: None,
+            loop_iteration: Some(2),
+            verify_exit_code: None,
+        };
+        q.insert_phase_run(&rec).unwrap();
+
+        let loop_iter: Option<i64> = q.conn.query_row(
+            "SELECT loop_iteration FROM phase_runs WHERE spec_id = 'S0020'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(loop_iter, Some(2), "loop_iteration=2 should be stored");
+    }
+
+    #[test]
+    fn test_phase_run_verify_exit_code_stored() {
+        let q = open_mem();
+        let rec = PhaseRunRecord {
+            spec_id: "S0021".to_string(),
+            task_id: Some("T0001".to_string()),
+            phase: "task-verify".to_string(),
+            level: "task".to_string(),
+            outcome: "redo".to_string(),
+            duration_ms: Some(500),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            started_at: "2026-04-29T00:00:00Z".to_string(),
+            completed_at: Some("2026-04-29T00:00:00Z".to_string()),
+            model: None,
+            runtime: Some("verify".to_string()),
+            pipeline_id: None,
+            attempt: 1,
+            failure_mode: None,
+            cold_start_ms: None,
+            inference_ms: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            tool_call_count: None,
+            tool_calls_by_type: None,
+            ttft_ms: None,
+            loop_iteration: Some(1),
+            verify_exit_code: Some(1),
+        };
+        q.insert_phase_run(&rec).unwrap();
+
+        let code: Option<i64> = q.conn.query_row(
+            "SELECT verify_exit_code FROM phase_runs WHERE spec_id = 'S0021'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(code, Some(1), "verify_exit_code=1 (failure) should be stored");
+
+        // Success case
+        let rec2 = PhaseRunRecord {
+            spec_id: "S0022".to_string(),
+            task_id: Some("T0001".to_string()),
+            phase: "task-verify".to_string(),
+            level: "task".to_string(),
+            outcome: "proceed".to_string(),
+            duration_ms: Some(500),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            started_at: "2026-04-29T00:00:00Z".to_string(),
+            completed_at: Some("2026-04-29T00:00:00Z".to_string()),
+            model: None,
+            runtime: Some("verify".to_string()),
+            pipeline_id: None,
+            attempt: 1,
+            failure_mode: None,
+            cold_start_ms: None,
+            inference_ms: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            tool_call_count: None,
+            tool_calls_by_type: None,
+            ttft_ms: None,
+            loop_iteration: Some(1),
+            verify_exit_code: Some(0),
+        };
+        q.insert_phase_run(&rec2).unwrap();
+
+        let code2: Option<i64> = q.conn.query_row(
+            "SELECT verify_exit_code FROM phase_runs WHERE spec_id = 'S0022'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(code2, Some(0), "verify_exit_code=0 (success) should be stored");
     }
 }

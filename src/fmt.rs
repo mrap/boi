@@ -106,6 +106,16 @@ pub fn is_pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+pub fn format_duration_ms(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    }
+}
+
 pub fn ensure_db_dir(db_str: &str) {
     if let Some(parent) = std::path::Path::new(db_str).parent() {
         let _ = std::fs::create_dir_all(parent); // intentional: best-effort dir creation; Queue::open reports actual error

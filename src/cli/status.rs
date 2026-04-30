@@ -1,10 +1,11 @@
 use crate::cli::daemon::{daemon_heartbeat_path, is_daemon_locked};
 use crate::config;
 use crate::fmt::{
-    display_width, elapsed_since, ensure_db_dir, progress_bar, term_width, time_ago, truncate,
-    BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW,
+    display_width, elapsed_since, ensure_db_dir, format_duration_ms, progress_bar, term_width,
+    time_ago, truncate, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW,
 };
 use crate::queue;
+use crate::telemetry::Telemetry;
 use serde_json::json;
 
 pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
@@ -69,7 +70,7 @@ pub fn render_single_spec(q: &queue::Queue, id: &str) -> String {
     }
 }
 
-fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
+fn render_status(spec_id: Option<&str>, all: bool, verbose: bool, db_str: &str) -> String {
     ensure_db_dir(db_str);
 
     let daemon_running = is_daemon_locked();
@@ -172,10 +173,34 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
             // Show current task
             if let Ok(Some(st)) = q.status(&s.id) {
                 if let Some(running_task) = st.tasks.iter().find(|t| t.status == "RUNNING") {
-                    out.push_str(&format!(
-                        "         {}\u{2192} {}: {}{}\n",
-                        DIM, running_task.id, running_task.title, RESET
-                    ));
+                    if verbose {
+                        // Fetch the most recent phase_runs row for this spec
+                        let telemetry = Telemetry::new(std::path::PathBuf::from(db_str));
+                        let runs = telemetry.phase_runs_by_spec(&s.id);
+                        let last = runs.last();
+                        let runtime_str = last
+                            .and_then(|r| r.runtime.as_deref())
+                            .unwrap_or("?");
+                        let model_str = last
+                            .and_then(|r| r.model.as_deref())
+                            .unwrap_or("?");
+                        let duration_str = last
+                            .and_then(|r| r.duration_ms)
+                            .map(format_duration_ms)
+                            .unwrap_or_default();
+                        out.push_str(&format!(
+                            "         {}\u{2192} {}: {}{}  {}[{} / {}{}]{}{}\n",
+                            DIM, running_task.id, running_task.title, RESET,
+                            CYAN, runtime_str, model_str,
+                            if duration_str.is_empty() { String::new() } else { format!("  {}", duration_str) },
+                            RESET, ""
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "         {}\u{2192} {}: {}{}\n",
+                            DIM, running_task.id, running_task.title, RESET
+                        ));
+                    }
                 }
             }
 
@@ -353,15 +378,15 @@ fn render_status(spec_id: Option<&str>, all: bool, db_str: &str) -> String {
     out
 }
 
-pub fn cmd_status(spec_id: Option<&str>, all: bool, db_str: &str) {
-    println!("{}", render_status(spec_id, all, db_str));
+pub fn cmd_status(spec_id: Option<&str>, all: bool, verbose: bool, db_str: &str) {
+    println!("{}", render_status(spec_id, all, verbose, db_str));
 }
 
-pub fn cmd_status_watch(spec_id: Option<&str>, all: bool, db_str: &str) {
+pub fn cmd_status_watch(spec_id: Option<&str>, all: bool, verbose: bool, db_str: &str) {
     loop {
         // Clear screen
         print!("\x1b[2J\x1b[H");
-        print!("{}", render_status(spec_id, all, db_str));
+        print!("{}", render_status(spec_id, all, verbose, db_str));
         let now = chrono::Utc::now().format("%H:%M:%S");
         println!("\n{}Updated at {} — Ctrl+C to exit{}", DIM, now, RESET);
         std::thread::sleep(std::time::Duration::from_secs(2));

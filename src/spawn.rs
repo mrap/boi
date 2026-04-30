@@ -17,6 +17,13 @@ pub struct ClaudeResult {
     pub startup_ms: u64,
     pub inference_ms: u64,
     pub total_ms: u64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_creation_tokens: Option<i64>,
+    pub cost_usd: Option<f64>,
+    pub tool_call_count: i64,
+    pub tool_calls_by_type: std::collections::HashMap<String, i64>,
 }
 
 pub fn pid_dir() -> std::path::PathBuf {
@@ -117,6 +124,13 @@ pub fn spawn_claude(
         let mut first_byte_time: Option<Instant> = None;
         let mut last_output = String::new();
         let mut raw_lines = Vec::new();
+        let mut input_tokens: Option<i64> = None;
+        let mut output_tokens: Option<i64> = None;
+        let mut cache_read_tokens: Option<i64> = None;
+        let mut cache_creation_tokens: Option<i64> = None;
+        let mut cost_usd: Option<f64> = None;
+        let mut tool_call_count: i64 = 0;
+        let mut tool_calls_by_type = std::collections::HashMap::<String, i64>::new();
 
         for line in reader.lines() {
             let line = match line {
@@ -130,19 +144,62 @@ pub fn spawn_claude(
                 let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match event_type {
                     "assistant" => {
-                        if let Some(msg) = event.pointer("/message/content/0/text").and_then(|v| v.as_str()) {
-                            boi_log!("  claude: {}", msg);
+                        if let Some(content) = event.pointer("/message/content").and_then(|v| v.as_array()) {
+                            for block in content {
+                                let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                if block_type == "text" {
+                                    if let Some(msg) = block.get("text").and_then(|v| v.as_str()) {
+                                        boi_log!("  claude: {}", msg);
+                                    }
+                                } else if block_type == "tool_use" {
+                                    tool_call_count += 1;
+                                    if let Some(tool_name) = block.get("name").and_then(|v| v.as_str()) {
+                                        *tool_calls_by_type.entry(tool_name.to_string()).or_insert(0) += 1;
+                                        let input_str = block.get("input")
+                                            .map(|v| v.to_string())
+                                            .unwrap_or_default();
+                                        boi_log!("  tool: {} {}", tool_name, input_str);
+                                    }
+                                }
+                            }
                         }
-                        if let Some(tool) = event.pointer("/message/content/0/name").and_then(|v| v.as_str()) {
-                            let input_str = event.pointer("/message/content/0/input")
-                                .map(|v| v.to_string())
-                                .unwrap_or_default();
-                            boi_log!("  tool: {} {}", tool, input_str);
+                        if let Some(usage) = event.pointer("/message/usage") {
+                            if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+                                input_tokens = Some(v);
+                            }
+                            if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+                                output_tokens = Some(v);
+                            }
+                            if let Some(v) = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()) {
+                                cache_read_tokens = Some(v);
+                            }
+                            if let Some(v) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()) {
+                                cache_creation_tokens = Some(v);
+                            }
                         }
                     }
                     "result" => {
                         if let Some(text) = event.get("result").and_then(|v| v.as_str()) {
                             last_output = text.to_string();
+                        }
+                        if let Some(v) = event.get("total_cost_usd").and_then(|v| v.as_f64())
+                            .or_else(|| event.get("cost_usd").and_then(|v| v.as_f64()))
+                        {
+                            cost_usd = Some(v);
+                        }
+                        if let Some(usage) = event.get("usage") {
+                            if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
+                                input_tokens = Some(v);
+                            }
+                            if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+                                output_tokens = Some(v);
+                            }
+                            if let Some(v) = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()) {
+                                cache_read_tokens = Some(v);
+                            }
+                            if let Some(v) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()) {
+                                cache_creation_tokens = Some(v);
+                            }
                         }
                     }
                     _ => {}
@@ -154,7 +211,7 @@ pub fn spawn_claude(
         if last_output.is_empty() && !raw_lines.is_empty() {
             last_output = raw_lines.join("\n");
         }
-        (first_byte_time, last_output)
+        (first_byte_time, last_output, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, tool_call_count, tool_calls_by_type)
     });
 
     let mut timed_out = false;
@@ -202,11 +259,19 @@ pub fn spawn_claude(
             startup_ms: 0,
             inference_ms: 0,
             total_ms,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            cost_usd: None,
+            tool_call_count: 0,
+            tool_calls_by_type: std::collections::HashMap::new(),
         });
     }
 
     // With setsid + process group kill, grandchildren are dead and pipes unblock naturally.
-    let (first_byte_instant, output) = reader_handle.join().unwrap_or((None, String::new()));
+    let (first_byte_instant, output, r_input_tokens, r_output_tokens, r_cache_read, r_cache_create, r_cost_usd, r_tool_count, r_tool_types) =
+        reader_handle.join().unwrap_or((None, String::new(), None, None, None, None, None, 0, std::collections::HashMap::new()));
     let stderr_output = stderr_handle.join().unwrap_or_default();
 
     if !stderr_output.is_empty() {
@@ -226,5 +291,12 @@ pub fn spawn_claude(
         startup_ms,
         inference_ms,
         total_ms,
+        input_tokens: r_input_tokens,
+        output_tokens: r_output_tokens,
+        cache_read_tokens: r_cache_read,
+        cache_creation_tokens: r_cache_create,
+        cost_usd: r_cost_usd,
+        tool_call_count: r_tool_count,
+        tool_calls_by_type: r_tool_types,
     })
 }
