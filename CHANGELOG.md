@@ -8,8 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] - Unreleased
 
 ### Added
+- Auto-load `~/.boi/.env` at startup: binary now loads `~/.boi/.env` (or `$BOI_ENV_FILE`) before provider registry initializes, so `OPENROUTER_API_KEY` and other secrets can live in that file without shell profile changes; existing process env always wins
+- Pipeline `[phase_overrides.<phase>]` blocks: pipeline TOMLs can now override `runtime`, `model`, `effort`, and `timeout` per phase; runner consults pipeline override first then falls back to phase TOML default; overrides are logged at info level in `[phase.invoked]` events for bench attribution
 - `scripts/autoresearch-propose.py`: LLM-driven hypothesis generator for BOI pipeline variants — reads bench results + current default, calls OpenRouter (gemini-flash) to propose a single variant TOML + rationale; tracks per-axis fail counts and pivots after 3 consecutive failures on the same axis; emits `boi.autoresearch.propose` telemetry
-- `openrouter` runtime support: phases can specify `runtime = "openrouter"` + any model string; requires `OPENROUTER_API_KEY` env var
+- `openrouter` runtime support: phases can specify `runtime = "openrouter"` + any model string; requires `OPENROUTER_API_KEY` env var (can be set in `~/.boi/.env`)
 - `boi providers list`: new subcommand — list all registered and disabled runtime providers (claude, codex, openrouter) and their availability on the current machine
 - Per-phase telemetry: `PhaseInvocation` struct captures runtime, model, effort, thinking config, prompt length, timeout, auth env var, CLI args, git SHA, and host fingerprint for every phase invocation
 - `phase_runs` SQLite table: append-only log of every phase invocation with full completion fields (duration_ms, startup_ms, inference_ms, tokens, cost, exit_status, exit_reason)

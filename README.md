@@ -338,6 +338,8 @@ Exit 0 = passed. Any non-zero exit = failed. Stdout/stderr are captured as the f
 
 BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) and `openrouter` (requires `OPENROUTER_API_KEY`) are also supported. Use `boi providers list` to see which providers are active on your machine.
 
+Set `OPENROUTER_API_KEY` in your shell profile **or** in `~/.boi/.env` — the binary auto-loads that file at startup so you don't need to export the key in every shell session.
+
 ### Global Default
 
 Set in `~/.boi/config.json`:
