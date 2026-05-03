@@ -203,9 +203,29 @@ name = "v2"
 spec_phases = ["spec-critique", "spec-improve"]   # phases run once on the spec
 task_phases = ["execute", "task-verify"]           # phases run per task
 post_phases = ["doc-update", "critic", "merge"]    # phases run after all tasks complete
+
+# Optional: override runtime/model/effort/timeout per phase for this pipeline.
+# Unset fields fall back to the phase TOML default.
+[phase_overrides.critic]
+model = "claude-haiku-4-5"
+
+[phase_overrides.execute]
+runtime = "openrouter"
+model = "google/gemini-2.0-flash-001"
+effort = "high"
+timeout = 3600
 ```
 
 Pass them with `--pipeline name:path/to/pipeline.toml` (repeatable for N-way comparisons).
+
+`[phase_overrides.<name>]` fields:
+
+| Field | Type | Values |
+|-------|------|--------|
+| `runtime` | string | `claude`, `openrouter`, `codex` |
+| `model` | string | any model ID the runtime accepts |
+| `effort` | string | `low`, `medium`, `high` |
+| `timeout` | integer | seconds |
 
 ### Pipeline v2 Mode (opt-in)
 

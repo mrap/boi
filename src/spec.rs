@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Runtime provider selector for a phase override.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseRuntime {
+    Claude,
+    Openrouter,
+    Codex,
+}
+
+/// Per-phase override values from a pipeline TOML's [phase_overrides.<name>] block.
+/// All fields are optional; unset fields fall back to the phase TOML default.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct PhaseOverride {
+    pub runtime: Option<PhaseRuntime>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub timeout: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BoiSpec {
     pub title: String,
@@ -18,6 +37,9 @@ pub struct BoiSpec {
     /// Context files to inject into every worker prompt for this spec
     #[serde(default)]
     pub context_files: Option<Vec<String>>,
+    /// Per-phase overrides injected from the pipeline TOML (runner applies these before phase TOML defaults).
+    #[serde(default)]
+    pub phase_overrides: HashMap<String, PhaseOverride>,
     pub tasks: Vec<BoiTask>,
 }
 

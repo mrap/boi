@@ -1105,6 +1105,7 @@ mod tests {
             spec_phases: None,
             task_phases: None,
             context_files: None,
+            phase_overrides: std::collections::HashMap::new(),
             tasks,
         }
     }

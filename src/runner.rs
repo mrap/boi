@@ -2,14 +2,70 @@ use crate::builtins::{self, BuiltinContext};
 use crate::phases::{PhaseConfig, Verdict};
 use crate::runtime::{self, InvocationContext, ProviderError, ProviderRegistry};
 use crate::runtime::claude::ClaudeCLIProvider;
-use crate::spec::BoiTask;
+use crate::spec::{BoiTask, PhaseOverride, PhaseRuntime};
 use crate::telemetry::{
     generate_invocation_id, LogLevel, PhaseCompletionFields, PhaseInvocation, Telemetry,
 };
 use crate::worker;
 use chrono::Utc;
 use serde_json::json;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+/// Apply pipeline phase_overrides to a PhaseConfig, returning the effective config.
+/// Unset override fields fall back to the phase TOML defaults. Emits a telemetry event
+/// when any field is overridden so bench runs are attributable in phase_runs records.
+pub fn apply_phase_overrides_from_map(
+    phase: &PhaseConfig,
+    overrides: &HashMap<String, PhaseOverride>,
+    phase_name: &str,
+    telemetry: &Telemetry,
+    spec_id: &str,
+) -> PhaseConfig {
+    let Some(ov) = overrides.get(phase_name) else {
+        return phase.clone();
+    };
+
+    let mut effective = phase.clone();
+    let mut applied: Vec<String> = Vec::new();
+
+    if let Some(rt) = &ov.runtime {
+        let rt_str = match rt {
+            PhaseRuntime::Claude => "claude",
+            PhaseRuntime::Openrouter => "openrouter",
+            PhaseRuntime::Codex => "codex",
+        };
+        effective.runtime = Some(rt_str.to_string());
+        applied.push(format!("runtime={rt_str}"));
+    }
+    if let Some(m) = &ov.model {
+        effective.model = Some(m.clone());
+        applied.push(format!("model={m}"));
+    }
+    if let Some(e) = &ov.effort {
+        effective.effort = Some(e.clone());
+        applied.push(format!("effort={e}"));
+    }
+    if let Some(t) = ov.timeout {
+        effective.timeout_minutes = Some((t / 60).max(1) as u32);
+        applied.push(format!("timeout={t}s"));
+    }
+
+    if !applied.is_empty() {
+        telemetry.emit(
+            "boi.phase.override_applied",
+            LogLevel::Info,
+            &json!({
+                "spec_id": spec_id,
+                "phase": phase_name,
+                "overrides": applied.join(", "),
+                "message": format!("phase '{}' overrides applied: {}", phase_name, applied.join(", ")),
+            }),
+        );
+    }
+
+    effective
+}
 
 /// Telemetry metrics collected during a single phase execution.
 /// Populated from ClaudeResult data when available.

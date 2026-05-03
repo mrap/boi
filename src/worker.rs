@@ -202,6 +202,25 @@ pub fn run_verify_with_code(verify_cmd: &str, dir: &str) -> (bool, Option<i64>) 
     }
 }
 
+/// Apply pipeline phase overrides to a PhaseConfig (delegates to runner::apply_phase_overrides_from_map).
+pub fn apply_phase_override(
+    phase: &phases::PhaseConfig,
+    overrides: &std::collections::HashMap<String, spec::PhaseOverride>,
+    phase_name: &str,
+    telemetry: &Telemetry,
+    spec_id: &str,
+) -> phases::PhaseConfig {
+    crate::runner::apply_phase_overrides_from_map(phase, overrides, phase_name, telemetry, spec_id)
+}
+
+/// Returns the effective timeout_secs for a phase: uses phase.timeout_minutes if set by an
+/// override, otherwise falls back to the global config timeout.
+pub fn effective_timeout(phase: &phases::PhaseConfig, config_timeout_secs: u64) -> u64 {
+    phase.timeout_minutes
+        .map(|m| m as u64 * 60)
+        .unwrap_or(config_timeout_secs)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_phase_run(
     queue: &Queue,
@@ -412,6 +431,17 @@ pub fn run_worker_with_phases(
         phases: None,
     }).collect();
 
+    // Load phase_overrides from spec file if available (bench runner injects them there).
+    // The DB does not store phase_overrides directly; the spec file is the source of truth.
+    let spec_phase_overrides: std::collections::HashMap<String, spec::PhaseOverride> =
+        if let Ok(content) = std::fs::read_to_string(spec_path) {
+            spec::parse(&content)
+                .map(|s| s.phase_overrides)
+                .unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+
     let mut boi_spec = spec::BoiSpec {
         title: spec_rec.title.clone(),
         mode: Some(spec_rec.mode.clone()),
@@ -422,6 +452,7 @@ pub fn run_worker_with_phases(
         spec_phases: None,
         task_phases: None,
         context_files: None,
+        phase_overrides: spec_phase_overrides,
         tasks,
     };
 
@@ -645,6 +676,8 @@ pub fn run_worker_with_phases(
                         continue;
                     }
                 };
+                let effective_phase = apply_phase_override(phase, &boi_spec.phase_overrides, phase_name, telemetry, spec_id);
+                let phase_timeout_secs = effective_timeout(&effective_phase, config.task_timeout_secs);
 
                 let phase_payload = json!({
                     "spec_id": spec_id,
@@ -663,11 +696,11 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, phase_output, metrics) = runner.run_phase_full(
-                    phase,
+                    &effective_phase,
                     &spec_content,
                     None,
                     &worktree_path,
-                    config.task_timeout_secs,
+                    phase_timeout_secs,
                     Some(spec_id),
                     &prompt_vars,
                 );
@@ -908,6 +941,8 @@ pub fn run_worker_with_phases(
                         continue;
                     }
                 };
+                let effective_phase = apply_phase_override(phase, &boi_spec.phase_overrides, phase_name, telemetry, spec_id);
+                let phase_timeout_secs = effective_timeout(&effective_phase, config.task_timeout_secs);
 
                 boi_log!("state: TaskPhase {{ task: {}, phase_idx: {}, phase: '{}', requeue_attempts: {} }}",
                     task.id, phase_idx, phase_name, requeue_attempts);
@@ -939,11 +974,11 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, _output, metrics) = runner.run_phase_full(
-                    phase,
+                    &effective_phase,
                     &spec_content,
                     Some(task),
                     &worktree_path,
-                    config.task_timeout_secs,
+                    phase_timeout_secs,
                     Some(spec_id),
                     &prompt_vars,
                 );
@@ -1063,7 +1098,9 @@ pub fn run_worker_with_phases(
                         continue;
                     }
                 };
-                let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
+                let effective_phase = apply_phase_override(phase, &boi_spec.phase_overrides, phase_name, telemetry, spec_id);
+                let phase_timeout_secs = effective_timeout(&effective_phase, config.task_timeout_secs);
+                let max_attempts = effective_phase.retry_count.unwrap_or(config.retry_count);
 
                 if attempt >= max_attempts {
                     boi_log!("state: TaskPhaseRetry -> Failed (max retries {} reached for task {} phase '{}')",
@@ -1104,11 +1141,11 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (retry_verdict, _output, retry_metrics) = runner.run_phase_full(
-                    phase,
+                    &effective_phase,
                     &spec_content,
                     Some(task),
                     &worktree_path,
-                    config.task_timeout_secs,
+                    phase_timeout_secs,
                     Some(spec_id),
                     &prompt_vars,
                 );
@@ -1242,6 +1279,8 @@ pub fn run_worker_with_phases(
                         continue;
                     }
                 };
+                let effective_phase = apply_phase_override(phase, &boi_spec.phase_overrides, phase_name, telemetry, spec_id);
+                let phase_timeout_secs = effective_timeout(&effective_phase, config.task_timeout_secs);
 
                 let phase_payload = json!({
                     "spec_id": spec_id,
@@ -1260,11 +1299,11 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, _output, metrics) = runner.run_phase_full(
-                    phase,
+                    &effective_phase,
                     &spec_content,
                     None,
                     &worktree_path,
-                    config.task_timeout_secs,
+                    phase_timeout_secs,
                     Some(spec_id),
                     &prompt_vars,
                 );
@@ -1276,7 +1315,7 @@ pub fn run_worker_with_phases(
                 match &verdict {
                     Verdict::Proceed => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
-                        if phase.completion_handler.as_deref() == Some("builtin:cleanup") {
+                        if effective_phase.completion_handler.as_deref() == Some("builtin:cleanup") {
                             worktree_removed = true;
                         }
                         state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };

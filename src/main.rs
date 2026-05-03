@@ -221,6 +221,9 @@ enum SpecAction {
 }
 
 fn main() {
+    // Auto-load ~/.boi/.env before any env vars are consumed (dotenvy::from_path; existing env wins).
+    boi::load_boi_env();
+
     let cli = Cli::parse();
     let cfg = config::load();
 
