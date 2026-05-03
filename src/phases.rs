@@ -196,9 +196,12 @@ impl PhaseConfig {
             .or_else(|| toml.worker.as_ref().and_then(|w| w.prompt_template.clone()))
             .unwrap_or_default();
 
-        let timeout_minutes = toml
-            .phase.as_ref().and_then(|p| p.timeout_minutes)
-            .or_else(|| toml.worker.as_ref().and_then(|w| w.timeout.map(|t| t / 60)));
+        // timeout_minutes is intentionally NOT populated from TOML here. It is set
+        // exclusively by apply_phase_overrides_from_map at runtime (pipeline overrides).
+        // Reading TOML-level timeout values here caused all phases to use short per-phase
+        // TOML ceilings (2-10 min) instead of the 1800s global default. The [worker]
+        // timeout / [phase] timeout_minutes TOML fields are metadata-only.
+        let timeout_minutes: Option<u32> = None;
 
         // Read level from [phase] section; fall back to name-based derivation for
         // user-created phases that don't specify level.

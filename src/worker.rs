@@ -217,6 +217,7 @@ pub fn apply_phase_override(
 /// override, otherwise falls back to the global config timeout.
 pub fn effective_timeout(phase: &phases::PhaseConfig, config_timeout_secs: u64) -> u64 {
     phase.timeout_minutes
+        .filter(|&m| m > 0)  // guard: 0-minute values (e.g. from integer division) fall through to global default
         .map(|m| m as u64 * 60)
         .unwrap_or(config_timeout_secs)
 }
