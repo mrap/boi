@@ -128,7 +128,7 @@ pub fn apply_phase_overrides_from_map(
         applied.push("effort".to_string());
     }
     if let Some(t) = ov.timeout {
-        out.timeout_minutes = Some(t as u32);
+        out.timeout_minutes = Some(((t + 59) / 60) as u32);
         applied.push("timeout".to_string());
     }
 

@@ -8,13 +8,16 @@ use boi::cli::doctor::cmd_doctor;
 use boi::cli::log::cmd_log;
 use boi::cli::outputs::cmd_outputs;
 use boi::cli::phases_cmd::{cmd_phase_runs, cmd_phases_list, cmd_phases_show};
+use boi::cli::prune::{cmd_prune_orphans, PruneConfig};
 use boi::cli::providers::cmd_providers_list;
+use boi::cli::research::cmd_research;
 use boi::cli::spec_mgmt::{cmd_spec, SpecActionData};
 use boi::cli::status::{cmd_status, cmd_status_json, cmd_status_watch};
 use boi::cli::telemetry_cmd::cmd_telemetry;
 use boi::cli::workers::cmd_workers;
 use boi::{config, hooks};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -176,6 +179,46 @@ enum Commands {
     },
     /// Launch interactive TUI dashboard
     Dashboard,
+    /// Generate shell completion script
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
+    /// Identify and optionally kill orphaned worker processes
+    PruneOrphans {
+        /// Show candidates without killing (default)
+        #[arg(long, conflicts_with = "apply")]
+        dry_run: bool,
+        /// Kill the identified orphan processes
+        #[arg(long, conflicts_with = "dry_run")]
+        apply: bool,
+        /// Skip confirmation prompt (required with --apply in non-TTY)
+        #[arg(long)]
+        yes: bool,
+        /// Override the empty-protected-set safety check
+        #[arg(long)]
+        force: bool,
+        /// Minimum idle seconds before considering a process orphaned (default 600)
+        #[arg(long, default_value = "600")]
+        max_idle_secs: u64,
+        /// Exclude processes whose cmdline contains this string (repeatable)
+        #[arg(long = "exclude-pattern")]
+        exclude_patterns: Vec<String>,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Dispatch a multi-angle research DAG from a brief
+    Research {
+        /// Path to the research brief (markdown with Question/Angles/Deliverable sections)
+        brief: PathBuf,
+        /// Number of parallel research angles (default 3)
+        #[arg(long, default_value = "3")]
+        threads: usize,
+        /// Project name to tag all dispatched specs with
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -189,9 +232,23 @@ enum DaemonAction {
     /// Start the daemon in the background
     Start,
     /// Stop the running daemon
-    Stop,
+    Stop {
+        /// Cancel all running specs before stopping (DESTRUCTIVE — destroys all in-flight work)
+        #[arg(long)]
+        destroy_running: bool,
+        /// Skip confirmation prompt (required in non-TTY environments)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Restart the daemon (stop + start)
-    Restart,
+    Restart {
+        /// Cancel all running specs before restarting (DESTRUCTIVE — destroys all in-flight work)
+        #[arg(long)]
+        destroy_running: bool,
+        /// Skip confirmation prompt (required in non-TTY environments)
+        #[arg(long)]
+        yes: bool,
+    },
     /// Run the daemon in the foreground (default)
     Foreground,
 }
@@ -288,8 +345,8 @@ fn main() {
         Commands::Daemon { action } => {
             match action.unwrap_or(DaemonAction::Foreground) {
                 DaemonAction::Start => cmd_start(),
-                DaemonAction::Stop => cmd_stop(),
-                DaemonAction::Restart => cmd_restart(),
+                DaemonAction::Stop { destroy_running, yes } => cmd_stop(destroy_running, yes),
+                DaemonAction::Restart { destroy_running, yes } => cmd_restart(destroy_running, yes),
                 DaemonAction::Foreground => cmd_daemon(db_str, hook_cfg, &cfg),
             }
         }
@@ -300,7 +357,7 @@ fn main() {
             cmd_workers(db_str, &cfg);
         }
         Commands::Stop => {
-            cmd_stop();
+            cmd_stop(false, false);
         }
         Commands::Telemetry { spec_id } => {
             cmd_telemetry(&spec_id, db_str);
@@ -393,6 +450,47 @@ fn main() {
         Commands::Dashboard => {
             run_dashboard(db_str);
         }
+        Commands::Completions { shell } => {
+            generate(shell, &mut Cli::command(), "boi", &mut std::io::stdout());
+        }
+        Commands::PruneOrphans {
+            dry_run,
+            apply,
+            yes,
+            force,
+            max_idle_secs,
+            exclude_patterns,
+            json,
+        } => {
+            let prune_cfg = PruneConfig {
+                dry_run: dry_run || !apply,
+                apply,
+                yes,
+                force,
+                max_idle_secs,
+                exclude_patterns,
+                json,
+            };
+            cmd_prune_orphans(&prune_cfg, db_str);
+        }
+        Commands::Research { brief, threads, project } => {
+            cmd_research(&brief, threads, project.as_deref(), db_str, &hook_cfg);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap_complete::Shell;
+
+    #[test]
+    fn completions_zsh_contains_boi_function() {
+        let mut buf = Vec::new();
+        generate(Shell::Zsh, &mut Cli::command(), "boi", &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.is_empty(), "zsh completion output should not be empty");
+        assert!(output.contains("_boi"), "zsh completion should contain '_boi'");
     }
 }
 

@@ -1,14 +1,39 @@
+use crate::pool::{JobId, JobOutput, JobStatus, WorkerPool};
+use crate::worker::WorkerConfig;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-/// Per-second cost estimate for shared-cpu-1x (1 vCPU, 256 MB).
-/// Source: Fly.io pricing — ~$0.0000026/sec at this size.
-const PER_SECOND_RATE_USD: f64 = 0.0000026;
+/// Per-second CPU rate for shared-cpu instances (Fly.io pricing).
+const SHARED_CPU_RATE_PER_SEC: f64 = 0.0000026;
+/// Per-second CPU rate for performance/dedicated CPU instances.
+const PERFORMANCE_CPU_RATE_PER_SEC: f64 = 0.0000080;
+/// Per-second memory rate per MB (Fly.io pricing).
+const MEMORY_RATE_PER_MB_PER_SEC: f64 = 0.0000000032;
 /// Average assumed runtime per container run when no measurement is available.
 const ASSUMED_RUNTIME_SECS: f64 = 60.0;
+/// Default cost cap in USD if none is configured.
+const DEFAULT_MAX_COST_USD: f64 = 10.0;
+
+/// Estimate the USD cost for one Fly.io machine run.
+///
+/// Uses published Fly.io per-second rates keyed by cpu_kind.
+pub fn estimate_cost_usd(
+    cpu_kind: &str,
+    cpu_count: u32,
+    memory_mb: u32,
+    expected_minutes: f64,
+) -> f64 {
+    let cpu_rate = match cpu_kind {
+        "performance" | "dedicated" => PERFORMANCE_CPU_RATE_PER_SEC,
+        _ => SHARED_CPU_RATE_PER_SEC,
+    };
+    let total_rate = cpu_rate * cpu_count as f64
+        + MEMORY_RATE_PER_MB_PER_SEC * memory_mb as f64;
+    total_rate * expected_minutes * 60.0
+}
 
 #[derive(Debug, Error)]
 pub enum RemoteError {
@@ -33,6 +58,11 @@ pub struct FlyDispatcher {
     app_name: String,
     base_url: String,
     client: Client,
+    cpu_kind: String,
+    cpu_count: u32,
+    memory_mb: u32,
+    max_cost_usd: f64,
+    image: Option<String>,
 }
 
 pub struct ContainerResult {
@@ -141,7 +171,40 @@ impl FlyDispatcher {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(RemoteError::Http)?;
-        Ok(Self { api_token, app_name, base_url, client })
+        Ok(Self {
+            api_token,
+            app_name,
+            base_url,
+            client,
+            cpu_kind: "shared".to_string(),
+            cpu_count: 1,
+            memory_mb: 256,
+            max_cost_usd: DEFAULT_MAX_COST_USD,
+            image: None,
+        })
+    }
+
+    /// Override machine sizing, app, image, and cost cap from a FlyPoolConfig.
+    pub fn with_fly_config(mut self, cfg: &crate::config::FlyPoolConfig) -> Self {
+        if let Some(app) = &cfg.app {
+            self.app_name = app.clone();
+        }
+        if let Some(img) = &cfg.image {
+            self.image = Some(img.clone());
+        }
+        if let Some(k) = &cfg.cpu_kind {
+            self.cpu_kind = k.clone();
+        }
+        if let Some(c) = cfg.cpu_count {
+            self.cpu_count = c;
+        }
+        if let Some(m) = cfg.memory_mb {
+            self.memory_mb = m;
+        }
+        if let Some(cap) = cfg.max_cost_usd {
+            self.max_cost_usd = cap;
+        }
+        self
     }
 }
 
@@ -149,7 +212,8 @@ impl FlyDispatcher {
 
 impl FlyDispatcher {
     fn auth(&self) -> String {
-        format!("Bearer {}", self.api_token)
+        // Fly Machines API requires "FlyV1" scheme, not "Bearer"
+        format!("FlyV1 {}", self.api_token)
     }
 
     fn machines_url(&self) -> String {
@@ -183,9 +247,9 @@ impl FlyDispatcher {
                 init,
                 auto_destroy: false,
                 guest: GuestConfig {
-                    cpu_kind: "shared".to_string(),
-                    cpus: 1,
-                    memory_mb: 256,
+                    cpu_kind: self.cpu_kind.clone(),
+                    cpus: self.cpu_count,
+                    memory_mb: self.memory_mb,
                 },
                 restart: RestartPolicy { policy: "no".to_string() },
             },
@@ -294,6 +358,16 @@ impl FlyDispatcher {
             .header("Authorization", self.auth())
             .send();
     }
+
+    fn get_machine(&self, id: &str) -> Result<MachineResponse, RemoteError> {
+        let resp = self
+            .client
+            .get(&self.machine_url(id))
+            .header("Authorization", self.auth())
+            .send()
+            .map_err(RemoteError::Http)?;
+        resp.json().map_err(RemoteError::Http)
+    }
 }
 
 // ── Public interface ──────────────────────────────────────────────────────────
@@ -324,7 +398,7 @@ impl FlyDispatcher {
 
         let exit_code = stop_result?;
 
-        let cost_usd = Some((duration_ms as f64 / 1000.0) * PER_SECOND_RATE_USD);
+        let cost_usd = Some(estimate_cost_usd(&self.cpu_kind, self.cpu_count, self.memory_mb, duration_ms as f64 / 60_000.0));
 
         Ok(ContainerResult {
             exit_code,
@@ -337,15 +411,15 @@ impl FlyDispatcher {
     }
 
     /// Estimate whether dispatching `estimated_runs` containers would exceed
-    /// `max_cost_usd`. Uses the per-second rate and an assumed 60-second
-    /// average runtime. Callers should pass in a tighter estimate when known.
+    /// `max_cost_usd`. Uses a fixed assumed 60-second average runtime.
+    /// Prefer `check_cost_guard_for_run` when cpu/mem/time are known.
     pub fn check_cost_guard(
         &self,
         estimated_runs: u32,
         max_cost_usd: f64,
     ) -> Result<(), RemoteError> {
-        let estimated =
-            estimated_runs as f64 * ASSUMED_RUNTIME_SECS * PER_SECOND_RATE_USD;
+        let estimated = estimated_runs as f64
+            * estimate_cost_usd(&self.cpu_kind, self.cpu_count, self.memory_mb, ASSUMED_RUNTIME_SECS / 60.0);
 
         if estimated > max_cost_usd {
             return Err(RemoteError::CostExceeded {
@@ -355,6 +429,129 @@ impl FlyDispatcher {
             });
         }
         Ok(())
+    }
+
+    /// Guard a single planned run against the configured cost cap.
+    ///
+    /// Computes the estimate from actual cpu/mem sizing and expected runtime,
+    /// then returns CostExceeded if `estimated > self.max_cost_usd`.
+    pub fn check_cost_guard_for_run(
+        &self,
+        cpu_kind: &str,
+        cpu_count: u32,
+        memory_mb: u32,
+        expected_minutes: f64,
+    ) -> Result<(), RemoteError> {
+        let estimated = estimate_cost_usd(cpu_kind, cpu_count, memory_mb, expected_minutes);
+        if estimated > self.max_cost_usd {
+            return Err(RemoteError::CostExceeded {
+                estimated,
+                max: self.max_cost_usd,
+                runs: 1,
+            });
+        }
+        Ok(())
+    }
+}
+
+// ── WorkerPool adapter ────────────────────────────────────────────────────────
+
+impl WorkerPool for FlyDispatcher {
+    /// POST /apps/{app}/machines — create and start a machine, return its ID.
+    fn spawn(
+        &self,
+        spec_id: &str,
+        spec_path: &str,
+        workspace_path: &str,
+        config: &WorkerConfig,
+    ) -> anyhow::Result<JobId> {
+        let image = self.image.clone()
+            .or_else(|| std::env::var("FLY_IMAGE").ok())
+            .unwrap_or_else(|| "registry.fly.io/boi-workers:latest".to_string());
+
+        let mut env = HashMap::new();
+        env.insert("BOI_SPEC_ID".to_string(), spec_id.to_string());
+        env.insert("BOI_SPEC_PATH".to_string(), spec_path.to_string());
+        env.insert("BOI_WORKSPACE".to_string(), workspace_path.to_string());
+        env.insert("BOI_TIMEOUT".to_string(), config.task_timeout_secs.to_string());
+
+        let expected_minutes = config.task_timeout_secs as f64 / 60.0;
+        self.check_cost_guard_for_run(
+            &self.cpu_kind.clone(),
+            self.cpu_count,
+            self.memory_mb,
+            expected_minutes,
+        )
+        .map_err(|e| anyhow::anyhow!("fly spawn cost guard: {e}"))?;
+
+        let machine_id = self
+            .create_machine(&image, env, vec![])
+            .map_err(|e| anyhow::anyhow!("fly spawn: {e}"))?;
+        Ok(JobId::new(machine_id))
+    }
+
+    /// GET /apps/{app}/machines/{id} — map machine state to JobStatus.
+    fn status(&self, job_id: &JobId) -> anyhow::Result<JobStatus> {
+        let machine = self
+            .get_machine(job_id.as_str())
+            .map_err(|e| anyhow::anyhow!("fly status: {e}"))?;
+
+        let exit_code = || {
+            machine
+                .events
+                .iter()
+                .find(|e| e.kind == "exit")
+                .and_then(|e| e.request.get("exit_code").and_then(|v| v.as_i64()))
+                .unwrap_or(0)
+        };
+
+        let status = match machine.state.as_deref() {
+            Some("stopped") | Some("destroyed") => {
+                if exit_code() == 0 { JobStatus::Completed } else { JobStatus::Failed }
+            }
+            Some("failed") => JobStatus::Failed,
+            None => JobStatus::Unknown,
+            _ => JobStatus::Running,
+        };
+        Ok(status)
+    }
+
+    /// GET exit code from machine events + fetch logs.
+    fn collect(&self, job_id: &JobId) -> anyhow::Result<JobOutput> {
+        let machine = self
+            .get_machine(job_id.as_str())
+            .map_err(|e| anyhow::anyhow!("fly collect: {e}"))?;
+
+        let exit_code = machine
+            .events
+            .iter()
+            .find(|e| e.kind == "exit")
+            .and_then(|e| e.request.get("exit_code").and_then(|v| v.as_i64()))
+            .unwrap_or(0) as i32;
+
+        let (stdout, stderr) = self.fetch_logs(job_id.as_str());
+        Ok(JobOutput { exit_code, stdout, stderr })
+    }
+
+    /// POST /apps/{app}/machines/{id}/stop — signal the machine to stop.
+    fn cancel(&self, job_id: &JobId) -> anyhow::Result<()> {
+        let stop_url = format!("{}/stop", self.machine_url(job_id.as_str()));
+        let _ = self
+            .client
+            .post(&stop_url)
+            .header("Authorization", self.auth())
+            .send();
+        Ok(())
+    }
+
+    /// DELETE /apps/{app}/machines/{id}?force=true — destroy the machine.
+    fn cleanup(&self, job_id: &JobId) -> anyhow::Result<()> {
+        self.delete_machine(job_id.as_str());
+        Ok(())
+    }
+
+    fn max_workers(&self) -> u32 {
+        10
     }
 }
 
@@ -547,6 +744,122 @@ mod fly_dispatch {
         assert!(
             matches!(result, Err(RemoteError::MissingToken)),
             "expected MissingToken error"
+        );
+    }
+}
+
+// ── fly_cost_guard: per-run estimate + guard tests ────────────────────────────
+
+#[cfg(test)]
+mod fly_cost_guard {
+    use super::*;
+
+    fn dispatcher() -> FlyDispatcher {
+        FlyDispatcher::new_for_test("tok", "app", "http://127.0.0.1:1").unwrap()
+    }
+
+    // ── estimate_cost_usd ────────────────────────────────────────────────────
+
+    #[test]
+    fn fly_cost_guard_estimate_shared_cpu_1x_256mb_1min() {
+        let cost = estimate_cost_usd("shared", 1, 256, 1.0);
+        // 0.0000026 * 1 + 0.0000000032 * 256 = 0.0000026 + ~0.000000819 = ~0.000003419
+        // × 60s = ~0.000205
+        assert!(cost > 0.0001 && cost < 0.01, "unexpected cost: {cost}");
+    }
+
+    #[test]
+    fn fly_cost_guard_estimate_performance_cpu_costs_more() {
+        let shared = estimate_cost_usd("shared", 2, 512, 5.0);
+        let perf = estimate_cost_usd("performance", 2, 512, 5.0);
+        assert!(perf > shared, "performance CPUs must cost more than shared");
+    }
+
+    #[test]
+    fn fly_cost_guard_estimate_longer_runtime_costs_more() {
+        let short = estimate_cost_usd("shared", 1, 256, 1.0);
+        let long = estimate_cost_usd("shared", 1, 256, 60.0);
+        assert!(long > short, "longer runtime must cost more");
+        // Should be approximately 60× more
+        assert!((long / short - 60.0).abs() < 1.0, "cost should scale linearly with time");
+    }
+
+    #[test]
+    fn fly_cost_guard_estimate_zero_minutes_is_zero() {
+        let cost = estimate_cost_usd("shared", 4, 1024, 0.0);
+        assert_eq!(cost, 0.0);
+    }
+
+    // ── check_cost_guard_for_run ─────────────────────────────────────────────
+
+    #[test]
+    fn fly_cost_guard_passes_when_cost_under_cap() {
+        let d = dispatcher();
+        // shared-1x 256MB 1 minute ≈ $0.0002 — well under $10 default cap
+        assert!(d.check_cost_guard_for_run("shared", 1, 256, 1.0).is_ok());
+    }
+
+    #[test]
+    fn fly_cost_guard_fails_when_cost_over_cap() {
+        // Use a $1.00 cap. performance-8x 8GB for 10 hours ≈ $3.25 → exceeds cap.
+        let cfg = crate::config::FlyPoolConfig {
+            max_cost_usd: Some(1.0),
+            cpu_kind: Some("performance".to_string()),
+            cpu_count: Some(8),
+            memory_mb: Some(8192),
+            ..Default::default()
+        };
+        let d = FlyDispatcher::new_for_test("tok", "app", "http://127.0.0.1:1")
+            .unwrap()
+            .with_fly_config(&cfg);
+        let err = d.check_cost_guard_for_run("performance", 8, 8192, 600.0).unwrap_err();
+        assert!(
+            matches!(err, RemoteError::CostExceeded { .. }),
+            "expected CostExceeded, got {err}"
+        );
+    }
+
+    #[test]
+    fn fly_cost_guard_custom_cap_from_config() {
+        let cfg = crate::config::FlyPoolConfig {
+            max_cost_usd: Some(0.001),
+            cpu_kind: Some("shared".to_string()),
+            cpu_count: Some(1),
+            memory_mb: Some(256),
+            ..Default::default()
+        };
+        let d = FlyDispatcher::new_for_test("tok", "app", "http://127.0.0.1:1")
+            .unwrap()
+            .with_fly_config(&cfg);
+        // $0.001 cap — even a 5-minute run should hit the cap
+        let result = d.check_cost_guard_for_run("shared", 1, 256, 5.0);
+        assert!(result.is_err(), "should fail with low custom cap");
+    }
+
+    #[test]
+    fn fly_cost_guard_default_cap_is_ten_dollars() {
+        let d = dispatcher();
+        assert_eq!(d.max_cost_usd, DEFAULT_MAX_COST_USD);
+    }
+
+    #[test]
+    fn fly_cost_guard_spawn_blocked_by_guard() {
+        use crate::worker::WorkerConfig;
+        let cfg = crate::config::FlyPoolConfig {
+            max_cost_usd: Some(0.0), // $0 cap — always reject
+            cpu_kind: Some("shared".to_string()),
+            cpu_count: Some(1),
+            memory_mb: Some(256),
+            ..Default::default()
+        };
+        let d = FlyDispatcher::new_for_test("tok", "app", "http://127.0.0.1:1")
+            .unwrap()
+            .with_fly_config(&cfg);
+        let worker_cfg = WorkerConfig { task_timeout_secs: 60, ..WorkerConfig::default() };
+        let err = d.spawn("spec-1", "/tmp/spec.yaml", "/tmp/ws", &worker_cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("cost guard"),
+            "spawn must fail with cost guard error, got: {err}"
         );
     }
 }

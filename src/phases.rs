@@ -487,10 +487,28 @@ impl PhaseRegistry {
                                 if !explicit.can_fail_spec {
                                     phase.can_fail_spec = core.can_fail_spec;
                                 }
-                                if !explicit.timeout_minutes {
-                                    if let Some(core_timeout) = core.timeout_minutes {
-                                        phase.timeout_minutes = Some(core_timeout);
-                                    }
+                                if explicit.timeout_minutes {
+                                    // from_toml() skips timeout_minutes to avoid core-phase TOML
+                                    // ceilings overriding runtime defaults. Re-extract it here when
+                                    // the user explicitly set it in their override file.
+                                    phase.timeout_minutes = raw_content.as_deref()
+                                        .and_then(|c| c.parse::<toml::Value>().ok())
+                                        .and_then(|v| {
+                                            // [phase].timeout_minutes wins (already in minutes)
+                                            v.get("phase")
+                                                .and_then(|p| p.get("timeout_minutes"))
+                                                .and_then(|t| t.as_integer())
+                                                .map(|t| t as u32)
+                                                .or_else(|| {
+                                                    // [worker].timeout is in seconds
+                                                    v.get("worker")
+                                                        .and_then(|w| w.get("timeout"))
+                                                        .and_then(|t| t.as_integer())
+                                                        .map(|t| ((t as u32) + 59) / 60)
+                                                })
+                                        });
+                                } else if let Some(core_timeout) = core.timeout_minutes {
+                                    phase.timeout_minutes = Some(core_timeout);
                                 }
                             }
                             let mtime = std::fs::metadata(&entry).ok()
@@ -545,8 +563,22 @@ impl PhaseRegistry {
                             if !explicit.level { phase.level = core.level; }
                             if !explicit.can_add_tasks { phase.can_add_tasks = core.can_add_tasks; }
                             if !explicit.can_fail_spec { phase.can_fail_spec = core.can_fail_spec; }
-                            if !explicit.timeout_minutes {
-                                if let Some(t) = core.timeout_minutes { phase.timeout_minutes = Some(t); }
+                            if explicit.timeout_minutes {
+                                phase.timeout_minutes = raw.parse::<toml::Value>().ok()
+                                    .and_then(|v| {
+                                        v.get("phase")
+                                            .and_then(|p| p.get("timeout_minutes"))
+                                            .and_then(|t| t.as_integer())
+                                            .map(|t| t as u32)
+                                            .or_else(|| {
+                                                v.get("worker")
+                                                    .and_then(|w| w.get("timeout"))
+                                                    .and_then(|t| t.as_integer())
+                                                    .map(|t| ((t as u32) + 59) / 60)
+                                            })
+                                    });
+                            } else if let Some(t) = core.timeout_minutes {
+                                phase.timeout_minutes = Some(t);
                             }
                         }
                         self.user_mtimes.borrow_mut().insert(resolved.to_string(), disk_mtime);
@@ -1962,6 +1994,78 @@ template = "Do something at the spec level."
         let ctx = BuiltinContext { spec_id, task_title: "", repo_path: repo.to_str().unwrap() };
         assert!(matches!(run_builtin(handler, &ctx), BuiltinResult::Success(_)), "cleanup phase failed");
         assert!(!dest.exists(), "worktree must be removed after cleanup");
+    }
+
+    #[test]
+    fn plan_critique_accepts_generate_with_tasks() {
+        // Verifies that mode:generate specs with a pre-defined tasks: array pass both spec
+        // validation and the plan-critique gate. Generate mode grants creative authority --
+        // pre-defined tasks are starting points, not structural defects.
+        let registry = test_registry();
+        let pc = registry
+            .get("plan-critique")
+            .expect("plan-critique phase must be in registry");
+
+        // A generate-mode spec with 2 tasks must pass spec validation.
+        let spec = crate::spec::BoiSpec {
+            title: "Research and Design Pipeline".into(),
+            mode: Some("generate".into()),
+            workspace: None,
+            initiative: None,
+            context: Some("Design a new data pipeline".into()),
+            outcomes: None,
+            spec_phases: None,
+            task_phases: None,
+            context_files: None,
+            phase_overrides: Default::default(),
+            worker_pool: None,
+            tasks: vec![
+                crate::spec::BoiTask {
+                    id: "t-1".into(),
+                    title: "Research existing solutions".into(),
+                    status: crate::spec::TaskStatus::Pending,
+                    depends: None,
+                    spec: Some("Research the existing data pipeline patterns.".into()),
+                    verify: Some("test -f research.md".into()),
+                    verify_prompt: None,
+                    phases: None,
+                },
+                crate::spec::BoiTask {
+                    id: "t-2".into(),
+                    title: "Draft design doc".into(),
+                    status: crate::spec::TaskStatus::Pending,
+                    depends: Some(vec!["t-1".into()]),
+                    spec: Some("Write the design document based on research.".into()),
+                    verify: Some("test -f design.md".into()),
+                    verify_prompt: None,
+                    phases: None,
+                },
+            ],
+        };
+        assert!(
+            crate::spec::validate(&spec).is_ok(),
+            "generate-mode spec with tasks must pass spec validation"
+        );
+
+        // The plan-critique prompt template must tell the LLM that generate-mode specs may
+        // include pre-defined tasks. The Mode-Specific Rules section covers this.
+        assert!(
+            pc.prompt_template.contains("generate"),
+            "plan-critique template must acknowledge generate mode: pre-defined tasks are \
+             valid starting points, not structural defects. Template (first 120 chars): {:?}",
+            &pc.prompt_template[..pc.prompt_template.len().min(120)]
+        );
+
+        // When the LLM finds no issues, the gate must produce Proceed.
+        let verdict = parse_phase_output(
+            &pc,
+            "## Plan Approved\n\nAll five criteria passed. The spec is ready for execution.",
+        );
+        assert_eq!(
+            verdict,
+            Verdict::Proceed,
+            "plan-critique must proceed when approve signal found"
+        );
     }
 
     mod pipeline_parse {

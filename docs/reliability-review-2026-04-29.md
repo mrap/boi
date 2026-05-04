@@ -20,7 +20,7 @@ Systematic trace of every failure path in the BOI daemon. Each finding includes 
 
 **Scenario:** Daemon dies while a worker is executing a spec with a workspace. The worker thread dies with it. Worktree at `~/.boi/worktrees/{spec_id}` is never cleaned up.
 
-**Current behavior:** On restart, `recover_stuck_specs` resets the spec to `queued`. When the daemon picks it up again, `worktree::create()` checks `if dest.exists() { return Ok(dest) }` (worktree.rs:23) — so it reuses the existing worktree. The stale branch `boi/{spec_id}` is NOT deleted because the branch-delete logic (`git branch -D`) at worktree.rs:34 only fires during `create()`, which short-circuits before reaching it if the directory already exists.
+**Current behavior:** On restart, `recover_stuck_specs` resets the spec to `queued`. When the daemon picks it up again, `worktree::create()` checks `if dest.exists() { return Ok(dest) }` (workspace/git.rs:140) — so it reuses the existing worktree. The stale branch `boi/{spec_id}` is NOT deleted because the branch-delete logic (`git branch -D`) at workspace/git.rs:150 only fires during `create()`, which short-circuits before reaching it if the directory already exists.
 
 **Impact:** The worktree is reused, but it contains **partially committed state from the prior failed run**. The worker operates on dirty state without knowing. If the prior run had done `git add -A` but not committed, the re-run inherits those staged changes.
 
@@ -144,7 +144,7 @@ The daemon's 30-second shutdown wait (daemon.rs:300) will expire. The daemon pro
 
 **Scenario:** User dispatches a spec with `workspace: /path/to/repo` while the repo has uncommitted changes (modified tracked files).
 
-**Current behavior:** `worktree::create` runs `git worktree add -b boi/{spec_id}`. Git creates the worktree from HEAD, inheriting the index but NOT the working directory changes. The worktree starts clean. **However**, after the spec completes, `merge_back` (worktree.rs:97) merges the branch into the source repo's current branch using `git merge --no-edit`. If the source repo has uncommitted changes in the same files, `git merge` will refuse with "Your local changes to the following files would be overwritten by merge."
+**Current behavior:** `worktree::create` runs `git worktree add -b boi/{spec_id}`. Git creates the worktree from HEAD, inheriting the index but NOT the working directory changes. The worktree starts clean. **However**, after the spec completes, `merge_back` (workspace/git.rs:68) merges the branch into the source repo's current branch using `git merge --no-edit`. If the source repo has uncommitted changes in the same files, `git merge` will refuse with "Your local changes to the following files would be overwritten by merge."
 
 **Impact:** Merge fails. The error is caught (worker.rs:1263/state_machine.rs:1010), logged, the worktree is preserved, but the completed work is stranded on the `boi/{spec_id}` branch. The spec shows as "completed" in the DB even though the merge failed. **The user's work is not lost but requires manual recovery.**
 
@@ -154,7 +154,7 @@ The daemon's 30-second shutdown wait (daemon.rs:300) will expire. The daemon pro
 
 **Scenario:** Two specs dispatch to the same workspace repo simultaneously. Both try to create `boi/{spec_id}` branches with different spec IDs, so no collision. BUT: if a user manually creates a branch named `boi/SXXXX` matching a future spec ID, `git worktree add -b boi/SXXXX` will fail because the branch exists.
 
-**Current behavior:** `worktree::create` first tries to delete the stale branch (`git branch -D boi/{spec_id}`, worktree.rs:34). This handles the case.
+**Current behavior:** `worktree::create` first tries to delete the stale branch (`git branch -D boi/{spec_id}`, workspace/git.rs:150). This handles the case.
 
 **Impact:** None — correctly handled by the stale branch deletion.
 
@@ -170,7 +170,7 @@ The daemon's 30-second shutdown wait (daemon.rs:300) will expire. The daemon pro
 
 ### F-17: `git worktree remove --force` can corrupt git index
 
-**Scenario:** `worktree::cleanup` (worktree.rs:117) runs `git worktree remove --force`. If the worktree has an active git process (e.g., a backgrounded `git status`), force-removing it can leave the main repo's `.git/worktrees/` in an inconsistent state.
+**Scenario:** `worktree::cleanup` (workspace/git.rs:196) runs `git worktree remove --force`. If the worktree has an active git process (e.g., a backgrounded `git status`), force-removing it can leave the main repo's `.git/worktrees/` in an inconsistent state.
 
 **Impact:** Low — BOI's setsid/process-group kill should have already killed all claude grandchildren before cleanup runs.
 
@@ -284,7 +284,7 @@ The daemon's 30-second shutdown wait (daemon.rs:300) will expire. The daemon pro
 
 **Current behavior:** There is no `boi decide` or `boi resume` command implemented. The spec stays "paused" forever. The worktree at `~/.boi/worktrees/{spec_id}` is never cleaned up. The branch `boi/{spec_id}` persists.
 
-**Impact:** Worktree and branch leak. Over time, these accumulate. `cleanup_stale()` (worktree.rs:156) only removes directories without a `.git` file — paused worktrees have valid `.git` files and are NOT cleaned up.
+**Impact:** Worktree and branch leak. Over time, these accumulate. `cleanup_stale()` (workspace/git.rs:113) only removes directories without a `.git` file — paused worktrees have valid `.git` files and are NOT cleaned up.
 
 **Fix recommendation:** Implement a `boi resume` command that sets the spec back to `queued`. Add a staleness check in `boi doctor` that flags paused specs older than N days and offers cleanup.
 

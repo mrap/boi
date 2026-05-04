@@ -349,8 +349,9 @@ pub fn run_worker_with_phases(
     telemetry: &Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let queue = Queue::open(queue_path)?;
-    queue.update_spec(spec_id, "running")?;
-    let _ = hooks::fire(hook_config, ON_WORKER_START, &json!({ "spec_id": spec_id })); // intentional: best-effort hook notification
+    let worker_id = format!("W-{}-{:?}", spec_id, std::thread::current().id());
+    queue.update_spec_running(spec_id, &worker_id)?;
+    let _ = hooks::fire(hook_config, ON_WORKER_START, &json!({ "spec_id": spec_id, "worker_id": worker_id })); // intentional: best-effort hook notification
 
     telemetry.emit("boi.worker.started", LogLevel::Info, &json!({
         "spec_id": spec_id,
@@ -366,9 +367,13 @@ pub fn run_worker_with_phases(
 
     let original_workspace = spec_rec.workspace.clone();
 
+    let workspace: Box<dyn crate::workspace::WorkspaceBackend> =
+        Box::new(crate::workspace::git::GitWorkspace::new());
+
     let worktree_path: String = match &original_workspace {
         Some(ws) if !ws.is_empty() => {
-            let worktree_dir = crate::worktree::create(spec_id, ws)?;
+            let worktree_dir = workspace.create(spec_id, ws)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             worktree_dir.to_str()
                 .ok_or_else(|| -> Box<dyn std::error::Error> { "worktree path is not valid UTF-8".into() })?
                 .to_string()
@@ -452,6 +457,7 @@ pub fn run_worker_with_phases(
         task_phases: task_phases_from_db,
         context_files: None,
         phase_overrides: phase_overrides_from_db,
+        worker_pool: None,
         tasks,
     };
 
@@ -1428,36 +1434,17 @@ pub fn run_worker_with_phases(
                     // we reach this state the worktree may already be gone.
                     if let Some(ws) = &boi_spec.workspace {
                         if std::path::Path::new(&worktree_path).exists() {
-                            let commit_msg = format!("boi({}): completed spec tasks", spec_id);
-                            match crate::worktree::commit_changes(spec_id, &commit_msg) {
-                                Ok(true) => {
-                                    boi_log!(" committed changes in worktree");
-                                    match crate::worktree::merge_back(spec_id, ws) {
-                                        Ok(output) => {
-                                            boi_log!(" merged worktree branch into source repo");
-                                            telemetry.emit("boi.worktree.merged", LogLevel::Info, &json!({
-                                                "spec_id": spec_id,
-                                                "message": format!("merged boi/{} into source repo", spec_id),
-                                                "merge_output": output.chars().take(200).collect::<String>(),
-                                            }));
-                                        }
-                                        Err(e) => {
-                                            boi_log!(" merge failed: {} — worktree preserved", e);
-                                            telemetry.emit("boi.worktree.merge_failed", LogLevel::Error, &json!({
-                                                "spec_id": spec_id,
-                                                "error": e.to_string(),
-                                            }));
-                                            let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(false) => {
-                                    boi_log!(" no changes to commit in worktree");
+                            match workspace.merge(std::path::Path::new(&worktree_path), ws) {
+                                Ok(()) => {
+                                    boi_log!(" merged worktree branch into source repo");
+                                    telemetry.emit("boi.worktree.merged", LogLevel::Info, &json!({
+                                        "spec_id": spec_id,
+                                        "message": format!("merged boi/{} into source repo", spec_id),
+                                    }));
                                 }
                                 Err(e) => {
-                                    boi_log!(" commit failed: {} — worktree preserved", e);
-                                    telemetry.emit("boi.worktree.commit_failed", LogLevel::Error, &json!({
+                                    boi_log!(" merge failed: {} — worktree preserved", e);
+                                    telemetry.emit("boi.worktree.merge_failed", LogLevel::Error, &json!({
                                         "spec_id": spec_id,
                                         "error": e.to_string(),
                                     }));
@@ -1467,16 +1454,10 @@ pub fn run_worker_with_phases(
                         }
                     }
                     boi_log!("state: Cleanup — removing worktree for spec {}", spec_id);
-                    let _ = crate::worktree::cleanup(spec_id); // intentional: best-effort worktree cleanup
-                    if let Some(ws) = &boi_spec.workspace {
-                        let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
-                    }
+                    let _ = workspace.cleanup(spec_id); // intentional: best-effort worktree cleanup
                 } else if config.cleanup_on_failure {
                     boi_log!("state: Cleanup — removing worktree for failed spec {}", spec_id);
-                    let _ = crate::worktree::cleanup(spec_id); // intentional: best-effort worktree cleanup
-                    if let Some(ws) = &boi_spec.workspace {
-                        let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
-                    }
+                    let _ = workspace.cleanup(spec_id); // intentional: best-effort worktree cleanup
                 } else {
                     boi_log!(" preserving worktree for failed spec {}", spec_id);
                 }

@@ -38,6 +38,8 @@ pub struct SpecRecord {
     pub spec_phases: Option<String>,
     /// JSON-serialized HashMap<phase_name, PhaseOverride> (from spec YAML).
     pub phase_overrides: Option<String>,
+    /// Named worker pool requested by this spec (None → use registry default).
+    pub worker_pool: Option<String>,
 }
 
 #[derive(Debug)]
@@ -300,6 +302,7 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "task_phases", "TEXT");
         Self::ensure_column(&conn, "specs", "spec_phases", "TEXT");
         Self::ensure_column(&conn, "specs", "phase_overrides", "TEXT");
+        Self::ensure_column(&conn, "specs", "worker_pool", "TEXT");
         Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
         Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
 
@@ -386,9 +389,9 @@ impl Queue {
         };
 
         tx.execute(
-            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace, project_context, task_phases, spec_phases, phase_overrides)
-             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace, project_context, task_phases_json, spec_phases_json, phase_overrides_json],
+            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace, project_context, task_phases, spec_phases, phase_overrides, worker_pool)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace, project_context, task_phases_json, spec_phases_json, phase_overrides_json, spec.worker_pool],
         )?;
 
         let mut yaml_to_canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -456,7 +459,93 @@ impl Queue {
                         priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                         max_iterations, iteration, project, phase, worker_timeout_seconds,
                         context, workspace, phase_loop_count, project_context,
-                        task_phases, spec_phases, phase_overrides
+                        task_phases, spec_phases, phase_overrides, worker_pool
+                 FROM specs WHERE id = ?1",
+            )?;
+            stmt.query_row(params![id], row_to_spec)?
+        };
+
+        tx.commit()?;
+        Ok(Some(rec))
+    }
+
+    /// Revert a spec from 'assigning' back to 'queued'.
+    /// Called when a named pool is at capacity — the spec waits its turn without
+    /// silently falling back to a different pool.
+    pub fn requeue(&self, spec_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE specs SET status = 'queued' WHERE id = ?1 AND status = 'assigning'",
+            params![spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// Like `dequeue()` but only returns a spec whose `worker_pool` is in
+    /// `available_pools`, or whose `worker_pool` is NULL and the default pool
+    /// is in `available_pools`.  Atomically sets status to 'assigning'.
+    ///
+    /// Pass the names of every pool that currently has free slots.
+    pub fn dequeue_for_pools(&self, available_pools: &[&str], default_pool: &str) -> Result<Option<SpecRecord>> {
+        if available_pools.is_empty() {
+            return Ok(None);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Build a parameterized IN clause.  SQLite doesn't support binding a
+        // variable-length list as a single parameter, so we construct the
+        // placeholders dynamically.
+        let placeholders: String = available_pools.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let default_in_available = available_pools.contains(&default_pool);
+
+        let sql = format!(
+            "SELECT id FROM specs
+             WHERE status = 'queued'
+               AND (depends_on IS NULL OR depends_on = ''
+                    OR EXISTS (SELECT 1 FROM specs s2
+                               WHERE s2.id = specs.depends_on AND s2.status = 'completed'))
+               AND (
+                 (worker_pool IN ({placeholders}))
+                 OR (worker_pool IS NULL AND {default_available})
+               )
+             ORDER BY priority ASC, queued_at ASC
+             LIMIT 1",
+            placeholders = placeholders,
+            default_available = if default_in_available { "1" } else { "0" },
+        );
+
+        let maybe_id: Option<String> = {
+            let mut stmt = tx.prepare(&sql)?;
+            let pool_params: Vec<&dyn rusqlite::ToSql> = available_pools
+                .iter()
+                .map(|p| p as &dyn rusqlite::ToSql)
+                .collect();
+            match stmt.query_row(pool_params.as_slice(), |row| row.get::<_, String>(0)) {
+                Ok(id) => Some(id),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e),
+            }
+        };
+
+        let id = match maybe_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        tx.execute(
+            "UPDATE specs SET status = 'assigning' WHERE id = ?1",
+            params![id],
+        )?;
+
+        let rec = {
+            let mut stmt = tx.prepare(
+                "SELECT id, title, mode, status, spec_path,
+                        (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id) as total_tasks,
+                        completed_tasks,
+                        priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
+                        max_iterations, iteration, project, phase, worker_timeout_seconds,
+                        context, workspace, phase_loop_count, project_context,
+                        task_phases, spec_phases, phase_overrides, worker_pool
                  FROM specs WHERE id = ?1",
             )?;
             stmt.query_row(params![id], row_to_spec)?
@@ -497,6 +586,18 @@ impl Queue {
         Ok(())
     }
 
+    /// Mark a spec as running and record the worker identity that owns it.
+    /// Use this instead of `update_spec(id, "running")` so ghost-worker detection
+    /// can cross-check worker_id against live processes.
+    pub fn update_spec_running(&self, spec_id: &str, worker_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE specs SET status = 'running', started_at = ?1, worker_id = ?2 WHERE id = ?3",
+            params![now, worker_id, spec_id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_spec(&self, spec_id: &str, status: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         match status {
@@ -530,7 +631,7 @@ impl Queue {
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
                     context, workspace, phase_loop_count, project_context,
-                    task_phases, spec_phases, phase_overrides
+                    task_phases, spec_phases, phase_overrides, worker_pool
              FROM specs WHERE id = ?1",
             params![spec_id],
             row_to_spec,
@@ -560,7 +661,7 @@ impl Queue {
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
                     context, workspace, phase_loop_count, project_context,
-                    task_phases, spec_phases, phase_overrides
+                    task_phases, spec_phases, phase_overrides, worker_pool
              FROM specs
              ORDER BY
                CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
@@ -1050,6 +1151,115 @@ impl Queue {
             .unwrap_or(None);
         Ok(result)
     }
+
+    /// Return all non-null current_pid values from the workers table.
+    pub fn get_worker_pids(&self) -> Result<Vec<u32>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT current_pid FROM workers WHERE current_pid IS NOT NULL",
+        )?;
+        let pids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .map(|p| p as u32)
+            .collect();
+        Ok(pids)
+    }
+
+    /// Return (active_pids, ended_pids) from the processes table.
+    /// active = ended_at IS NULL, ended = ended_at IS NOT NULL.
+    pub fn get_process_pids(&self) -> Result<(Vec<u32>, Vec<u32>)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pid, ended_at FROM processes WHERE pid IS NOT NULL",
+        )?;
+        let mut active = Vec::new();
+        let mut ended = Vec::new();
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows.filter_map(|r| r.ok()) {
+            let (pid, ended_at) = row;
+            if ended_at.is_some() {
+                ended.push(pid as u32);
+            } else {
+                active.push(pid as u32);
+            }
+        }
+        Ok((active, ended))
+    }
+
+    /// Set ended_at on all processes rows for the given pid that have no ended_at yet.
+    pub fn mark_process_ended_by_pid(&self, pid: u32) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE processes SET ended_at = ?1 WHERE pid = ?2 AND ended_at IS NULL",
+            params![now, pid as i64],
+        )
+    }
+
+    // --- Daemon consistency health checks ---
+
+    /// Return (spec_id, title, running_task_id) for all specs currently in 'running' or 'assigning' state.
+    /// running_task_id is the ID of a RUNNING task if one exists, otherwise empty string.
+    pub fn list_running_specs(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, COALESCE(s.title, ''), COALESCE(
+                 (SELECT t.id FROM tasks t WHERE t.spec_id = s.id AND t.status = 'RUNNING' LIMIT 1),
+                 ''
+             )
+             FROM specs s
+             WHERE s.status IN ('running', 'assigning')
+             ORDER BY s.created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Count specs stuck in `running` >1 hour with no iteration activity in the last hour
+    /// (ghost worker symptom).
+    pub fn ghost_worker_count(&self) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM specs
+             WHERE status = 'running'
+               AND started_at < datetime('now', '-1 hour')
+               AND NOT EXISTS (
+                 SELECT 1 FROM iterations i
+                 WHERE i.spec_id = specs.id
+                   AND i.started_at > datetime('now', '-1 hour')
+               )",
+            [],
+            |r| r.get(0),
+        )
+    }
+
+    /// Count specs in `running` with no worker_id set (duplicate-assignment symptom).
+    pub fn running_without_worker_id_count(&self) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM specs
+             WHERE status = 'running'
+               AND (worker_id IS NULL OR worker_id = '')",
+            [],
+            |r| r.get(0),
+        )
+    }
+
+    /// Count specs in `running` or `assigning` for >1 hour with no recent iteration
+    /// (stale status symptom).
+    pub fn stale_status_count(&self) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT COUNT(*) FROM specs
+             WHERE status IN ('running', 'assigning')
+               AND started_at < datetime('now', '-1 hour')
+               AND (
+                 NOT EXISTS (SELECT 1 FROM iterations WHERE spec_id = specs.id)
+                 OR (SELECT MAX(started_at) FROM iterations WHERE spec_id = specs.id)
+                      < datetime('now', '-1 hour')
+               )",
+            [],
+            |r| r.get(0),
+        )
+    }
 }
 
 /// Read and concatenate content from a list of file paths.
@@ -1100,6 +1310,7 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
         task_phases: row.get(23)?,
         spec_phases: row.get(24)?,
         phase_overrides: row.get(25)?,
+        worker_pool: row.get(26)?,
     })
 }
 
@@ -1133,6 +1344,7 @@ mod tests {
             task_phases: None,
             context_files: None,
             phase_overrides: std::collections::HashMap::new(),
+            worker_pool: None,
             tasks,
         }
     }
@@ -1863,5 +2075,320 @@ mod tests {
             |r| r.get(0),
         ).unwrap();
         assert_eq!(code2, Some(0), "verify_exit_code=0 (success) should be stored");
+    }
+
+    // --- per_spec_pool tests ---
+
+    fn make_spec_with_pool(title: &str, pool: Option<&str>) -> BoiSpec {
+        let mut s = make_spec(title, vec![make_task("t-1", "Task")]);
+        s.worker_pool = pool.map(|p| p.to_string());
+        s
+    }
+
+    #[test]
+    fn per_spec_pool_stored_on_enqueue() {
+        let q = open_mem();
+        let spec = make_spec_with_pool("Pool Spec", Some("fly-runners"));
+        let id = q.enqueue(&spec, None).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        assert_eq!(st.spec.worker_pool.as_deref(), Some("fly-runners"));
+    }
+
+    #[test]
+    fn per_spec_pool_none_for_unset_pool() {
+        let q = open_mem();
+        let spec = make_spec_with_pool("Default Spec", None);
+        let id = q.enqueue(&spec, None).unwrap();
+        let st = q.status(&id).unwrap().unwrap();
+        assert!(st.spec.worker_pool.is_none());
+    }
+
+    #[test]
+    fn per_spec_pool_returned_by_dequeue() {
+        let q = open_mem();
+        let spec = make_spec_with_pool("Dequeue Pool Spec", Some("local"));
+        let _id = q.enqueue(&spec, None).unwrap();
+        let rec = q.dequeue().unwrap().expect("should dequeue");
+        assert_eq!(rec.worker_pool.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn per_spec_pool_requeue_reverts_assigning_to_queued() {
+        let q = open_mem();
+        let spec = make_spec_with_pool("Requeue Spec", Some("fly-runners"));
+        let id = q.enqueue(&spec, None).unwrap();
+
+        let rec = q.dequeue().unwrap().expect("should dequeue");
+        assert_eq!(rec.status, "assigning");
+
+        q.requeue(&id).unwrap();
+
+        let st = q.status(&id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "queued", "requeue must restore queued status");
+    }
+
+    #[test]
+    fn per_spec_pool_dequeue_for_pools_returns_matching_spec() {
+        let q = open_mem();
+        let spec = make_spec_with_pool("Fly Spec", Some("fly-runners"));
+        let id = q.enqueue(&spec, None).unwrap();
+
+        let rec = q.dequeue_for_pools(&["fly-runners"], "local").unwrap();
+        assert!(rec.is_some(), "should dequeue spec requesting available pool");
+        assert_eq!(rec.unwrap().id, id);
+    }
+
+    #[test]
+    fn per_spec_pool_dequeue_for_pools_skips_unavailable_pool() {
+        let q = open_mem();
+        // Spec wants fly-runners, but only local is available
+        let spec = make_spec_with_pool("Fly Spec", Some("fly-runners"));
+        q.enqueue(&spec, None).unwrap();
+
+        let rec = q.dequeue_for_pools(&["local"], "local").unwrap();
+        assert!(rec.is_none(), "should NOT dequeue spec when its pool is not available");
+    }
+
+    #[test]
+    fn per_spec_pool_dequeue_for_pools_null_pool_uses_default() {
+        let q = open_mem();
+        // Spec has no worker_pool → uses default pool ("local")
+        let spec = make_spec_with_pool("Default Spec", None);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        let rec = q.dequeue_for_pools(&["local"], "local").unwrap();
+        assert!(rec.is_some(), "null worker_pool spec should dequeue when default pool is available");
+        assert_eq!(rec.unwrap().id, id);
+    }
+
+    #[test]
+    fn per_spec_pool_dequeue_for_pools_null_pool_blocked_when_default_unavailable() {
+        let q = open_mem();
+        // Spec has no worker_pool; default is "local" but local is NOT available
+        let spec = make_spec_with_pool("Default Spec", None);
+        q.enqueue(&spec, None).unwrap();
+
+        let rec = q.dequeue_for_pools(&["fly-runners"], "local").unwrap();
+        assert!(rec.is_none(), "null worker_pool spec blocked when default pool unavailable");
+    }
+
+    #[test]
+    fn per_spec_pool_dequeue_for_pools_empty_available_returns_none() {
+        let q = open_mem();
+        let spec = make_spec_with_pool("Any Spec", Some("local"));
+        q.enqueue(&spec, None).unwrap();
+
+        let rec = q.dequeue_for_pools(&[], "local").unwrap();
+        assert!(rec.is_none(), "empty available_pools must return None immediately");
+    }
+}
+
+// Regression tests for daemon consistency invariants (H1/H2/H3 from
+// docs/diagnostics/2026-05-daemon-consistency.md).
+// These tests document BROKEN behaviour and must FAIL until TE1AC lands the fix.
+#[cfg(test)]
+mod daemon_consistency {
+    use super::*;
+    use crate::spec::{BoiSpec, BoiTask, TaskStatus};
+    use std::collections::HashMap;
+
+    fn minimal_spec(title: &str) -> BoiSpec {
+        BoiSpec {
+            title: title.to_string(),
+            mode: Some("execute".to_string()),
+            workspace: None,
+            initiative: None,
+            context: None,
+            outcomes: None,
+            spec_phases: None,
+            task_phases: None,
+            context_files: None,
+            phase_overrides: HashMap::new(),
+            worker_pool: None,
+            tasks: vec![BoiTask {
+                id: "t-1".to_string(),
+                title: "Task".to_string(),
+                status: TaskStatus::Pending,
+                depends: None,
+                spec: None,
+                verify: None,
+                verify_prompt: None,
+                phases: None,
+            }],
+        }
+    }
+
+    // H1 — running specs must have worker_id set.
+    // Invariant: every spec in status='running' must carry a non-NULL worker_id
+    // so that the daemon can detect ghost workers and avoid re-dispatching live work.
+    #[test]
+    fn running_spec_must_have_worker_id() {
+        let q = Queue::open(":memory:").unwrap();
+        let spec = minimal_spec("H1-ghost-worker-invariant");
+        let spec_id = q.enqueue(&spec, None).unwrap();
+
+        // Reproduce the exact call sequence from worker.rs:
+        //   dequeue() → assigning, then update_spec_running(worker_id).
+        let assigned = q.dequeue().unwrap().expect("spec should be dequeued");
+        assert_eq!(assigned.status, "assigning", "dequeue should set assigning");
+
+        let worker_id = format!("W-{}-test", spec_id);
+        q.update_spec_running(&spec_id, &worker_id).unwrap();
+
+        let st = q.status(&spec_id).unwrap().unwrap();
+        assert_eq!(st.spec.status, "running", "spec should be running");
+        assert_eq!(
+            st.spec.worker_id.as_deref(),
+            Some(worker_id.as_str()),
+            "worker_id must be set on a running spec so ghost-worker detection works",
+        );
+    }
+}
+
+// Integration tests for per-spec pool routing end-to-end (Queue + PoolRegistry).
+#[cfg(test)]
+mod integration_pool {
+    use super::*;
+    use crate::config::PoolRegistry;
+    use crate::pool::{JobId, JobOutput, JobStatus, WorkerPool};
+    use crate::spec::{BoiSpec, BoiTask, TaskStatus};
+    use crate::worker::WorkerConfig;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct MockPool {
+        name: String,
+        spawned: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WorkerPool for MockPool {
+        fn spawn(
+            &self,
+            spec_id: &str,
+            _: &str,
+            _: &str,
+            _: &WorkerConfig,
+        ) -> anyhow::Result<JobId> {
+            self.spawned.lock().unwrap().push(spec_id.to_string());
+            Ok(JobId::new(format!("{}-{}", self.name, spec_id)))
+        }
+        fn status(&self, _: &JobId) -> anyhow::Result<JobStatus> {
+            Ok(JobStatus::Completed)
+        }
+        fn collect(&self, _: &JobId) -> anyhow::Result<JobOutput> {
+            Ok(JobOutput { exit_code: 0, stdout: String::new(), stderr: String::new() })
+        }
+        fn cancel(&self, _: &JobId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn max_workers(&self) -> u32 {
+            5
+        }
+    }
+
+    fn make_registry(
+        local_spawned: Arc<Mutex<Vec<String>>>,
+        remote_spawned: Arc<Mutex<Vec<String>>>,
+    ) -> PoolRegistry {
+        let mut pools: HashMap<String, Box<dyn WorkerPool>> = HashMap::new();
+        pools.insert(
+            "mock-local".to_string(),
+            Box::new(MockPool { name: "mock-local".to_string(), spawned: local_spawned }),
+        );
+        pools.insert(
+            "mock-remote".to_string(),
+            Box::new(MockPool { name: "mock-remote".to_string(), spawned: remote_spawned }),
+        );
+        PoolRegistry::from_pools(pools, "mock-local")
+    }
+
+    fn make_spec(title: &str, worker_pool: Option<&str>) -> BoiSpec {
+        BoiSpec {
+            title: title.to_string(),
+            mode: Some("execute".to_string()),
+            workspace: None,
+            initiative: None,
+            context: None,
+            outcomes: None,
+            spec_phases: None,
+            task_phases: None,
+            context_files: None,
+            phase_overrides: HashMap::new(),
+            worker_pool: worker_pool.map(|p| p.to_string()),
+            tasks: vec![BoiTask {
+                id: "t-1".to_string(),
+                title: "Task".to_string(),
+                status: TaskStatus::Pending,
+                depends: None,
+                spec: None,
+                verify: None,
+                verify_prompt: None,
+                phases: None,
+            }],
+        }
+    }
+
+    /// End-to-end: spec with explicit pool → routed to that pool;
+    /// spec without pool → routed to registry default.
+    #[test]
+    fn integration_per_spec_pool() {
+        let local_spawned: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let remote_spawned: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let registry = make_registry(local_spawned.clone(), remote_spawned.clone());
+        let q = Queue::open(":memory:").unwrap();
+        let config = WorkerConfig::default();
+
+        // — Spec 1: explicitly requests mock-remote —
+        let remote_spec = make_spec("Remote Spec", Some("mock-remote"));
+        let remote_id = q.enqueue(&remote_spec, None).unwrap();
+
+        let rec = q
+            .dequeue_for_pools(&["mock-local", "mock-remote"], "mock-local")
+            .unwrap()
+            .expect("remote spec should dequeue");
+        assert_eq!(rec.id, remote_id, "dequeued the remote spec");
+
+        let pool = registry
+            .resolve(rec.worker_pool.as_deref())
+            .expect("mock-remote must resolve");
+        pool.spawn(&rec.id, "", "", &config).unwrap();
+
+        assert_eq!(
+            remote_spawned.lock().unwrap().as_slice(),
+            [remote_id.as_str()],
+            "spec with worker_pool=mock-remote must run on mock-remote",
+        );
+        assert!(
+            local_spawned.lock().unwrap().is_empty(),
+            "mock-local must not be used for the remote spec",
+        );
+
+        // — Spec 2: no worker_pool → routed to default (mock-local) —
+        let default_spec = make_spec("Default Spec", None);
+        let default_id = q.enqueue(&default_spec, None).unwrap();
+
+        let rec2 = q
+            .dequeue_for_pools(&["mock-local", "mock-remote"], "mock-local")
+            .unwrap()
+            .expect("default spec should dequeue");
+        assert_eq!(rec2.id, default_id, "dequeued the default spec");
+        assert!(rec2.worker_pool.is_none(), "no explicit pool set on default spec");
+
+        let pool2 = registry
+            .resolve(rec2.worker_pool.as_deref())
+            .expect("default pool must resolve");
+        pool2.spawn(&rec2.id, "", "", &config).unwrap();
+
+        assert_eq!(
+            local_spawned.lock().unwrap().as_slice(),
+            [default_id.as_str()],
+            "spec without worker_pool must run on mock-local (the default)",
+        );
+        // remote_spawned still only has the one entry from spec 1
+        assert_eq!(
+            remote_spawned.lock().unwrap().len(),
+            1,
+            "mock-remote must not receive the default spec",
+        );
     }
 }

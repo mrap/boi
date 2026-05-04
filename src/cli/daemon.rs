@@ -1,7 +1,6 @@
 use crate::fmt::{ensure_db_dir, is_pid_alive};
 use crate::spawn::pid_dir;
-use crate::telemetry::Telemetry;
-use crate::{config, hooks, phases, queue, runtime, worker};
+use crate::{config, hooks, phases, pool, queue, runtime, worker};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -114,9 +113,9 @@ pub fn cmd_start() {
     println!("log: {}", log_path.display());
 }
 
-pub fn cmd_restart() {
+pub fn cmd_restart(destroy_running: bool, yes: bool) {
     if is_daemon_locked() {
-        cmd_stop();
+        cmd_stop(destroy_running, yes);
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
     cmd_start();
@@ -245,8 +244,20 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         provider_registry.validate_phases(phase_registry.list().into_iter());
     }
 
-    let active: std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = match cfg.build_pool_registry(db_str, hook_cfg) {
+        Ok(r) => {
+            eprintln!("[boi daemon] pool registry: default={}", r.default_name());
+            r
+        }
+        Err(e) => {
+            eprintln!("[boi daemon] ERROR: failed to build pool registry: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Per-pool active job tracking: pool_name → running JobIds
+    let mut active_jobs: std::collections::HashMap<String, Vec<pool::JobId>> =
+        std::collections::HashMap::new();
 
     while running.load(std::sync::atomic::Ordering::SeqCst) {
         // Write heartbeat
@@ -255,71 +266,102 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
             eprintln!("[boi daemon] ERROR: failed to write heartbeat: {}", e);
         }
 
-        {
-            let mut workers = active.lock().unwrap_or_else(|e| {
-                eprintln!("[boi daemon] worker mutex poisoned, recovering: {}", e);
-                e.into_inner()
-            });
-            workers.retain(|h| !h.is_finished());
-
-            if workers.len() < wc.max_workers as usize {
-                match queue::Queue::open(db_str) {
-                    Ok(queue) => match queue.dequeue() {
-                        Ok(Some(rec)) => {
-                            let spec_id = rec.id.clone();
-                            let spec_path = match rec.spec_path.as_deref() {
-                                Some(p) if !p.is_empty() => p.to_string(),
-                                _ => {
-                                    eprintln!(
-                                        "[boi daemon] spec {} has no spec_path — marking failed",
-                                        spec_id
-                                    );
-                                    if let Ok(q2) = queue::Queue::open(db_str) {
-                                        if let Err(e) = q2.update_spec(&spec_id, "failed") {
-                                            eprintln!("[boi daemon] ERROR: failed to mark spec {} as failed: {}", spec_id, e);
-                                        }
-                                    }
-                                    continue;
-                                }
-                            };
-                            let qpath = db_str.to_string();
-                            let hc = hook_cfg.clone();
-                            let timeout = wc.task_timeout_secs;
-                            let retries = wc.retry_count;
-                            let cleanup_fail = wc.cleanup_on_failure;
-                            let cbin = wc.claude_bin.clone();
-                            let models = wc.models.clone();
-
-                            // Use per-spec timeout if set, otherwise default
-                            let spec_timeout = rec
-                                .worker_timeout_seconds
-                                .map(|t| t as u64)
-                                .unwrap_or(timeout);
-
-                            let tel = Telemetry::new(PathBuf::from(&qpath));
-                            eprintln!("[boi daemon] starting worker for {}", spec_id);
-                            let handle = std::thread::spawn(move || {
-                                let wc = worker::WorkerConfig {
-                                    max_workers: 1,
-                                    task_timeout_secs: spec_timeout,
-                                    retry_count: retries,
-                                    cleanup_on_failure: cleanup_fail,
-                                    claude_bin: cbin,
-                                    models,
-                                };
-                                if let Err(e) =
-                                    worker::run_worker(&spec_id, &spec_path, &qpath, &hc, &wc, &tel)
-                                {
-                                    eprintln!("[boi daemon] worker error for {}: {}", spec_id, e);
-                                }
-                            });
-                            workers.push(handle);
+        // Prune finished jobs across all pools
+        for pool_name in registry.pool_names() {
+            if let Some(pool) = registry.get(pool_name) {
+                let jobs = active_jobs.entry(pool_name.to_string()).or_default();
+                let mut still_running = Vec::new();
+                for job_id in jobs.drain(..) {
+                    match pool.status(&job_id) {
+                        Ok(pool::JobStatus::Running) => still_running.push(job_id),
+                        _ => {
+                            let _ = pool.cleanup(&job_id);
                         }
-                        Ok(None) => {}
-                        Err(e) => eprintln!("[boi daemon] dequeue error: {}", e),
-                    },
-                    Err(e) => eprintln!("[boi daemon] queue open error: {}", e),
+                    }
                 }
+                *jobs = still_running;
+            }
+        }
+
+        // Compute which pools have free capacity
+        let available_pools: Vec<&str> = registry
+            .pool_names()
+            .into_iter()
+            .filter(|name| {
+                if let Some(pool) = registry.get(name) {
+                    let active = active_jobs.get(*name).map_or(0, |j| j.len());
+                    active < pool.max_workers() as usize
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        if !available_pools.is_empty() {
+            match queue::Queue::open(db_str) {
+                Ok(queue) => match queue.dequeue_for_pools(&available_pools, registry.default_name()) {
+                    Ok(Some(rec)) => {
+                        let spec_id = rec.id.clone();
+                        let spec_path = match rec.spec_path.as_deref() {
+                            Some(p) if !p.is_empty() => p.to_string(),
+                            _ => {
+                                eprintln!(
+                                    "[boi daemon] spec {} has no spec_path — marking failed",
+                                    spec_id
+                                );
+                                if let Ok(q2) = queue::Queue::open(db_str) {
+                                    if let Err(e) = q2.update_spec(&spec_id, "failed") {
+                                        eprintln!("[boi daemon] ERROR: failed to mark spec {} as failed: {}", spec_id, e);
+                                    }
+                                }
+                                continue;
+                            }
+                        };
+
+                        let pool_name = rec.worker_pool.as_deref()
+                            .unwrap_or(registry.default_name())
+                            .to_string();
+                        let pool = match registry.resolve(rec.worker_pool.as_deref()) {
+                            Some(p) => p,
+                            None => {
+                                eprintln!(
+                                    "[boi daemon] unknown pool '{}' for spec {} — requeueing",
+                                    pool_name, spec_id
+                                );
+                                if let Ok(q2) = queue::Queue::open(db_str) {
+                                    let _ = q2.requeue(&spec_id);
+                                }
+                                continue;
+                            }
+                        };
+
+                        // Use per-spec timeout if set, otherwise default
+                        let spec_timeout = rec
+                            .worker_timeout_seconds
+                            .map(|t| t as u64)
+                            .unwrap_or(wc.task_timeout_secs);
+
+                        let spec_wc = worker::WorkerConfig {
+                            max_workers: 1,
+                            task_timeout_secs: spec_timeout,
+                            retry_count: wc.retry_count,
+                            cleanup_on_failure: wc.cleanup_on_failure,
+                            claude_bin: wc.claude_bin.clone(),
+                            models: wc.models.clone(),
+                        };
+
+                        eprintln!("[boi daemon] starting worker for {} on pool '{}'", spec_id, pool_name);
+                        match pool.spawn(&spec_id, &spec_path, db_str, &spec_wc) {
+                            Ok(job_id) => {
+                                active_jobs.entry(pool_name).or_default().push(job_id);
+                            }
+                            Err(e) => eprintln!("[boi daemon] spawn error for {}: {}", spec_id, e),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => eprintln!("[boi daemon] dequeue error: {}", e),
+                },
+                Err(e) => eprintln!("[boi daemon] queue open error: {}", e),
             }
         }
 
@@ -334,19 +376,29 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
 
     eprintln!("[boi daemon] shutting down...");
 
-    // Wait for workers to finish (with timeout)
+    // Wait for active jobs to finish (with timeout)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    {
-        let mut workers = active.lock().unwrap_or_else(|e| {
-            eprintln!("[boi daemon] worker mutex poisoned during shutdown: {}", e);
-            e.into_inner()
-        });
-        while !workers.is_empty() && std::time::Instant::now() < deadline {
-            workers.retain(|h| !h.is_finished());
-            if !workers.is_empty() {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+    loop {
+        let total_active: usize = active_jobs.values().map(|j| j.len()).sum();
+        if total_active == 0 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        for pool_name in registry.pool_names() {
+            if let Some(pool) = registry.get(pool_name) {
+                let jobs = active_jobs.entry(pool_name.to_string()).or_default();
+                let mut still_running = Vec::new();
+                for job_id in jobs.drain(..) {
+                    match pool.status(&job_id) {
+                        Ok(pool::JobStatus::Running) => still_running.push(job_id),
+                        _ => {
+                            let _ = pool.cleanup(&job_id);
+                        }
+                    }
+                }
+                *jobs = still_running;
             }
         }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     // Clean up heartbeat (lock file releases automatically when _lock_file drops)
@@ -355,7 +407,57 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
     eprintln!("[boi daemon] stopped");
 }
 
-pub fn cmd_stop() {
+pub fn confirm_and_destroy_running_specs(db_str: &str, yes: bool) -> bool {
+    let queue = match queue::Queue::open(db_str) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("error opening queue: {}", e);
+            return false;
+        }
+    };
+    let running = match queue.list_running_specs() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error listing running specs: {}", e);
+            return false;
+        }
+    };
+    if running.is_empty() {
+        return true;
+    }
+    println!("WARNING: The following SPECS (and ALL their tasks) will be permanently cancelled:");
+    for (spec_id, title, task_id) in &running {
+        let task_info = if task_id.is_empty() { String::new() } else { format!(" (running task: {})", task_id) };
+        println!("  {} — {}{}", spec_id, title, task_info);
+    }
+    // SAFETY: isatty(0) is a standard POSIX call checking if stdin is a TTY.
+    let is_tty = unsafe { libc::isatty(0) } == 1;
+    if !is_tty && !yes {
+        eprintln!("ERROR: --destroy-running requires --yes in non-TTY environments.");
+        eprintln!("       Re-run with: boi daemon stop --destroy-running --yes");
+        std::process::exit(1);
+    }
+    if !yes {
+        print!("Cancel {} spec(s)? This cannot be undone. [y/N] ", running.len());
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        if input.trim().to_lowercase() != "y" {
+            println!("Aborted.");
+            return false;
+        }
+    }
+    for (spec_id, _, _) in &running {
+        match queue.cancel(spec_id) {
+            Ok(_) => eprintln!("[boi] cancelled spec {}", spec_id),
+            Err(e) => eprintln!("[boi] error cancelling {}: {}", spec_id, e),
+        }
+    }
+    true
+}
+
+pub fn cmd_stop(destroy_running: bool, yes: bool) {
     let pid = match read_daemon_pid() {
         Some(p) => p,
         None => {
@@ -374,8 +476,15 @@ pub fn cmd_stop() {
         return;
     }
 
-    // Kill all setsid'd Claude subprocesses before stopping the daemon (F-04)
-    cleanup_pid_files(&pid_dir());
+    if destroy_running {
+        let cfg = config::load();
+        let db_path = cfg.db_path();
+        let db_str_owned = db_path.to_str().unwrap_or("/tmp/boi.db").to_string();
+        if !confirm_and_destroy_running_specs(&db_str_owned, yes) {
+            return;
+        }
+        cleanup_pid_files(&pid_dir());
+    }
 
     // SAFETY: `pid` was read from the daemon lock file and verified alive via
     // `is_pid_alive`. Sending SIGTERM to a valid PID is a standard POSIX operation.

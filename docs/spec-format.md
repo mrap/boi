@@ -125,6 +125,7 @@ phase_overrides:                # optional: swap runtime/model for named phases
   critic:
     runtime: openrouter
     model: google/gemini-2.5-flash
+worker_pool: fly-runners        # optional: named pool; omit for registry default
 
 tasks:
   ...

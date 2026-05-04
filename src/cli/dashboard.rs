@@ -963,7 +963,7 @@ pub fn run_dashboard(db_path: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+mod plan_layout_tests {
     use super::{plan_layout, LayoutPlan, MIN_FINISHED};
 
     // height=60: all three sections have items well under budget

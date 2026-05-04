@@ -20,6 +20,7 @@ Use `.yaml` or `.yml` extension. BOI detects format by extension:
 | `blocked_by` | No | list of strings | Spec IDs this spec depends on (e.g. `[SA7F3, SF2B1]`) |
 | `outcomes` | Recommended | list of outcome objects | Spec-level declarations of what this spec delivers. Verified after all tasks DONE. |
 | `phase_overrides` | No | map of phase-name → override object | Per-phase runtime/model overrides applied to every task in this spec |
+| `worker_pool` | No | string | Named pool to dispatch this spec's workers on. Omit to use the registry default. Validated at dispatch time. |
 | `tasks` | Yes | list of task objects | Ordered list of tasks |
 
 ## Outcome Object Fields
@@ -114,6 +115,7 @@ phase_overrides:        # optional — per-phase runtime/model/timeout overrides
   critic:
     runtime: openrouter
     model: google/gemini-2.5-flash
+worker_pool: fly-runners  # optional — named pool; omit for registry default
 tasks:                  # required, list of task objects
   - id: t-1             # required, unique
     title: string       # required

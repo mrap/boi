@@ -97,6 +97,13 @@ and field (e.g., "t-3 Verify:") where the problem appears.
 
 ---
 
+## Mode-Specific Rules
+
+**generate mode:** A spec with `mode: generate` may include a pre-defined
+`tasks:` array. These tasks are valid starting points; workers have creative
+authority to add, modify, or remove them during execution. Do NOT flag the
+presence of tasks in a generate-mode spec as a structural defect.
+
 ## Rules
 
 - Be concise. One finding per problem, not one per sentence.

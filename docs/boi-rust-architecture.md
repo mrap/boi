@@ -48,7 +48,8 @@ boi/
       config_cmd.rs     — boi config [get|set]
       critic_cmd.rs     — boi critic [status|run|disable|enable|checks]
       review_cmd.rs     — boi review <id>
-      cleanup.rs        — boi cleanup
+      prune.rs          — boi prune-orphans
+      research.rs       — boi research <brief.md> [--threads N] [--project NAME]
     daemon/
       mod.rs            — tokio main loop (poll every 5s)
       scheduler.rs      — dequeue eligible specs; assign to free worker slots

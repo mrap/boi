@@ -18,6 +18,7 @@ fn make_spec_with_phases() -> BoiSpec {
         task_phases: Some(vec!["execute".to_string(), "code-review".to_string()]),
         context_files: None,
         phase_overrides: std::collections::HashMap::new(),
+        worker_pool: None,
         tasks: vec![BoiTask {
             id: "t-1".to_string(),
             title: "dummy task".to_string(),

@@ -1,4 +1,6 @@
 pub mod builtins;
+pub mod pool;
+pub mod remote;
 pub mod cli;
 pub mod config;
 pub mod fmt;
@@ -14,6 +16,7 @@ pub mod telemetry;
 #[cfg(test)]
 pub mod test_utils;
 pub mod worker;
+pub mod workspace;
 pub mod worktree;
 
 /// Loads `~/.boi/.env` (or `$BOI_ENV_FILE`) into process env at startup.
