@@ -5,7 +5,7 @@ use crate::{
     },
     phases::{self, PhaseLevel, PhaseRegistry, Verdict},
     queue::{FullTaskRecord, PhaseRunRecord, Queue},
-    runner::{ClaudePhaseRunner, PhaseRunner},
+    runner::{apply_phase_overrides_from_map, ClaudePhaseRunner, PhaseRunner},
     spec,
     telemetry::{LogLevel, Telemetry},
 };
@@ -412,6 +412,15 @@ pub fn run_worker_with_phases(
         phases: None,
     }).collect();
 
+    let task_phases_from_db: Option<Vec<String>> = spec_rec.task_phases.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let spec_phases_from_db: Option<Vec<String>> = spec_rec.spec_phases.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let phase_overrides_from_db: std::collections::HashMap<String, spec::PhaseOverride> =
+        spec_rec.phase_overrides.as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
     let mut boi_spec = spec::BoiSpec {
         title: spec_rec.title.clone(),
         mode: Some(spec_rec.mode.clone()),
@@ -419,11 +428,14 @@ pub fn run_worker_with_phases(
         initiative: None,
         context: spec_rec.context.clone(),
         outcomes: None,
-        spec_phases: None,
-        task_phases: None,
+        spec_phases: spec_phases_from_db,
+        task_phases: task_phases_from_db,
         context_files: None,
+        phase_overrides: phase_overrides_from_db.clone(),
         tasks,
     };
+    // Keep reference for apply_phase_overrides_from_map calls below.
+    let phase_overrides_from_db = phase_overrides_from_db;
 
     // Reconstruct full spec content from DB fields for spec-level phase runners.
     let spec_content = {
@@ -936,10 +948,11 @@ pub fn run_worker_with_phases(
                 prompt_vars.insert(TemplateVar::TaskDepends.key().into(),
                     task.depends.as_ref().map(|d| d.join(", ")).unwrap_or_default());
 
+                let phase_overridden = apply_phase_overrides_from_map(phase, &phase_overrides_from_db, phase_name, &telemetry, spec_id);
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, _output, metrics) = runner.run_phase_full(
-                    phase,
+                    &phase_overridden,
                     &spec_content,
                     Some(task),
                     &worktree_path,
@@ -1101,10 +1114,11 @@ pub fn run_worker_with_phases(
                 prompt_vars.insert(TemplateVar::TaskDepends.key().into(),
                     task.depends.as_ref().map(|d| d.join(", ")).unwrap_or_default());
 
+                let phase_overridden = apply_phase_overrides_from_map(phase, &phase_overrides_from_db, phase_name, &telemetry, spec_id);
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (retry_verdict, _output, retry_metrics) = runner.run_phase_full(
-                    phase,
+                    &phase_overridden,
                     &spec_content,
                     Some(task),
                     &worktree_path,

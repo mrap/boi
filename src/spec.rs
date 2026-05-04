@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Which runtime to use for a phase override.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseRuntime {
+    Claude,
+    Openrouter,
+    Codex,
+    Deterministic,
+}
+
+/// Per-phase override: swap runtime, model, effort, or timeout for a named phase.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PhaseOverride {
+    pub runtime: Option<PhaseRuntime>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub timeout: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BoiSpec {
     pub title: String,
@@ -18,6 +37,9 @@ pub struct BoiSpec {
     /// Context files to inject into every worker prompt for this spec
     #[serde(default)]
     pub context_files: Option<Vec<String>>,
+    /// Per-phase runtime/model overrides applied to every task in this spec
+    #[serde(default)]
+    pub phase_overrides: HashMap<String, PhaseOverride>,
     pub tasks: Vec<BoiTask>,
 }
 

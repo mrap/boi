@@ -2,7 +2,7 @@ use crate::builtins::{self, BuiltinContext};
 use crate::phases::{PhaseConfig, Verdict};
 use crate::runtime::{self, InvocationContext, ProviderError, ProviderRegistry};
 use crate::runtime::claude::ClaudeCLIProvider;
-use crate::spec::BoiTask;
+use crate::spec::{BoiTask, PhaseOverride, PhaseRuntime};
 use crate::telemetry::{
     generate_invocation_id, LogLevel, PhaseCompletionFields, PhaseInvocation, Telemetry,
 };
@@ -92,6 +92,56 @@ pub trait PhaseRunner: Send + Sync {
     ) -> (Verdict, String, PhaseMetrics) {
         (self.run_phase(phase, spec_content, task, worktree_path, timeout_secs, spec_id, vars), String::new(), PhaseMetrics::default())
     }
+}
+
+/// Apply per-phase overrides from a `HashMap<phase_name, PhaseOverride>` to a `PhaseConfig`.
+/// Returns a modified clone of `phase` with overrides applied. Emits telemetry when overrides fire.
+pub fn apply_phase_overrides_from_map(
+    phase: &PhaseConfig,
+    overrides: &std::collections::HashMap<String, PhaseOverride>,
+    phase_name: &str,
+    telemetry: &Telemetry,
+    spec_id: &str,
+) -> PhaseConfig {
+    let Some(ov) = overrides.get(phase_name) else {
+        return phase.clone();
+    };
+
+    let mut out = phase.clone();
+    let mut applied: Vec<String> = Vec::new();
+
+    if let Some(ref rt) = ov.runtime {
+        out.runtime = Some(match rt {
+            PhaseRuntime::Claude => "claude".to_string(),
+            PhaseRuntime::Openrouter => "openrouter".to_string(),
+            PhaseRuntime::Codex => "codex".to_string(),
+            PhaseRuntime::Deterministic => "deterministic".to_string(),
+        });
+        applied.push("runtime".to_string());
+    }
+    if let Some(ref m) = ov.model {
+        out.model = Some(m.clone());
+        applied.push("model".to_string());
+    }
+    if let Some(ref e) = ov.effort {
+        out.effort = Some(e.clone());
+        applied.push("effort".to_string());
+    }
+    if let Some(t) = ov.timeout {
+        out.timeout_minutes = Some(t as u32);
+        applied.push("timeout".to_string());
+    }
+
+    if !applied.is_empty() {
+        telemetry.emit("boi.phase.override_applied", crate::telemetry::LogLevel::Info, &serde_json::json!({
+            "spec_id": spec_id,
+            "phase": phase_name,
+            "fields": applied,
+            "message": format!("phase override applied: {:?}", applied),
+        }));
+    }
+
+    out
 }
 
 /// Production phase runner that dispatches phases through the provider registry.

@@ -32,6 +32,12 @@ pub struct SpecRecord {
     /// Number of completed critique↔improve loop cycles for this spec.
     pub phase_loop_count: i64,
     pub project_context: Option<String>,
+    /// JSON-serialized Vec<String> of task-level phase names (from spec YAML).
+    pub task_phases: Option<String>,
+    /// JSON-serialized Vec<String> of spec-level phase names (from spec YAML).
+    pub spec_phases: Option<String>,
+    /// JSON-serialized HashMap<phase_name, PhaseOverride> (from spec YAML).
+    pub phase_overrides: Option<String>,
 }
 
 #[derive(Debug)]
@@ -364,10 +370,19 @@ impl Queue {
         let mode = spec.mode.as_deref().unwrap_or("execute");
         let total = spec.tasks.len() as i64;
 
+        let task_phases_json: Option<String> = spec.task_phases.as_ref()
+            .filter(|v| !v.is_empty())
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+        let phase_overrides_json: Option<String> = if spec.phase_overrides.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&spec.phase_overrides).ok()
+        };
+
         tx.execute(
-            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace, project_context)
-             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace, project_context],
+            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace, project_context, task_phases, phase_overrides)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace, project_context, task_phases_json, phase_overrides_json],
         )?;
 
         let mut yaml_to_canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -434,7 +449,8 @@ impl Queue {
                         completed_tasks,
                         priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                         max_iterations, iteration, project, phase, worker_timeout_seconds,
-                        context, workspace, phase_loop_count, project_context
+                        context, workspace, phase_loop_count, project_context,
+                        task_phases, spec_phases, phase_overrides
                  FROM specs WHERE id = ?1",
             )?;
             stmt.query_row(params![id], row_to_spec)?
@@ -507,7 +523,8 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace, phase_loop_count, project_context
+                    context, workspace, phase_loop_count, project_context,
+                    task_phases, spec_phases, phase_overrides
              FROM specs WHERE id = ?1",
             params![spec_id],
             row_to_spec,
@@ -536,7 +553,8 @@ impl Queue {
                     completed_tasks,
                     priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
                     max_iterations, iteration, project, phase, worker_timeout_seconds,
-                    context, workspace, phase_loop_count, project_context
+                    context, workspace, phase_loop_count, project_context,
+                    task_phases, spec_phases, phase_overrides
              FROM specs
              ORDER BY
                CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,
@@ -1073,6 +1091,9 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpecRecord> {
         workspace: row.get(20)?,
         phase_loop_count: row.get::<_, Option<i64>>(21)?.unwrap_or(0),
         project_context: row.get(22)?,
+        task_phases: row.get(23)?,
+        spec_phases: row.get(24)?,
+        phase_overrides: row.get(25)?,
     })
 }
 
@@ -1105,6 +1126,7 @@ mod tests {
             spec_phases: None,
             task_phases: None,
             context_files: None,
+            phase_overrides: std::collections::HashMap::new(),
             tasks,
         }
     }
