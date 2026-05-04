@@ -313,29 +313,34 @@ The `workspace` field remains a simple path — the *source* to isolate from. `w
 
 ## Implementation Plan
 
-### Phase 1: Extract the Trait
+### Phase 1: Extract the Trait ✓ done
 
-Refactor `worktree.rs` into a `WorkspaceBackend` trait:
+Refactor `worktree.rs` into a `WorkspaceBackend` trait (done — `src/workspace/mod.rs`):
 
 ```rust
+pub type BackendResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
 pub trait WorkspaceBackend: Send + Sync {
-    fn create(&self, spec_id: &str, source: &str) -> Result<PathBuf>;
-    fn cleanup(&self, spec_id: &str) -> Result<()>;
-    fn cleanup_stale(&self) -> Result<()>;
+    fn create(&self, spec_id: &str, source: &str) -> BackendResult<PathBuf>;
+    fn exec(&self, workspace_path: &Path, command: &str) -> BackendResult<ExecResult>;
+    fn merge(&self, workspace_path: &Path, target: &str) -> BackendResult<()>; // default: Ok(())
+    fn cleanup(&self, spec_id: &str) -> BackendResult<()>;
 }
 ```
 
-Current code becomes `GitWorkspaceBackend`. Worker code changes from:
+Current code becomes `GitWorkspace` (done — `src/workspace/git.rs`). `worker.rs` now uses
+`Box<dyn WorkspaceBackend>` (done — T8BB9); direct `crate::worktree::*` calls replaced:
 
 ```rust
+// before
 let worktree_dir = crate::worktree::create(spec_id, ws)?;
+
+// after
+let workspace: Box<dyn WorkspaceBackend> = Box::new(GitWorkspace::new());
+let worktree_dir = workspace.create(spec_id, ws)?;
 ```
 
-to:
-
-```rust
-let workspace_dir = backend.create(spec_id, ws)?;
-```
+`worktree.rs` is now a thin re-export shim for any callers not yet migrated.
 
 ### Phase 2: Add `CustomBackend`
 

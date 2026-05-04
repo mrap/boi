@@ -2,7 +2,8 @@
 # install.sh — One-time setup for BOI (Beginning of Infinity).
 #
 # Creates N git worktrees, writes ~/.boi/config.json,
-# creates runtime directories, and sets up the boi command alias.
+# creates runtime directories, sets up the boi command alias,
+# and auto-installs shell completions (zsh, bash, fish).
 #
 # Usage:
 #   bash install.sh              # Default: 3 workers
@@ -205,6 +206,12 @@ detect_repo_root() {
 
     if git rev-parse --git-dir &>/dev/null; then
         REPO_PATH="$(git rev-parse --show-toplevel)"
+        return 0
+    fi
+
+    # Fallback: use the directory containing install.sh (the boi repo itself)
+    if git -C "${SCRIPT_DIR}" rev-parse --git-dir &>/dev/null; then
+        REPO_PATH="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
         return 0
     fi
 
@@ -520,6 +527,82 @@ install_plugin() {
     fi
 }
 
+install_completions() {
+    local boi_bin="${BOI_BIN:-${SCRIPT_DIR}/boi.sh}"
+
+    if [[ "${DRY_RUN}" == "true" ]]; then
+        echo "[boi] [dry-run] Would install shell completions" >&2
+        return 0
+    fi
+
+    if [[ ! -x "${boi_bin}" ]]; then
+        echo "[boi] completions: boi not found or not executable at ${boi_bin} — skipping" >&2
+        return 0
+    fi
+
+    local shells=("zsh" "bash" "fish")
+
+    for shell in "${shells[@]}"; do
+        local target
+        case "${shell}" in
+            zsh)  target="${HOME}/.zfunc/_boi" ;;
+            bash) target="${HOME}/.local/share/bash-completion/completions/boi" ;;
+            fish) target="${HOME}/.config/fish/completions/boi.fish" ;;
+        esac
+
+        local dir
+        dir="$(dirname "${target}")"
+
+        if ! mkdir -p "${dir}" 2>/dev/null; then
+            echo "[boi] completions (${shell}): could not create ${dir} — skipping" >&2
+            continue
+        fi
+
+        local tmp="${target}.boi-tmp"
+        if ! "${boi_bin}" completions "${shell}" > "${tmp}" 2>/dev/null; then
+            echo "[boi] completions (${shell}): generation failed — skipping" >&2
+            rm -f "${tmp}" 2>/dev/null || true
+            continue
+        fi
+
+        if [[ ! -s "${tmp}" ]]; then
+            echo "[boi] completions (${shell}): empty output — skipping" >&2
+            rm -f "${tmp}" 2>/dev/null || true
+            continue
+        fi
+
+        if [[ -f "${target}" ]]; then
+            if diff -q "${target}" "${tmp}" > /dev/null 2>&1; then
+                echo "[boi] completions (${shell}): up to date" >&2
+                rm -f "${tmp}" 2>/dev/null || true
+                continue
+            else
+                echo "[boi] completions (${shell}): user file differs at ${target} — leaving untouched" >&2
+                rm -f "${tmp}" 2>/dev/null || true
+                continue
+            fi
+        fi
+
+        if mv "${tmp}" "${target}"; then
+            echo "[boi] completions (${shell}): installed" >&2
+        else
+            echo "[boi] completions (${shell}): write failed at ${target} — skipping" >&2
+            rm -f "${tmp}" 2>/dev/null || true
+        fi
+    done
+
+    # For zsh: ensure ~/.zshrc has fpath entry (idempotent)
+    if [[ -f "${HOME}/.zshrc" ]]; then
+        if ! grep -q 'fpath=(.*\.zfunc' "${HOME}/.zshrc" 2>/dev/null; then
+            {
+                echo 'fpath=("$HOME/.zfunc" $fpath)'
+                echo 'autoload -U compinit && compinit'
+            } >> "${HOME}/.zshrc"
+            echo "[boi] completions (zsh): added fpath entry to ~/.zshrc" >&2
+        fi
+    fi
+}
+
 verify_install() {
     log_step "Verifying installation"
 
@@ -617,6 +700,10 @@ main() {
     echo ""
 
     install_plugin
+    echo ""
+
+    log_step "Installing shell completions"
+    install_completions
     echo ""
 
     if [[ "${DRY_RUN}" == "false" ]]; then

@@ -5,11 +5,25 @@ All notable changes to BOI will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2026-05-04] - Agent Context Standardization
+
+### Changed
+- AGENTS.md: Renamed from CLAUDE.md; added "Related repos" cross-link to mrap-hex and hex-foundation; added fresh-LLM Quick Start summary; added How-to-add-a-feature runbook and gotchas section
+- CLAUDE.md: Now a symlink to AGENTS.md — both resolve to same content for cross-tool compatibility
+
+### Verified (cross-repo sync)
+- Confirmed AGENTS.md and CLAUDE.md resolve to identical content (diff exit 0)
+- Confirmed cross-links to mrap-hex and hex-foundation present in AGENTS.md Quick Start
+
 ## [0.3.0] - Unreleased
 
 ### Added
+- Height-aware dashboard layout: `boi dashboard` now respects terminal height; RUNNING and QUEUED sections are prioritized and always fit on screen; FINISHED shows as many items as fit in remaining rows; truncated sections show a `+N more` hint; layout recomputes on terminal resize
+- `boi completions <shell>`: generate shell completion scripts for bash, zsh, fish, elvish, or powershell; pipe to the appropriate completion directory (see README Shell Completions section)
+- Auto-load `~/.boi/.env` at startup: binary now loads `~/.boi/.env` (or `$BOI_ENV_FILE`) before provider registry initializes, so `OPENROUTER_API_KEY` and other secrets can live in that file without shell profile changes; existing process env always wins
+- Pipeline `[phase_overrides.<phase>]` blocks: pipeline TOMLs can now override `runtime`, `model`, `effort`, and `timeout` per phase; runner consults pipeline override first then falls back to phase TOML default; overrides are logged at info level in `[phase.invoked]` events for bench attribution
 - `scripts/autoresearch-propose.py`: LLM-driven hypothesis generator for BOI pipeline variants — reads bench results + current default, calls OpenRouter (gemini-flash) to propose a single variant TOML + rationale; tracks per-axis fail counts and pivots after 3 consecutive failures on the same axis; emits `boi.autoresearch.propose` telemetry
-- `openrouter` runtime support: phases can specify `runtime = "openrouter"` + any model string; requires `OPENROUTER_API_KEY` env var
+- `openrouter` runtime support: phases can specify `runtime = "openrouter"` + any model string; requires `OPENROUTER_API_KEY` env var (can be set in `~/.boi/.env`)
 - `boi providers list`: new subcommand — list all registered and disabled runtime providers (claude, codex, openrouter) and their availability on the current machine
 - Per-phase telemetry: `PhaseInvocation` struct captures runtime, model, effort, thinking config, prompt length, timeout, auth env var, CLI args, git SHA, and host fingerprint for every phase invocation
 - `phase_runs` SQLite table: append-only log of every phase invocation with full completion fields (duration_ms, startup_ms, inference_ms, tokens, cost, exit_status, exit_reason)

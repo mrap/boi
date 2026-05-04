@@ -69,6 +69,49 @@ pub fn cmd_doctor(db_str: &str, cfg: &config::Config) {
                     issues += 1;
                 }
             }
+
+            // Daemon consistency: ghost workers, missing worker_id, stale status
+            let ghost = q.ghost_worker_count();
+            let no_wid = q.running_without_worker_id_count();
+            let stale = q.stale_status_count();
+            match (ghost, no_wid, stale) {
+                (Ok(g), Ok(n), Ok(s)) => {
+                    if g == 0 && s == 0 {
+                        println!(
+                            "  {}✓{} Daemon consistency: 0 ghost workers, 0 stale specs ({} running without worker_id)",
+                            GREEN, RESET, n
+                        );
+                    } else {
+                        if g > 0 {
+                            println!(
+                                "  {}✗{} Ghost workers: {} spec(s) running >1h with no iteration activity",
+                                RED, RESET, g
+                            );
+                            issues += 1;
+                        }
+                        if s > 0 {
+                            println!(
+                                "  {}✗{} Stale status: {} spec(s) in running/assigning >1h",
+                                RED, RESET, s
+                            );
+                            issues += 1;
+                        }
+                        if n > 0 && g == 0 && s == 0 {
+                            println!(
+                                "  {}⊘{} Running without worker_id: {} spec(s)",
+                                YELLOW, RESET, n
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    println!(
+                        "  {}⊘{} Daemon consistency checks skipped (query error)",
+                        YELLOW,
+                        RESET
+                    );
+                }
+            }
         }
         Err(e) => {
             println!("  {}✗{} Database error: {}", RED, RESET, e);

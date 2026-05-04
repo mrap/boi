@@ -37,7 +37,7 @@ All commands enter through `boi.sh`, which bootstraps Python and delegates to li
 | `boi config [get\|set]` | Show/change global config | `lib.cli_ops.config_ops()` |
 | `boi critic [status\|run\|disable\|enable\|checks]` | Critic review system | `lib.critic.*` |
 | `boi review <id>` | Review EXPERIMENT_PROPOSED tasks | `lib.review.*` |
-| `boi cleanup` | Recover specs stuck as `running` after daemon crash | `lib.queue.recover_running_specs()` |
+| `boi prune-orphans [--dry-run\|--apply] [--max-idle-secs N] [--json]` | Identify (and optionally kill) orphaned worker processes | `src/cli/prune.rs` |
 
 ### Dispatch Flags
 

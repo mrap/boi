@@ -347,6 +347,38 @@ This means the `ssh` provider handles workspace transport as part of spawn/colle
 
 Trade-offs: network latency on status polls. Large workspace transfers. SSH key management. Connection drops leave orphaned remote processes. Need a way to detect and clean up stale jobs.
 
+### `fly`
+
+Dispatches workers to Fly.io Machines via the Machines API. Unlike `docker` and `ssh`, this provider is implemented natively in Rust (`src/remote/fly.rs`) — no shell commands needed.
+
+**Required env var:** `FLY_API_TOKEN`. BOI errors loudly at startup if `type: fly` is configured but the token is missing.
+
+```yaml
+worker_pool:
+  type: fly
+  fly:
+    app: boi-workers                             # Fly.io app name
+    region: iad                                  # target region (optional)
+    image: registry.fly.io/boi-workers:latest   # OCI image to run
+    cpu_kind: shared                             # "shared" or "performance"
+    cpu_count: 1
+    memory_mb: 256
+    max_cost_usd: 10.0                           # cost guard cap (default 10.0)
+```
+
+Under the hood:
+- **spawn:** `POST /apps/{app}/machines` — creates and starts a machine, returns machine_id as job_id
+- **status:** `GET /apps/{app}/machines/{id}` — maps machine state (`started`/`stopped`/`failed`) to `Running`/`Completed`/`Failed`
+- **collect:** reads exit code from machine events + fetches logs
+- **cancel:** `POST /apps/{app}/machines/{id}/stop`
+- **cleanup:** `DELETE /apps/{app}/machines/{id}`
+
+**Cost guard:** before issuing the Machines API call, `spawn()` estimates cost from `(cpu_kind, cpu_count, memory_mb, expected_minutes)` and refuses if it exceeds `max_cost_usd` (default `10.0`). Override via `worker_pool.fly.max_cost_usd`.
+
+Use cases: scaling beyond local hardware, running workers in a specific region close to data sources, reproducible remote environments without managing SSH keys or Docker hosts.
+
+Trade-offs: Fly.io account and `FLY_API_TOKEN` required. Machine cold-start adds ~5–15 s overhead. Costs money per run.
+
 ### `queue`
 
 Submits jobs to an external job queue (AWS Batch, Kubernetes Job, Meta's internal TW, etc.).
@@ -482,77 +514,46 @@ tasks:
     verify: "test -f model.pt"
 ```
 
-Or with inline config:
-
-```yaml
-title: "Run on build server"
-worker_pool:
-  type: ssh
-  hosts:
-    - host: "build-server"
-      user: "deploy"
-      slots: 1
-tasks:
-  - id: t-1
-    title: "Heavy build"
-    spec: "Compile with optimizations"
-    verify: "test -f target/release/binary"
-```
-
 Resolution order:
-1. Spec-level `worker_pool` (inline object or named profile)
-2. Named profile (if spec has `profile: meta-internal`)
-3. Global `worker_pool` in `config.yaml`
+1. Spec-level `worker_pool` (named pool string) — looked up in the PoolRegistry
+2. Global `worker_pools` block in `config.yaml` (named pools registry)
+3. Global `worker_pool` block in `config.yaml` (single pool fallback)
 4. Default: `local` with `max_workers: 5`
+
+If the named pool exists but is at capacity, the spec stays queued — BOI never silently falls back to a different pool.
 
 ### Named Pools
 
-Config can define named pools:
+Config can define named pools. **v1 supports `local` and `fly` types.** (`ssh`, `docker`, `queue` are planned.)
 
 ```yaml
-pools:
+worker_pools:
   local:
     type: local
     max_workers: 5
 
-  gpu-cluster:
-    type: ssh
-    max_workers: 6
-    hosts:
-      - host: "gpu1"
-        slots: 2
-        tags: ["gpu", "a100"]
-      - host: "gpu2"
-        slots: 2
-        tags: ["gpu", "a100"]
-      - host: "gpu3"
-        slots: 2
-        tags: ["gpu", "h100"]
-
-  ci:
-    type: docker
+  fly-runners:
+    type: fly
+    app: boi-runners
+    region: iad
     max_workers: 10
-    image: "ci-runner:latest"
+
+  default: local
 ```
+
+Note: fly fields are **flat** in named-pool format (not nested under `fly:`). This differs from the top-level `worker_pool:` block which uses a nested `fly:` sub-object.
 
 Named pools allow specs to select a pool by name without repeating the full config.
 
-## Changes to the Spec Format
+## Spec Format: `worker_pool` Field
 
-Current:
-
-```yaml
-# No worker_pool field exists
-```
-
-Proposed additions:
+Add `worker_pool: <name>` at the top level of a spec to pin it to a named pool:
 
 ```yaml
-worker_pool: gpu-cluster           # short form: named pool
-worker_pool:                       # long form: inline config
-  type: ssh
-  hosts: [...]
+worker_pool: gpu-cluster           # string: named pool from config
 ```
+
+The field is a plain string referencing a pool name from the `worker_pools` config block. Inline pool config at the spec level is not supported — define the pool in config and reference it by name. Pool-name existence is validated at dispatch time.
 
 The `max_workers` field at the spec level is intentionally absent. The pool's `max_workers` is a pool-wide limit, not a per-spec limit. A spec runs on one worker; the pool limits how many specs run concurrently.
 
@@ -601,6 +602,8 @@ The recommended pairings:
 - `queue` + `docker` — cloud-scale via container orchestration
 
 ## Implementation Plan
+
+> **Status:** Phases 1–4 are implemented. Phase 5 (docker/ssh built-in providers) is planned.
 
 ### Phase 1: Extract the Trait
 
@@ -749,15 +752,17 @@ pub fn run_daemon(queue_path: &str, provider: &dyn WorkerPoolProvider, ...) {
 }
 ```
 
-### Phase 4: Config Parsing + Provider Resolution
+### Phase 4: Config Parsing + Provider Resolution ✓
 
-Add `worker_pool` to `Config` and `BoiSpec`. Resolution logic:
-1. Parse spec-level override (inline or named pool reference)
-2. Look up named pool in `config.yaml`
-3. Fall back to config-level default
-4. Fall back to `LocalPoolProvider`
+`worker_pool: Option<String>` added to `BoiSpec`. `PoolRegistry` built via `Config::build_pool_registry()`. Resolution logic:
+1. Parse spec-level `worker_pool` (named pool string)
+2. Look up in `PoolRegistry` (built from `worker_pools:` named block, or falls back to `worker_pool:` single block)
+3. If pool exists but is at capacity, spec stays queued (no silent fallback)
+4. `worker_pool: null` → uses the registry's `default` pool
 
-### Phase 5: Built-in Providers
+`Queue::dequeue_for_pools(available_pools, default_pool)` implements the capacity check atomically in SQLite.
+
+### Phase 5: Built-in Providers (planned)
 
 Add `DockerPoolProvider` and `SshPoolProvider` as built-in types. Each wraps `CustomPoolProvider` with provider-specific defaults and validation.
 

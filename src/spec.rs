@@ -1,6 +1,25 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+/// Which runtime to use for a phase override.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PhaseRuntime {
+    Claude,
+    Openrouter,
+    Codex,
+    Deterministic,
+}
+
+/// Per-phase override: swap runtime, model, effort, or timeout for a named phase.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct PhaseOverride {
+    pub runtime: Option<PhaseRuntime>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub timeout: Option<u64>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct BoiSpec {
     pub title: String,
@@ -18,6 +37,13 @@ pub struct BoiSpec {
     /// Context files to inject into every worker prompt for this spec
     #[serde(default)]
     pub context_files: Option<Vec<String>>,
+    /// Per-phase runtime/model overrides applied to every task in this spec
+    #[serde(default)]
+    pub phase_overrides: HashMap<String, PhaseOverride>,
+    /// Named worker pool to use for this spec. None → use the registry default.
+    /// Pool-name existence is validated at dispatch time, not here.
+    #[serde(default)]
+    pub worker_pool: Option<String>,
     pub tasks: Vec<BoiTask>,
 }
 
@@ -560,5 +586,56 @@ tasks:
         let spec = parse(yaml).unwrap();
         assert_eq!(spec.tasks[0].phases, Some(vec!["execute".to_string()]));
         assert_eq!(spec.tasks[1].phases, None);
+    }
+
+    // --- spec_worker_pool tests ---
+
+    #[test]
+    fn spec_worker_pool_defaults_to_none() {
+        let spec = parse(MINIMAL_YAML).unwrap();
+        assert!(spec.worker_pool.is_none());
+    }
+
+    #[test]
+    fn spec_worker_pool_parses_named_pool() {
+        let yaml = r#"
+title: "Pool Spec"
+worker_pool: fly-runners
+tasks:
+  - id: t-1
+    title: "Task"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(spec.worker_pool.as_deref(), Some("fly-runners"));
+    }
+
+    #[test]
+    fn spec_worker_pool_none_when_field_absent() {
+        let yaml = r#"
+title: "No Pool"
+tasks:
+  - id: t-1
+    title: "Task"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        assert_eq!(spec.worker_pool, None);
+    }
+
+    #[test]
+    fn spec_worker_pool_roundtrips_through_serde() {
+        let yaml = r#"
+title: "Roundtrip"
+worker_pool: local
+tasks:
+  - id: t-1
+    title: "Task"
+    status: PENDING
+"#;
+        let spec = parse(yaml).unwrap();
+        let serialized = serde_yml::to_string(&spec).unwrap();
+        let spec2: BoiSpec = serde_yml::from_str(&serialized).unwrap();
+        assert_eq!(spec.worker_pool, spec2.worker_pool);
     }
 }

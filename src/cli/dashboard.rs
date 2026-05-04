@@ -13,6 +13,123 @@ use std::time::{Duration, Instant};
 const BAR_WIDTH: usize = 8;
 const BAR_VIS: usize = BAR_WIDTH + 2;
 
+const HEADER_ROWS: usize = 2;
+const FOOTER_ROWS: usize = 1;
+const SECTION_HEADER_ROWS: usize = 1;
+const SECTION_TRAILING_BLANK: usize = 1;
+const MIN_FINISHED: usize = 3;
+const HINT_ROW: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LayoutPlan {
+    run_show: usize,
+    que_show: usize,
+    fin_show: usize,
+    run_hidden: usize,
+    que_hidden: usize,
+    fin_hidden: usize,
+}
+
+fn items_in_budget(row_budget: usize, items: usize, extra: usize) -> usize {
+    let mut count = 0;
+    let mut rows = 0usize;
+    for i in 0..items {
+        let r = if i < extra { 2 } else { 1 };
+        if rows.saturating_add(r) > row_budget {
+            break;
+        }
+        rows += r;
+        count += 1;
+    }
+    count
+}
+
+/// Allocate visible row counts per section given the terminal height.
+///
+/// Priority order: RUNNING > QUEUED > FINISHED. Always reserves
+/// MIN_FINISHED rows for FINISHED if any finished items exist.
+///
+/// `running_extra` is the count of RUNNING items that have a
+/// current-task subline (so they take 2 rows instead of 1).
+fn plan_layout(
+    height: usize,
+    running: usize,
+    running_extra: usize,
+    queued: usize,
+    finished: usize,
+) -> LayoutPlan {
+    let zero = LayoutPlan {
+        run_show: 0,
+        que_show: 0,
+        fin_show: 0,
+        run_hidden: 0,
+        que_hidden: 0,
+        fin_hidden: 0,
+    };
+
+    if height == 0 || (running == 0 && queued == 0 && finished == 0) {
+        return zero;
+    }
+
+    let content_budget = height.saturating_sub(HEADER_ROWS + FOOTER_ROWS);
+    if content_budget < 6 {
+        return zero;
+    }
+
+    let sec_per = SECTION_HEADER_ROWS + SECTION_TRAILING_BLANK;
+    let sec_overhead = if running > 0 { sec_per } else { 0 }
+        + if queued > 0 { sec_per } else { 0 }
+        + if finished > 0 { sec_per } else { 0 };
+    let budget = content_budget.saturating_sub(sec_overhead);
+
+    // Reserve MIN_FINISHED items + hint row if finished will be truncated
+    let fin_base = MIN_FINISHED.min(finished);
+    let fin_reserve = if finished > 0 {
+        fin_base + if finished > fin_base { HINT_ROW } else { 0 }
+    } else {
+        0
+    };
+    let fin_reserve = fin_reserve.min(budget);
+
+    let run_que_budget = budget.saturating_sub(fin_reserve);
+
+    // Running allocation (priority: highest)
+    let running_want = running + running_extra;
+    let (run_show, remaining_after_run) = if running_want <= run_que_budget {
+        (running, run_que_budget - running_want)
+    } else {
+        // Truncated: subtract hint row from item budget
+        let item_budget = run_que_budget.saturating_sub(HINT_ROW);
+        let show = items_in_budget(item_budget, running, running_extra);
+        (show, 0)
+    };
+
+    // Queued allocation
+    let (que_show, remaining_after_que) = if queued <= remaining_after_run {
+        (queued, remaining_after_run - queued)
+    } else {
+        let show = remaining_after_run.saturating_sub(HINT_ROW).min(queued);
+        (show, 0)
+    };
+
+    // Finished gets reserved minimum plus any leftover
+    let fin_budget = fin_reserve + remaining_after_que;
+    let fin_show = if fin_budget >= finished {
+        finished
+    } else {
+        fin_budget.saturating_sub(HINT_ROW).min(finished)
+    };
+
+    LayoutPlan {
+        run_show,
+        que_show,
+        fin_show,
+        run_hidden: running.saturating_sub(run_show),
+        que_hidden: queued.saturating_sub(que_show),
+        fin_hidden: finished.saturating_sub(fin_show),
+    }
+}
+
 fn compact_bar(completed: i64, total: i64) -> String {
     let filled = if total == 0 {
         0
@@ -842,5 +959,90 @@ pub fn run_dashboard(db_path: &str) {
         let _ = std::process::Command::new(boi_bin)
             .args(["log", &spec_id, "--follow"])
             .status();
+    }
+}
+
+#[cfg(test)]
+mod plan_layout_tests {
+    use super::{plan_layout, LayoutPlan, MIN_FINISHED};
+
+    // height=60: all three sections have items well under budget
+    #[test]
+    fn tall_terminal_all_visible() {
+        let p = plan_layout(60, 2, 0, 5, 30);
+        assert_eq!(p.run_show, 2);
+        assert_eq!(p.que_show, 5);
+        assert_eq!(p.fin_show, 30);
+        assert_eq!(p.run_hidden, 0);
+        assert_eq!(p.que_hidden, 0);
+        assert_eq!(p.fin_hidden, 0);
+    }
+
+    // height=20: all running visible, queued shrinks, finished >= MIN_FINISHED
+    #[test]
+    fn short_terminal_priority() {
+        let p = plan_layout(20, 4, 0, 8, 30);
+        assert_eq!(p.run_show, 4, "all running must be visible");
+        assert!(p.fin_show >= MIN_FINISHED, "finished must show at least MIN_FINISHED");
+        // queued is deprioritised and shrinks
+        assert!(p.que_show < 8);
+        // hidden counts must be consistent
+        assert_eq!(p.run_hidden, 4 - p.run_show);
+        assert_eq!(p.que_hidden, 8 - p.que_show);
+        assert_eq!(p.fin_hidden, 30 - p.fin_show);
+    }
+
+    // height=10: very tight — running is trimmed, finished gets whatever fits
+    #[test]
+    fn tiny_terminal() {
+        let p = plan_layout(10, 5, 0, 0, 20);
+        // running must be trimmed
+        assert!(p.run_hidden > 0, "some running items should be hidden");
+        // queued was already 0
+        assert_eq!(p.que_show, 0);
+        assert_eq!(p.que_hidden, 0);
+        // finished either gets MIN_FINISHED or fewer if truly no room
+        assert!(p.fin_show + p.fin_hidden == 20);
+    }
+
+    // empty: all inputs zero → all outputs zero
+    #[test]
+    fn empty_state() {
+        let p = plan_layout(40, 0, 0, 0, 0);
+        assert_eq!(p, LayoutPlan { run_show: 0, que_show: 0, fin_show: 0, run_hidden: 0, que_hidden: 0, fin_hidden: 0 });
+    }
+
+    // only finished items — they fill nearly the whole content budget
+    #[test]
+    fn only_finished() {
+        let p = plan_layout(30, 0, 0, 0, 50);
+        // run and queued are empty
+        assert_eq!(p.run_show, 0);
+        assert_eq!(p.que_show, 0);
+        // finished fills close to entire budget (content=27, overhead=2, budget=25, fin_show=24)
+        assert!(p.fin_show >= 20, "finished should fill most of the screen, got {}", p.fin_show);
+        assert_eq!(p.fin_hidden, 50 - p.fin_show);
+    }
+
+    // exact_fit: height=19, running=2, queued=3, finished=5 — no truncation
+    #[test]
+    fn exact_fit() {
+        let p = plan_layout(19, 2, 0, 3, 5);
+        assert_eq!(p.run_show, 2);
+        assert_eq!(p.que_show, 3);
+        assert_eq!(p.fin_show, 5);
+        assert_eq!(p.run_hidden, 0);
+        assert_eq!(p.que_hidden, 0);
+        assert_eq!(p.fin_hidden, 0);
+    }
+
+    // resize_smaller: same data, smaller height → counts decrease monotonically
+    #[test]
+    fn resize_smaller() {
+        let big = plan_layout(30, 2, 0, 5, 30);
+        let small = plan_layout(10, 2, 0, 5, 30);
+        assert!(small.run_show <= big.run_show, "run_show must not increase on shrink");
+        assert!(small.que_show <= big.que_show, "que_show must not increase on shrink");
+        assert!(small.fin_show <= big.fin_show, "fin_show must not increase on shrink");
     }
 }

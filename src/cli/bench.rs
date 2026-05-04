@@ -1,12 +1,53 @@
 use crate::fmt::{ensure_db_dir, BOLD, CYAN, GREEN, RESET};
+use crate::spec::PhaseOverride;
 use crate::{queue, spec};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+/// Inject or replace the `phase_overrides` YAML block in a spec string.
+/// Serializes each PhaseOverride as a nested mapping under `phase_overrides:`.
+fn inject_phase_overrides(yaml_content: &str, overrides: &HashMap<String, PhaseOverride>) -> String {
+    if overrides.is_empty() {
+        return yaml_content.to_string();
+    }
+    let inner = match serde_yml::to_string(overrides) {
+        Ok(s) => s,
+        Err(_) => return yaml_content.to_string(),
+    };
+    let indented: String = inner.lines().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n");
+    let new_block = format!("phase_overrides:\n{indented}\n");
+
+    let lines: Vec<&str> = yaml_content.lines().collect();
+    let mut out = String::new();
+    let mut replaced = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let l = lines[i];
+        if l.trim_start().starts_with("phase_overrides:") && !replaced {
+            i += 1;
+            while i < lines.len() && (lines[i].starts_with(' ') || lines[i].starts_with('\t')) {
+                i += 1;
+            }
+            out.push_str(&new_block);
+            replaced = true;
+        } else {
+            out.push_str(l);
+            out.push('\n');
+            i += 1;
+        }
+    }
+    if !replaced {
+        out.push_str(&new_block);
+    }
+    out
+}
+
 #[derive(serde::Deserialize)]
 struct PipelineTomlFile {
     pipeline: PipelineToml,
+    #[serde(default)]
+    phase_overrides: HashMap<String, PhaseOverride>,
 }
 
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -18,23 +59,29 @@ pub struct PipelineToml {
     pub task_phases: Vec<String>,
     #[serde(default)]
     pub post_phases: Vec<String>,
+    /// Per-phase overrides; populated from top-level [phase_overrides.<name>] TOML blocks.
+    #[serde(default)]
+    pub phase_overrides: HashMap<String, PhaseOverride>,
 }
 
 pub fn load_pipeline_config(path: &Path) -> PipelineToml {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
+    match try_load_pipeline_config(path) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("error: cannot read pipeline config {:?}: {e}", path);
-            std::process::exit(1);
-        }
-    };
-    match toml::from_str::<PipelineTomlFile>(&content) {
-        Ok(f) => f.pipeline,
-        Err(e) => {
-            eprintln!("error: invalid pipeline config {:?}: {e}", path);
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     }
+}
+
+/// Load a pipeline config, returning an error string instead of calling process::exit.
+pub fn try_load_pipeline_config(path: &Path) -> Result<PipelineToml, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read pipeline config {:?}: {e}", path))?;
+    let mut file: PipelineTomlFile = toml::from_str(&content)
+        .map_err(|e| format!("invalid pipeline config {:?}: {e}", path))?;
+    file.pipeline.phase_overrides = file.phase_overrides;
+    Ok(file.pipeline)
 }
 
 pub fn cmd_bench(
@@ -137,6 +184,9 @@ fn run_one(
     }
     if !pipeline_cfg.post_phases.is_empty() {
         modified = inject_yaml_list(&modified, "post_phases", &pipeline_cfg.post_phases);
+    }
+    if !pipeline_cfg.phase_overrides.is_empty() {
+        modified = inject_phase_overrides(&modified, &pipeline_cfg.phase_overrides);
     }
 
     let ts = std::time::SystemTime::now()

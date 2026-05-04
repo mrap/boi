@@ -203,9 +203,29 @@ name = "v2"
 spec_phases = ["spec-critique", "spec-improve"]   # phases run once on the spec
 task_phases = ["execute", "task-verify"]           # phases run per task
 post_phases = ["doc-update", "critic", "merge"]    # phases run after all tasks complete
+
+# Optional: override runtime/model/effort/timeout per phase for this pipeline.
+# Unset fields fall back to the phase TOML default.
+[phase_overrides.critic]
+model = "claude-haiku-4-5"
+
+[phase_overrides.execute]
+runtime = "openrouter"
+model = "google/gemini-2.0-flash-001"
+effort = "high"
+timeout = 3600
 ```
 
 Pass them with `--pipeline name:path/to/pipeline.toml` (repeatable for N-way comparisons).
+
+`[phase_overrides.<name>]` fields:
+
+| Field | Type | Values |
+|-------|------|--------|
+| `runtime` | string | `claude`, `openrouter`, `codex` |
+| `model` | string | any model ID the runtime accepts |
+| `effort` | string | `low`, `medium`, `high` |
+| `timeout` | integer | seconds |
 
 ### Pipeline v2 Mode (opt-in)
 
@@ -318,6 +338,8 @@ Exit 0 = passed. Any non-zero exit = failed. Stdout/stderr are captured as the f
 
 BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) and `openrouter` (requires `OPENROUTER_API_KEY`) are also supported. Use `boi providers list` to see which providers are active on your machine.
 
+Set `OPENROUTER_API_KEY` in your shell profile **or** in `~/.boi/.env` — the binary auto-loads that file at startup so you don't need to export the key in every shell session. Override the path with `$BOI_ENV_FILE`.
+
 ### Global Default
 
 Set in `~/.boi/config.json`:
@@ -362,6 +384,51 @@ models:
 
 Keys are phase names. Values are full model IDs or aliases. Config-level overrides take precedence over the `model` field in each phase's `.phase.toml` at runtime.
 
+### Worker Pool
+
+By default BOI runs workers as local threads. Set `worker_pool.type: fly` in `~/.boi/config.yaml` to dispatch workers to [Fly.io Machines](docs/extensibility/worker-pool-providers.md#fly) instead:
+
+```yaml
+worker_pool:
+  type: fly
+  fly:
+    app: boi-workers
+    image: registry.fly.io/boi-workers:latest
+    cpu_kind: shared
+    cpu_count: 1
+    memory_mb: 256
+    max_cost_usd: 10.0   # cost guard; spawn is refused if estimate exceeds this
+```
+
+Requires `FLY_API_TOKEN` in the environment or `~/.boi/.env`. BOI errors loudly at startup if the token is missing.
+
+**Named pools** let you declare multiple pools and have specs pick one by name:
+
+```yaml
+# ~/.boi/config.yaml
+worker_pools:
+  local:
+    type: local
+    max_workers: 5
+  fly-runners:
+    type: fly
+    app: boi-runners
+    region: iad
+    max_workers: 10
+  default: local
+```
+
+**Per-spec pool selection:** add `worker_pool: <name>` to a spec to pin it to a specific pool:
+
+```yaml
+worker_pool: fly-runners   # top-level spec field; omit to use registry default
+tasks:
+  - id: t-1
+    ...
+```
+
+If the named pool is at capacity, the spec stays queued — BOI never silently falls back to a different pool. See [Worker Pool Providers](docs/extensibility/worker-pool-providers.md) for full reference.
+
 ### Context Injection
 
 Inject files into every worker prompt so workers have access to shared memory, project notes, or other context.
@@ -389,6 +456,14 @@ Both lists are merged at dispatch time. File contents are read once and stored i
 
 `boi doctor` validates the configured runtime's CLI is installed. If the global default is `codex`, it checks for `codex` in PATH instead of `claude`.
 
+It also runs three daemon consistency checks against the live DB:
+
+- **Ghost workers**: specs marked `running` for >1h with no iteration activity in that window (worker died without updating state).
+- **Stale status**: specs stuck in `running` or `assigning` for >1h (daemon crash or missed transition).
+- **Running without worker_id**: specs in `running` state with no `worker_id` recorded (informational; non-zero exit only when ghost or stale counts are non-zero).
+
+Any ghost or stale finding exits non-zero so `boi doctor` can gate CI or alerting pipelines.
+
 ## CLI Reference
 
 ```
@@ -400,7 +475,7 @@ boi cancel <queue-id>                     Cancel a running or queued spec
 boi stop                                  Stop daemon and all workers
 boi install [--workers N]                 One-time setup (run outside Claude Code)
 boi resume <queue-id> | --all            Resume failed or canceled specs
-boi cleanup                               Kill orphaned worker processes
+boi prune-orphans [--dry-run|--apply] [--max-idle-secs N] [--json]  Identify (and optionally kill) orphaned worker processes
 boi workers [--json]                      Show worktree health
 boi telemetry <queue-id> [--json]        Per-iteration metrics
 boi phases <queue-id> [--full]           Phase invocations table (runtime, model, duration, cost)
@@ -413,6 +488,8 @@ boi project create|list|status|context|delete
 boi bench --pipeline name:path [--pipeline ...] --spec FILE | --battery DIR [--runs N]  Benchmark N pipelines
 boi bench --phase <name> --spec FILE [--runs N]  Benchmark a single phase in isolation
 boi providers list                            List registered and disabled runtime providers
+boi completions <shell>                       Print shell completion script (bash/zsh/fish/elvish/powershell)
+boi research <brief.md> [--threads N] [--project NAME]  Dispatch multi-angle research DAG
 ```
 
 **`dispatch` options:**
@@ -425,6 +502,103 @@ boi providers list                            List registered and disabled runti
 | `--worktree-isolate` | Dedicated git worktree and branch for this spec |
 | `--after SA7F3,TB2E1` | Wait for listed specs to complete before starting |
 | `--project NAME` | Associate with a project (injects project context) |
+
+## Pruning Orphaned Workers
+
+Failed deploys, cancelled specs, and daemon restarts can leave behind orphaned processes: `claude -p` subprocesses no longer tracked by BOI, `tail -f` watchers on deleted worktrees, and worker shell wrappers stuck on dead pipes. `boi prune-orphans` identifies and (optionally) removes them safely.
+
+```
+boi prune-orphans [--dry-run|--apply] [--yes] [--max-idle-secs N] [--exclude-pattern PAT] [--json]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | (default) Show candidates without killing anything |
+| `--apply` | Send SIGTERM, wait 10s, then SIGKILL survivors; updates DB |
+| `--yes` | Required with `--apply` in non-TTY environments |
+| `--max-idle-secs N` | Idle-CPU threshold in seconds (default: 600) |
+| `--exclude-pattern PAT` | Repeatable regex matched against cmdline; matching PIDs are never touched |
+| `--json` | Machine-readable output (list of objects with full process info) |
+
+### Safety Heuristics
+
+A process is a **prune candidate** if it meets **at least one** of:
+
+1. PID is alive but absent from `workers.current_pid` in the DB.
+2. PID has a `processes` row with `ended_at IS NOT NULL` (DB thinks it ended, but the OS disagrees).
+3. PID's working directory is a `/private/tmp/.../boi-*-boi-rust/` path whose spec is no longer active.
+4. PID has had 0% CPU for ≥ `--max-idle-secs` seconds.
+5. PID's parent is dead **and** PID has been alive ≥ `--max-idle-secs` seconds.
+
+**Never touched:**
+- PIDs in `workers.current_pid` with a recent heartbeat.
+- `claude` sessions that have a controlling TTY or no parent in the BOI process tree (interactive sessions).
+- Long-running daemons matched by name: `claude-mem`, `claude/remote/server`, `claude-compare/server.py`, the BOI daemon itself.
+- PIDs matching any `--exclude-pattern`.
+
+If the protected set is empty (e.g. DB unreachable), the command refuses to run unless `--force` is also passed.
+
+### Periodic Scanning via hex-events
+
+A hex-events policy at `~/.hex-events/policies/boi-prune-orphans.yaml` runs `prune-orphans --dry-run` every hour and logs any candidates found to `/tmp/boi-orphan-alerts.log`. It does **not** auto-kill; to enable automatic pruning, change `--dry-run` to `--apply --yes` in the policy action.
+
+## Research DAG
+
+Dispatch a multi-angle research DAG from a brief file:
+
+```bash
+boi research brief.md [--threads 3] [--project NAME]
+```
+
+The brief is a Markdown file with three sections:
+
+```markdown
+# Question
+What is the optimal caching strategy for high-read workloads?
+
+# Angles
+- Redis vs Memcached trade-offs
+- Cache invalidation patterns
+
+# Deliverable
+A decision doc with a recommended approach.
+```
+
+`boi research` dispatches `--threads` angle specs in parallel, one synthesis spec that depends on the last angle, and one deliverable spec that depends on synthesis. If `Angles` has fewer entries than `--threads`, extra angles are generated from the top entities in `Question`.
+
+## Shell Completions
+
+Enable tab-completion for subcommands, flags, and `--mode` values.
+
+### Zsh (oh-my-zsh)
+
+```bash
+boi completions zsh > ~/.oh-my-zsh/completions/_boi
+# restart shell
+```
+
+### Zsh (no oh-my-zsh)
+
+```bash
+mkdir -p ~/.zfunc && boi completions zsh > ~/.zfunc/_boi
+# add to ~/.zshrc:
+#   fpath=(~/.zfunc $fpath)
+#   autoload -U compinit && compinit
+```
+
+### Bash
+
+```bash
+boi completions bash > /usr/local/etc/bash_completion.d/boi
+# or add to ~/.bashrc:
+#   source <(boi completions bash)
+```
+
+### Fish
+
+```bash
+boi completions fish > ~/.config/fish/completions/boi.fish
+```
 
 ## Output Preservation
 

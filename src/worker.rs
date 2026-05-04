@@ -202,6 +202,26 @@ pub fn run_verify_with_code(verify_cmd: &str, dir: &str) -> (bool, Option<i64>) 
     }
 }
 
+/// Apply pipeline phase overrides to a PhaseConfig (delegates to runner::apply_phase_overrides_from_map).
+pub fn apply_phase_override(
+    phase: &phases::PhaseConfig,
+    overrides: &std::collections::HashMap<String, spec::PhaseOverride>,
+    phase_name: &str,
+    telemetry: &Telemetry,
+    spec_id: &str,
+) -> phases::PhaseConfig {
+    crate::runner::apply_phase_overrides_from_map(phase, overrides, phase_name, telemetry, spec_id)
+}
+
+/// Returns the effective timeout_secs for a phase: uses phase.timeout_minutes if set by an
+/// override, otherwise falls back to the global config timeout.
+pub fn effective_timeout(phase: &phases::PhaseConfig, config_timeout_secs: u64) -> u64 {
+    phase.timeout_minutes
+        .filter(|&m| m > 0)  // guard: 0-minute values (e.g. from integer division) fall through to global default
+        .map(|m| m as u64 * 60)
+        .unwrap_or(config_timeout_secs)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_phase_run(
     queue: &Queue,
@@ -329,8 +349,9 @@ pub fn run_worker_with_phases(
     telemetry: &Telemetry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let queue = Queue::open(queue_path)?;
-    queue.update_spec(spec_id, "running")?;
-    let _ = hooks::fire(hook_config, ON_WORKER_START, &json!({ "spec_id": spec_id })); // intentional: best-effort hook notification
+    let worker_id = format!("W-{}-{:?}", spec_id, std::thread::current().id());
+    queue.update_spec_running(spec_id, &worker_id)?;
+    let _ = hooks::fire(hook_config, ON_WORKER_START, &json!({ "spec_id": spec_id, "worker_id": worker_id })); // intentional: best-effort hook notification
 
     telemetry.emit("boi.worker.started", LogLevel::Info, &json!({
         "spec_id": spec_id,
@@ -346,9 +367,13 @@ pub fn run_worker_with_phases(
 
     let original_workspace = spec_rec.workspace.clone();
 
+    let workspace: Box<dyn crate::workspace::WorkspaceBackend> =
+        Box::new(crate::workspace::git::GitWorkspace::new());
+
     let worktree_path: String = match &original_workspace {
         Some(ws) if !ws.is_empty() => {
-            let worktree_dir = crate::worktree::create(spec_id, ws)?;
+            let worktree_dir = workspace.create(spec_id, ws)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             worktree_dir.to_str()
                 .ok_or_else(|| -> Box<dyn std::error::Error> { "worktree path is not valid UTF-8".into() })?
                 .to_string()
@@ -412,6 +437,15 @@ pub fn run_worker_with_phases(
         phases: None,
     }).collect();
 
+    let task_phases_from_db: Option<Vec<String>> = spec_rec.task_phases.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let spec_phases_from_db: Option<Vec<String>> = spec_rec.spec_phases.as_ref()
+        .and_then(|s| serde_json::from_str(s).ok());
+    let phase_overrides_from_db: std::collections::HashMap<String, spec::PhaseOverride> =
+        spec_rec.phase_overrides.as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
     let mut boi_spec = spec::BoiSpec {
         title: spec_rec.title.clone(),
         mode: Some(spec_rec.mode.clone()),
@@ -419,9 +453,11 @@ pub fn run_worker_with_phases(
         initiative: None,
         context: spec_rec.context.clone(),
         outcomes: None,
-        spec_phases: None,
-        task_phases: None,
+        spec_phases: spec_phases_from_db,
+        task_phases: task_phases_from_db,
         context_files: None,
+        phase_overrides: phase_overrides_from_db,
+        worker_pool: None,
         tasks,
     };
 
@@ -645,6 +681,8 @@ pub fn run_worker_with_phases(
                         continue;
                     }
                 };
+                let effective_phase = apply_phase_override(&phase, &boi_spec.phase_overrides, phase_name, telemetry, spec_id);
+                let phase_timeout_secs = effective_timeout(&effective_phase, config.task_timeout_secs);
 
                 let phase_payload = json!({
                     "spec_id": spec_id,
@@ -663,11 +701,11 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, phase_output, metrics) = runner.run_phase_full(
-                    phase,
+                    &effective_phase,
                     &spec_content,
                     None,
                     &worktree_path,
-                    config.task_timeout_secs,
+                    phase_timeout_secs,
                     Some(spec_id),
                     &prompt_vars,
                 );
@@ -908,6 +946,8 @@ pub fn run_worker_with_phases(
                         continue;
                     }
                 };
+                let effective_phase = apply_phase_override(&phase, &boi_spec.phase_overrides, phase_name, telemetry, spec_id);
+                let phase_timeout_secs = effective_timeout(&effective_phase, config.task_timeout_secs);
 
                 boi_log!("state: TaskPhase {{ task: {}, phase_idx: {}, phase: '{}', requeue_attempts: {} }}",
                     task.id, phase_idx, phase_name, requeue_attempts);
@@ -939,11 +979,11 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, _output, metrics) = runner.run_phase_full(
-                    phase,
+                    &effective_phase,
                     &spec_content,
                     Some(task),
                     &worktree_path,
-                    config.task_timeout_secs,
+                    phase_timeout_secs,
                     Some(spec_id),
                     &prompt_vars,
                 );
@@ -1063,7 +1103,9 @@ pub fn run_worker_with_phases(
                         continue;
                     }
                 };
-                let max_attempts = phase.retry_count.unwrap_or(config.retry_count);
+                let effective_phase = apply_phase_override(&phase, &boi_spec.phase_overrides, phase_name, telemetry, spec_id);
+                let phase_timeout_secs = effective_timeout(&effective_phase, config.task_timeout_secs);
+                let max_attempts = effective_phase.retry_count.unwrap_or(config.retry_count);
 
                 if attempt >= max_attempts {
                     boi_log!("state: TaskPhaseRetry -> Failed (max retries {} reached for task {} phase '{}')",
@@ -1104,11 +1146,11 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (retry_verdict, _output, retry_metrics) = runner.run_phase_full(
-                    phase,
+                    &effective_phase,
                     &spec_content,
                     Some(task),
                     &worktree_path,
-                    config.task_timeout_secs,
+                    phase_timeout_secs,
                     Some(spec_id),
                     &prompt_vars,
                 );
@@ -1242,6 +1284,8 @@ pub fn run_worker_with_phases(
                         continue;
                     }
                 };
+                let effective_phase = apply_phase_override(&phase, &boi_spec.phase_overrides, phase_name, telemetry, spec_id);
+                let phase_timeout_secs = effective_timeout(&effective_phase, config.task_timeout_secs);
 
                 let phase_payload = json!({
                     "spec_id": spec_id,
@@ -1260,11 +1304,11 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, _output, metrics) = runner.run_phase_full(
-                    phase,
+                    &effective_phase,
                     &spec_content,
                     None,
                     &worktree_path,
-                    config.task_timeout_secs,
+                    phase_timeout_secs,
                     Some(spec_id),
                     &prompt_vars,
                 );
@@ -1276,7 +1320,7 @@ pub fn run_worker_with_phases(
                 match &verdict {
                     Verdict::Proceed => {
                         let _ = hooks::fire(hook_config, ON_PHASE_COMPLETE, &phase_payload); // intentional: best-effort hook notification
-                        if phase.completion_handler.as_deref() == Some("builtin:cleanup") {
+                        if effective_phase.completion_handler.as_deref() == Some("builtin:cleanup") {
                             worktree_removed = true;
                         }
                         state = WorkerState::PostTaskSpecPhase { phase_idx: phase_idx + 1 };
@@ -1390,36 +1434,17 @@ pub fn run_worker_with_phases(
                     // we reach this state the worktree may already be gone.
                     if let Some(ws) = &boi_spec.workspace {
                         if std::path::Path::new(&worktree_path).exists() {
-                            let commit_msg = format!("boi({}): completed spec tasks", spec_id);
-                            match crate::worktree::commit_changes(spec_id, &commit_msg) {
-                                Ok(true) => {
-                                    boi_log!(" committed changes in worktree");
-                                    match crate::worktree::merge_back(spec_id, ws) {
-                                        Ok(output) => {
-                                            boi_log!(" merged worktree branch into source repo");
-                                            telemetry.emit("boi.worktree.merged", LogLevel::Info, &json!({
-                                                "spec_id": spec_id,
-                                                "message": format!("merged boi/{} into source repo", spec_id),
-                                                "merge_output": output.chars().take(200).collect::<String>(),
-                                            }));
-                                        }
-                                        Err(e) => {
-                                            boi_log!(" merge failed: {} — worktree preserved", e);
-                                            telemetry.emit("boi.worktree.merge_failed", LogLevel::Error, &json!({
-                                                "spec_id": spec_id,
-                                                "error": e.to_string(),
-                                            }));
-                                            let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(false) => {
-                                    boi_log!(" no changes to commit in worktree");
+                            match workspace.merge(std::path::Path::new(&worktree_path), ws) {
+                                Ok(()) => {
+                                    boi_log!(" merged worktree branch into source repo");
+                                    telemetry.emit("boi.worktree.merged", LogLevel::Info, &json!({
+                                        "spec_id": spec_id,
+                                        "message": format!("merged boi/{} into source repo", spec_id),
+                                    }));
                                 }
                                 Err(e) => {
-                                    boi_log!(" commit failed: {} — worktree preserved", e);
-                                    telemetry.emit("boi.worktree.commit_failed", LogLevel::Error, &json!({
+                                    boi_log!(" merge failed: {} — worktree preserved", e);
+                                    telemetry.emit("boi.worktree.merge_failed", LogLevel::Error, &json!({
                                         "spec_id": spec_id,
                                         "error": e.to_string(),
                                     }));
@@ -1429,16 +1454,10 @@ pub fn run_worker_with_phases(
                         }
                     }
                     boi_log!("state: Cleanup — removing worktree for spec {}", spec_id);
-                    let _ = crate::worktree::cleanup(spec_id); // intentional: best-effort worktree cleanup
-                    if let Some(ws) = &boi_spec.workspace {
-                        let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
-                    }
+                    let _ = workspace.cleanup(spec_id); // intentional: best-effort worktree cleanup
                 } else if config.cleanup_on_failure {
                     boi_log!("state: Cleanup — removing worktree for failed spec {}", spec_id);
-                    let _ = crate::worktree::cleanup(spec_id); // intentional: best-effort worktree cleanup
-                    if let Some(ws) = &boi_spec.workspace {
-                        let _ = crate::worktree::delete_branch(spec_id, ws); // intentional: best-effort branch cleanup
-                    }
+                    let _ = workspace.cleanup(spec_id); // intentional: best-effort worktree cleanup
                 } else {
                     boi_log!(" preserving worktree for failed spec {}", spec_id);
                 }
