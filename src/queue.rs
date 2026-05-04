@@ -297,6 +297,9 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "workspace", "TEXT");
         Self::ensure_column(&conn, "specs", "phase_loop_count", "INTEGER DEFAULT 0");
         Self::ensure_column(&conn, "specs", "project_context", "TEXT");
+        Self::ensure_column(&conn, "specs", "task_phases", "TEXT");
+        Self::ensure_column(&conn, "specs", "spec_phases", "TEXT");
+        Self::ensure_column(&conn, "specs", "phase_overrides", "TEXT");
         Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
         Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
 
@@ -373,6 +376,9 @@ impl Queue {
         let task_phases_json: Option<String> = spec.task_phases.as_ref()
             .filter(|v| !v.is_empty())
             .map(|v| serde_json::to_string(v).unwrap_or_default());
+        let spec_phases_json: Option<String> = spec.spec_phases.as_ref()
+            .filter(|v| !v.is_empty())
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
         let phase_overrides_json: Option<String> = if spec.phase_overrides.is_empty() {
             None
         } else {
@@ -380,9 +386,9 @@ impl Queue {
         };
 
         tx.execute(
-            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace, project_context, task_phases, phase_overrides)
-             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace, project_context, task_phases_json, phase_overrides_json],
+            "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace, project_context, task_phases, spec_phases, phase_overrides)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace, project_context, task_phases_json, spec_phases_json, phase_overrides_json],
         )?;
 
         let mut yaml_to_canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();

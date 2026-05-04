@@ -121,11 +121,18 @@ outcomes:
   - description: "CLI reads config files"
     verify: "python3 cli.py --config sample.yaml"
 
+phase_overrides:                # optional: swap runtime/model for named phases
+  critic:
+    runtime: openrouter
+    model: google/gemini-2.5-flash
+
 tasks:
   ...
 ```
 
 The `mode` field sets the execution mode (overrides the `--mode` CLI flag).
+
+`phase_overrides` applies runtime/model/effort/timeout overrides to every task in the spec for a given phase name. See [yaml-spec-schema.md](../docs/yaml-spec-schema.md) for the full override object fields.
 
 ## Generate Mode Specs
 

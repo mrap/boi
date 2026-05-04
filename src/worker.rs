@@ -675,7 +675,7 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, phase_output, metrics) = runner.run_phase_full(
-                    phase,
+                    &phase,
                     &spec_content,
                     None,
                     &worktree_path,
@@ -948,7 +948,7 @@ pub fn run_worker_with_phases(
                 prompt_vars.insert(TemplateVar::TaskDepends.key().into(),
                     task.depends.as_ref().map(|d| d.join(", ")).unwrap_or_default());
 
-                let phase_overridden = apply_phase_overrides_from_map(phase, &phase_overrides_from_db, phase_name, &telemetry, spec_id);
+                let phase_overridden = apply_phase_overrides_from_map(&phase, &phase_overrides_from_db, phase_name, &telemetry, spec_id);
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, _output, metrics) = runner.run_phase_full(
@@ -1114,7 +1114,7 @@ pub fn run_worker_with_phases(
                 prompt_vars.insert(TemplateVar::TaskDepends.key().into(),
                     task.depends.as_ref().map(|d| d.join(", ")).unwrap_or_default());
 
-                let phase_overridden = apply_phase_overrides_from_map(phase, &phase_overrides_from_db, phase_name, &telemetry, spec_id);
+                let phase_overridden = apply_phase_overrides_from_map(&phase, &phase_overrides_from_db, phase_name, &telemetry, spec_id);
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (retry_verdict, _output, retry_metrics) = runner.run_phase_full(
@@ -1274,7 +1274,7 @@ pub fn run_worker_with_phases(
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
                 let (verdict, _output, metrics) = runner.run_phase_full(
-                    phase,
+                    &phase,
                     &spec_content,
                     None,
                     &worktree_path,

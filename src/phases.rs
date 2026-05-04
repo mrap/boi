@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Canonical template variable keys for phase prompts.
 /// Using this enum prevents typos and makes it easy to find all usages.
@@ -299,9 +301,73 @@ fn non_empty(opt: &Option<String>) -> Option<String> {
     })
 }
 
+/// FNV-1a 64-bit hash of the content string, used to detect file modifications
+/// that occur within the same mtime tick (e.g., rapid writes in tests or on
+/// coarse-grained filesystems).
+fn content_checksum(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 pub struct PhaseRegistry {
     core: HashMap<String, PhaseConfig>,
     user: HashMap<String, PhaseConfig>,
+    /// Maps user phase name → the file it was loaded from.
+    /// Used in `get()` to detect deleted or modified files.
+    user_sources: HashMap<String, PathBuf>,
+    /// Freshly-reloaded user phases (populated when `get()` detects a stale mtime or content).
+    user_fresh: RefCell<HashMap<String, PhaseConfig>>,
+    /// Records the mtime of each user phase file when it was last loaded/reloaded.
+    user_mtimes: RefCell<HashMap<String, Option<SystemTime>>>,
+    /// Records a checksum of each user phase file's content when it was last loaded/reloaded.
+    /// Used to detect content changes that occur within the same mtime tick.
+    user_checksums: RefCell<HashMap<String, u64>>,
+}
+
+/// Tracks which [phase] section fields are explicitly present in a user override TOML.
+/// Unset fields inherit from the matching core phase rather than using runtime-based fallbacks.
+#[derive(Clone, Copy)]
+struct PhaseExplicitFlags {
+    requires_claude: bool,
+    level: bool,
+    can_add_tasks: bool,
+    can_fail_spec: bool,
+    timeout_minutes: bool,
+    /// True if the TOML has a [phase] section at all (even an empty one).
+    has_phase_section: bool,
+}
+
+impl PhaseExplicitFlags {
+    fn from_toml_value(v: &toml::Value) -> Self {
+        let phase = v.get("phase");
+        // [worker].timeout also sets timeout_minutes (via /60 in from_toml), so treat
+        // it as explicit to avoid inheriting the core's timeout_minutes over the user's.
+        let worker_timeout_set = v.get("worker").and_then(|w| w.get("timeout")).is_some();
+        PhaseExplicitFlags {
+            requires_claude: phase.and_then(|p| p.get("requires_claude")).is_some(),
+            level: phase.and_then(|p| p.get("level")).is_some(),
+            can_add_tasks: phase.and_then(|p| p.get("can_add_tasks")).is_some(),
+            can_fail_spec: phase.and_then(|p| p.get("can_fail_spec")).is_some(),
+            timeout_minutes: phase.and_then(|p| p.get("timeout_minutes")).is_some() || worker_timeout_set,
+            has_phase_section: phase.is_some(),
+        }
+    }
+
+    /// Fallback when raw TOML can't be parsed: assume everything explicit to avoid clobbering.
+    fn assume_all_explicit() -> Self {
+        PhaseExplicitFlags {
+            requires_claude: true,
+            level: true,
+            can_add_tasks: true,
+            can_fail_spec: true,
+            timeout_minutes: true,
+            has_phase_section: true,
+        }
+    }
 }
 
 impl Default for PhaseRegistry {
@@ -331,6 +397,10 @@ impl PhaseRegistry {
         let mut registry = PhaseRegistry {
             core,
             user: HashMap::new(),
+            user_sources: HashMap::new(),
+            user_fresh: RefCell::new(HashMap::new()),
+            user_mtimes: RefCell::new(HashMap::new()),
+            user_checksums: RefCell::new(HashMap::new()),
         };
 
         let user_dir = user_phases_dir();
@@ -357,6 +427,10 @@ impl PhaseRegistry {
         PhaseRegistry {
             core,
             user: HashMap::new(),
+            user_sources: HashMap::new(),
+            user_fresh: RefCell::new(HashMap::new()),
+            user_mtimes: RefCell::new(HashMap::new()),
+            user_checksums: RefCell::new(HashMap::new()),
         }
     }
 
@@ -376,8 +450,52 @@ impl PhaseRegistry {
                     if !seen.insert(entry.clone()) {
                         continue;
                     }
+                    // Parse raw TOML to detect which [phase] fields are explicitly set,
+                    // so we can inherit unset fields from the matching core phase below.
+                    let raw_content = std::fs::read_to_string(&entry).ok();
+                    let explicit = raw_content.as_deref()
+                        .and_then(|c| c.parse::<toml::Value>().ok())
+                        .map(|v| PhaseExplicitFlags::from_toml_value(&v))
+                        .unwrap_or(PhaseExplicitFlags::assume_all_explicit());
                     match load_phase_file(&entry) {
-                        Ok(phase) => {
+                        Ok(mut phase) => {
+                            // Inherit [phase] fields from core when the user override
+                            // didn't set them explicitly. Without this, the runtime-based
+                            // fallback in from_toml would silently override the core's
+                            // explicit value (e.g., requires_claude=false → true when
+                            // [worker].runtime="claude" but no [phase] section exists).
+                            if let Some(core) = self.core.get(&phase.name) {
+                                if !explicit.has_phase_section {
+                                    eprintln!(
+                                        "WARN: [{}] user override has no [phase] section; \
+                                         inheriting phase fields from core",
+                                        phase.name
+                                    );
+                                }
+                                if !explicit.requires_claude {
+                                    phase.requires_claude = core.requires_claude;
+                                }
+                                if !explicit.level {
+                                    phase.level = core.level;
+                                }
+                                if !explicit.can_add_tasks {
+                                    phase.can_add_tasks = core.can_add_tasks;
+                                }
+                                if !explicit.can_fail_spec {
+                                    phase.can_fail_spec = core.can_fail_spec;
+                                }
+                                if !explicit.timeout_minutes {
+                                    if let Some(core_timeout) = core.timeout_minutes {
+                                        phase.timeout_minutes = Some(core_timeout);
+                                    }
+                                }
+                            }
+                            let mtime = std::fs::metadata(&entry).ok()
+                                .and_then(|m| m.modified().ok());
+                            let checksum = content_checksum(raw_content.as_deref().unwrap_or(""));
+                            self.user_mtimes.borrow_mut().insert(phase.name.clone(), mtime);
+                            self.user_checksums.borrow_mut().insert(phase.name.clone(), checksum);
+                            self.user_sources.insert(phase.name.clone(), entry.clone());
                             self.user.insert(phase.name.clone(), phase);
                         }
                         Err(e) => {
@@ -393,10 +511,57 @@ impl PhaseRegistry {
         }
     }
 
-    pub fn get(&self, name: &str) -> Option<&PhaseConfig> {
+    pub fn get(&self, name: &str) -> Option<PhaseConfig> {
         // "spec-review" is a backward-compat alias for "spec-critique".
         let resolved = if name == "spec-review" { "spec-critique" } else { name };
-        self.user.get(resolved).or_else(|| self.core.get(resolved))
+        if let Some(source_path) = self.user_sources.get(resolved) {
+            if !source_path.exists() {
+                // File deleted mid-run: fall back to core (prevents stale-override scenario).
+                return self.core.get(resolved).cloned();
+            }
+
+            let disk_mtime = std::fs::metadata(source_path).ok()
+                .and_then(|m| m.modified().ok());
+            let cached_mtime = *self.user_mtimes.borrow().get(resolved).unwrap_or(&None);
+
+            // Read the file once. Compare mtime first (fast), then checksum as a fallback
+            // for filesystems where rapid writes share the same mtime tick.
+            let mtime_changed = matches!((cached_mtime, disk_mtime), (Some(c), Some(d)) if d != c);
+            let raw_on_disk = std::fs::read_to_string(source_path).ok();
+            let checksum_changed = raw_on_disk.as_deref()
+                .map(|raw| content_checksum(raw) != *self.user_checksums.borrow().get(resolved).unwrap_or(&0))
+                .unwrap_or(false);
+            if mtime_changed || checksum_changed {
+                if let Some(raw) = raw_on_disk {
+                    let explicit = raw.parse::<toml::Value>().ok()
+                        .map(|v| PhaseExplicitFlags::from_toml_value(&v))
+                        .unwrap_or_else(PhaseExplicitFlags::assume_all_explicit);
+                    if let Ok(mut phase) = load_phase_file(source_path) {
+                        if let Some(core) = self.core.get(&phase.name) {
+                            if !explicit.requires_claude { phase.requires_claude = core.requires_claude; }
+                            if !explicit.level { phase.level = core.level; }
+                            if !explicit.can_add_tasks { phase.can_add_tasks = core.can_add_tasks; }
+                            if !explicit.can_fail_spec { phase.can_fail_spec = core.can_fail_spec; }
+                            if !explicit.timeout_minutes {
+                                if let Some(t) = core.timeout_minutes { phase.timeout_minutes = Some(t); }
+                            }
+                        }
+                        self.user_mtimes.borrow_mut().insert(resolved.to_string(), disk_mtime);
+                        self.user_checksums.borrow_mut().insert(resolved.to_string(), content_checksum(&raw));
+                        self.user_fresh.borrow_mut().insert(resolved.to_string(), phase.clone());
+                        return Some(phase);
+                    }
+                }
+            }
+
+            // Return the freshly-reloaded entry if it exists (from a prior stale-reload),
+            // otherwise return the originally-loaded user entry.
+            if let Some(fresh) = self.user_fresh.borrow().get(resolved) {
+                return Some(fresh.clone());
+            }
+            return self.user.get(resolved).cloned();
+        }
+        self.core.get(resolved).cloned()
     }
 
     pub fn list(&self) -> Vec<&PhaseConfig> {
@@ -437,6 +602,9 @@ impl PhaseRegistry {
                 phase.model = Some(model.clone());
             }
             if let Some(phase) = self.user.get_mut(resolved) {
+                phase.model = Some(model.clone());
+            }
+            if let Some(phase) = self.user_fresh.borrow_mut().get_mut(resolved) {
                 phase.model = Some(model.clone());
             }
         }
@@ -1407,7 +1575,7 @@ approve_signal = ""
     fn test_parse_phase_output_approved() {
         let registry = test_registry();
         let critic = registry.get("critic").unwrap();
-        let outcome = parse_phase_output(critic, "Everything looks good.\n\n## Critic Approved\n");
+        let outcome = parse_phase_output(&critic, "Everything looks good.\n\n## Critic Approved\n");
         assert_eq!(outcome, Verdict::Proceed);
     }
 
@@ -1416,7 +1584,7 @@ approve_signal = ""
         let registry = test_registry();
         let critic = registry.get("critic").unwrap();
         let outcome = parse_phase_output(
-            critic,
+            &critic,
             "[CRITIC] Missing error handling in parse_spec()\n[CRITIC] Dead code in worker.rs",
         );
         assert_eq!(
@@ -1459,7 +1627,7 @@ approve_signal = ""
     fn test_parse_phase_output_plan_critique_rejected() {
         let registry = test_registry();
         let pc = registry.get("plan-critique").unwrap();
-        let outcome = parse_phase_output(pc, "[PLAN-CRITIQUE] Task t-3 has unrealistic dependency");
+        let outcome = parse_phase_output(&pc, "[PLAN-CRITIQUE] Task t-3 has unrealistic dependency");
         // on_reject = "requeue:spec-review" → loops back instead of hard-failing
         assert_eq!(outcome, Verdict::Redo { tasks: vec![] });
     }
@@ -1560,7 +1728,7 @@ approve_signal = ""
         // spec-review is now a backward-compat alias for spec-critique
         let spec_critique = registry.get("spec-review").expect("spec-review alias must exist");
 
-        let prompt = build_phase_prompt(spec_critique, &spec_content, None, &std::collections::HashMap::new());
+        let prompt = build_phase_prompt(&spec_critique, &spec_content, None, &std::collections::HashMap::new());
 
         assert!(prompt.contains("Set up CSV ingestion"), "prompt must contain task title from fixture");
         assert!(prompt.contains("Optimize database writes"), "prompt must contain second task title");
@@ -1678,7 +1846,7 @@ template = "Do something at the spec level."
         let registry = test_registry();
         let phase = registry.get("spec-improve").unwrap();
         assert_eq!(phase.approve_signal.as_deref(), Some("## Spec Improved"));
-        let verdict = parse_phase_output(phase, "Work done.\n\n## Spec Improved\n");
+        let verdict = parse_phase_output(&phase, "Work done.\n\n## Spec Improved\n");
         assert_eq!(verdict, Verdict::Proceed, "approved output must yield Proceed");
     }
 
@@ -1706,7 +1874,7 @@ template = "Do something at the spec level."
     fn test_spec_critique_approve_signal_is_proceed() {
         let registry = test_registry();
         let phase = registry.get("spec-critique").unwrap();
-        let verdict = parse_phase_output(phase, "All checks passed.\n\n## Spec Approved\n");
+        let verdict = parse_phase_output(&phase, "All checks passed.\n\n## Spec Approved\n");
         assert_eq!(verdict, Verdict::Proceed);
     }
 
@@ -1715,7 +1883,7 @@ template = "Do something at the spec level."
         let registry = test_registry();
         let phase = registry.get("spec-critique").unwrap();
         // [CRITIQUE] in output + on_reject = "requeue:spec-improve" → Redo
-        let verdict = parse_phase_output(phase, "### [CRITIQUE] 1\n\nTask t-3 verify is broken.\n");
+        let verdict = parse_phase_output(&phase, "### [CRITIQUE] 1\n\nTask t-3 verify is broken.\n");
         assert!(
             matches!(verdict, Verdict::Redo { .. }),
             "critique rejection must yield Redo (requeue), got {:?}", verdict

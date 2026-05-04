@@ -19,6 +19,7 @@ Use `.yaml` or `.yml` extension. BOI detects format by extension:
 | `workspace` | No | string | Pin spec to a specific worktree path |
 | `blocked_by` | No | list of strings | Spec IDs this spec depends on (e.g. `[SA7F3, SF2B1]`) |
 | `outcomes` | Recommended | list of outcome objects | Spec-level declarations of what this spec delivers. Verified after all tasks DONE. |
+| `phase_overrides` | No | map of phase-name → override object | Per-phase runtime/model overrides applied to every task in this spec |
 | `tasks` | Yes | list of task objects | Ordered list of tasks |
 
 ## Outcome Object Fields
@@ -41,6 +42,28 @@ outcomes:
 **How it differs from task `verify`:** Task `verify` proves a single task step was done. `outcomes` prove the whole spec delivered what it promised. A spec can have all tasks pass but still fail outcomes if the combined result is wrong.
 
 **Validation:** Specs without `outcomes` emit a WARNING. After existing specs are migrated, this will become a hard ERROR.
+
+## Phase Override Object Fields
+
+The `phase_overrides` map lets a spec swap the runtime, model, effort level, or timeout for any named phase. Keys are phase names (e.g. `critic`, `execute`); values are override objects:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `runtime` | string | Override runtime: `claude`, `openrouter`, `codex`, `deterministic` |
+| `model` | string | Override model identifier (e.g. `google/gemini-2.5-flash`) |
+| `effort` | string | Override effort level (e.g. `low`, `high`) |
+| `timeout` | integer | Override timeout in seconds |
+
+```yaml
+phase_overrides:
+  critic:
+    runtime: openrouter
+    model: google/gemini-2.5-flash
+  execute:
+    timeout: 1800
+```
+
+All fields are optional; only the fields present in the override object are applied.
 
 ## Task Object Fields
 
@@ -87,6 +110,10 @@ blocked_by:             # optional
 outcomes:               # recommended — verified after all tasks DONE
   - description: "Artifact exists and is correct"
     verify: "test -f /path/to/artifact"
+phase_overrides:        # optional — per-phase runtime/model/timeout overrides
+  critic:
+    runtime: openrouter
+    model: google/gemini-2.5-flash
 tasks:                  # required, list of task objects
   - id: t-1             # required, unique
     title: string       # required
