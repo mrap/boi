@@ -735,8 +735,9 @@ mod tests {
 
     #[test]
     fn test_emit_100_events_under_1_second() {
-        // RED: with per-emit connections this loop should exceed 200ms on any
-        // real filesystem (each emit opens connection + WAL pragma + schema check)
+        // Verify the shared connection (Arc<Mutex<Connection>>) is used instead of
+        // per-emit connections. Per-emit opens would take multiple seconds for 1000
+        // emits on a real filesystem; a pooled connection completes well under 1s.
         let db = temp_db("perf_100");
         let _ = std::fs::remove_file(&db);
 

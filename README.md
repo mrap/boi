@@ -203,9 +203,29 @@ name = "v2"
 spec_phases = ["spec-critique", "spec-improve"]   # phases run once on the spec
 task_phases = ["execute", "task-verify"]           # phases run per task
 post_phases = ["doc-update", "critic", "merge"]    # phases run after all tasks complete
+
+# Optional: override runtime/model/effort/timeout per phase for this pipeline.
+# Unset fields fall back to the phase TOML default.
+[phase_overrides.critic]
+model = "claude-haiku-4-5"
+
+[phase_overrides.execute]
+runtime = "openrouter"
+model = "google/gemini-2.0-flash-001"
+effort = "high"
+timeout = 3600
 ```
 
 Pass them with `--pipeline name:path/to/pipeline.toml` (repeatable for N-way comparisons).
+
+`[phase_overrides.<name>]` fields:
+
+| Field | Type | Values |
+|-------|------|--------|
+| `runtime` | string | `claude`, `openrouter`, `codex` |
+| `model` | string | any model ID the runtime accepts |
+| `effort` | string | `low`, `medium`, `high` |
+| `timeout` | integer | seconds |
 
 ### Pipeline v2 Mode (opt-in)
 
@@ -317,6 +337,8 @@ Exit 0 = passed. Any non-zero exit = failed. Stdout/stderr are captured as the f
 ## Runtime Configuration
 
 BOI is runtime-agnostic. The default runtime is `claude` (Claude Code CLI). `codex` (Codex CLI) and `openrouter` (requires `OPENROUTER_API_KEY`) are also supported. Use `boi providers list` to see which providers are active on your machine.
+
+Set `OPENROUTER_API_KEY` in your shell profile **or** in `~/.boi/.env` — the binary auto-loads that file at startup so you don't need to export the key in every shell session.
 
 ### Global Default
 

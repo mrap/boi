@@ -12,7 +12,7 @@ pub enum PhaseRuntime {
 }
 
 /// Per-phase override: swap runtime, model, effort, or timeout for a named phase.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct PhaseOverride {
     pub runtime: Option<PhaseRuntime>,
     pub model: Option<String>,

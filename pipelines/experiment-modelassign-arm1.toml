@@ -1,10 +1,19 @@
 # Experiment 2: Per-Phase Model Assignment — Arm 1 (treatment)
 # IV: Model assignment policy
 # Config: Haiku 4.5 for critic; Sonnet 4.6 for execute/task-verify
-# Override: Set model="claude-haiku-4-5" on critic phase TOML
+# Override: critic → Haiku (cheaper judgment); execute/task-verify → Sonnet (quality execution)
 
 [pipeline]
 name = "experiment-modelassign-arm1"
 spec_phases = ["plan-critique", "spec-critique", "critic"]
 task_phases = ["execute", "task-verify"]
 post_phases = []
+
+[phase_overrides.critic]
+model = "claude-haiku-4-5"
+
+[phase_overrides.execute]
+model = "claude-sonnet-4-6"
+
+[phase_overrides.task-verify]
+model = "claude-sonnet-4-6"

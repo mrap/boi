@@ -1,10 +1,30 @@
 # Experiment 2: Per-Phase Model Assignment — Arm 2 (treatment)
 # IV: Model assignment policy
 # Config: gemini-flash via OpenRouter for ALL judgment phases; Sonnet for execute/task-verify
-# Override: Set runtime="openrouter", model="gemini-flash" on all spec_phases
+# Override: plan-critique/spec-critique/critic → OpenRouter Gemini Flash; execute/task-verify → Claude Sonnet
 
 [pipeline]
 name = "experiment-modelassign-arm2"
 spec_phases = ["plan-critique", "spec-critique", "critic"]
 task_phases = ["execute", "task-verify"]
 post_phases = []
+
+[phase_overrides.plan-critique]
+runtime = "openrouter"
+model = "google/gemini-2.0-flash-001"
+
+[phase_overrides.spec-critique]
+runtime = "openrouter"
+model = "google/gemini-2.0-flash-001"
+
+[phase_overrides.critic]
+runtime = "openrouter"
+model = "google/gemini-2.0-flash-001"
+
+[phase_overrides.execute]
+runtime = "claude"
+model = "claude-sonnet-4-6"
+
+[phase_overrides.task-verify]
+runtime = "claude"
+model = "claude-sonnet-4-6"
