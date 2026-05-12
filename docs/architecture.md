@@ -25,9 +25,11 @@ You → boi dispatch --spec spec.yaml → Spec Queue (priority-sorted)
 
 ## Components
 
-### CLI (`boi.sh` → Rust binary)
+### CLI (Rust binary)
 
-`boi.sh` is a thin wrapper that execs `~/.boi/bin/boi` (the compiled Rust binary) when it exists. All subcommand routing, argument parsing, and business logic lives in the Rust binary (`src/main.rs`, `src/cli/`).
+The installer symlinks `~/bin/boi → ~/.boi/bin/boi` (the compiled Rust binary) directly. All subcommand routing, argument parsing, and business logic lives in the Rust binary (`src/main.rs`, `src/cli/`).
+
+`boi.sh` remains in the repo as a compatibility shim for anyone with hardcoded paths to it, but the installer no longer symlinks to it.
 
 ### Daemon (`daemon.py`)
 
@@ -113,7 +115,7 @@ Computes quality scores across 18 signals in 4 categories (Code Quality, Test Qu
 
 ```
 ~/boi/
-  boi.sh                        # CLI entry point
+  boi.sh                        # Legacy bash shim (kept for compat; installer uses ~/.boi/bin/boi directly)
   daemon.py                     # Queue-aware dispatch daemon (Python/SQLite)
   worker.py                     # Iterative worker (one runtime CLI invocation per iteration)
   dashboard.sh                  # Live-updating compact display

@@ -295,19 +295,15 @@ Migrations are numbered (`001_initial.sql`, `002_add_phase.sql`, ...) and applie
 
 ### Dequeue Logic
 
+`Queue::dequeue_filtered(runner_tags_json)` selects the highest-priority eligible spec whose `required_tags` are a subset of the runner's tags (both stored as JSON arrays). An empty `required_tags` matches any runner.
+
 ```rust
-pub fn dequeue_next(conn: &Connection, available_workers: &[&str]) -> anyhow::Result<Option<QueueEntry>> {
-    conn.query_row(
-        "SELECT * FROM specs
-         WHERE status IN ('queued', 'requeued')
-           AND (cooldown_until IS NULL OR cooldown_until < datetime('now'))
-           AND (worktree IS NULL OR worktree IN (?))
-         ORDER BY priority ASC, submitted_at ASC
-         LIMIT 1",
-        params![available_worker_list],
-        map_row_to_entry,
-    ).optional()
-}
+// tags_match returns true if every required tag is present in the runner's tag set.
+pub fn tags_match(runner_tags_json: &str, required_tags_json: &str) -> bool { ... }
+
+// dequeue_filtered finds the first queued spec (by priority ASC, queued_at ASC)
+// whose required_tags pass tags_match, marks it 'assigning', and returns it.
+pub fn dequeue_filtered(&self, runner_tags_json: &str) -> Result<Option<SpecRecord>> { ... }
 ```
 
 ### File Lock
@@ -491,39 +487,39 @@ context:
 
 hooks:
   on_dispatch:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.dispatched"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.dispatched"
     blocking: false
     timeout: 10
   on_worker_start:
-    command: "python3 ~/.hex-events/hex_emit.py boi.worker.start"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.worker.start"
     blocking: false
     timeout: 10
   on_task_start:
-    command: "python3 ~/.hex-events/hex_emit.py boi.task.start"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.task.start"
     blocking: false
     timeout: 10
   on_task_complete:
-    command: "python3 ~/.hex-events/hex_emit.py boi.task.completed"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.task.completed"
     blocking: false
     timeout: 10
   on_task_fail:
-    command: "python3 ~/.hex-events/hex_emit.py boi.task.failed"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.task.failed"
     blocking: false
     timeout: 10
   on_complete:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.completed"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.completed"
     blocking: false
     timeout: 10
   on_fail:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.failed"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.failed"
     blocking: false
     timeout: 10
   on_cancel:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.cancelled"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.cancelled"
     blocking: false
     timeout: 10
   on_stall:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.stalled"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.stalled"
     blocking: false
     timeout: 10
 ```

@@ -23,50 +23,55 @@ Hooks are configured in `~/.boi/hooks.yaml`. BOI loads that file if it exists; o
 
 ```yaml
 # ~/.boi/hooks.yaml
+#
+# NOTE: The daemon runs under launchd with a minimal PATH (/usr/bin:/bin:...).
+# Prepend /opt/homebrew/bin so that `python3` resolves to Homebrew Python
+# (≥3.10) rather than the system Python (3.9), which cannot import hex-events'
+# db.py (uses PEP 604 `X | None` annotations).
 
 hooks:
   on_dispatch:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.dispatched"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.dispatched"
     blocking: false
     timeout: 10
 
   on_worker_start:
-    command: "python3 ~/.hex-events/hex_emit.py boi.worker.start"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.worker.start"
     blocking: false
     timeout: 10
 
   on_task_start:
-    command: "python3 ~/.hex-events/hex_emit.py boi.task.start"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.task.start"
     blocking: false
     timeout: 10
 
   on_task_complete:
-    command: "python3 ~/.hex-events/hex_emit.py boi.task.completed"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.task.completed"
     blocking: false
     timeout: 10
 
   on_task_fail:
-    command: "python3 ~/.hex-events/hex_emit.py boi.task.failed"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.task.failed"
     blocking: false
     timeout: 10
 
   on_complete:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.completed"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.completed"
     blocking: false
     timeout: 10
 
   on_fail:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.failed"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.failed"
     blocking: false
     timeout: 10
 
   on_cancel:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.cancelled"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.cancelled"
     blocking: false
     timeout: 10
 
   on_stall:
-    command: "python3 ~/.hex-events/hex_emit.py boi.spec.stalled"
+    command: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.stalled"
     blocking: false
     timeout: 10
 ```
@@ -85,7 +90,7 @@ A hook may be specified as a bare string (equivalent to `blocking: false`, `time
 
 ```yaml
 hooks:
-  on_dispatch: "python3 ~/.hex-events/hex_emit.py boi.spec.dispatched"
+  on_dispatch: "PATH=/opt/homebrew/bin:$PATH python3 ~/.hex-events/hex_emit.py boi.spec.dispatched"
 ```
 
 ---
