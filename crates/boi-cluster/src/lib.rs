@@ -3,7 +3,7 @@
 //! Phase 1 layers:
 //! - T4BF7: typed [`EtcdClient`] wrapper + lease management (`client`).
 //! - T7C09: schemas — `nodes`, `dispatch_queue`, `claims`, `hooks_hwm`.
-//! - T5ABC (next): membership module on top of the above.
+//! - T5ABC: membership watch + cached snapshot (`membership`).
 
 pub mod client;
 
