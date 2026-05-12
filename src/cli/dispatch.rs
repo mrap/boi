@@ -34,6 +34,17 @@ pub fn cmd_dispatch(
         }
     };
 
+    // Layer 4 (2026-05-12): every dispatched spec must declare `workspace:`
+    // (target git repo for a worktree) or `workspace_rationale:` (explanation
+    // of why no repo is targeted). Prevents the silent-drift pattern where
+    // specs without workspace fall through to /tmp/ and write to absolute
+    // paths into source repos, stranding files. The validator + tests
+    // already exist in src/spec.rs; this is the last wire-in.
+    if let Err(e) = spec::validate_for_dispatch(&boi_spec) {
+        eprintln!("error: spec dispatch validation failed: {}", e);
+        std::process::exit(1);
+    }
+
     if dry_run {
         println!("spec valid: {} ({} tasks)", boi_spec.title, boi_spec.tasks.len());
         return;
