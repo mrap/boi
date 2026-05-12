@@ -299,32 +299,6 @@ name = "boi-node"
 version = "0.1.0"
 
 [[package]]
-name = "boi-plugin-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "boi-proto",
- "futures",
- "libc",
- "prost",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tonic",
- "tracing",
-]
-
-[[package]]
-name = "boi-proto"
-version = "0.1.0"
-dependencies = [
- "prost",
- "tonic",
- "tonic-build",
-]
-
-[[package]]
 name = "boi-test-harness"
 version = "0.1.0"
 dependencies = [
