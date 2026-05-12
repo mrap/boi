@@ -234,7 +234,7 @@ Each proto declares package `boi.<name>.v1` (Q4 hybrid versioning). Each service
 3. **/boi/dispatch-queue with state_version CAS** (`dispatch_queue.rs`). Per F-03. Every state transition is a `Txn(compare(state_version == N); put state_version = N+1)`.
 4. **/boi/claims with lease_id fencing** (`claims.rs`). Per Q2: `claim_lease_id` sub-key, single-field Txn compare.
 5. **/boi/hooks-hwm prefix** (`hooks_hwm.rs`). Per Q6 audit tier; only HWM lives in etcd, bulk events on local-disk WAL.
-6. **Membership module** (`membership.rs`). etcd watch + 30s TTL cached snapshot. Exposes `current()` returning a struct with the etcd `mod_revision` it was read at (Q1 enables revision pinning later in Phase 4).
+6. **Membership module** (`membership.rs`). etcd watch + 30s TTL cached snapshot. Exposes `snapshot()` returning a `MembershipSnapshot` struct with the etcd `mod_revision` it was read at (Q1 enables revision pinning later in Phase 4).
 7. **E2E test:** 3-node cluster, kill/restart, partition simulation via Docker network commands.
 
 ---
