@@ -1,6 +1,6 @@
 use chrono::Utc;
 use rand::Rng;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result};
 
 pub struct Queue {
     conn: Connection,
@@ -105,6 +105,7 @@ pub struct PhaseRunRecord {
     pub ttft_ms: Option<i64>,
     pub loop_iteration: Option<i64>,
     pub verify_exit_code: Option<i64>,
+    pub context_json: Option<String>,
 }
 
 #[derive(Debug)]
@@ -286,6 +287,14 @@ impl Queue {
                 tasks_total INTEGER,
                 tasks_done INTEGER,
                 tasks_failed INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS runners (
+                runner_id TEXT PRIMARY KEY,
+                secret_key_hash TEXT NOT NULL,
+                tags TEXT DEFAULT '[]',
+                registered_at TEXT NOT NULL,
+                last_seen TEXT
             );",
         )?;
 
@@ -303,6 +312,9 @@ impl Queue {
         Self::ensure_column(&conn, "specs", "spec_phases", "TEXT");
         Self::ensure_column(&conn, "specs", "phase_overrides", "TEXT");
         Self::ensure_column(&conn, "specs", "worker_pool", "TEXT");
+        Self::ensure_column(&conn, "specs", "runner_id", "TEXT");
+        Self::ensure_column(&conn, "specs", "remote_cost_usd", "REAL");
+        Self::ensure_column(&conn, "specs", "remote_duration_secs", "REAL");
         Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
         Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
 
@@ -321,11 +333,18 @@ impl Queue {
         Self::ensure_column(&conn, "phase_runs", "ttft_ms", "INTEGER");
         Self::ensure_column(&conn, "phase_runs", "loop_iteration", "INTEGER");
         Self::ensure_column(&conn, "phase_runs", "verify_exit_code", "INTEGER");
+        Self::ensure_column(&conn, "phase_runs", "context_json", "TEXT");
 
         Self::ensure_column(&conn, "bench_results", "total_cost_usd", "REAL");
         Self::ensure_column(&conn, "bench_results", "total_input_tokens", "INTEGER");
         Self::ensure_column(&conn, "bench_results", "total_output_tokens", "INTEGER");
         Self::ensure_column(&conn, "bench_results", "tasks_skipped", "INTEGER DEFAULT 0");
+
+        // Phase 3: load-aware dispatch hints
+        Self::ensure_column(&conn, "runners", "slots_free", "INTEGER");
+        Self::ensure_column(&conn, "runners", "ram_free_mb", "INTEGER");
+        // Phase 3: tag matching
+        Self::ensure_column(&conn, "specs", "required_tags", "TEXT DEFAULT '[]'");
 
         Ok(Queue { conn })
     }
@@ -368,9 +387,38 @@ impl Queue {
         spec_path: Option<&str>,
         project_context: Option<&str>,
     ) -> Result<String> {
-        let tx = self.conn.unchecked_transaction()?;
+        // Intake validation: reject specs with pre-DONE or non-PENDING tasks before
+        // acquiring a write lock or touching the DB (eliminates spec_validation failure class).
+        if let Err(reason) = crate::spec::validate_intake(spec) {
+            eprintln!(
+                "[boi] ERROR: intake-reject: {} — {}",
+                spec_path.unwrap_or("<unknown>"),
+                reason
+            );
+            return Err(rusqlite::Error::InvalidParameterName(reason));
+        }
 
-        let id = gen_id('S', &tx);
+        // BEGIN IMMEDIATE acquires a write lock upfront so the dedup SELECT and the
+        // INSERT are atomic — no TOCTOU window even with concurrent boi dispatch calls.
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+
+        // Pre-dispatch dedup: skip if the same spec_path is already queued/running.
+        // This prevents the double-dispatch defect (S8552+S05C5 incident: same spec
+        // dispatched 26s apart, both ran 64+ minutes concurrently at 2x LLM cost).
+        if let Some(path) = spec_path {
+            let existing: Option<String> = self.conn.query_row(
+                "SELECT id FROM specs WHERE spec_path = ?1 AND status IN ('queued', 'running') LIMIT 1",
+                [path],
+                |row| row.get::<_, String>(0),
+            ).optional()?;
+            if let Some(existing_id) = existing {
+                self.conn.execute("ROLLBACK", [])?;
+                eprintln!("[boi] INFO: dedup-skip: spec_path={} already queued/running as {}", path, existing_id);
+                return Ok(existing_id);
+            }
+        }
+
+        let id = gen_id('S', &self.conn);
 
         let now = Utc::now().to_rfc3339();
         let mode = spec.mode.as_deref().unwrap_or("execute");
@@ -388,15 +436,18 @@ impl Queue {
             serde_json::to_string(&spec.phase_overrides).ok()
         };
 
-        tx.execute(
+        if let Err(e) = self.conn.execute(
             "INSERT INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace, project_context, task_phases, spec_phases, phase_overrides, worker_pool)
              VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![id, spec.title, mode, spec_path, total, now, spec.context, spec.workspace, project_context, task_phases_json, spec_phases_json, phase_overrides_json, spec.worker_pool],
-        )?;
+        ) {
+            let _ = self.conn.execute("ROLLBACK", []);
+            return Err(e);
+        }
 
         let mut yaml_to_canonical: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for task in spec.tasks.iter() {
-            let canonical_task_id = gen_id('T', &tx);
+            let canonical_task_id = gen_id('T', &self.conn);
             yaml_to_canonical.insert(task.id.clone(), canonical_task_id.clone());
         }
 
@@ -408,14 +459,17 @@ impl Queue {
                 .collect();
             let depends_json = serde_json::to_string(&canonical_deps)
                 .unwrap_or_else(|_| "[]".to_string());
-            tx.execute(
+            if let Err(e) = self.conn.execute(
                 "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)
                  VALUES (?1, ?2, ?3, 'PENDING', ?4, ?5, ?6)",
                 params![canonical_task_id, id, task.title, depends_json, task.spec, task.verify],
-            )?;
+            ) {
+                let _ = self.conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
         }
 
-        tx.commit()?;
+        self.conn.execute("COMMIT", [])?;
         Ok(id)
     }
 
@@ -443,6 +497,68 @@ impl Queue {
 
         let id = match maybe_id {
             Some(id) => id,
+            None => return Ok(None),
+        };
+
+        tx.execute(
+            "UPDATE specs SET status = 'assigning' WHERE id = ?1",
+            params![id],
+        )?;
+
+        let rec = {
+            let mut stmt = tx.prepare(
+                "SELECT id, title, mode, status, spec_path,
+                        (SELECT COUNT(*) FROM tasks WHERE tasks.spec_id = specs.id) as total_tasks,
+                        completed_tasks,
+                        priority, depends_on, queued_at, started_at, completed_at, worker_id, error,
+                        max_iterations, iteration, project, phase, worker_timeout_seconds,
+                        context, workspace, phase_loop_count, project_context,
+                        task_phases, spec_phases, phase_overrides, worker_pool
+                 FROM specs WHERE id = ?1",
+            )?;
+            stmt.query_row(params![id], row_to_spec)?
+        };
+
+        tx.commit()?;
+        Ok(Some(rec))
+    }
+
+    /// Returns true if every tag in `required_tags_json` (a JSON array) is present
+    /// in `runner_tags_json` (also a JSON array).  An empty required list always matches.
+    pub fn tags_match(runner_tags_json: &str, required_tags_json: &str) -> bool {
+        let runner: Vec<String> = serde_json::from_str(runner_tags_json).unwrap_or_default();
+        let required: Vec<String> = serde_json::from_str(required_tags_json).unwrap_or_default();
+        required.iter().all(|tag| runner.contains(tag))
+    }
+
+    /// Like `dequeue()` but skips specs whose `required_tags` are not a subset of
+    /// `runner_tags_json`.  Returns the highest-priority eligible spec, or None.
+    pub fn dequeue_filtered(&self, runner_tags_json: &str) -> Result<Option<SpecRecord>> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        let candidates: Vec<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, COALESCE(required_tags, '[]') FROM specs
+                 WHERE status = 'queued'
+                   AND (depends_on IS NULL OR depends_on = ''
+                        OR EXISTS (SELECT 1 FROM specs s2
+                                   WHERE s2.id = specs.depends_on AND s2.status = 'completed'))
+                 ORDER BY priority ASC, queued_at ASC",
+            )?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            });
+            match mapped {
+                Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+                Err(e) => return Err(e),
+            }
+        };
+
+        let id = match candidates
+            .into_iter()
+            .find(|(_, req_tags)| Self::tags_match(runner_tags_json, req_tags))
+        {
+            Some((id, _)) => id,
             None => return Ok(None),
         };
 
@@ -586,6 +702,33 @@ impl Queue {
         Ok(())
     }
 
+    /// Atomically check that a task is still PENDING and claim it as RUNNING.
+    /// Returns true if claim succeeded, false if another worker already claimed it.
+    /// Uses BEGIN IMMEDIATE to acquire a write lock before the read, preventing the
+    /// TOCTOU race where two workers both see PENDING and both mark it RUNNING.
+    pub fn try_claim_task(&self, spec_id: &str, task_id: &str) -> Result<bool> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let current_status: Option<String> = self.conn.query_row(
+            "SELECT status FROM tasks WHERE spec_id = ?1 AND id = ?2",
+            params![spec_id, task_id],
+            |row| row.get(0),
+        ).optional()?;
+        match current_status.as_deref() {
+            Some("PENDING") => {
+                self.conn.execute(
+                    "UPDATE tasks SET status = 'RUNNING', started_at = datetime('now') WHERE spec_id = ?1 AND id = ?2",
+                    params![spec_id, task_id],
+                )?;
+                self.conn.execute("COMMIT", [])?;
+                Ok(true)
+            }
+            _ => {
+                self.conn.execute("ROLLBACK", [])?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Mark a spec as running and record the worker identity that owns it.
     /// Use this instead of `update_spec(id, "running")` so ghost-worker detection
     /// can cross-check worker_id against live processes.
@@ -594,6 +737,269 @@ impl Queue {
         self.conn.execute(
             "UPDATE specs SET status = 'running', started_at = ?1, worker_id = ?2 WHERE id = ?3",
             params![now, worker_id, spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// Claim a spec for a remote runner: set status=running + runner_id.
+    /// Called by the HTTP API after dequeue() atomically marks it 'assigning'.
+    pub fn claim_for_runner(&self, spec_id: &str, runner_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE specs SET status = 'running', started_at = ?1, runner_id = ?2 WHERE id = ?3",
+            params![now, runner_id, spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record completion/failure of a spec from a remote runner.
+    pub fn complete_from_runner(
+        &self,
+        spec_id: &str,
+        status: &str,
+        cost_usd: Option<f64>,
+        duration_secs: Option<f64>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE specs SET status = ?1, completed_at = ?2, remote_cost_usd = ?3,
+             remote_duration_secs = ?4, error = ?5 WHERE id = ?6",
+            params![status, now, cost_usd, duration_secs, error, spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert a spec received from a remote central into the local runner DB,
+    /// using the central's spec_id verbatim so worker telemetry correlates correctly.
+    pub fn enqueue_with_id(
+        &self,
+        spec_id: &str,
+        spec: &crate::spec::BoiSpec,
+        spec_path: Option<&str>,
+        workspace_override: Option<&str>,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let mode = spec.mode.as_deref().unwrap_or("execute");
+        let total = spec.tasks.len() as i64;
+        let workspace = workspace_override.or(spec.workspace.as_deref());
+        tx.execute(
+            "INSERT OR REPLACE INTO specs (id, title, mode, status, spec_path, total_tasks, queued_at, context, workspace)
+             VALUES (?1, ?2, ?3, 'queued', ?4, ?5, ?6, ?7, ?8)",
+            params![spec_id, spec.title, mode, spec_path, total, now, spec.context, workspace],
+        )?;
+        // Guard: clean stale tasks and phase_runs from any prior dispatch of this spec_id.
+        // INSERT OR REPLACE on tasks alone leaves orphaned phase_runs that corrupt task
+        // history on re-dispatch, causing 0-iteration failures (TPHA3-class bug).
+        let stale_ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM tasks WHERE spec_id = ?1")?;
+            let ids: Vec<String> = stmt
+                .query_map(params![spec_id], |r| r.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            ids
+        };
+        if !stale_ids.is_empty() {
+            eprintln!(
+                "[boi] WARN: [enqueue_with_id] discarding {} stale task(s) for spec {} before re-dispatch: {:?}",
+                stale_ids.len(),
+                spec_id,
+                stale_ids
+            );
+            tx.execute("DELETE FROM phase_runs WHERE spec_id = ?1", params![spec_id])?;
+            tx.execute("DELETE FROM tasks WHERE spec_id = ?1", params![spec_id])?;
+        }
+        for task in &spec.tasks {
+            let depends_json = task
+                .depends
+                .as_deref()
+                .map(|d| serde_json::to_string(d).unwrap_or_else(|_| "[]".to_string()))
+                .unwrap_or_else(|| "[]".to_string());
+            tx.execute(
+                "INSERT INTO tasks (id, spec_id, title, status, depends, spec_content, verify_content)
+                 VALUES (?1, ?2, ?3, 'PENDING', ?4, ?5, ?6)",
+                params![task.id, spec_id, task.title, depends_json, task.spec, task.verify],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark a spec as merge_failed with an error message.
+    pub fn set_merge_failed(&self, spec_id: &str, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE specs SET status = 'merge_failed', error = ?1 WHERE id = ?2",
+            params![reason, spec_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get workspace path for a spec (used by API handler for remote merge).
+    pub fn get_spec_status(&self, spec_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT status FROM specs WHERE id = ?1",
+                params![spec_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|o| o.flatten())
+    }
+
+    pub fn get_spec_workspace(&self, spec_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT workspace FROM specs WHERE id = ?1",
+                params![spec_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|o| o.flatten())
+    }
+
+    /// Get the runner_id that claimed a spec (for fleet event emission).
+    pub fn get_spec_runner_id(&self, spec_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT runner_id FROM specs WHERE id = ?1",
+                params![spec_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|o| o.flatten())
+    }
+
+    /// Get runners whose last_seen is older than threshold_secs seconds.
+    /// Returns (runner_id, last_seen) pairs; only includes runners with a known last_seen.
+    pub fn get_timed_out_runners(&self, threshold_secs: i64) -> Result<Vec<(String, String)>> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(threshold_secs);
+        let cutoff_str = cutoff.to_rfc3339();
+        let mut stmt = self.conn.prepare(
+            "SELECT runner_id, last_seen FROM runners \
+             WHERE last_seen IS NOT NULL AND last_seen < ?1",
+        )?;
+        let rows = stmt.query_map(params![cutoff_str], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+    }
+
+    /// Get spec IDs currently running on a given runner (used for host_down events).
+    pub fn get_running_specs_for_runner(&self, runner_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM specs WHERE status = 'running' AND runner_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![runner_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+    }
+
+    /// Fleet status: running specs per runner + last 10 completions.
+    pub fn fleet_status(&self) -> Result<(Vec<(String, Vec<(String, String)>)>, Vec<(String, String, String, String)>)> {
+        // Running specs: group by runner_id
+        let mut run_stmt = self.conn.prepare(
+            "SELECT COALESCE(runner_id, 'local'), id, COALESCE(title, '')
+             FROM specs WHERE status = 'running'
+             ORDER BY runner_id, started_at",
+        )?;
+        let rows = run_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        let mut runner_map: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (rid, sid, title) = row?;
+            runner_map.entry(rid).or_default().push((sid, title));
+        }
+        let mut runners: Vec<(String, Vec<(String, String)>)> =
+            runner_map.into_iter().collect();
+        runners.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Last 10 completions
+        let mut comp_stmt = self.conn.prepare(
+            "SELECT COALESCE(runner_id, 'local'), id, COALESCE(title, ''), status
+             FROM specs WHERE status IN ('completed', 'failed', 'merge_failed')
+             ORDER BY completed_at DESC LIMIT 10",
+        )?;
+        let completions: Vec<(String, String, String, String)> = comp_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((runners, completions))
+    }
+
+    /// Return all registered runners with their last-reported capacity.
+    pub fn list_runners(&self) -> Result<Vec<(String, Option<i64>, Option<i64>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT runner_id, slots_free, ram_free_mb FROM runners ORDER BY runner_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>>>()
+    }
+
+    /// Register a runner with its HMAC key (stored as hex). Upserts on conflict.
+    pub fn register_runner(&self, runner_id: &str, key_hex: &str, tags: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO runners (runner_id, secret_key_hash, tags, registered_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(runner_id) DO UPDATE SET secret_key_hash = ?2, tags = ?3, registered_at = ?4",
+            params![runner_id, key_hex, tags, now],
+        )?;
+        Ok(())
+    }
+
+    /// Look up the stored HMAC key for a runner. Returns None if runner is not registered.
+    pub fn lookup_runner_key(&self, runner_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT secret_key_hash FROM runners WHERE runner_id = ?1",
+                params![runner_id],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
+    /// Update the last_seen timestamp for a runner.
+    pub fn touch_runner(&self, runner_id: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE runners SET last_seen = ?1 WHERE runner_id = ?2",
+            params![now, runner_id],
+        )?;
+        Ok(())
+    }
+
+    /// Store the runner's current load hints (slots_free, ram_free_mb) and update last_seen.
+    /// These are advisory — used by the central to avoid dispatching to saturated runners.
+    pub fn update_runner_capacity(
+        &self,
+        runner_id: &str,
+        slots_free: Option<i64>,
+        ram_free_mb: Option<i64>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE runners SET last_seen = ?1, slots_free = ?2, ram_free_mb = ?3 WHERE runner_id = ?4",
+            params![now, slots_free, ram_free_mb, runner_id],
         )?;
         Ok(())
     }
@@ -676,6 +1082,30 @@ impl Queue {
 
     pub fn cancel(&self, spec_id: &str) -> Result<()> {
         self.update_spec(spec_id, "cancelled")
+    }
+
+    pub fn list_running_specs(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, COALESCE(s.title, ''), COALESCE(
+                 (SELECT t.id FROM tasks t WHERE t.spec_id = s.id AND t.status = 'RUNNING' LIMIT 1),
+                 ''
+             )
+             FROM specs s
+             WHERE s.status IN ('running', 'assigning')
+             ORDER BY s.queued_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
     }
 
     pub fn set_spec_fields(
@@ -803,9 +1233,11 @@ impl Queue {
              duration_ms, cost_usd, input_tokens, output_tokens, started_at, completed_at,
              model, runtime, pipeline_id, attempt, failure_mode,
              cold_start_ms, inference_ms, cache_read_tokens, cache_creation_tokens,
-             tool_call_count, tool_calls_by_type, ttft_ms, loop_iteration, verify_exit_code)
+             tool_call_count, tool_calls_by_type, ttft_ms, loop_iteration, verify_exit_code,
+             context_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                     ?26)",
             params![
                 rec.spec_id,
                 rec.task_id,
@@ -832,6 +1264,7 @@ impl Queue {
                 rec.ttft_ms,
                 rec.loop_iteration,
                 rec.verify_exit_code,
+                rec.context_json,
             ],
         )?;
         Ok(())
@@ -1198,24 +1631,6 @@ impl Queue {
 
     // --- Daemon consistency health checks ---
 
-    /// Return (spec_id, title, running_task_id) for all specs currently in 'running' or 'assigning' state.
-    /// running_task_id is the ID of a RUNNING task if one exists, otherwise empty string.
-    pub fn list_running_specs(&self) -> Result<Vec<(String, String, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT s.id, COALESCE(s.title, ''), COALESCE(
-                 (SELECT t.id FROM tasks t WHERE t.spec_id = s.id AND t.status = 'RUNNING' LIMIT 1),
-                 ''
-             )
-             FROM specs s
-             WHERE s.status IN ('running', 'assigning')
-             ORDER BY s.created_at",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
     /// Count specs stuck in `running` >1 hour with no iteration activity in the last hour
     /// (ghost worker symptom).
     pub fn ghost_worker_count(&self) -> Result<i64> {
@@ -1337,6 +1752,7 @@ mod tests {
             title: title.to_string(),
             mode: Some("execute".to_string()),
             workspace: None,
+            workspace_rationale: Some("test fixture — no repo target".into()),
             initiative: None,
             context: None,
             outcomes: None,
@@ -1345,6 +1761,8 @@ mod tests {
             context_files: None,
             phase_overrides: std::collections::HashMap::new(),
             worker_pool: None,
+            max_cost_usd: None,
+            key_artifacts: None,
             tasks,
         }
     }
@@ -1595,6 +2013,68 @@ mod tests {
     }
 
     #[test]
+    fn recover_stuck_specs_preserves_done() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T1"), make_task("t-2", "T2"), make_task("t-3", "T3")]);
+        let id = q.enqueue(&spec, None).unwrap();
+        q.update_spec(&id, "running").unwrap();
+
+        // Use get_tasks (ORDER BY rowid = insertion order) consistently
+        let initial_tasks = q.get_tasks(&id).unwrap();
+        let tid1 = initial_tasks[0].id.clone();
+        let tid2 = initial_tasks[1].id.clone();
+
+        q.update_task(&id, &tid1, "DONE").unwrap();
+        q.update_task(&id, &tid2, "RUNNING").unwrap();
+
+        let count = q.recover_stuck_specs().unwrap();
+        assert_eq!(count, 1, "should reset exactly 1 task (t-2)");
+
+        let tasks = q.get_tasks(&id).unwrap();
+        let t1 = tasks.iter().find(|t| t.id == tid1).expect("t-1 missing");
+        let t2 = tasks.iter().find(|t| t.id == tid2).expect("t-2 missing");
+        let t3 = tasks.iter().find(|t| t.id != tid1 && t.id != tid2).expect("t-3 missing");
+        assert_eq!(t1.status, "DONE", "T1 must stay DONE");
+        assert_eq!(t2.status, "PENDING", "T2 must be reset to PENDING");
+        assert_eq!(t3.status, "PENDING", "T3 must stay PENDING");
+    }
+
+    #[test]
+    fn restart_resumes_at_pending_task() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T1"), make_task("t-2", "T2"), make_task("t-3", "T3")]);
+        let id = q.enqueue(&spec, None).unwrap();
+
+        // Use get_tasks (ORDER BY rowid = insertion order) consistently
+        let initial_tasks = q.get_tasks(&id).unwrap();
+        let tid1 = initial_tasks[0].id.clone();
+        let tid2 = initial_tasks[1].id.clone();
+
+        q.update_task(&id, &tid1, "DONE").unwrap();
+
+        let count = q.recover_stuck_specs().unwrap();
+        assert_eq!(count, 0, "no RUNNING tasks to reset on clean restart");
+
+        let tasks = q.get_tasks(&id).unwrap();
+        let t1 = tasks.iter().find(|t| t.id == tid1).unwrap();
+        let t2 = tasks.iter().find(|t| t.id == tid2).unwrap();
+        assert_eq!(t1.status, "DONE");
+        assert_eq!(t2.status, "PENDING");
+
+        let done_ids: std::collections::HashSet<String> = tasks.iter()
+            .filter(|t| t.status == "DONE")
+            .map(|t| t.id.clone())
+            .collect();
+        assert!(done_ids.contains(&tid1), "done_ids must contain t-1");
+        assert!(!done_ids.contains(&tid2), "done_ids must not contain t-2");
+
+        let first_pending = tasks.iter()
+            .find(|t| !done_ids.contains(&t.id))
+            .expect("must have a pending task");
+        assert_eq!(first_pending.id, tid2, "first pending task must be t-2");
+    }
+
+    #[test]
     fn test_gen_id_collision() {
         let q = open_mem();
         // Pre-insert a known spec ID to create a collision target.
@@ -1770,6 +2250,7 @@ mod tests {
             ttft_ms: Some(200),
             loop_iteration: Some(2),
             verify_exit_code: Some(0),
+            context_json: None,
         };
         q.insert_phase_run(&rec).unwrap();
 
@@ -1840,6 +2321,7 @@ mod tests {
             ttft_ms: None,
             loop_iteration: None,
             verify_exit_code: None,
+            context_json: None,
         };
         q.insert_phase_run(&rec).unwrap();
 
@@ -1914,6 +2396,7 @@ mod tests {
                 ttft_ms: None,
                 loop_iteration: None,
                 verify_exit_code: None,
+                context_json: None,
             };
             q.insert_phase_run(&rec).unwrap();
         }
@@ -1953,6 +2436,7 @@ mod tests {
         assert!(has_col("phase_runs", "ttft_ms"), "ttft_ms column should exist");
         assert!(has_col("phase_runs", "loop_iteration"), "loop_iteration column should exist");
         assert!(has_col("phase_runs", "verify_exit_code"), "verify_exit_code column should exist");
+        assert!(has_col("phase_runs", "context_json"), "context_json column should exist");
 
         assert!(has_col("bench_results", "total_cost_usd"), "total_cost_usd column should exist");
         assert!(has_col("bench_results", "total_input_tokens"), "total_input_tokens column should exist");
@@ -1989,6 +2473,7 @@ mod tests {
             ttft_ms: None,
             loop_iteration: Some(2),
             verify_exit_code: None,
+            context_json: None,
         };
         q.insert_phase_run(&rec).unwrap();
 
@@ -2029,6 +2514,7 @@ mod tests {
             ttft_ms: None,
             loop_iteration: Some(1),
             verify_exit_code: Some(1),
+            context_json: None,
         };
         q.insert_phase_run(&rec).unwrap();
 
@@ -2066,6 +2552,7 @@ mod tests {
             ttft_ms: None,
             loop_iteration: Some(1),
             verify_exit_code: Some(0),
+            context_json: None,
         };
         q.insert_phase_run(&rec2).unwrap();
 
@@ -2181,6 +2668,155 @@ mod tests {
         let rec = q.dequeue_for_pools(&[], "local").unwrap();
         assert!(rec.is_none(), "empty available_pools must return None immediately");
     }
+
+    // Regression tests for S8552+S05C5 double-dispatch incident:
+    // second dispatch of the same spec_path while first is queued/running must be a no-op.
+
+    #[test]
+    fn test_dedup_skips_duplicate_spec_path_when_queued() {
+        let q = open_mem();
+        let spec = make_spec("Dedup Spec", vec![make_task("t-1", "T")]);
+        let spec_path = "/tmp/boi-test-dedup-spec.yaml";
+
+        // First dispatch: should insert normally.
+        let id1 = q.enqueue(&spec, Some(spec_path)).unwrap();
+        assert!(is_valid_spec_id(&id1), "first dispatch id={}", id1);
+
+        let count: i64 = q.conn.query_row(
+            "SELECT COUNT(*) FROM specs WHERE spec_path = ?1",
+            [spec_path],
+            |r| r.get::<_, i64>(0),
+        ).unwrap();
+        assert_eq!(count, 1, "should be exactly 1 spec after first dispatch");
+
+        // Second dispatch of the same spec_path while first is still 'queued' → dedup no-op.
+        let id2 = q.enqueue(&spec, Some(spec_path)).unwrap();
+
+        // Dedup returns the existing spec id.
+        assert_eq!(id1, id2, "dedup should return the existing spec id, not insert a new one");
+
+        let count2: i64 = q.conn.query_row(
+            "SELECT COUNT(*) FROM specs WHERE spec_path = ?1",
+            [spec_path],
+            |r| r.get::<_, i64>(0),
+        ).unwrap();
+        assert_eq!(count2, 1, "dedup must not insert a second row; count={}", count2);
+    }
+
+    #[test]
+    fn test_dedup_skips_when_running() {
+        let q = open_mem();
+        let spec = make_spec("Dedup Running", vec![make_task("t-1", "T")]);
+        let spec_path = "/tmp/boi-test-dedup-running-spec.yaml";
+
+        let id1 = q.enqueue(&spec, Some(spec_path)).unwrap();
+        q.update_spec(&id1, "running").unwrap();
+
+        let id2 = q.enqueue(&spec, Some(spec_path)).unwrap();
+        assert_eq!(id1, id2, "dedup should return existing id when already running");
+
+        let count: i64 = q.conn.query_row(
+            "SELECT COUNT(*) FROM specs WHERE spec_path = ?1",
+            [spec_path],
+            |r| r.get::<_, i64>(0),
+        ).unwrap();
+        assert_eq!(count, 1, "no second row when first is running; count={}", count);
+    }
+
+    #[test]
+    fn test_dedup_allows_dispatch_after_completion() {
+        let q = open_mem();
+        let spec = make_spec("Dedup Completed", vec![make_task("t-1", "T")]);
+        let spec_path = "/tmp/boi-test-dedup-completed-spec.yaml";
+
+        let id1 = q.enqueue(&spec, Some(spec_path)).unwrap();
+        q.update_spec(&id1, "completed").unwrap();
+
+        // Completed spec must NOT block a new dispatch of the same spec_path.
+        let id2 = q.enqueue(&spec, Some(spec_path)).unwrap();
+        assert_ne!(id1, id2, "new dispatch allowed after completion; id2={}", id2);
+
+        let count: i64 = q.conn.query_row(
+            "SELECT COUNT(*) FROM specs WHERE spec_path = ?1",
+            [spec_path],
+            |r| r.get::<_, i64>(0),
+        ).unwrap();
+        assert_eq!(count, 2, "should have 2 rows (one completed, one queued); count={}", count);
+    }
+
+    #[test]
+    fn test_stale_task_no_reattachment() {
+        let q = open_mem();
+        // First dispatch of SPEC-A with two tasks (simulates a prior failed run)
+        let spec_a = make_spec(
+            "Spec A",
+            vec![make_task("TA1", "Old Task A1"), make_task("TA2", "Old Task A2")],
+        );
+        q.enqueue_with_id("SPEC-A", &spec_a, None, None).unwrap();
+
+        // Simulate a phase_run left behind by the failed first run
+        q.conn
+            .execute(
+                "INSERT INTO phase_runs (spec_id, task_id, phase, level, outcome, started_at, attempt) \
+                 VALUES ('SPEC-A', 'TA1', 'execute', 'task', 'failed', '2026-01-01T00:00:00Z', 1)",
+                [],
+            )
+            .unwrap();
+
+        // Verify stale state is present before re-dispatch
+        let old_task_count: i64 = q
+            .conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE spec_id = 'SPEC-A'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_task_count, 2, "setup: expected 2 stale tasks before re-dispatch");
+
+        let old_phase_count: i64 = q
+            .conn
+            .query_row("SELECT COUNT(*) FROM phase_runs WHERE spec_id = 'SPEC-A'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_phase_count, 1, "setup: expected 1 stale phase_run before re-dispatch");
+
+        // Re-dispatch SPEC-A with new spec content (simulating a retry / new iteration)
+        let spec_b = make_spec("Spec A v2", vec![make_task("TB1", "New Task B1")]);
+        q.enqueue_with_id("SPEC-A", &spec_b, None, None).unwrap();
+
+        // Stale phase_runs must be cleared — orphaned phase history causes 0-iteration failures
+        let phase_count_after: i64 = q
+            .conn
+            .query_row("SELECT COUNT(*) FROM phase_runs WHERE spec_id = 'SPEC-A'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(phase_count_after, 0, "stale phase_runs must be cleared on re-dispatch");
+
+        // Old task TA1 must not persist after re-dispatch
+        let stale_ta1: Option<String> = q
+            .conn
+            .query_row(
+                "SELECT id FROM tasks WHERE spec_id = 'SPEC-A' AND id = 'TA1'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(stale_ta1.is_none(), "stale task TA1 must not survive re-dispatch");
+
+        // New task TB1 must be present and PENDING
+        let new_status: String = q
+            .conn
+            .query_row(
+                "SELECT status FROM tasks WHERE spec_id = 'SPEC-A' AND id = 'TB1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_status, "PENDING", "re-dispatched task must start as PENDING");
+
+        // Exactly 1 task for SPEC-A — no stale extras from prior run
+        let total_tasks: i64 = q
+            .conn
+            .query_row("SELECT COUNT(*) FROM tasks WHERE spec_id = 'SPEC-A'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total_tasks, 1, "re-dispatch must produce exactly 1 fresh task, no stale extras");
+    }
 }
 
 // Regression tests for daemon consistency invariants (H1/H2/H3 from
@@ -2197,6 +2833,7 @@ mod daemon_consistency {
             title: title.to_string(),
             mode: Some("execute".to_string()),
             workspace: None,
+            workspace_rationale: Some("test fixture — no repo target".into()),
             initiative: None,
             context: None,
             outcomes: None,
@@ -2205,6 +2842,8 @@ mod daemon_consistency {
             context_files: None,
             phase_overrides: HashMap::new(),
             worker_pool: None,
+            max_cost_usd: None,
+            key_artifacts: None,
             tasks: vec![BoiTask {
                 id: "t-1".to_string(),
                 title: "Task".to_string(),
@@ -2307,6 +2946,7 @@ mod integration_pool {
             title: title.to_string(),
             mode: Some("execute".to_string()),
             workspace: None,
+            workspace_rationale: Some("test fixture — no repo target".into()),
             initiative: None,
             context: None,
             outcomes: None,
@@ -2315,6 +2955,8 @@ mod integration_pool {
             context_files: None,
             phase_overrides: HashMap::new(),
             worker_pool: worker_pool.map(|p| p.to_string()),
+            max_cost_usd: None,
+            key_artifacts: None,
             tasks: vec![BoiTask {
                 id: "t-1".to_string(),
                 title: "Task".to_string(),
@@ -2391,4 +3033,177 @@ mod integration_pool {
             "mock-remote must not receive the default spec",
         );
     }
+}
+
+// Phase 1 distributed-fleet integration tests: local fallback behaviour.
+// These verify that when no remote runner claims a spec via the HTTP API,
+// specs are processed locally and fleet_status() reports runner_id='local'.
+#[cfg(test)]
+mod fleet_local_fallback {
+    use super::*;
+    use crate::spec::{BoiSpec, BoiTask, TaskStatus};
+    use std::collections::HashMap;
+
+    fn minimal_spec(title: &str) -> BoiSpec {
+        BoiSpec {
+            title: title.to_string(),
+            mode: Some("execute".to_string()),
+            workspace: None,
+            workspace_rationale: Some("test fixture — no repo target".into()),
+            initiative: None,
+            context: None,
+            outcomes: None,
+            spec_phases: None,
+            task_phases: None,
+            context_files: None,
+            phase_overrides: HashMap::new(),
+            worker_pool: None,
+            max_cost_usd: None,
+            key_artifacts: None,
+            tasks: vec![BoiTask {
+                id: "t-1".to_string(),
+                title: "Task".to_string(),
+                status: TaskStatus::Pending,
+                depends: None,
+                spec: None,
+                verify: None,
+                verify_prompt: None,
+                phases: None,
+            }],
+        }
+    }
+
+    // Specs dequeued locally (no runner claim) complete with runner_id='local'
+    // in fleet_status(). This is the single-host fallback path.
+    #[test]
+    fn local_completion_shows_runner_id_local_in_fleet_status() {
+        let q = Queue::open(":memory:").unwrap();
+        let spec = minimal_spec("local-fallback-spec");
+        let spec_id = q.enqueue(&spec, None).unwrap();
+
+        // Simulate local daemon: dequeue (→ assigning) then mark running, then complete.
+        // runner_id is never set, so it stays NULL in the DB.
+        let rec = q.dequeue().unwrap().expect("spec should be dequeued");
+        assert_eq!(rec.status, "assigning");
+
+        q.update_spec_running(&spec_id, "W-local-test").unwrap();
+        q.update_spec(&spec_id, "completed").unwrap();
+
+        let (running, completions) = q.fleet_status().unwrap();
+        assert!(running.is_empty(), "no specs should be running after completion");
+
+        assert_eq!(completions.len(), 1, "one completion expected");
+        let (runner_id, sid, _title, status) = &completions[0];
+        assert_eq!(runner_id, "local", "local execution must show runner_id='local'");
+        assert_eq!(sid, &spec_id);
+        assert_eq!(status, "completed");
+    }
+
+    // A remote runner claiming via claim_for_runner() shows its own runner_id, not 'local'.
+    // Confirms the two paths are correctly distinguished.
+    #[test]
+    fn remote_runner_shows_own_runner_id_in_fleet_status() {
+        let q = Queue::open(":memory:").unwrap();
+        let spec = minimal_spec("remote-runner-spec");
+        let spec_id = q.enqueue(&spec, None).unwrap();
+
+        let _ = q.dequeue().unwrap().expect("spec should be dequeued");
+        q.claim_for_runner(&spec_id, "mac-mini-1").unwrap();
+        q.complete_from_runner(&spec_id, "completed", Some(0.01), Some(42.0), None)
+            .unwrap();
+
+        let (_running, completions) = q.fleet_status().unwrap();
+        assert_eq!(completions.len(), 1);
+        let (runner_id, sid, _title, status) = &completions[0];
+        assert_eq!(runner_id, "mac-mini-1");
+        assert_eq!(sid, &spec_id);
+        assert_eq!(status, "completed");
+    }
+
+    // With multiple specs: some local, some remote — both appear correctly in fleet_status.
+    #[test]
+    fn mixed_local_and_remote_completions() {
+        let q = Queue::open(":memory:").unwrap();
+
+        // Spec 1: local
+        let local_id = q.enqueue(&minimal_spec("local-spec"), None).unwrap();
+        let _ = q.dequeue().unwrap().expect("local spec dequeued");
+        q.update_spec_running(&local_id, "W-local").unwrap();
+        q.update_spec(&local_id, "completed").unwrap();
+
+        // Spec 2: remote
+        let remote_id = q.enqueue(&minimal_spec("remote-spec"), None).unwrap();
+        let _ = q.dequeue().unwrap().expect("remote spec dequeued");
+        q.claim_for_runner(&remote_id, "mac-mini-2").unwrap();
+        q.complete_from_runner(&remote_id, "completed", None, None, None)
+            .unwrap();
+
+        let (_running, completions) = q.fleet_status().unwrap();
+        assert_eq!(completions.len(), 2);
+
+        // fleet_status orders by completed_at DESC, so remote (more recent) first
+        let ids_and_runners: Vec<(&str, &str)> = completions
+            .iter()
+            .map(|(r, id, _, _)| (r.as_str(), id.as_str()))
+            .collect();
+
+        assert!(
+            ids_and_runners.iter().any(|(r, id)| *r == "local" && *id == local_id),
+            "local spec must appear with runner_id='local': {:?}",
+            ids_and_runners
+        );
+        assert!(
+            ids_and_runners.iter().any(|(r, id)| *r == "mac-mini-2" && *id == remote_id),
+            "remote spec must appear with runner_id='mac-mini-2': {:?}",
+            ids_and_runners
+        );
+    }
+
+    // dequeue() still returns queued specs even when no remote runners exist.
+    // This verifies the queue itself has no dependency on the HTTP API being present.
+    #[test]
+    fn dequeue_works_without_http_api() {
+        let q = Queue::open(":memory:").unwrap();
+        let spec = minimal_spec("no-api-spec");
+        let spec_id = q.enqueue(&spec, None).unwrap();
+
+        let rec = q.dequeue().unwrap();
+        assert!(rec.is_some(), "dequeue must work without HTTP API running");
+        assert_eq!(rec.unwrap().id, spec_id);
+    }
+
+    #[test]
+    fn runner_register_and_lookup() {
+        let q = Queue::open(":memory:").unwrap();
+        q.register_runner("mac-mini", "deadbeef01020304", "[]").unwrap();
+        let key = q.lookup_runner_key("mac-mini").unwrap();
+        assert_eq!(key, Some("deadbeef01020304".to_string()));
+    }
+
+    #[test]
+    fn runner_lookup_unknown_returns_none() {
+        let q = Queue::open(":memory:").unwrap();
+        let key = q.lookup_runner_key("nobody").unwrap();
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn runner_upsert_updates_key() {
+        let q = Queue::open(":memory:").unwrap();
+        q.register_runner("r1", "key-v1", "[]").unwrap();
+        q.register_runner("r1", "key-v2", "[]").unwrap();
+        let key = q.lookup_runner_key("r1").unwrap();
+        assert_eq!(key, Some("key-v2".to_string()));
+    }
+
+    #[test]
+    fn runner_touch_updates_last_seen() {
+        let q = Queue::open(":memory:").unwrap();
+        q.register_runner("heartbeat-runner", "abc", "[]").unwrap();
+        q.touch_runner("heartbeat-runner").unwrap();
+        // last_seen is set — verify no error and row exists
+        let key = q.lookup_runner_key("heartbeat-runner").unwrap();
+        assert!(key.is_some());
+    }
+
 }

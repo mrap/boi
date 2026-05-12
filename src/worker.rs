@@ -479,6 +479,16 @@ pub fn run_worker_with_phases(
         title: spec_rec.title.clone(),
         mode: Some(spec_rec.mode.clone()),
         workspace: original_workspace.clone(),
+        // Layer 4 (2026-05-12): worker rehydrates spec from DB after the
+        // dispatch gate has already validated workspace-or-rationale. The
+        // DB doesn't yet persist the rationale, so we synthesize an explicit
+        // marker if workspace is absent — this is downstream of validation,
+        // not a bypass.
+        workspace_rationale: if original_workspace.is_none() {
+            Some("rehydrated — dispatch-gate already validated".into())
+        } else {
+            None
+        },
         initiative: None,
         context: spec_rec.context.clone(),
         outcomes: None,

@@ -135,6 +135,7 @@ fn make_angle_spec(question: &str, angle: &str, idx: usize) -> spec::BoiSpec {
         title: format!("Research: {} — angle: {}", q_short, angle),
         mode: Some("execute".to_string()),
         workspace: None,
+        workspace_rationale: Some("research command — synthesized spec, no repo target".into()),
         initiative: None,
         context: Some(format!("Research angle: {}\n\nQuestion: {}", angle, question)),
         outcomes: None,
@@ -143,6 +144,8 @@ fn make_angle_spec(question: &str, angle: &str, idx: usize) -> spec::BoiSpec {
         context_files: None,
         phase_overrides: HashMap::new(),
         worker_pool: None,
+        max_cost_usd: None,
+        key_artifacts: None,
         tasks: vec![spec::BoiTask {
             id: format!("T{:04}", idx + 1),
             title: format!("Investigate: {}", angle),
@@ -172,6 +175,7 @@ fn make_synthesis_spec(question: &str, angle_count: usize) -> spec::BoiSpec {
         title: format!("Research synthesis: {}", q_short),
         mode: Some("execute".to_string()),
         workspace: None,
+        workspace_rationale: Some("research command — synthesized spec, no repo target".into()),
         initiative: None,
         context: Some(format!(
             "Synthesize findings from {} research angles for: {}",
@@ -183,6 +187,8 @@ fn make_synthesis_spec(question: &str, angle_count: usize) -> spec::BoiSpec {
         context_files: None,
         phase_overrides: HashMap::new(),
         worker_pool: None,
+        max_cost_usd: None,
+        key_artifacts: None,
         tasks: vec![spec::BoiTask {
             id: "T0001".to_string(),
             title: "Synthesize angle findings".to_string(),
@@ -216,6 +222,7 @@ fn make_deliverable_spec(question: &str, deliverable: &str) -> spec::BoiSpec {
         title: format!("Research deliverable: {}", q_short),
         mode: Some("execute".to_string()),
         workspace: None,
+        workspace_rationale: Some("research command — synthesized spec, no repo target".into()),
         initiative: None,
         context: Some(format!("Produce final deliverable for research: {}", question)),
         outcomes: None,
@@ -224,6 +231,8 @@ fn make_deliverable_spec(question: &str, deliverable: &str) -> spec::BoiSpec {
         context_files: None,
         phase_overrides: HashMap::new(),
         worker_pool: None,
+        max_cost_usd: None,
+        key_artifacts: None,
         tasks: vec![spec::BoiTask {
             id: "T0001".to_string(),
             title: "Produce deliverable".to_string(),

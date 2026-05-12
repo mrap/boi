@@ -22,6 +22,9 @@ rust_decimal = "1"
 thiserror = "1"
 anyhow = "1"
 dotenvy = "0.15"
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 serial_test = "3"

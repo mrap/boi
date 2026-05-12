@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
 /// Which runtime to use for a phase override.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -24,7 +25,17 @@ pub struct PhaseOverride {
 pub struct BoiSpec {
     pub title: String,
     pub mode: Option<String>,
+    /// Target git repo for this spec. When set, the worker creates a worktree
+    /// here and merges back on completion. Either `workspace` OR
+    /// `workspace_rationale` must be set — see [validate].
     pub workspace: Option<String>,
+    /// Required when `workspace` is null: a non-empty rationale explaining why
+    /// this spec touches no git repo. Forces every spec author to make a
+    /// conscious choice rather than silently dropping into the `/tmp/` +
+    /// abs-path-write pattern that stranded 49 files in the BOI main checkout
+    /// (incident 2026-05-12). The string is logged in `boi log <id>`.
+    #[serde(default)]
+    pub workspace_rationale: Option<String>,
     pub initiative: Option<String>,
     pub context: Option<String>,
     pub outcomes: Option<Vec<Outcome>>,
@@ -44,7 +55,35 @@ pub struct BoiSpec {
     /// Pool-name existence is validated at dispatch time, not here.
     #[serde(default)]
     pub worker_pool: Option<String>,
+    /// Maximum total cost in USD for this spec. None → no ceiling enforced.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
+    /// Paths that must exist on disk before emitting boi.spec.completed.
+    /// If any path is missing the spec transitions to Failed instead.
+    #[serde(default)]
+    pub key_artifacts: Option<Vec<String>>,
     pub tasks: Vec<BoiTask>,
+}
+
+/// Check that all paths listed in `spec.key_artifacts` exist on disk.
+/// Returns `Ok(())` if key_artifacts is absent, null, or empty.
+/// Returns `Err(missing)` with the list of missing paths if any are absent.
+pub fn check_key_artifacts(spec: &BoiSpec) -> Result<(), Vec<PathBuf>> {
+    let paths = match spec.key_artifacts.as_ref() {
+        None => return Ok(()),
+        Some(v) if v.is_empty() => return Ok(()),
+        Some(v) => v,
+    };
+    let missing: Vec<PathBuf> = paths
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| !p.exists())
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -103,6 +142,17 @@ pub enum ValidationError {
     DuplicateTaskId(String),
     UnknownDependency { task_id: String, dep_id: String },
     CircularDependency(Vec<String>),
+    /// Neither `workspace` nor `workspace_rationale` was declared. Layer 4
+    /// (2026-05-12): every spec must make an explicit choice.
+    MissingWorkspaceAndRationale,
+    /// `workspace_rationale` was set but empty / whitespace-only.
+    EmptyWorkspaceRationale,
+    /// Both `workspace` and `workspace_rationale` were declared. Mutually
+    /// exclusive — a rationale exists to explain absence of workspace.
+    WorkspaceAndRationaleBothDeclared,
+    /// `workspace` points to a path that is not a git repo (no `.git` dir
+    /// at the root).
+    WorkspaceNotAGitRepo(String),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -117,6 +167,31 @@ impl std::fmt::Display for ValidationError {
             ValidationError::CircularDependency(cycle) => {
                 write!(f, "circular dependency: {}", cycle.join(", "))
             }
+            ValidationError::MissingWorkspaceAndRationale => write!(
+                f,
+                "spec must declare either `workspace: <path-to-git-repo>` or \
+                 `workspace_rationale: <non-empty reason>` — neither was provided. \
+                 If this spec touches a git repo, declare it explicitly so a worktree \
+                 is created. If it genuinely doesn't, explain why."
+            ),
+            ValidationError::EmptyWorkspaceRationale => write!(
+                f,
+                "`workspace_rationale` is set but empty or whitespace-only. Provide a \
+                 non-empty explanation of why this spec needs no git workspace."
+            ),
+            ValidationError::WorkspaceAndRationaleBothDeclared => write!(
+                f,
+                "spec declares both `workspace` and `workspace_rationale`. These are \
+                 mutually exclusive — `workspace_rationale` exists to explain the \
+                 ABSENCE of a workspace. Pick one."
+            ),
+            ValidationError::WorkspaceNotAGitRepo(path) => write!(
+                f,
+                "workspace `{}` is not a git repo (no .git found at the root). \
+                 Point `workspace` at a real git repo or use `workspace_rationale` to \
+                 explain that this spec has no repo target.",
+                path
+            ),
         }
     }
 }
@@ -136,7 +211,58 @@ pub fn parse_unchecked(content: &str) -> Result<BoiSpec, Box<dyn std::error::Err
     Ok(spec)
 }
 
+/// Layer 4 — workspace OR rationale must be declared, exclusively.
+///
+/// Every spec must explicitly state its target git repo (`workspace:`) or
+/// declare with a rationale that it touches no repo (`workspace_rationale:`).
+/// This prevents the silent-drift pattern that stranded 49 uncommitted files
+/// in the BOI main checkout (incident 2026-05-12): specs without `workspace:`
+/// fell through to a `/tmp/` scratch dir, and any task that wrote to absolute
+/// paths in the source repo did so outside any worktree → no commit → drift.
+fn validate_workspace_or_rationale(spec: &BoiSpec) -> Result<(), ValidationError> {
+    let ws = spec.workspace.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let rationale = spec.workspace_rationale.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match (ws, spec.workspace_rationale.as_deref(), rationale) {
+        (Some(_), Some(_), Some(_)) => Err(ValidationError::WorkspaceAndRationaleBothDeclared),
+        (Some(path), _, _) => {
+            // workspace is set — verify it points at a real git repo.
+            let p = std::path::Path::new(path);
+            let git_dir = p.join(".git");
+            if !git_dir.exists() {
+                return Err(ValidationError::WorkspaceNotAGitRepo(path.to_string()));
+            }
+            Ok(())
+        }
+        (None, Some(raw), None) if raw.trim().is_empty() => {
+            // workspace_rationale was provided but empty/whitespace.
+            Err(ValidationError::EmptyWorkspaceRationale)
+        }
+        (None, None, _) => Err(ValidationError::MissingWorkspaceAndRationale),
+        (None, _, Some(_)) => Ok(()),
+        // Defensive: should be unreachable given the filter above, but the
+        // exhaustiveness check keeps the match honest if shapes drift.
+        (None, Some(_), None) => Err(ValidationError::EmptyWorkspaceRationale),
+    }
+}
+
+/// Strict validation invoked at dispatch time. Runs `validate` first, then
+/// enforces the Layer 4 workspace-or-rationale gate. Use this from
+/// `cmd_dispatch` and any other path that enqueues new specs.
+pub fn validate_for_dispatch(spec: &BoiSpec) -> Result<(), ValidationError> {
+    validate(spec)?;
+    validate_workspace_or_rationale(spec)?;
+    Ok(())
+}
+
 /// Validate a parsed spec. Returns first error encountered.
+///
+/// Baseline structural checks only. Does NOT include the Layer 4 workspace
+/// gate — that lives in [validate_for_dispatch] so it fires at the dispatch
+/// entry point (`cmd_dispatch`) without breaking in-flight readers / test
+/// fixtures that legitimately parse partial specs.
 pub fn validate(spec: &BoiSpec) -> Result<(), ValidationError> {
     if spec.title.trim().is_empty() {
         return Err(ValidationError::MissingTitle);
@@ -271,6 +397,31 @@ pub fn ready_tasks(spec: &BoiSpec) -> Vec<&BoiTask> {
                     .all(|dep| done_ids.contains(dep.as_str()))
         })
         .collect()
+}
+
+/// Validate a spec at intake time (pre-dispatch).
+/// Rejects specs where any task has a non-PENDING status at creation time.
+/// This catches the S1223-class (pre-DONE tasks) and status-enum-mismatch failures
+/// before they consume worker budget.
+pub fn validate_intake(spec: &BoiSpec) -> Result<(), String> {
+    if spec.tasks.is_empty() {
+        return Err("empty-task-list: spec has no tasks".to_string());
+    }
+    for task in &spec.tasks {
+        if task.status == TaskStatus::Done {
+            return Err(format!(
+                "pre-done-task: task {} has status DONE at creation",
+                task.id
+            ));
+        }
+        if task.status != TaskStatus::Pending {
+            return Err(format!(
+                "invalid-create-status: task {} has status {:?}, expected PENDING",
+                task.id, task.status
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -637,5 +788,163 @@ tasks:
         let serialized = serde_yml::to_string(&spec).unwrap();
         let spec2: BoiSpec = serde_yml::from_str(&serialized).unwrap();
         assert_eq!(spec.worker_pool, spec2.worker_pool);
+    }
+
+    // --- validate_intake tests ---
+
+    #[test]
+    fn test_intake_reject_pre_done_task() {
+        let yaml = r#"
+title: "Pre-done spec"
+tasks:
+  - id: T1
+    title: "Already done task"
+    status: DONE
+"#;
+        let spec = parse_unchecked(yaml).unwrap();
+        let err = validate_intake(&spec).unwrap_err();
+        assert!(err.contains("pre-done-task"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_intake_reject_invalid_status() {
+        let yaml = r#"
+title: "Running status spec"
+tasks:
+  - id: T1
+    title: "Already running task"
+    status: RUNNING
+"#;
+        let spec = parse_unchecked(yaml).unwrap();
+        let err = validate_intake(&spec).unwrap_err();
+        assert!(err.contains("invalid-create-status"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_intake_reject_empty_tasks() {
+        let yaml = r#"
+title: "Empty spec"
+tasks: []
+"#;
+        let spec = parse_unchecked(yaml).unwrap();
+        let err = validate_intake(&spec).unwrap_err();
+        assert!(err.contains("empty-task-list"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_intake_accept_valid_spec() {
+        let yaml = r#"
+title: "Valid spec"
+tasks:
+  - id: T1
+    title: "Task one"
+    status: PENDING
+  - id: T2
+    title: "Task two"
+    status: PENDING
+  - id: T3
+    title: "Task three"
+    status: PENDING
+"#;
+        let spec = parse_unchecked(yaml).unwrap();
+        assert!(validate_intake(&spec).is_ok());
+    }
+
+    // ── Layer 4 — workspace OR rationale required at dispatch ───────────────
+
+    mod workspace_or_rationale {
+        use super::*;
+
+        fn spec_with(workspace: Option<&str>, rationale: Option<&str>) -> BoiSpec {
+            let mut yaml = String::from("title: \"Test\"\ntasks:\n  - id: t-1\n    title: \"x\"\n    status: PENDING\n");
+            if let Some(ws) = workspace {
+                yaml.push_str(&format!("workspace: \"{}\"\n", ws));
+            }
+            if let Some(r) = rationale {
+                yaml.push_str(&format!("workspace_rationale: \"{}\"\n", r));
+            }
+            parse_unchecked(&yaml).unwrap()
+        }
+
+        #[test]
+        fn rejects_missing_both_workspace_and_rationale() {
+            let spec = spec_with(None, None);
+            let err = validate_for_dispatch(&spec)
+                .expect_err("expected MissingWorkspaceAndRationale");
+            assert!(
+                matches!(err, ValidationError::MissingWorkspaceAndRationale),
+                "got: {:?}",
+                err
+            );
+            // Error message must be actionable
+            let msg = err.to_string();
+            assert!(msg.contains("workspace") && msg.contains("rationale"),
+                "error must point at both fields: {}", msg);
+        }
+
+        #[test]
+        fn rejects_empty_whitespace_rationale() {
+            let spec = spec_with(None, Some("   \t  "));
+            let err = validate_for_dispatch(&spec)
+                .expect_err("expected EmptyWorkspaceRationale");
+            assert!(
+                matches!(err, ValidationError::EmptyWorkspaceRationale),
+                "got: {:?}",
+                err
+            );
+        }
+
+        #[test]
+        fn rejects_both_workspace_and_rationale() {
+            // Use a path we know is a git repo so the workspace itself passes.
+            let repo = env!("CARGO_MANIFEST_DIR");
+            let spec = spec_with(Some(repo), Some("ambiguous — both set"));
+            let err = validate_for_dispatch(&spec)
+                .expect_err("expected WorkspaceAndRationaleBothDeclared");
+            assert!(
+                matches!(err, ValidationError::WorkspaceAndRationaleBothDeclared),
+                "got: {:?}",
+                err
+            );
+        }
+
+        #[test]
+        fn rejects_workspace_path_not_a_git_repo() {
+            let spec = spec_with(Some("/tmp/definitely-not-a-git-repo-zzz9999"), None);
+            let err = validate_for_dispatch(&spec)
+                .expect_err("expected WorkspaceNotAGitRepo");
+            assert!(
+                matches!(err, ValidationError::WorkspaceNotAGitRepo(_)),
+                "got: {:?}",
+                err
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("not a git repo"),
+                "error must say so: {}", msg);
+        }
+
+        #[test]
+        fn accepts_workspace_pointing_at_git_repo() {
+            let repo = env!("CARGO_MANIFEST_DIR");
+            let spec = spec_with(Some(repo), None);
+            validate_for_dispatch(&spec).expect("Ok expected for valid repo");
+        }
+
+        #[test]
+        fn accepts_rationale_only() {
+            let spec = spec_with(
+                None,
+                Some("Pure analysis — writes only to projects/, no repo target."),
+            );
+            validate_for_dispatch(&spec).expect("Ok expected for rationale-only");
+        }
+
+        #[test]
+        fn baseline_validate_does_not_enforce_workspace() {
+            // Layer 4 gate is dispatch-only — baseline validate() stays liberal so
+            // in-flight spec readers (worker resume, etc.) don't trip on the field.
+            let spec = spec_with(None, None);
+            validate(&spec).expect("baseline validate must not enforce workspace gate");
+        }
     }
 }

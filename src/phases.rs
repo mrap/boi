@@ -2075,6 +2075,7 @@ template = "Do something at the spec level."
             title: "Research and Design Pipeline".into(),
             mode: Some("generate".into()),
             workspace: None,
+            workspace_rationale: Some("test fixture — no repo target".into()),
             initiative: None,
             context: Some("Design a new data pipeline".into()),
             outcomes: None,
