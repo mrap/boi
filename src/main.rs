@@ -7,6 +7,7 @@ use boi::cli::dispatch::cmd_dispatch;
 use boi::cli::doctor::cmd_doctor;
 use boi::cli::log::cmd_log;
 use boi::cli::outputs::cmd_outputs;
+use boi::cli::overrides_cmd::{cmd_overrides_clear, cmd_overrides_clear_all, cmd_overrides_list};
 use boi::cli::phases_cmd::{cmd_phase_runs, cmd_phases_list, cmd_phases_show};
 use boi::cli::prune::{cmd_prune_orphans, PruneConfig};
 use boi::cli::providers::cmd_providers_list;
@@ -147,6 +148,11 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
+    /// Manage phase override files in ~/.boi/phases/
+    Overrides {
+        #[command(subcommand)]
+        action: Option<OverridesAction>,
+    },
     /// Manage and inspect runtime providers
     Providers {
         #[command(subcommand)]
@@ -225,6 +231,20 @@ enum Commands {
 enum ProvidersAction {
     /// List registered and disabled providers
     List,
+}
+
+#[derive(Subcommand)]
+enum OverridesAction {
+    /// List active phase override files
+    List,
+    /// Remove one or all phase override files
+    Clear {
+        /// Name of the override file to remove
+        name: Option<String>,
+        /// Remove all override files
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -381,6 +401,21 @@ fn main() {
                 match name {
                     Some(n) => cmd_phases_show(&n),
                     None => cmd_phases_list(),
+                }
+            }
+        }
+        Commands::Overrides { action } => {
+            match action.unwrap_or(OverridesAction::List) {
+                OverridesAction::List => cmd_overrides_list(),
+                OverridesAction::Clear { name, all } => {
+                    if all {
+                        cmd_overrides_clear_all();
+                    } else if let Some(n) = name {
+                        cmd_overrides_clear(&n);
+                    } else {
+                        eprintln!("error: specify a name or --all");
+                        std::process::exit(1);
+                    }
                 }
             }
         }

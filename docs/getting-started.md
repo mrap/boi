@@ -164,9 +164,9 @@ boi phases runs SA7F3 --full    # every field for every invocation
 ### Phase overrides
 
 ```bash
-boi phases list                  # list override files in ~/.boi/phases/
-boi phases clear <name>          # remove a specific override file
-boi phases clear --all           # remove all override files
+boi overrides list               # list override files in ~/.boi/phases/
+boi overrides clear <name>       # remove a specific override file
+boi overrides clear --all        # remove all override files
 ```
 
 ### Iteration breakdown

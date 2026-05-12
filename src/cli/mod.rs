@@ -7,6 +7,7 @@ pub mod dispatch;
 pub mod doctor;
 pub mod log;
 pub mod outputs;
+pub mod overrides_cmd;
 pub mod phases_cmd;
 pub mod prune;
 pub mod providers;
