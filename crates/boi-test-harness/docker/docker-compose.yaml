@@ -21,7 +21,6 @@ services:
     build:
       context: ../../..
       dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
-    command: ["boi-node", "--node-id=node-a"]
     environment:
       BOI_ETCD_ENDPOINTS: "http://etcd:2379"
       BOI_NODE_ID: "node-a"
@@ -35,7 +34,6 @@ services:
     build:
       context: ../../..
       dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
-    command: ["boi-node", "--node-id=node-b"]
     environment:
       BOI_ETCD_ENDPOINTS: "http://etcd:2379"
       BOI_NODE_ID: "node-b"
@@ -49,7 +47,6 @@ services:
     build:
       context: ../../..
       dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
-    command: ["boi-node", "--node-id=node-c"]
     environment:
       BOI_ETCD_ENDPOINTS: "http://etcd:2379"
       BOI_NODE_ID: "node-c"

@@ -7,12 +7,13 @@
 # red signal. Phase 0c replaces the stub with the real implementation
 # and this Dockerfile keeps working without changes.
 
-FROM rust:1.78 AS builder
+FROM rust:latest AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p boi-node
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:trixie-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
