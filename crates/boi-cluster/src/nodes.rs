@@ -19,7 +19,8 @@ pub const NODES_PREFIX: &str = "/boi/nodes/";
 pub const CAPS_PREFIX: &str = "/boi/caps/";
 
 /// Reserved static-cap keys (BOI core writes only).
-pub const RESERVED_CAP_KEYS: &[&str] = &["os", "arch", "region", "runtime"];
+pub const RESERVED_CAP_KEYS: &[&str] =
+    &["os", "arch", "region", "runtime", "cluster_admin"];
 
 /// User-defined cap key prefix.
 pub const USER_CAP_PREFIX: &str = "x-";
