@@ -8,12 +8,14 @@ description = "Plugin host — spawns plugin children, runs the BOI_READY handsh
 boi-proto = { path = "../boi-proto" }
 tonic = "0.12"
 prost = "0.13"
+prost-types = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "fs", "sync"] }
 tokio-stream = "0.1"
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
 futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

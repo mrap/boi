@@ -9,6 +9,8 @@ syntax = "proto3";
 
 package boi.provisioner.v1;
 
+import "google/protobuf/duration.proto";
+
 service Provisioner {
   rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
   rpc Provision(ProvisionRequest) returns (ProvisionResponse);
@@ -38,6 +40,9 @@ message ProvisionRequest {
   JoinToken join_token = 1;
   CapHint cap_hint = 2;
   string spec_id = 3;
+  string request_id = 4;
+  string boi_bootstrap_url = 5;
+  google.protobuf.Duration deadline = 6;
 }
 message ProvisionResponse {
   // Provider-specific machine identifier.

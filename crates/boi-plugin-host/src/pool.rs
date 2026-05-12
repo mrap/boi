@@ -96,7 +96,7 @@ impl Default for RetentionPolicy {
 /// Enforce [`RetentionPolicy`] over `~/.boi/logs/<spec_id>/`, deleting
 /// task logs oldest-mtime-first until both caps hold. Returns the
 /// number of files removed.
-pub fn enforce_retention(
+pub async fn enforce_retention(
     spec_dir: &Path,
     policy: RetentionPolicy,
 ) -> io::Result<u32> {
@@ -104,14 +104,14 @@ pub fn enforce_retention(
 
     let now = SystemTime::now();
     let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
-    let rd = match std::fs::read_dir(spec_dir) {
+    let mut rd = match tokio::fs::read_dir(spec_dir).await {
         Ok(r) => r,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e),
     };
-    for entry in rd.flatten() {
+    while let Some(entry) = rd.next_entry().await? {
         let path = entry.path();
-        let meta = match entry.metadata() {
+        let meta = match entry.metadata().await {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -125,26 +125,26 @@ pub fn enforce_retention(
     entries.sort_by_key(|(_p, mtime, _len)| *mtime);
 
     let mut removed = 0u32;
+    let mut surviving: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
 
     // Age cap.
-    entries.retain(|(p, mtime, _len)| {
-        let age = now.duration_since(*mtime).map(|d| d.as_secs()).unwrap_or(0);
+    for (p, mtime, len) in entries {
+        let age = now.duration_since(mtime).map(|d| d.as_secs()).unwrap_or(0);
         if age > policy.max_age_secs {
-            if std::fs::remove_file(p).is_ok() {
+            if tokio::fs::remove_file(&p).await.is_ok() {
                 removed += 1;
             }
-            false
         } else {
-            true
+            surviving.push((p, mtime, len));
         }
-    });
+    }
 
     // Byte cap — drop oldest first until under cap.
-    let mut total: u64 = entries.iter().map(|(_p, _m, n)| *n).sum();
+    let mut total: u64 = surviving.iter().map(|(_p, _m, n)| *n).sum();
     let mut i = 0;
-    while total > policy.max_bytes_per_spec && i < entries.len() {
-        let (path, _mtime, len) = &entries[i];
-        if std::fs::remove_file(path).is_ok() {
+    while total > policy.max_bytes_per_spec && i < surviving.len() {
+        let (path, _mtime, len) = &surviving[i];
+        if tokio::fs::remove_file(path).await.is_ok() {
             total = total.saturating_sub(*len);
             removed += 1;
         }
