@@ -22,6 +22,7 @@ macro_rules! boi_log {
 
 use std::{
     collections::{HashMap, HashSet},
+    io::Write,
     process::Command,
     sync::Arc,
     time::Instant,
@@ -764,6 +765,7 @@ pub fn run_worker_with_phases(
                 record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, Some(&pipeline_id), Some((spec_loop_count as i64) + 1), exp010_ctx.as_deref());
 
                 emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
+                emit_boi_phase_verdict(&effective_phase, spec_id, None, Some((spec_loop_count as i64) + 1), &verdict, &phase_output, metrics.model.as_deref(), elapsed_ms);
 
                 // Apply spec-review JSON suggestions to the DB before task execution begins.
                 // IDs are already canonical (loaded from DB), so no YAML-to-DB mapping needed.
@@ -1063,10 +1065,16 @@ pub fn run_worker_with_phases(
                 // Inject most-recent checkpoint (non-fatal; empty string if none found)
                 prompt_vars.insert(TemplateVar::PriorTaskContext.key().into(),
                     load_prior_checkpoint(spec_id, &done_ids));
+                // Populate diff vars for the code-review prompt template
+                if phase_name == "code-review" {
+                    let (cf, lc) = collect_worktree_diff(&worktree_path);
+                    prompt_vars.insert("CHANGED_FILES".into(), cf);
+                    prompt_vars.insert("LINES_CHANGED".into(), lc);
+                }
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let (verdict, _output, metrics) = runner.run_phase_full(
+                let (verdict, phase_output, metrics) = runner.run_phase_full(
                     &effective_phase,
                     &spec_content,
                     Some(task),
@@ -1080,6 +1088,7 @@ pub fn run_worker_with_phases(
                 record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, Some(&pipeline_id), Some(1), None);
 
                 emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &verdict, elapsed_ms);
+                emit_boi_phase_verdict(&effective_phase, spec_id, Some(&task.id), Some(1), &verdict, &phase_output, metrics.model.as_deref(), elapsed_ms);
 
                 boi_log!("state: TaskPhase verdict: task={} phase='{}' -> {:?} ({}ms)",
                     task.id, phase_name, verdict, elapsed_ms);
@@ -1234,10 +1243,16 @@ pub fn run_worker_with_phases(
                 // Inject most-recent checkpoint (non-fatal; empty string if none found)
                 prompt_vars.insert(TemplateVar::PriorTaskContext.key().into(),
                     load_prior_checkpoint(spec_id, &done_ids));
+                // Populate diff vars for the code-review prompt template
+                if phase_name == "code-review" {
+                    let (cf, lc) = collect_worktree_diff(&worktree_path);
+                    prompt_vars.insert("CHANGED_FILES".into(), cf);
+                    prompt_vars.insert("LINES_CHANGED".into(), lc);
+                }
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let (retry_verdict, _output, retry_metrics) = runner.run_phase_full(
+                let (retry_verdict, retry_phase_output, retry_metrics) = runner.run_phase_full(
                     &effective_phase,
                     &spec_content,
                     Some(task),
@@ -1251,6 +1266,7 @@ pub fn run_worker_with_phases(
                 record_phase_run(&queue, spec_id, Some(&task.id), phase_name, "task", &retry_verdict, &phase_started_at, elapsed_ms, &retry_metrics, attempt as i64, Some(&pipeline_id), Some(attempt as i64 + 1), None);
 
                 emit_phase_verdict(telemetry, spec_id, Some(&task.id), phase_name, &retry_verdict, elapsed_ms);
+                emit_boi_phase_verdict(&effective_phase, spec_id, Some(&task.id), Some(attempt as i64 + 1), &retry_verdict, &retry_phase_output, retry_metrics.model.as_deref(), elapsed_ms);
 
                 boi_log!("state: TaskPhaseRetry verdict: task={} phase='{}' attempt={} -> {:?} ({}ms)",
                     task.id, phase_name, attempt, retry_verdict, elapsed_ms);
@@ -1396,7 +1412,7 @@ pub fn run_worker_with_phases(
 
                 let phase_start = Instant::now();
                 let phase_started_at = Utc::now().to_rfc3339();
-                let (verdict, _output, metrics) = runner.run_phase_full(
+                let (verdict, phase_output, metrics) = runner.run_phase_full(
                     &effective_phase,
                     &spec_content,
                     None,
@@ -1410,6 +1426,7 @@ pub fn run_worker_with_phases(
                 record_phase_run(&queue, spec_id, None, phase_name, "spec", &verdict, &phase_started_at, elapsed_ms, &metrics, 1, Some(&pipeline_id), Some((spec_redo_count as i64) + 1), None);
 
                 emit_phase_verdict(telemetry, spec_id, None, phase_name, &verdict, elapsed_ms);
+                emit_boi_phase_verdict(&effective_phase, spec_id, None, Some((spec_redo_count as i64) + 1), &verdict, &phase_output, metrics.model.as_deref(), elapsed_ms);
 
                 match &verdict {
                     Verdict::Proceed => {
@@ -1686,6 +1703,126 @@ fn emit_phase_verdict(
     telemetry.emit("boi.phase.outcome", LogLevel::Info, &payload);
 }
 
+/// Finding severity parsed from reviewer structured output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFinding {
+    pub severity: String,
+    pub category: String,
+}
+
+/// Parse findings from reviewer output sections (### Critical / ### Important / ### Suggestions).
+/// Returns (findings_list, count_critical, count_important, count_suggestion).
+pub fn parse_review_findings(output: &str) -> (Vec<ReviewFinding>, usize, usize, usize) {
+    let mut findings = Vec::new();
+    let mut current_severity: Option<&str> = None;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        // Detect section headers
+        if trimmed.starts_with("### Critical") || trimmed.eq_ignore_ascii_case("### critical findings") {
+            current_severity = Some("critical");
+        } else if trimmed.starts_with("### Important") || trimmed.eq_ignore_ascii_case("### important findings") {
+            current_severity = Some("important");
+        } else if trimmed.starts_with("### Suggestion") || trimmed.eq_ignore_ascii_case("### suggestions") {
+            current_severity = Some("suggestion");
+        } else if trimmed.starts_with("### ") {
+            // Any other ### heading resets the context
+            current_severity = None;
+        } else if let Some(sev) = current_severity {
+            // Collect bullet/numbered list items as finding entries
+            let content = if let Some(rest) = trimmed.strip_prefix("- ") {
+                rest.trim()
+            } else if trimmed.starts_with("* ") {
+                trimmed[2..].trim()
+            } else if trimmed.len() > 2
+                && trimmed.as_bytes()[0].is_ascii_digit()
+                && (trimmed.as_bytes()[1] == b'.' || trimmed.as_bytes()[1] == b')')
+            {
+                trimmed[2..].trim()
+            } else {
+                continue;
+            };
+            if !content.is_empty() {
+                findings.push(ReviewFinding {
+                    severity: sev.to_string(),
+                    category: content.to_string(),
+                });
+            }
+        }
+    }
+
+    let critical = findings.iter().filter(|f| f.severity == "critical").count();
+    let important = findings.iter().filter(|f| f.severity == "important").count();
+    let suggestion = findings.iter().filter(|f| f.severity == "suggestion").count();
+    (findings, critical, important, suggestion)
+}
+
+/// Write a `boi.phase.verdict` event to `~/.boi/telemetry/boi.jsonl` for any phase
+/// that has approve/reject signals (i.e., code-review, plan-critique, critic, task-verify).
+pub fn emit_boi_phase_verdict(
+    phase: &crate::phases::PhaseConfig,
+    spec_id: &str,
+    task_id: Option<&str>,
+    iteration: Option<i64>,
+    verdict: &Verdict,
+    phase_output: &str,
+    model: Option<&str>,
+    elapsed_ms: i64,
+) {
+    // Only emit for review phases (those with explicit approval/rejection signals)
+    if phase.approve_signal.is_none() && phase.reject_signal.is_none() {
+        return;
+    }
+
+    let verdict_str = match verdict {
+        Verdict::Proceed | Verdict::Done { success: true, .. } => "approve",
+        _ => "reject",
+    };
+
+    let (findings, n_critical, n_important, n_suggestion) = parse_review_findings(phase_output);
+    let findings_json: Vec<serde_json::Value> = findings.iter().map(|f| {
+        json!({"severity": f.severity, "category": f.category})
+    }).collect();
+
+    let event = json!({
+        "event": "boi.phase.verdict",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "phase": phase.name,
+        "spec_id": spec_id,
+        "task_id": task_id,
+        "iteration": iteration,
+        "verdict": verdict_str,
+        "findings": findings_json,
+        "finding_count": {
+            "critical": n_critical,
+            "important": n_important,
+            "suggestion": n_suggestion,
+        },
+        "duration_ms": elapsed_ms,
+        "model": model,
+    });
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = std::path::PathBuf::from(&home).join(".boi").join("telemetry");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[boi] WARN: could not create telemetry dir {}: {}", dir.display(), e);
+        return;
+    }
+    let path = dir.join("boi.jsonl");
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if let Ok(line) = serde_json::to_string(&event) {
+                if let Err(e) = writeln!(f, "{}", line) {
+                    eprintln!("[boi] WARN: phase_verdict write failed ({}): {}", path.display(), e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[boi] WARN: phase_verdict open failed ({}): {}", path.display(), e);
+        }
+    }
+}
+
 /// Load the most recent checkpoint for the given spec, scanning only tasks in `done_ids`.
 /// Returns the formatted "## Prior task context\n..." prefix, or an empty string on any failure.
 fn load_prior_checkpoint(spec_id: &str, done_ids: &std::collections::HashSet<String>) -> String {
@@ -1767,6 +1904,98 @@ pub(crate) fn initial_worker_state(
     Ok(WorkerState::SpecPhase { phase_idx: 0 })
 }
 
+/// Resolve the git base branch for a worktree diff.
+/// Tries `origin/main`, `origin/master`, `main`, `master`, then `HEAD~1`.
+fn resolve_base_ref(worktree_path: &str) -> Option<String> {
+    let candidates = ["origin/main", "origin/master", "main", "master"];
+    for candidate in candidates {
+        let ok = Command::new("git")
+            .args(["rev-parse", "--verify", candidate])
+            .current_dir(worktree_path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(candidate.to_string());
+        }
+    }
+    // Last resort: parent commit
+    let ok = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD~1"])
+        .current_dir(worktree_path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if ok {
+        Some("HEAD~1".to_string())
+    } else {
+        None
+    }
+}
+
+/// Collect the changed-files list and lines-changed summary for the code-review
+/// prompt. Returns `(CHANGED_FILES, LINES_CHANGED)` as strings ready for
+/// template substitution.
+///
+/// Falls back to `git ls-files` if the base ref cannot be resolved or the diff
+/// is empty, preserving prior behaviour rather than crashing.
+pub fn collect_worktree_diff(worktree_path: &str) -> (String, String) {
+    let base = match resolve_base_ref(worktree_path) {
+        Some(b) => b,
+        None => {
+            eprintln!("[boi] WARN: could not resolve base ref in {}; falling back to ls-files", worktree_path);
+            return fallback_ls_files(worktree_path);
+        }
+    };
+
+    let range = format!("{}..HEAD", base);
+
+    // Changed-files list
+    let names_out = Command::new("git")
+        .args(["diff", "--name-only", &range])
+        .current_dir(worktree_path)
+        .output();
+
+    let changed_files = match names_out {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    };
+
+    if changed_files.is_empty() {
+        eprintln!("[boi] WARN: diff vs {} is empty in {}; falling back to ls-files", base, worktree_path);
+        return fallback_ls_files(worktree_path);
+    }
+
+    // Lines-changed summary
+    let stat_out = Command::new("git")
+        .args(["diff", "--shortstat", &range])
+        .current_dir(worktree_path)
+        .output();
+
+    let lines_changed = match stat_out {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => "(stat unavailable)".to_string(),
+    };
+
+    (changed_files, lines_changed)
+}
+
+fn fallback_ls_files(worktree_path: &str) -> (String, String) {
+    let out = Command::new("git")
+        .args(["ls-files"])
+        .current_dir(worktree_path)
+        .output();
+    let files = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => "(could not list files)".to_string(),
+    };
+    (files, "0 files changed".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1783,16 +2012,20 @@ mod tests {
         Telemetry::new(db)
     }
 
-    /// Run `f` with CLAUDE_BIN and BOI_REPO set, holding ENV_LOCK.
+    /// Run `f` with CLAUDE_BIN, BOI_REPO, and BOI_PIPELINES_FILE set, holding ENV_LOCK.
+    /// BOI_PIPELINES_FILE is set to "" so tests use the hardcoded fallback pipeline
+    /// instead of the user's installed ~/.boi/pipelines.toml, which may differ.
     fn with_test_env<F: FnOnce()>(bin_path: &str, repo_path: &str, f: F) {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_bin = std::env::var("CLAUDE_BIN").ok();
         let old_repo = std::env::var("BOI_REPO").ok();
+        let old_pipelines = std::env::var("BOI_PIPELINES_FILE").ok();
         // SAFETY: ENV_LOCK is held so no concurrent env access from other test
         // threads. Setting vars for the duration of the test closure only.
         unsafe {
             std::env::set_var("CLAUDE_BIN", bin_path);
             std::env::set_var("BOI_REPO", repo_path);
+            std::env::set_var("BOI_PIPELINES_FILE", "");
         }
         f();
         // SAFETY: ENV_LOCK is held, restoring original env values after the test.
@@ -1804,6 +2037,10 @@ mod tests {
             match old_repo {
                 Some(v) => std::env::set_var("BOI_REPO", v),
                 None => std::env::remove_var("BOI_REPO"),
+            }
+            match old_pipelines {
+                Some(v) => std::env::set_var("BOI_PIPELINES_FILE", v),
+                None => std::env::remove_var("BOI_PIPELINES_FILE"),
             }
         }
     }
@@ -1822,6 +2059,151 @@ mod tests {
         assert_eq!(cfg.max_workers, 5);
         assert_eq!(cfg.retry_count, 3);
         assert_eq!(cfg.task_timeout_secs, 1800);
+    }
+
+    // ── collect_worktree_diff tests ────────────────────────────────────────
+
+    /// Helper: create a git repo with one commit on main and a second commit
+    /// with a changed file on a new branch, then return the repo path.
+    fn setup_diff_repo(label: &str) -> std::path::PathBuf {
+        use std::process::Command as Cmd;
+        let dir = test_utils::test_dir(label);
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            Cmd::new("git").args(&args).current_dir(&dir).output().unwrap();
+        }
+        std::fs::write(dir.join("base.txt"), "base").unwrap();
+        Cmd::new("git").args(["add", "."]).current_dir(&dir).output().unwrap();
+        Cmd::new("git").args(["commit", "-m", "init"]).current_dir(&dir).output().unwrap();
+        // Rename default branch to main so resolve_base_ref finds it
+        Cmd::new("git").args(["branch", "-M", "main"]).current_dir(&dir).output().unwrap();
+        // Create a feature branch with a new file
+        Cmd::new("git").args(["checkout", "-b", "feature"]).current_dir(&dir).output().unwrap();
+        std::fs::write(dir.join("changed.txt"), "new content").unwrap();
+        Cmd::new("git").args(["add", "."]).current_dir(&dir).output().unwrap();
+        Cmd::new("git").args(["commit", "-m", "add changed.txt"]).current_dir(&dir).output().unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_changed_files_non_empty_diff() {
+        let repo = setup_diff_repo("diff-nonempty");
+        let path = repo.to_str().unwrap();
+        let (changed_files, lines_changed) = collect_worktree_diff(path);
+        assert!(
+            changed_files.contains("changed.txt"),
+            "CHANGED_FILES should contain 'changed.txt', got: {:?}",
+            changed_files
+        );
+        assert!(
+            !lines_changed.is_empty(),
+            "LINES_CHANGED should not be empty, got: {:?}",
+            lines_changed
+        );
+    }
+
+    #[test]
+    fn test_changed_files_rendered_in_code_review_prompt() {
+        let repo = setup_diff_repo("diff-prompt");
+        let path = repo.to_str().unwrap();
+        let (cf, lc) = collect_worktree_diff(path);
+
+        // Simulate what build_phase_prompt does with these vars
+        let template = "Files:\n{{CHANGED_FILES}}\nStats: {{LINES_CHANGED}}";
+        let rendered = template
+            .replace("{{CHANGED_FILES}}", &cf)
+            .replace("{{LINES_CHANGED}}", &lc);
+
+        assert!(
+            rendered.contains("changed.txt"),
+            "rendered prompt must contain CHANGED_FILES content"
+        );
+        assert!(
+            !rendered.contains("{{CHANGED_FILES}}"),
+            "CHANGED_FILES placeholder must be substituted"
+        );
+        assert!(
+            !rendered.contains("{{LINES_CHANGED}}"),
+            "LINES_CHANGED placeholder must be substituted"
+        );
+    }
+
+    #[test]
+    fn test_changed_files_fallback_on_empty_diff() {
+        // On a repo with no commits ahead of main the diff is empty; expect fallback
+        let dir = test_utils::test_dir("diff-empty");
+        use std::process::Command as Cmd;
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            Cmd::new("git").args(&args).current_dir(&dir).output().unwrap();
+        }
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        Cmd::new("git").args(["add", "."]).current_dir(&dir).output().unwrap();
+        Cmd::new("git").args(["commit", "-m", "init"]).current_dir(&dir).output().unwrap();
+        Cmd::new("git").args(["branch", "-M", "main"]).current_dir(&dir).output().unwrap();
+        // HEAD IS main — diff vs main is empty → should fall back to ls-files
+        let (cf, lc) = collect_worktree_diff(dir.to_str().unwrap());
+        assert!(
+            cf.contains("a.txt"),
+            "fallback should list tracked files, got: {:?}",
+            cf
+        );
+        assert_eq!(lc, "0 files changed", "fallback lines_changed should be sentinel");
+    }
+
+    // ── end collect_worktree_diff tests ───────────────────────────────────
+
+    #[test]
+    fn test_phase_verdict_parse_findings_basic() {
+        let output = r#"
+## Code Review Approved
+
+### Critical
+- Memory safety issue in allocation path
+- Undefined behavior in unsafe block
+
+### Important
+- Missing error handling on file open
+* Unused import left in module
+
+### Suggestions
+1. Consider extracting helper function
+2. Add doc comment to public API
+3. Rename variable for clarity
+"#;
+        let (findings, n_crit, n_imp, n_sug) = parse_review_findings(output);
+        assert_eq!(n_crit, 2, "expected 2 critical findings");
+        assert_eq!(n_imp, 2, "expected 2 important findings");
+        assert_eq!(n_sug, 3, "expected 3 suggestions");
+        assert_eq!(findings.len(), 7);
+        assert!(findings.iter().any(|f| f.severity == "critical" && f.category.contains("Memory safety")));
+        assert!(findings.iter().any(|f| f.severity == "important" && f.category.contains("Missing error handling")));
+        assert!(findings.iter().any(|f| f.severity == "suggestion" && f.category.contains("doc comment")));
+    }
+
+    #[test]
+    fn test_phase_verdict_parse_findings_empty_output() {
+        let (findings, n_crit, n_imp, n_sug) = parse_review_findings("");
+        assert_eq!(findings.len(), 0);
+        assert_eq!(n_crit, 0);
+        assert_eq!(n_imp, 0);
+        assert_eq!(n_sug, 0);
+    }
+
+    #[test]
+    fn test_phase_verdict_parse_findings_no_sections() {
+        let output = "This is a plain approval with no structured findings.\n\nLooks good!";
+        let (findings, n_crit, n_imp, n_sug) = parse_review_findings(output);
+        assert_eq!(findings.len(), 0);
+        assert_eq!(n_crit, 0);
+        assert_eq!(n_imp, 0);
+        assert_eq!(n_sug, 0);
     }
 
     #[test]

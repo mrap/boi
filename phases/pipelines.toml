@@ -26,6 +26,12 @@ task_phases      = ["execute", "task-verify"]
 [mode.generate]
 spec_pre_phases  = ["plan-critique"]
 spec_post_phases = ["critic", "evaluate"]
+# doc-update intentionally excluded: generate mode produces prose/design documents,
+# not code. doc-update is a code-maintenance phase (updates API docs, changelogs,
+# README) and has no meaningful work to do on a document-generation spec.
+# Historical SA9EE logs showed it running because the pre-2026-05-12 pipeline had
+# a different shape; the migration removed it. If a generate spec also writes code,
+# use phase_overrides to add doc-update for that task explicitly.
 task_phases      = ["decompose", "execute", "code-review", "task-verify"]
 
 [mode.v2]
