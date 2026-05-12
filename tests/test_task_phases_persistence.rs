@@ -11,6 +11,7 @@ fn make_spec_with_phases() -> BoiSpec {
         title: "phases-persistence-test".to_string(),
         mode: Some("execute".to_string()),
         workspace: None,
+        workspace_rationale: Some("test fixture".to_string()),
         initiative: None,
         context: None,
         outcomes: None,
@@ -19,6 +20,8 @@ fn make_spec_with_phases() -> BoiSpec {
         context_files: None,
         phase_overrides: std::collections::HashMap::new(),
         worker_pool: None,
+        max_cost_usd: None,
+        key_artifacts: None,
         tasks: vec![BoiTask {
             id: "t-1".to_string(),
             title: "dummy task".to_string(),
