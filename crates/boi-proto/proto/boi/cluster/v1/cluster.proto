@@ -18,6 +18,33 @@ service Cluster {
 
   // Returns the current MembershipSnapshot for read-mostly callers.
   rpc GetMembership(GetMembershipRequest) returns (GetMembershipResponse);
+
+  // Stream worker stdout for a task from the claimant node. Internal
+  // node-to-node RPC (not exposed to plugins): the boi CLI resolves
+  // /boi/claims/<task_id> to the claimant node_id and opens this RPC
+  // against that node. The server reads from the durable tee at
+  // ~/.boi/logs/<spec_id>/<task_id>.log starting at `since_bytes` and
+  // streams chunks until the cap or EOF (with `follow=true`, blocks
+  // for newly-appended bytes). Per §16 Q7.
+  rpc Tail(TailRequest) returns (stream TailChunk);
+}
+
+message TailRequest {
+  string task_id = 1;
+  // Resume from this absolute byte offset in the on-disk log.
+  uint64 since_bytes = 2;
+  // Hard cap on bytes streamed (0 = unbounded).
+  uint64 max_bytes = 3;
+  // If true, stream new appends until the task completes.
+  bool follow = 4;
+}
+
+message TailChunk {
+  bytes data = 1;
+  // Absolute byte offset of the first byte in `data`.
+  uint64 offset = 2;
+  // True on the final chunk in this stream.
+  bool eof = 3;
 }
 
 message HandshakeRequest { uint32 host_proto_minor = 1; }

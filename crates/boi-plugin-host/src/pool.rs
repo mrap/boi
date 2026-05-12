@@ -72,6 +72,87 @@ pub fn payload_for_tee(event: &WorkerEvent) -> Option<&[u8]> {
     }
 }
 
+/// Retention policy for the per-spec log directory tee'd by
+/// [`append_chunk`]. Per §16 Q7: rotate oldest task logs once the
+/// per-spec on-disk total exceeds `max_bytes`, and unconditionally
+/// drop any log whose mtime is older than `max_age`.
+#[derive(Clone, Copy)]
+pub struct RetentionPolicy {
+    pub max_age_secs: u64,
+    pub max_bytes_per_spec: u64,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            // 7 days
+            max_age_secs: 7 * 24 * 60 * 60,
+            // 100 MiB
+            max_bytes_per_spec: 100 * 1024 * 1024,
+        }
+    }
+}
+
+/// Enforce [`RetentionPolicy`] over `~/.boi/logs/<spec_id>/`, deleting
+/// task logs oldest-mtime-first until both caps hold. Returns the
+/// number of files removed.
+pub fn enforce_retention(
+    spec_dir: &Path,
+    policy: RetentionPolicy,
+) -> io::Result<u32> {
+    use std::time::SystemTime;
+
+    let now = SystemTime::now();
+    let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+    let rd = match std::fs::read_dir(spec_dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(now);
+        entries.push((path, mtime, meta.len()));
+    }
+    // Oldest first.
+    entries.sort_by_key(|(_p, mtime, _len)| *mtime);
+
+    let mut removed = 0u32;
+
+    // Age cap.
+    entries.retain(|(p, mtime, _len)| {
+        let age = now.duration_since(*mtime).map(|d| d.as_secs()).unwrap_or(0);
+        if age > policy.max_age_secs {
+            if std::fs::remove_file(p).is_ok() {
+                removed += 1;
+            }
+            false
+        } else {
+            true
+        }
+    });
+
+    // Byte cap — drop oldest first until under cap.
+    let mut total: u64 = entries.iter().map(|(_p, _m, n)| *n).sum();
+    let mut i = 0;
+    while total > policy.max_bytes_per_spec && i < entries.len() {
+        let (path, _mtime, len) = &entries[i];
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(*len);
+            removed += 1;
+        }
+        i += 1;
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
