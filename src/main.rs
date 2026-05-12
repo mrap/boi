@@ -275,6 +275,22 @@ enum SpecAction {
         #[arg(long)]
         on: String,
     },
+    /// Tail worker stdout for a task (use --follow for live streaming)
+    Tail {
+        task_id: String,
+        /// Follow output as it is written
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Start at this byte offset (resume point)
+        #[arg(long, default_value = "0")]
+        since_bytes: u64,
+        /// Cap the number of bytes returned (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        max_bytes: u64,
+        /// Print the final byte offset to stderr after streaming
+        #[arg(long)]
+        print_offset: bool,
+    },
 }
 
 fn main() {
@@ -371,6 +387,9 @@ fn main() {
                 }
                 Some(SpecAction::Skip { task_id }) => SpecActionData::Skip { task_id },
                 Some(SpecAction::Block { task_id, on }) => SpecActionData::Block { task_id, on },
+                Some(SpecAction::Tail { task_id, follow, since_bytes, max_bytes, print_offset }) => {
+                    SpecActionData::Tail { task_id, follow, since_bytes, max_bytes, print_offset }
+                }
             };
             cmd_spec(&queue_id, action_data, db_str);
         }

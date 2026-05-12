@@ -18,6 +18,13 @@ pub enum SpecActionData {
         task_id: String,
         on: String,
     },
+    Tail {
+        task_id: String,
+        follow: bool,
+        since_bytes: u64,
+        max_bytes: u64,
+        print_offset: bool,
+    },
 }
 
 fn format_spec_yaml(spec: &queue::SpecRecord, tasks: &[queue::FullTaskRecord]) -> String {
@@ -143,6 +150,11 @@ pub fn cmd_spec(queue_id: &str, action: SpecActionData, db_str: &str) {
                 std::process::exit(1);
             }
         },
+        SpecActionData::Tail { task_id, follow, since_bytes, max_bytes, print_offset } => {
+            crate::cli::tail_cmd::cmd_tail(
+                queue_id, &task_id, follow, since_bytes, max_bytes, print_offset,
+            );
+        }
         SpecActionData::Block { task_id, on } => {
             match q.block_task(queue_id, &task_id, &on) {
                 Ok(()) => println!("blocked {} on {} in {}", task_id, on, queue_id),
