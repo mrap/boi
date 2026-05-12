@@ -73,11 +73,17 @@ If there are **zero Critical or Important findings**, output:
 ## Code Review Approved
 ```
 
-If there are **any Critical or Important findings**, output findings grouped by severity,
-then append new PENDING tasks using the `[CODE-REVIEW]` prefix so the spec author can
-address them. Example:
+If there are **any Critical or Important findings**, output the rejection sentinel on its
+own line first (this is machine-parsed; do not omit it), then the findings grouped by
+severity, then new PENDING tasks using the `[CODE-REVIEW]` prefix:
 
 ```
+<<CODE-REVIEW-REJECT>>
+
+### Critical
+
+[PERSONA] file.py:LINE -- description
+
 ### [CODE-REVIEW] t-fix-1: Fix SQL injection in lib/db.py:42
 PENDING
 
