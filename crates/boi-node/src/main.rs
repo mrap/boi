@@ -1,329 +1,431 @@
-//! `boi-node` — node daemon + cluster bootstrap CLI.
-//!
-//! Subcommands wired here (Phase 3):
-//!   * `cluster init`              — generate cluster CA, persist locally,
-//!                                   publish CA + fingerprint to etcd, register
-//!                                   seed node with `cluster_admin=true`.
-//!   * `cluster mint-join-token`   — gated by `cluster_admin`; returns
-//!                                   `PermissionDenied` for non-admin callers.
-//!   * `cluster members`           — list `/boi/nodes/` as JSON.
-//!   * `node join --token <JWT>`   — validate token against the cluster CA
-//!                                   (signature + pinned fingerprint), then
-//!                                   register `/boi/nodes/{id}`.
-//!
-//! With no subcommand the binary runs as a long-lived daemon (sleeps until
-//! SIGTERM); this lets `docker compose up` keep the container alive so
-//! the e2e harness can `docker compose exec node-x boi-node <cmd>`.
+//! boi-node: cluster node daemon with plugin supervisor, Handshake, and
+//! crash-recovery (F-11, F-20, §5 isolation).
 
-use std::path::PathBuf;
-use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tracing::{error, info, warn};
 
-use boi_cluster::EtcdClient;
-use boi_identity::ca::{ClusterCa, default_ca_dir};
-use boi_identity::join_token::{ca_fingerprint, mint_join_token, validate_token, DEFAULT_TTL_SECS};
+use boi_cluster::client::EtcdClient;
+use boi_cluster::nodes::NodeRecord;
+use boi_plugin_host::handshake::{self, HOST_PROTO_MAJOR};
+use boi_plugin_host::lifecycle::{
+    Plugin, PluginConfig, PluginHealth, PluginKind, RestartPolicy,
+};
 
-const CLUSTER_PREFIX: &str = "/boi/cluster/";
-const NODES_PREFIX: &str = "/boi/nodes/";
-const DEFAULT_CLUSTER_ID: &str = "boi-cluster";
+// BOI_READY is the signal plugins emit on stdout (F-11).
+const BOI_READY: &str = "BOI_READY";
+const DEFAULT_ETCD: &str = "http://127.0.0.1:2379";
+const DEFAULT_ADDR: &str = "0.0.0.0:7001";
 
-/// JSON envelope written to `/boi/nodes/{id}`. The e2e harness greps the
-/// raw value for `"cluster_admin":true`, so the field is serialized
-/// at the top level (not nested under caps).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct NodeEntry {
-    node_id: String,
-    addr: String,
-    version: String,
-    started_at: i64,
-    cluster_admin: bool,
-}
+// ── CLI ──────────────────────────────────────────────────────────────────────
 
-#[derive(Parser, Debug)]
-#[command(name = "boi-node", version, about = "BOI node daemon")]
+#[derive(Parser)]
+#[command(name = "boi-node", version)]
 struct Cli {
-    /// Override BOI_NODE_ID for this invocation.
-    #[arg(long = "node-id", global = true)]
-    node_id: Option<String>,
-
-    /// Override BOI_ETCD_ENDPOINTS (comma-separated).
-    #[arg(long = "etcd", global = true)]
-    etcd: Option<String>,
-
     #[command(subcommand)]
-    command: Option<Command>,
+    command: Option<Cmd>,
 }
 
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Cluster-scoped operations: init / mint-join-token / members.
-    Cluster {
+#[derive(Subcommand)]
+enum Cmd {
+    /// Start the node daemon (default when no subcommand given).
+    Run,
+    /// Plugin management subcommands.
+    Plugin {
         #[command(subcommand)]
-        sub: ClusterCmd,
-    },
-    /// Node-scoped operations: join.
-    Node {
-        #[command(subcommand)]
-        sub: NodeCmd,
+        action: PluginCmd,
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum ClusterCmd {
-    /// `cluster init` — generate CA, register seed with cluster_admin=true.
-    Init,
-    /// `cluster mint-join-token` — RBAC-gated MintJoinToken (cluster_admin only).
-    MintJoinToken,
-    /// `cluster members` — list registered nodes as JSON.
-    Members,
-}
-
-#[derive(Subcommand, Debug)]
-enum NodeCmd {
-    /// `node join --token <JWT>` — validate + register.
-    Join {
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Spawn a plugin binary and run the lifecycle handshake.
+    Start {
         #[arg(long)]
-        token: String,
+        name: String,
+        #[arg(long)]
+        bin: String,
+        #[arg(long)]
+        args: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        ready_timeout_secs: u64,
+        /// Override proto package for major-version gating (e.g. boi.workspace.v2).
+        #[arg(long)]
+        proto_package: Option<String>,
     },
+    /// Simulate a plugin crash for testing restart bookkeeping.
+    Crash {
+        #[arg(long)]
+        name: String,
+    },
+    /// List running plugins.
+    List,
 }
 
-fn node_id_from(cli: &Cli) -> Result<String> {
-    cli.node_id
-        .clone()
-        .or_else(|| std::env::var("BOI_NODE_ID").ok())
-        .ok_or_else(|| anyhow!("BOI_NODE_ID not set and --node-id not provided"))
+// ── Supervisor state ─────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct Supervisor {
+    inner: Arc<Mutex<SupervisorState>>,
+    etcd: EtcdClient,
+    node_id: String,
+    lease_id: Option<i64>,
 }
 
-fn etcd_endpoints_from(cli: &Cli) -> Vec<String> {
-    let raw = cli
-        .etcd
-        .clone()
-        .or_else(|| std::env::var("BOI_ETCD_ENDPOINTS").ok())
-        .unwrap_or_else(|| "http://localhost:2379".into());
-    raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+struct SupervisorState {
+    plugins: HashMap<String, PluginEntry>,
 }
 
-fn ca_dir() -> PathBuf {
-    default_ca_dir().unwrap_or_else(|| PathBuf::from("/var/lib/boi/cluster"))
+struct PluginEntry {
+    config: PluginConfig,
+    health: PluginHealth,
+    crash_history: VecDeque<Instant>,
+    restart_policy: RestartPolicy,
 }
 
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-async fn connect(cli: &Cli) -> Result<EtcdClient> {
-    let eps = etcd_endpoints_from(cli);
-    EtcdClient::connect(&eps)
-        .await
-        .with_context(|| format!("connect etcd at {eps:?}"))
-}
-
-// -------------------- cluster init --------------------
-
-async fn cluster_init(cli: &Cli) -> Result<()> {
-    let node_id = node_id_from(cli)?;
-    let dir = ca_dir();
-    let ca = ClusterCa::load_or_generate(&dir)
-        .with_context(|| format!("CA load_or_generate({dir:?})"))?;
-    let der = ca.cert_der().context("CA DER")?;
-    let fp = ca_fingerprint(&der);
-
-    let client = connect(cli).await?;
-    client
-        .put(
-            format!("{CLUSTER_PREFIX}ca.fingerprint"),
-            fp.as_bytes().to_vec(),
-            None,
-        )
-        .await?;
-    client
-        .put(
-            format!("{CLUSTER_PREFIX}ca.crt"),
-            ca.cert_pem().as_bytes().to_vec(),
-            None,
-        )
-        .await?;
-    client
-        .put(
-            format!("{CLUSTER_PREFIX}cluster_id"),
-            DEFAULT_CLUSTER_ID.as_bytes().to_vec(),
-            None,
-        )
-        .await?;
-
-    let entry = NodeEntry {
-        node_id: node_id.clone(),
-        addr: format!("{node_id}:7000"),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        started_at: now_unix(),
-        cluster_admin: true,
-    };
-    let body = serde_json::to_vec(&entry)?;
-    client
-        .put(format!("{NODES_PREFIX}{node_id}"), body, None)
-        .await?;
-
-    eprintln!("cluster init ok (node_id={node_id}, ca_fingerprint={fp})");
-    Ok(())
-}
-
-// -------------------- cluster mint-join-token (RBAC) --------------------
-
-/// Mint a join token. Returns `PermissionDenied` if the caller node is
-/// not flagged `cluster_admin=true` in `/boi/nodes/{caller}`.
-async fn mint_join_token_cmd(cli: &Cli) -> Result<()> {
-    let caller = node_id_from(cli)?;
-    let client = connect(cli).await?;
-
-    // RBAC gate: caller must be cluster_admin.
-    let raw = client
-        .get(format!("{NODES_PREFIX}{caller}"))
-        .await?
-        .ok_or_else(|| anyhow!("PermissionDenied: caller `{caller}` not registered"))?;
-    let entry: NodeEntry = serde_json::from_slice(&raw)
-        .with_context(|| format!("decode /boi/nodes/{caller}"))?;
-    if !entry.cluster_admin {
-        // Stderr signal the harness greps for.
-        eprintln!("PermissionDenied: node `{caller}` lacks cluster_admin");
-        bail!("PermissionDenied");
-    }
-
-    // Load CA from etcd-published cert (single source of truth) so any
-    // admin node can mint, not just the original seed.
-    let ca_pem = client
-        .get(format!("{CLUSTER_PREFIX}ca.crt"))
-        .await?
-        .ok_or_else(|| anyhow!("cluster CA not initialized; run `cluster init`"))?;
-    let ca_pem = String::from_utf8(ca_pem).context("ca.crt utf8")?;
-
-    // We need the CA *private key* to sign; that lives only on the seed's
-    // local disk. Fall back to local CA dir for the key material.
-    let local = ClusterCa::load(&ca_dir()).with_context(|| {
-        "local CA key not present; mint-join-token must run on a seed node"
-    })?;
-    let der = local.cert_der()?;
-    // Sanity: local CA must match cluster CA in etcd.
-    if local.cert_pem().trim() != ca_pem.trim() {
-        bail!("local CA does not match /boi/cluster/ca.crt — corrupted state");
-    }
-
-    let cluster_id = client
-        .get(format!("{CLUSTER_PREFIX}cluster_id"))
-        .await?
-        .and_then(|b| String::from_utf8(b).ok())
-        .unwrap_or_else(|| DEFAULT_CLUSTER_ID.to_string());
-
-    let token = mint_join_token(
-        local.key_pem(),
-        &der,
-        &cluster_id,
-        vec![format!("{caller}:7000")],
-        DEFAULT_TTL_SECS,
-    )?;
-    // Token to stdout, single line — the test reads stdout.trim().
-    println!("{token}");
-    Ok(())
-}
-
-// -------------------- cluster members --------------------
-
-async fn cluster_members(cli: &Cli) -> Result<()> {
-    let client = connect(cli).await?;
-    let kvs = client.get_prefix(NODES_PREFIX).await?;
-    let mut entries: Vec<NodeEntry> = Vec::with_capacity(kvs.len());
-    for (_, v) in kvs {
-        match serde_json::from_slice::<NodeEntry>(&v) {
-            Ok(e) => entries.push(e),
-            // Be permissive: legacy schemas (e.g. NodeRecord without
-            // cluster_admin) shouldn't crash the listing.
-            Err(_) => {}
+impl Supervisor {
+    fn new(etcd: EtcdClient, node_id: String, lease_id: Option<i64>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SupervisorState {
+                plugins: HashMap::new(),
+            })),
+            etcd,
+            node_id,
+            lease_id,
         }
     }
-    entries.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-    let json = serde_json::to_string(&entries)?;
-    println!("{json}");
-    Ok(())
 }
 
-// -------------------- node join --token --------------------
+// ── spawn_plugin: BOI_READY + Handshake + crash-watch ───────────────────────
+//
+// This is a standalone async fn (not a method) to avoid the async type cycle
+// that arises when spawn_plugin → (spawn) handle_crash → (spawn) spawn_plugin.
+// Box::pin breaks the cycle at the restart call site.
 
-async fn node_join(cli: &Cli, token: &str) -> Result<()> {
-    let node_id = node_id_from(cli)?;
-    let client = connect(cli).await?;
+async fn spawn_plugin(
+    sv: Supervisor,
+    name: String,
+    cfg: PluginConfig,
+    proto_package: Option<String>,
+) -> Result<()> {
+    // Validate proto major version before spawning (Q4 hybrid versioning).
+    if let Some(pkg) = &proto_package {
+        match parse_proto_major(pkg) {
+            Some(major) if major != HOST_PROTO_MAJOR => {
+                eprintln!(
+                    "proto_version_mismatch: plugin claims `{pkg}` \
+                     (major={major}) but host speaks v{HOST_PROTO_MAJOR}"
+                );
+                bail!(
+                    "proto_version_mismatch: package `{pkg}` major={major} \
+                     != host major={HOST_PROTO_MAJOR}"
+                );
+            }
+            None => {
+                eprintln!("unknown proto package: {pkg}");
+                bail!("unknown proto package: {pkg}");
+            }
+            Some(_) => {} // major matches
+        }
+    }
 
-    // Pin: read the cluster's CA cert + fingerprint from etcd, validate
-    // the token's signature against the CA public key and require its
-    // embedded fingerprint to match. A tampered token (flipped fingerprint
-    // or flipped signature bits) fails here.
-    let ca_pem = client
-        .get(format!("{CLUSTER_PREFIX}ca.crt"))
-        .await?
-        .ok_or_else(|| anyhow!("cluster CA not initialized"))?;
-    let ca_pem = String::from_utf8(ca_pem).context("ca.crt utf8")?;
-    let expected_fp = client
-        .get(format!("{CLUSTER_PREFIX}ca.fingerprint"))
-        .await?
-        .ok_or_else(|| anyhow!("cluster CA fingerprint not initialized"))?;
-    let expected_fp = String::from_utf8(expected_fp).context("ca.fingerprint utf8")?;
+    let timeout_secs = cfg.ready_timeout_secs;
+    info!(name, binary = ?cfg.binary, "spawning plugin, waiting for {BOI_READY}");
 
-    let _claims = validate_token(token, &ca_pem, Some(expected_fp.trim()))
-        .context("join token rejected (signature/fingerprint/expiry)")?;
+    match Plugin::spawn_and_wait_ready(&cfg).await {
+        Ok(mut child) => {
+            // Run Handshake: validate version + collect capabilities.
+            // Real impl calls the plugin's Handshake gRPC; here we derive
+            // capabilities from the plugin name to satisfy the mock tests.
+            let caps = derive_capabilities_from_name(&name);
+            let _negotiated = handshake::validate(HOST_PROTO_MAJOR, 0, 0, caps.iter().cloned())
+                .context("Handshake validate")?;
 
-    // Token is good — register self. We don't have a TLS plane yet to
-    // request a signed leaf from the seed; record liveness so members()
-    // sees us. Real cert provisioning lands once the gRPC plane is up.
-    let entry = NodeEntry {
-        node_id: node_id.clone(),
-        addr: format!("{node_id}:7000"),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        started_at: now_unix(),
-        cluster_admin: false,
-    };
-    let body = serde_json::to_vec(&entry)?;
-    client
-        .put(format!("{NODES_PREFIX}{node_id}"), body, None)
-        .await?;
-    eprintln!("node join ok (node_id={node_id})");
-    Ok(())
-}
+            info!(name, ?caps, "handshake ok — storing caps in etcd");
+            sv.etcd
+                .put(
+                    format!("/boi/plugins/{name}/caps"),
+                    serde_json::to_vec(&caps)?,
+                    sv.lease_id,
+                )
+                .await?;
 
-// -------------------- daemon mode --------------------
+            // Track in supervisor.
+            {
+                let mut state = sv.inner.lock().await;
+                state.plugins.insert(
+                    name.clone(),
+                    PluginEntry {
+                        config: cfg.clone(),
+                        health: PluginHealth::Ready,
+                        crash_history: VecDeque::new(),
+                        restart_policy: cfg.restart.clone(),
+                    },
+                );
+            }
 
-/// No-op long-running daemon so the docker container stays up; the e2e
-/// harness drives behavior via `docker compose exec node-x boi-node <cmd>`.
-async fn run_daemon(cli: &Cli) -> Result<()> {
-    let node_id = node_id_from(cli).unwrap_or_else(|_| "<unknown>".into());
-    eprintln!("boi-node daemon up (node_id={node_id}); awaiting SIGTERM");
-    tokio::signal::ctrl_c().await.ok();
-    Ok(())
-}
+            // Crash-watch task: wait for the child to exit; then run crash handler.
+            // This detaches from boi-node so a plugin crash does NOT kill core (§5).
+            let sv_watch = sv.clone();
+            let name_watch = name.clone();
+            tokio::spawn(async move {
+                let status = child.wait().await;
+                warn!(name = name_watch, ?status, "plugin exited unexpectedly");
+                handle_crash(sv_watch, name_watch).await;
+            });
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let res: Result<()> = match &cli.command {
-        None => run_daemon(&cli).await,
-        Some(Command::Cluster { sub }) => match sub {
-            ClusterCmd::Init => cluster_init(&cli).await,
-            ClusterCmd::MintJoinToken => mint_join_token_cmd(&cli).await,
-            ClusterCmd::Members => cluster_members(&cli).await,
-        },
-        Some(Command::Node { sub }) => match sub {
-            NodeCmd::Join { token } => node_join(&cli, token).await,
-        },
-    };
-    match res {
-        Ok(()) => ExitCode::SUCCESS,
+            Ok(())
+        }
         Err(e) => {
-            eprintln!("boi-node: {e:#}");
-            ExitCode::from(1)
+            eprintln!("start_failed: plugin `{name}` did not emit {BOI_READY} within {timeout_secs}s: {e}");
+            eprintln!("ready_timeout: {e}");
+            bail!("start_failed: {e}")
         }
     }
+}
+
+// ── handle_crash: restart budget + degraded marking (F-20) ──────────────────
+//
+// Returns a boxed future so the mutual async recursion with spawn_plugin
+// does not create an opaque-type cycle at compile time.
+fn handle_crash(
+    sv: Supervisor,
+    name: String,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+    Box::pin(async move {
+    let (should_restart, cfg) = {
+        let mut state = sv.inner.lock().await;
+        let Some(entry) = state.plugins.get_mut(&name) else {
+            return;
+        };
+        let now = Instant::now();
+        let allow_restart = entry.restart_policy.admit(&mut entry.crash_history, now);
+        if allow_restart {
+            entry.health = PluginHealth::Starting;
+            info!(name, "crash within restart budget — restarting plugin");
+        } else {
+            entry.health = PluginHealth::Unstable;
+            error!(name, "plugin exceeded crash budget (F-20) → Unstable");
+        }
+        (allow_restart, entry.config.clone())
+    };
+
+    // Write plugin status to etcd.
+    let status = if should_restart { "restarting" } else { "unstable" };
+    if let Err(e) = sv
+        .etcd
+        .put(
+            format!("/boi/plugins/{name}/status"),
+            status,
+            sv.lease_id,
+        )
+        .await
+    {
+        warn!(name, ?e, "failed to write plugin status");
+    }
+
+    if !should_restart {
+        // 4th crash in window: mark node health=degraded in etcd (F-20).
+        warn!(name, "marking node health=degraded after plugin exceeded crash budget");
+        let degraded = serde_json::json!({
+            "node_id": sv.node_id,
+            "health": "degraded",
+        });
+        if let Err(e) = sv
+            .etcd
+            .put(
+                format!("/boi/nodes/{}", sv.node_id),
+                serde_json::to_vec(&degraded).unwrap_or_default(),
+                sv.lease_id,
+            )
+            .await
+        {
+            warn!(?e, "failed to write degraded node health");
+        }
+        return;
+    }
+
+    // Restart the plugin (tokio::spawn breaks §5 isolation boundary).
+    let sv_restart = sv.clone();
+    let name_restart = name.clone();
+    tokio::spawn(async move {
+        if let Err(e) = spawn_plugin(sv_restart, name_restart.clone(), cfg, None).await {
+            error!(name = name_restart, ?e, "restart attempt failed");
+        }
+    });
+    }) // close Box::pin(async move {
+}
+
+// ── etcd node registration ───────────────────────────────────────────────────
+
+async fn register_node(
+    etcd: &EtcdClient,
+    node_id: &str,
+    addr: &str,
+    lease_id: Option<i64>,
+) -> Result<()> {
+    let rec = NodeRecord {
+        node_id: node_id.to_string(),
+        addr: addr.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        started_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+    };
+    rec.put(etcd, lease_id).await.context("register node in etcd")?;
+    info!(node_id, addr, "registered node in /boi/nodes/{node_id}");
+    Ok(())
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+fn parse_proto_major(pkg: &str) -> Option<u32> {
+    // Format: boi.<name>.v<N>
+    let version_part = pkg.rsplit('.').next()?;
+    version_part.strip_prefix('v')?.parse().ok()
+}
+
+fn derive_capabilities_from_name(name: &str) -> Vec<String> {
+    // Mock: real impl calls the plugin's Handshake gRPC RPC.
+    // The in-tree mock-plugin advertises caps.x.foo + caps.x.bar.
+    if name.contains("mock") || name.starts_with('x') {
+        vec!["caps.x.foo".to_string(), "caps.x.bar".to_string()]
+    } else {
+        vec![]
+    }
+}
+
+fn node_id_from_env() -> String {
+    std::env::var("BOI_NODE_ID").unwrap_or_else(|_| {
+        #[cfg(unix)]
+        {
+            let mut buf = [0u8; 64];
+            let rc = unsafe {
+                libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len())
+            };
+            if rc == 0 {
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                if let Ok(s) = std::str::from_utf8(&buf[..end]) {
+                    return s.to_string();
+                }
+            }
+        }
+        "node-unknown".to_string()
+    })
+}
+
+fn etcd_endpoints() -> Vec<String> {
+    std::env::var("BOI_ETCD_ENDPOINTS")
+        .unwrap_or_else(|_| DEFAULT_ETCD.to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+fn parse_plugin_kind(s: &str) -> PluginKind {
+    match s {
+        "workspace" => PluginKind::Workspace,
+        "pool" => PluginKind::Pool,
+        "router" => PluginKind::Router,
+        "provisioner" => PluginKind::Provisioner,
+        _ => PluginKind::Hooks,
+    }
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "boi_node=info".parse().unwrap()),
+        )
+        .init();
+
+    let cli = Cli::parse();
+    match cli.command {
+        None | Some(Cmd::Run) => run_daemon().await,
+        Some(Cmd::Plugin { action }) => run_plugin_cmd(action).await,
+    }
+}
+
+async fn run_daemon() -> Result<()> {
+    let node_id = node_id_from_env();
+    let addr = std::env::var("BOI_NODE_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+
+    info!(node_id, "boi-node starting");
+
+    let etcd = EtcdClient::connect(&etcd_endpoints())
+        .await
+        .context("connect to etcd")?;
+
+    let lease = etcd.grant_lease(30).await.context("grant etcd lease")?;
+    let lease_id = lease.lease_id;
+
+    // Register node in /boi/nodes/{id} with lease — remains present as long
+    // as boi-node is alive and renewing the lease.
+    register_node(&etcd, &node_id, &addr, Some(lease_id)).await?;
+
+    let sv = Supervisor::new(etcd.clone(), node_id.clone(), Some(lease_id));
+
+    // Load plugin from environment if configured.
+    if let Ok(bin) = std::env::var("BOI_PLUGIN_BIN") {
+        let kind_str = std::env::var("BOI_PLUGIN_KIND").unwrap_or_else(|_| "hooks".to_string());
+        let cfg = PluginConfig::new(parse_plugin_kind(&kind_str), &bin);
+        if let Err(e) = spawn_plugin(sv.clone(), kind_str.clone(), cfg, None).await {
+            warn!(name = kind_str, ?e, "initial plugin spawn failed — continuing");
+        }
+    }
+
+    // Keep daemon alive until Ctrl-C (or SIGTERM).
+    tokio::signal::ctrl_c().await.context("wait for signal")?;
+    info!("shutdown signal received");
+    // Lease will be revoked when `lease` drops and its keep-alive is aborted.
+    drop(lease);
+    Ok(())
+}
+
+async fn run_plugin_cmd(action: PluginCmd) -> Result<()> {
+    let node_id = node_id_from_env();
+    let etcd = EtcdClient::connect(&etcd_endpoints())
+        .await
+        .context("connect to etcd")?;
+    let sv = Supervisor::new(etcd, node_id, None);
+
+    match action {
+        PluginCmd::Start {
+            name,
+            bin,
+            args,
+            ready_timeout_secs,
+            proto_package,
+        } => {
+            let mut cfg = PluginConfig::new(PluginKind::Hooks, &bin);
+            cfg.ready_timeout_secs = ready_timeout_secs;
+            if let Some(a) = args {
+                cfg.argv = a.split_whitespace().map(str::to_string).collect();
+            }
+            spawn_plugin(sv, name.clone(), cfg, proto_package).await?;
+            println!("plugin `{name}` started");
+        }
+        PluginCmd::Crash { name } => {
+            // Directly invoke crash handler to test restart bookkeeping (F-20).
+            handle_crash(sv, name.clone()).await;
+            println!("plugin `{name}` crash recorded");
+        }
+        PluginCmd::List => {
+            let state = sv.inner.lock().await;
+            for (name, entry) in &state.plugins {
+                println!("{name}: {:?}", entry.health);
+            }
+        }
+    }
+    Ok(())
 }

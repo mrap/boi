@@ -401,12 +401,23 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "boi-cluster",
+<<<<<<< HEAD
  "boi-identity",
  "clap",
  "hex",
  "serde",
  "serde_json",
  "tokio",
+=======
+ "boi-plugin-host",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+>>>>>>> boi/S0B41
 ]
 
 [[package]]

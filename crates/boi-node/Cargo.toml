@@ -8,6 +8,7 @@ name = "boi-node"
 path = "src/main.rs"
 
 [dependencies]
+<<<<<<< HEAD
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
@@ -16,3 +17,17 @@ serde_json = "1"
 hex = "0.4"
 boi-cluster = { path = "../boi-cluster" }
 boi-identity = { path = "../boi-identity" }
+=======
+boi-plugin-host = { path = "../boi-plugin-host" }
+boi-cluster = { path = "../boi-cluster" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "signal"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+>>>>>>> boi/S0B41
