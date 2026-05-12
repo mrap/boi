@@ -1,0 +1,8 @@
+[package]
+name = "boi-node"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "boi-node"
+path = "src/main.rs"
