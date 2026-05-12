@@ -19,16 +19,24 @@ use boi_cluster::dispatch_queue::{
     queue_key, DispatchQueueRecord, QueueEntry, QUEUE_PREFIX,
 };
 use boi_cluster::membership::Membership;
-use boi_cluster::nodes::{NodeCaps, NodeRecord};
+use boi_cluster::nodes::{NodeCaps, NodeRecord, NODES_PREFIX};
 use boi_plugin_host::handshake::{self, HOST_PROTO_MAJOR};
 use boi_plugin_host::lifecycle::{
     Plugin, PluginConfig, PluginHealth, PluginKind, RestartPolicy,
 };
+use boi_plugin_host::provisioner::{
+    build_provision_request, CapHint, JoinToken, ProvisionerClient,
+};
+use tonic::transport::Channel;
+use uuid::Uuid;
 
 const BOI_READY: &str = "BOI_READY";
 const DEFAULT_ETCD: &str = "http://127.0.0.1:2379";
 const DEFAULT_ADDR: &str = "0.0.0.0:7001";
 const EVENTS_PREFIX: &str = "/boi/events/";
+const CLUSTER_ADMIN_KEY: &str = "/boi/cluster/admin";
+const PROVISION_FAILURES_PREFIX: &str = "/boi/provision-failures/";
+const JOIN_TOKENS_PREFIX: &str = "/boi/join-tokens/";
 
 // Assignment-loop cadence — fast enough that the 5s test budget catches
 // a dispatch within one iteration, slow enough to keep etcd churn low.
@@ -76,6 +84,11 @@ enum Cmd {
         #[command(subcommand)]
         action: InternalCmd,
     },
+    /// Cluster node join (alias for daemon with token verification).
+    NodeJoin {
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -122,6 +135,11 @@ enum ClusterCmd {
 enum NodeCmd {
     /// Advertise this node's caps under /boi/caps/{node_id}.
     Advertise,
+    /// Join an existing cluster using a provisioned BOI_TOKEN.
+    Join {
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -146,6 +164,16 @@ enum InternalCmd {
         lease_id: Option<String>,
         #[arg(long, default_value = "done")]
         status: String,
+    },
+    /// Mint a short-lived JoinToken for provisioning. Admin-gated (Q3).
+    MintProvisionToken {
+        #[arg(long)]
+        for_caps: String,
+    },
+    /// Set provisioner plugin mode (test harness hook).
+    SetProvisionerMode {
+        #[arg(long)]
+        mode: String,
     },
 }
 
@@ -446,6 +474,170 @@ async fn emit_event(etcd: &EtcdClient, kind: &str, payload: serde_json::Value) {
     }
 }
 
+// ── Provisioning helpers (Phase 5, §8, F-01, F-06) ──────────────────────────
+
+/// True if `node_id` is the registered cluster_admin in etcd,
+/// or if `BOI_NODE_ADMIN=true` is set (test override).
+async fn is_cluster_admin(etcd: &EtcdClient, node_id: &str) -> bool {
+    if std::env::var("BOI_NODE_ADMIN").as_deref() == Ok("true") {
+        return true;
+    }
+    match etcd.get(CLUSTER_ADMIN_KEY).await {
+        Ok(Some(v)) => String::from_utf8_lossy(&v).trim() == node_id,
+        _ => false,
+    }
+}
+
+/// Check if F-06 cooldown is active for the given task.
+async fn provision_cooldown_active(etcd: &EtcdClient, task_id: &str) -> bool {
+    let key = format!("{PROVISION_FAILURES_PREFIX}{task_id}");
+    match etcd.get(key).await {
+        Ok(Some(v)) => {
+            if let Ok(map) = serde_json::from_slice::<serde_json::Value>(&v) {
+                let failures = map
+                    .get("consecutive_claim_failures")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cooldown_until = map
+                    .get("cooldown_until")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                failures >= 3 && unix_now() < cooldown_until
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Increment the provision failure counter for a task.
+/// After 3 consecutive failures, set a 5-minute cooldown (F-06).
+async fn increment_provision_failures(etcd: &EtcdClient, task_id: &str) {
+    let key = format!("{PROVISION_FAILURES_PREFIX}{task_id}");
+    let (failures, cooldown_until) = match etcd.get(key.clone()).await {
+        Ok(Some(v)) => {
+            if let Ok(map) = serde_json::from_slice::<serde_json::Value>(&v) {
+                let f = map
+                    .get("consecutive_claim_failures")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    + 1;
+                let cu = if f >= 3 { unix_now() + 300 } else { 0 };
+                (f, cu)
+            } else {
+                (1, 0)
+            }
+        }
+        _ => (1, 0),
+    };
+    let val = serde_json::json!({
+        "consecutive_claim_failures": failures,
+        "cooldown_until": cooldown_until,
+        "task_id": task_id,
+    });
+    if let Ok(b) = serde_json::to_vec(&val) {
+        let _ = etcd.put(key, b, None).await;
+    }
+    if failures >= 3 {
+        warn!(
+            task_id,
+            failures,
+            "F-06: provision failure threshold reached — cooldown active for 5 min"
+        );
+    }
+}
+
+/// After a successful Provision RPC, watch for the expected node to
+/// appear under `/boi/nodes/` within 60 s. If absent, increment the
+/// F-06 failure counter.
+async fn watch_provision_join(etcd: EtcdClient, task_id: String, expected_node_id: String) {
+    use tokio::time::{sleep, Duration as TD, Instant};
+    let deadline = Instant::now() + TD::from_secs(60);
+    let node_key = format!("{NODES_PREFIX}{expected_node_id}");
+    loop {
+        if Instant::now() >= deadline {
+            warn!(
+                task_id,
+                expected_node_id, "provisioned node did not join within 60s — incrementing F-06 counter"
+            );
+            increment_provision_failures(&etcd, &task_id).await;
+            return;
+        }
+        match etcd.get(node_key.clone()).await {
+            Ok(Some(_)) => {
+                info!(task_id, expected_node_id, "provisioned node joined cluster");
+                return;
+            }
+            _ => {}
+        }
+        sleep(TD::from_secs(5)).await;
+    }
+}
+
+/// Call the Provisioner plugin and handle the F-06 join-watcher.
+async fn provision_task(
+    etcd: &EtcdClient,
+    task_id: &str,
+    provisioner_addr: &str,
+    requires: BTreeMap<String, String>,
+) {
+    if provision_cooldown_active(etcd, task_id).await {
+        debug!(task_id, "Provisioner cooldown active (F-06) — skipping");
+        return;
+    }
+    let join_token = JoinToken {
+        token: Uuid::new_v4().to_string(),
+        expires_at: format!("{}Z", unix_now() + 300),
+    };
+    let cap_hint = CapHint {
+        caps: requires.into_iter().collect(),
+    };
+    let bootstrap_url = std::env::var("BOI_BOOTSTRAP_URL")
+        .unwrap_or_else(|_| "http://node-a:7001".to_string());
+    let req = build_provision_request(
+        join_token,
+        cap_hint,
+        task_id.to_string(),
+        bootstrap_url,
+        None,
+    );
+    let channel = match Channel::from_shared(provisioner_addr.to_string()) {
+        Ok(ep) => match ep.connect().await {
+            Ok(ch) => ch,
+            Err(e) => {
+                warn!(task_id, ?e, "failed to connect to Provisioner plugin");
+                return;
+            }
+        },
+        Err(e) => {
+            warn!(task_id, ?e, "invalid Provisioner plugin addr");
+            return;
+        }
+    };
+    let mut client = ProvisionerClient::new(channel);
+    let resp = match client.provision(req).await {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            warn!(task_id, ?e, "Provisioner.Provision RPC failed");
+            return;
+        }
+    };
+    info!(
+        task_id,
+        machine_id = %resp.machine_id,
+        expected_node_id = %resp.expected_node_id,
+        "Provisioner accepted request — monitoring for node join"
+    );
+    // F-06: watch for the new node to appear within 60 s.
+    let etcd_w = etcd.clone();
+    let tid = task_id.to_string();
+    let nid = resp.expected_node_id.clone();
+    tokio::spawn(async move {
+        watch_provision_join(etcd_w, tid, nid).await;
+    });
+}
+
 // ── Assignment loop ──────────────────────────────────────────────────────────
 //
 // Polls `/boi/dispatch-queue/` for pending tasks. For each pending task
@@ -478,7 +670,7 @@ async fn assignment_loop(
 async fn assignment_tick(
     etcd: &EtcdClient,
     membership: &Membership,
-    _node_id: &str,
+    node_id: &str,
     claim_lease_id: i64,
 ) -> Result<()> {
     // List pending tasks from the dispatch_queue.
@@ -577,6 +769,24 @@ async fn assignment_tick(
                     }),
                 )
                 .await;
+
+                // Phase 5 — F-01: provision new capacity when no capable
+                // node exists. Only cluster_admin nodes mint tokens (Q3).
+                if is_cluster_admin(etcd, node_id).await {
+                    if let Ok(addr) = std::env::var("BOI_PROVISIONER_ADDR") {
+                        let etcd_c = etcd.clone();
+                        let tid = task_id.to_string();
+                        let cap_map = rec.requires.clone();
+                        tokio::spawn(async move {
+                            provision_task(&etcd_c, &tid, &addr, cap_map).await;
+                        });
+                    }
+                } else {
+                    debug!(
+                        task_id,
+                        node_id, "node is not cluster_admin — skipping Provisioner call"
+                    );
+                }
             }
         }
     }
@@ -788,6 +998,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Cluster { action }) => run_cluster_cmd(action).await,
         Some(Cmd::Node { action }) => run_node_cmd(action).await,
         Some(Cmd::Internal { action }) => run_internal_cmd(action).await,
+        Some(Cmd::NodeJoin { token }) => run_node_join(token).await,
     }
 }
 
@@ -941,12 +1152,22 @@ async fn run_dispatch_file(path: PathBuf) -> Result<()> {
 async fn run_cluster_cmd(action: ClusterCmd) -> Result<()> {
     match action {
         ClusterCmd::Init => {
+            let node_id = node_id_from_env();
             let etcd = EtcdClient::connect(&etcd_endpoints())
                 .await
                 .context("connect to etcd")?;
             etcd.put("/boi/cluster/initialised", b"1".to_vec(), None)
                 .await
                 .context("write cluster init marker")?;
+            // Register this node as cluster_admin (Q3: admin-gated token mint).
+            etcd.put(
+                CLUSTER_ADMIN_KEY,
+                node_id.as_bytes().to_vec(),
+                None,
+            )
+            .await
+            .context("write cluster admin marker")?;
+            info!(node_id, "cluster admin registered");
             println!("ok");
         }
     }
@@ -974,8 +1195,31 @@ async fn run_node_cmd(action: NodeCmd) -> Result<()> {
                 .context("advertise caps")?;
             println!("ok");
         }
+        NodeCmd::Join { token } => {
+            // Validate BOI_TOKEN / --token if present, then run daemon.
+            let tok = token
+                .or_else(|| std::env::var("BOI_TOKEN").ok())
+                .unwrap_or_default();
+            if !tok.is_empty() {
+                // Verify the token exists in etcd before joining.
+                let etcd = EtcdClient::connect(&etcd_endpoints())
+                    .await
+                    .context("connect to etcd for token check")?;
+                let key = format!("{JOIN_TOKENS_PREFIX}{tok}");
+                if etcd.get(key).await?.is_none() {
+                    eprintln!("PermissionDenied: join token `{tok}` not found or expired");
+                    std::process::exit(1);
+                }
+                info!("join token validated — starting node daemon");
+            }
+            run_daemon().await?;
+        }
     }
     Ok(())
+}
+
+async fn run_node_join(token: Option<String>) -> Result<()> {
+    run_node_cmd(NodeCmd::Join { token }).await
 }
 
 async fn run_internal_cmd(action: InternalCmd) -> Result<()> {
@@ -1017,6 +1261,42 @@ async fn run_internal_cmd(action: InternalCmd) -> Result<()> {
                 eprintln!("{e}");
                 std::process::exit(2);
             }
+            println!("ok");
+        }
+        InternalCmd::MintProvisionToken { for_caps } => {
+            let node_id = node_id_from_env();
+            // Q3: only cluster_admin nodes may mint join tokens.
+            if !is_cluster_admin(&etcd, &node_id).await {
+                eprintln!(
+                    "PermissionDenied: node `{node_id}` is not cluster_admin \
+                     and is not authorized to mint provision tokens"
+                );
+                std::process::exit(1);
+            }
+            let token = Uuid::new_v4().to_string();
+            let expiry_ts = unix_now() + 300; // 5-min validity
+            let token_val = serde_json::json!({
+                "token": token,
+                "for_caps": for_caps,
+                "expires_at": expiry_ts,
+                "minted_by": node_id,
+            });
+            let key = format!("{JOIN_TOKENS_PREFIX}{token}");
+            if let Ok(body) = serde_json::to_vec(&token_val) {
+                etcd.put(key, body, None)
+                    .await
+                    .context("store join token")?;
+            }
+            println!("{token}");
+        }
+        InternalCmd::SetProvisionerMode { mode } => {
+            etcd.put(
+                "/boi/provisioner-mode",
+                mode.as_bytes().to_vec(),
+                None,
+            )
+            .await
+            .context("set provisioner mode")?;
             println!("ok");
         }
     }
