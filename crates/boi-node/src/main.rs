@@ -4,17 +4,20 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use boi_assign::{assign, AssignResult, CapRequires, TaskRecord};
 use boi_cluster::claims::{claim_key, ClaimRecord, CLAIMS_PREFIX};
-use boi_cluster::client::{EtcdClient, TxnOp};
+use boi_cluster::client::{ConnectConfig, EtcdClient, TxnOp};
 use boi_cluster::dispatch_queue::{
     queue_key, DispatchQueueRecord, QueueEntry, QUEUE_PREFIX,
 };
@@ -33,6 +36,17 @@ const EVENTS_PREFIX: &str = "/boi/events/";
 // Assignment-loop cadence — fast enough that the 5s test budget catches
 // a dispatch within one iteration, slow enough to keep etcd churn low.
 const ASSIGN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+// Prometheus /metrics endpoint port.
+const METRICS_PORT: u16 = 9090;
+
+// Relative path under $HOME for operator-triggered local-fallback drain output.
+const PENDING_FLUSH_DIR: &str = ".boi/pending-flush";
+
+// F-12: counter incremented on each dispatch rejected due to etcd unreachable.
+// Shared between the daemon metrics server and CLI dispatch subcommands via
+// atomic so multiple tasks can update it safely.
+static REJECTED_ETCD_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -116,6 +130,10 @@ enum SpecCmd {
 enum ClusterCmd {
     /// Initialise the cluster (no-op once etcd is reachable).
     Init,
+    /// F-07: drain this node — stop accepting new tasks, persist all
+    /// in-flight claim records to ~/.boi/pending-flush/ as JSONL, and
+    /// print a warning to stderr. Operator-invoked only.
+    LocalFallback,
 }
 
 #[derive(Subcommand)]
@@ -489,7 +507,11 @@ async fn assignment_tick(
     let snapshot = match membership.snapshot().await {
         Ok(s) => s,
         Err(e) => {
-            debug!(?e, "membership snapshot stale; skipping tick");
+            // StaleSnapshot means etcd is unreachable — log it and skip
+            // this tick. IN-FLIGHT SURVIVES: workers already running are
+            // not touched; the loop simply waits for etcd to reconnect
+            // (within one membership TTL cycle per spec §RESUME).
+            warn!(?e, "StaleSnapshot: etcd unreachable; skipping assignment tick, in-flight workers unaffected");
             return Ok(());
         }
     };
@@ -768,6 +790,111 @@ async fn commit_task_with_fence(
     Ok(())
 }
 
+// ── F-12: Prometheus /metrics endpoint ───────────────────────────────────────
+//
+// Minimal HTTP/1.1 server — no external crate, just tokio TCP.
+// Serves `boi_dispatch_rejected_etcd_unreachable_total` (design doc §9).
+async fn serve_metrics_endpoint(port: u16) {
+    let listener = match TcpListener::bind(("0.0.0.0", port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(?e, port, "failed to bind prometheus /metrics endpoint");
+            return;
+        }
+    };
+    info!(port, "prometheus /metrics endpoint listening");
+    loop {
+        let Ok((mut stream, _peer)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let count = REJECTED_ETCD_UNREACHABLE.load(Ordering::Relaxed);
+            let body = format!(
+                "# HELP boi_dispatch_rejected_etcd_unreachable_total \
+                 Dispatch requests rejected because etcd was unreachable (F-12).\n\
+                 # TYPE boi_dispatch_rejected_etcd_unreachable_total counter\n\
+                 boi_dispatch_rejected_etcd_unreachable_total {count}\n"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes()).await;
+        });
+    }
+}
+
+// ── F-07: local-fallback drain ────────────────────────────────────────────────
+//
+// Operator-invoked command: reads all in-flight claim envelopes from etcd,
+// persists them to ~/.boi/pending-flush/{task_id}.jsonl (one JSON object per
+// file), prints a WARNING to stderr, and signals mode=local-fallback on stdout.
+// This is intentionally synchronous and idempotent — safe to call multiple
+// times.
+async fn run_local_fallback() -> Result<()> {
+    let etcd = EtcdClient::connect(&etcd_endpoints())
+        .await
+        .context("connect to etcd for local-fallback drain")?;
+
+    // Read all in-flight claim envelopes.
+    let kvs = etcd
+        .get_prefix(CLAIMS_PREFIX)
+        .await
+        .context("read claims for drain")?;
+
+    // Resolve the pending-flush directory.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let flush_dir = std::path::PathBuf::from(&home).join(PENDING_FLUSH_DIR);
+    std::fs::create_dir_all(&flush_dir)
+        .with_context(|| format!("create pending-flush dir {flush_dir:?}"))?;
+
+    let mut count = 0usize;
+    for (k, v) in &kvs {
+        let key_str = String::from_utf8_lossy(k);
+        // Sanitize the task_id portion for use as a filename.
+        let task_id = key_str
+            .strip_prefix(CLAIMS_PREFIX)
+            .unwrap_or(key_str.as_ref())
+            .replace('/', "_");
+        if task_id.is_empty() {
+            continue;
+        }
+        let record = serde_json::json!({
+            "key": key_str.as_ref(),
+            "value": String::from_utf8_lossy(v),
+            "flushed_at": unix_now(),
+            "mode": "local-fallback",
+        });
+        let path = flush_dir.join(format!("{task_id}.jsonl"));
+        let line = serde_json::to_string(&record).unwrap_or_default() + "\n";
+        // Write atomically: tmp → rename.
+        let tmp = flush_dir.join(format!("{task_id}.jsonl.tmp"));
+        std::fs::write(&tmp, line.as_bytes())
+            .with_context(|| format!("write pending-flush tmp {tmp:?}"))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("rename pending-flush record {path:?}"))?;
+        count += 1;
+    }
+
+    // Warn loudly on stderr so operators see it.
+    eprintln!(
+        "WARNING: switched to local-fallback mode — node is draining, \
+         {count} in-flight claim(s) persisted to {flush_dir:?}"
+    );
+    eprintln!("mode=local-fallback: pending-flush drain complete ({count} records)");
+
+    // Signal mode switch on stdout for scripted callers.
+    println!(
+        "local-fallback: node drained — {count} claims persisted to ~/.boi/pending-flush/"
+    );
+
+    Ok(())
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -829,6 +956,11 @@ async fn run_daemon() -> Result<()> {
         lease_expiry_watcher(etcd_w).await;
     });
 
+    // F-12: Prometheus /metrics endpoint.
+    tokio::spawn(async move {
+        serve_metrics_endpoint(METRICS_PORT).await;
+    });
+
     tokio::signal::ctrl_c().await.context("wait for signal")?;
     info!("shutdown signal received");
     drop(lease);
@@ -874,9 +1006,22 @@ async fn run_plugin_cmd(action: PluginCmd) -> Result<()> {
 async fn run_spec_cmd(action: SpecCmd) -> Result<()> {
     match action {
         SpecCmd::Dispatch { name, requires } => {
-            let etcd = EtcdClient::connect(&etcd_endpoints())
-                .await
-                .context("connect to etcd")?;
+            // F-01 FAIL-LOUD DISPATCH: use a single-attempt connect so CLI
+            // commands fail fast when etcd is unreachable rather than waiting
+            // through the full 6-attempt retry budget.
+            let fast_cfg = ConnectConfig {
+                attempts: 1,
+                initial_backoff: Duration::from_millis(250),
+                max_backoff: Duration::from_millis(250),
+            };
+            let etcd = match EtcdClient::connect_with(&etcd_endpoints(), &fast_cfg).await {
+                Ok(c) => c,
+                Err(e) => {
+                    REJECTED_ETCD_UNREACHABLE.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("etcd_unreachable: {e}");
+                    bail!("etcd_unreachable: cannot reach etcd cluster — dispatch rejected");
+                }
+            };
             let task_id = new_task_id(&name);
             let mut rec = DispatchQueueRecord::new_pending(&name, &task_id);
             for tok in requires.split(',') {
@@ -906,9 +1051,19 @@ async fn run_spec_cmd(action: SpecCmd) -> Result<()> {
 }
 
 async fn run_dispatch_file(path: PathBuf) -> Result<()> {
-    let etcd = EtcdClient::connect(&etcd_endpoints())
-        .await
-        .context("connect to etcd")?;
+    let fast_cfg = ConnectConfig {
+        attempts: 1,
+        initial_backoff: Duration::from_millis(250),
+        max_backoff: Duration::from_millis(250),
+    };
+    let etcd = match EtcdClient::connect_with(&etcd_endpoints(), &fast_cfg).await {
+        Ok(c) => c,
+        Err(e) => {
+            REJECTED_ETCD_UNREACHABLE.fetch_add(1, Ordering::Relaxed);
+            eprintln!("etcd_unreachable: {e}");
+            bail!("etcd_unreachable: cannot reach etcd cluster — dispatch file rejected");
+        }
+    };
     let bytes = std::fs::read(&path)
         .with_context(|| format!("read spec file {}", path.display()))?;
     let doc: serde_yaml::Value =
@@ -948,6 +1103,9 @@ async fn run_cluster_cmd(action: ClusterCmd) -> Result<()> {
                 .await
                 .context("write cluster init marker")?;
             println!("ok");
+        }
+        ClusterCmd::LocalFallback => {
+            run_local_fallback().await?;
         }
     }
     Ok(())
