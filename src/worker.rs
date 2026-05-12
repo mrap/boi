@@ -1784,6 +1784,15 @@ pub fn emit_boi_phase_verdict(
         json!({"severity": f.severity, "category": f.category})
     }).collect();
 
+    // Resolve model with a fallback chain: explicit arg (from RuntimeOutput, only set
+    // on LLM phases) → effective phase config (carries phase_overrides) → sentinel.
+    // Without this fallback, verify-phase telemetry (task-verify, doc-update, ...)
+    // logs `"model": null` because PhaseMetrics::default() in the non-Claude path
+    // leaves model unset. See s1c7d-t02ec-timeout-deepdive-2026-05-12.md side-finding.
+    let resolved_model: &str = model
+        .or(phase.model.as_deref())
+        .unwrap_or("unknown");
+
     let event = json!({
         "event": "boi.phase.verdict",
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -1799,7 +1808,7 @@ pub fn emit_boi_phase_verdict(
             "suggestion": n_suggestion,
         },
         "duration_ms": elapsed_ms,
-        "model": model,
+        "model": resolved_model,
     });
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -2204,6 +2213,86 @@ mod tests {
         assert_eq!(n_crit, 0);
         assert_eq!(n_imp, 0);
         assert_eq!(n_sug, 0);
+    }
+
+    fn make_phase_with_signals(name: &str, model: Option<&str>) -> crate::phases::PhaseConfig {
+        crate::phases::PhaseConfig {
+            name: name.into(),
+            level: crate::phases::PhaseLevel::Task,
+            description: "test".into(),
+            prompt_template: String::new(),
+            timeout_minutes: Some(5),
+            retry_count: None,
+            can_add_tasks: false,
+            can_fail_spec: false,
+            requires_claude: false,
+            runtime: None,
+            completion_handler: None,
+            approve_signal: Some("## Approved".into()),
+            reject_signal: Some("[REJECT]".into()),
+            on_approve: None,
+            on_reject: None,
+            on_crash: None,
+            min_lines_changed: None,
+            model: model.map(String::from),
+            code_model: None,
+            effort: None,
+            hooks_pre: vec![],
+            hooks_post: vec![],
+        }
+    }
+
+    /// Regression test for the T4417 side-finding documented in
+    /// projects/boi-internal-ship/s1c7d-t02ec-timeout-deepdive-2026-05-12.md:
+    /// boi.phase.verdict events were emitting `"duration_ms": 0` and
+    /// `"model": null` for verify-path phases (task-verify, doc-update, ...).
+    /// The bug was that `PhaseMetrics` returned from non-Claude paths leaves
+    /// `model` unset, so the call site passed `None` straight through to the
+    /// emission JSON. The fix adds a fallback chain: arg → phase.model → "unknown".
+    #[test]
+    fn test_phase_verdict_emits_real_duration_and_non_null_model() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = test_utils::test_file("phase-verdict-emit", "dir");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create tmp home");
+
+        let old_home = std::env::var("HOME").ok();
+        // SAFETY: ENV_LOCK held — see with_test_env for the same pattern.
+        unsafe { std::env::set_var("HOME", &tmp); }
+
+        // Pre-fix bug reproducer: model arg is None (matches verify-path
+        // PhaseMetrics::default()) AND phase.model is None. Before the fix,
+        // this produced `"model": null` in the emitted JSON.
+        let phase = make_phase_with_signals("task-verify", None);
+        let verdict = crate::phases::Verdict::Proceed;
+        emit_boi_phase_verdict(&phase, "S0TEST", Some("TFAKE"), Some(1), &verdict, "", None, 4242);
+
+        let jsonl_path = tmp.join(".boi").join("telemetry").join("boi.jsonl");
+        let contents = std::fs::read_to_string(&jsonl_path)
+            .expect("telemetry jsonl should have been written");
+
+        // SAFETY: ENV_LOCK still held; restore HOME before asserting so a
+        // panic doesn't leak the override into another test.
+        unsafe {
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        let line = contents.lines().last().expect("at least one event line");
+        let v: serde_json::Value = serde_json::from_str(line).expect("valid json");
+
+        assert_eq!(v["event"], "boi.phase.verdict");
+        // duration_ms must reflect the real elapsed time, not 0.
+        assert_eq!(v["duration_ms"], 4242, "duration_ms must not be hardcoded 0");
+        assert_ne!(v["duration_ms"], 0, "duration_ms must not be 0");
+        // model must not be null — fallback to phase.model or sentinel.
+        assert!(!v["model"].is_null(), "model must not be null; got {}", v["model"]);
+        assert!(
+            v["model"].as_str().is_some_and(|s| !s.is_empty()),
+            "model must be a non-empty string; got {}", v["model"]
+        );
     }
 
     #[test]

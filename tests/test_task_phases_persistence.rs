@@ -20,6 +20,7 @@ fn make_spec_with_phases() -> BoiSpec {
         context_files: None,
         phase_overrides: std::collections::HashMap::new(),
         worker_pool: None,
+        workspace_rationale: None,
         max_cost_usd: None,
         key_artifacts: None,
         tasks: vec![BoiTask {
