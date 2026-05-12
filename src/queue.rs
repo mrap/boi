@@ -473,7 +473,7 @@ impl Queue {
         Ok(id)
     }
 
-    /// Returns the highest-priority queued spec whose depends_on (if any) is completed.
+    /// Returns the highest-priority queued spec whose every depends_on dependency (if any) is completed.
     /// Atomically sets the spec status to 'assigning' to prevent double-dispatch.
     pub fn dequeue(&self) -> Result<Option<SpecRecord>> {
         let tx = self.conn.unchecked_transaction()?;
