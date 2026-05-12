@@ -88,6 +88,8 @@ pub struct PhaseConfig {
     pub on_crash: Option<String>,
     pub min_lines_changed: Option<u32>,
     pub model: Option<String>,
+    // DEPRECATED: parsed from TOML for backwards compatibility but never read after construction.
+    // Setting this in a phase.toml has no effect — use `model` instead.
     pub code_model: Option<String>,
     pub effort: Option<String>,
     pub hooks_pre: Vec<String>,
@@ -146,6 +148,7 @@ struct WorkerSection {
     runtime: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    // Kept for TOML backwards compatibility; value is stored in PhaseConfig but never consumed.
     #[serde(default)]
     code_model: Option<String>,
 }
