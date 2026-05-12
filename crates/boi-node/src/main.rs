@@ -147,6 +147,12 @@ enum ClusterCmd {
     /// in-flight claim records to ~/.boi/pending-flush/ as JSONL, and
     /// print a warning to stderr. Operator-invoked only.
     LocalFallback,
+    /// List cluster members ({node_id, addr}) read from etcd /boi/nodes/.
+    Members,
+    /// Mint a JWT join token signed by the cluster CA. Admin-gated (Q3):
+    /// caller must hold `caps.static.cluster_admin=true`.
+    #[command(name = "mint-join-token")]
+    MintJoinToken,
 }
 
 #[derive(Subcommand)]
@@ -1314,6 +1320,26 @@ async fn run_cluster_cmd(action: ClusterCmd) -> Result<()> {
             etcd.put("/boi/cluster/initialised", b"1".to_vec(), None)
                 .await
                 .context("write cluster init marker")?;
+
+            // Generate (or load) the cluster CA on disk, then publish its
+            // SHA-256 fingerprint into etcd so join clients can pin TLS
+            // to the right CA without TOFU (F-04, Phase 3).
+            let ca_dir = cluster_ca_dir();
+            std::fs::create_dir_all(&ca_dir)
+                .with_context(|| format!("create cluster CA dir {ca_dir:?}"))?;
+            let ca = boi_identity::ca::ClusterCa::load_or_generate(&ca_dir)
+                .context("generate or load cluster CA")?;
+            let der = ca.cert_der().context("serialize CA cert DER")?;
+            let fingerprint = boi_identity::join_token::ca_fingerprint(&der);
+            etcd.put(
+                "/boi/cluster/ca.fingerprint",
+                fingerprint.as_bytes().to_vec(),
+                None,
+            )
+            .await
+            .context("write ca.fingerprint to etcd")?;
+            info!(fingerprint, "wrote /boi/cluster/ca.fingerprint");
+
             // Register this node as cluster_admin (Q3: admin-gated token mint).
             etcd.put(
                 CLUSTER_ADMIN_KEY,
@@ -1322,14 +1348,138 @@ async fn run_cluster_cmd(action: ClusterCmd) -> Result<()> {
             )
             .await
             .context("write cluster admin marker")?;
+
+            // Mark the seed node record with caps.static.cluster_admin=true
+            // so the e2e admin gate can observe it directly at /boi/nodes/{id}.
+            let addr = std::env::var("BOI_NODE_ADDR")
+                .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+            let seed_record = serde_json::json!({
+                "node_id": node_id,
+                "addr": addr,
+                "version": env!("CARGO_PKG_VERSION"),
+                "started_at": unix_now() as i64,
+                "caps": {
+                    "static": { "cluster_admin": true }
+                },
+            });
+            etcd.put(
+                format!("/boi/nodes/{node_id}"),
+                serde_json::to_vec(&seed_record)?,
+                None,
+            )
+            .await
+            .context("write seed node record with cluster_admin=true")?;
+
+            // Also reflect cluster_admin on the caps map at /boi/caps/{id}.
+            let mut caps = NodeCaps::default();
+            caps.r#static
+                .insert("cluster_admin".to_string(), "true".to_string());
+            caps.put(&etcd, &node_id, None)
+                .await
+                .context("publish seed caps with cluster_admin=true")?;
+
             info!(node_id, "cluster admin registered");
             println!("ok");
         }
         ClusterCmd::LocalFallback => {
             run_local_fallback().await?;
         }
+        ClusterCmd::Members => {
+            let etcd = EtcdClient::connect(&etcd_endpoints())
+                .await
+                .context("connect to etcd")?;
+            // Read /boi/nodes/ — each entry is a JSON envelope with
+            // node_id and addr; print "<id> <addr>" so the harness can
+            // compare member listings across all three nodes.
+            let kvs = etcd
+                .get_prefix(NODES_PREFIX)
+                .await
+                .context("list /boi/nodes/")?;
+            let mut rows: Vec<(String, String)> = Vec::new();
+            for (k, v) in &kvs {
+                let key = String::from_utf8_lossy(k);
+                let id = key
+                    .strip_prefix(NODES_PREFIX)
+                    .unwrap_or(key.as_ref())
+                    .to_string();
+                let addr = serde_json::from_slice::<serde_json::Value>(v)
+                    .ok()
+                    .and_then(|j| {
+                        j.get("addr").and_then(|a| a.as_str()).map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                rows.push((id, addr));
+            }
+            rows.sort();
+            for (id, addr) in rows {
+                println!("{id} {addr}");
+            }
+        }
+        ClusterCmd::MintJoinToken => {
+            // Admin-gated token minting (Q3). The caller must be the
+            // registered cluster_admin; otherwise we fail closed with
+            // PermissionDenied on stderr and a non-zero exit.
+            let node_id = node_id_from_env();
+            let etcd = EtcdClient::connect(&etcd_endpoints())
+                .await
+                .context("connect to etcd")?;
+            if !is_cluster_admin(&etcd, &node_id).await {
+                eprintln!(
+                    "PermissionDenied: node `{node_id}` is not cluster_admin \
+                     and may not mint join tokens (Q3)"
+                );
+                std::process::exit(1);
+            }
+            // Load the CA from the canonical cluster dir and call
+            // boi_identity::join_token::mint_join_token. Returns the JWT
+            // on stdout for the caller to ship to the joining node.
+            let ca_dir = cluster_ca_dir();
+            let ca = boi_identity::ca::ClusterCa::load_or_generate(&ca_dir)
+                .context("load cluster CA for mint-join-token")?;
+            let der = ca.cert_der().context("serialize CA cert DER")?;
+            let cluster_id = std::env::var("BOI_CLUSTER_ID")
+                .unwrap_or_else(|_| "boi-cluster".to_string());
+            let seed_addr = std::env::var("BOI_NODE_ADDR")
+                .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+            let token = boi_identity::join_token::mint_join_token(
+                ca.key_pem(),
+                &der,
+                &cluster_id,
+                vec![seed_addr],
+                boi_identity::join_token::DEFAULT_TTL_SECS,
+            )
+            .context("mint-join-token: signing failed")?;
+            // Record the minted token so legacy in-cluster lookups still
+            // work (NodeCmd::Join checks this prefix as a fallback).
+            let key = format!("{JOIN_TOKENS_PREFIX}{token}");
+            let _ = etcd
+                .put(
+                    key,
+                    serde_json::to_vec(&serde_json::json!({
+                        "minted_by": node_id,
+                        "expires_at": unix_now() as i64
+                            + boi_identity::join_token::DEFAULT_TTL_SECS,
+                    }))?,
+                    None,
+                )
+                .await;
+            println!("{token}");
+        }
     }
     Ok(())
+}
+
+/// Canonical on-disk location for cluster CA material. Overridable via
+/// `BOI_CLUSTER_DIR` for container/test environments; otherwise falls
+/// back to `~/.boi/cluster/` (or `/boi/cluster/` if HOME is absent).
+fn cluster_ca_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("BOI_CLUSTER_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = boi_identity::ca::default_ca_dir() {
+        return dir;
+    }
+    PathBuf::from("/boi/cluster")
 }
 
 async fn run_node_cmd(action: NodeCmd) -> Result<()> {
@@ -1359,16 +1509,52 @@ async fn run_node_cmd(action: NodeCmd) -> Result<()> {
                 .or_else(|| std::env::var("BOI_TOKEN").ok())
                 .unwrap_or_default();
             if !tok.is_empty() {
-                // Verify the token exists in etcd before joining.
+                // Phase 3 fail-closed join path: verify token signature
+                // against the cluster CA public key and pin the embedded
+                // ca_fingerprint to the local CA's fingerprint. Any
+                // mismatch (bad signature, tampered payload, wrong CA,
+                // fingerprint flip) aborts the join before we touch etcd.
                 let etcd = EtcdClient::connect(&etcd_endpoints())
                     .await
                     .context("connect to etcd for token check")?;
-                let key = format!("{JOIN_TOKENS_PREFIX}{tok}");
-                if etcd.get(key).await?.is_none() {
-                    eprintln!("PermissionDenied: join token `{tok}` not found or expired");
+                let ca_dir = cluster_ca_dir();
+                let ca = match boi_identity::ca::ClusterCa::load(&ca_dir) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!(
+                            "fail-closed: cannot load cluster CA from {ca_dir:?} \
+                             to verify join token: {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                };
+                let der = match ca.cert_der() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("fail-closed: CA DER serialization failed: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let local_fp = boi_identity::join_token::ca_fingerprint(&der);
+                // verify signature + pin ca_fingerprint
+                if let Err(e) = boi_identity::join_token::validate_token(
+                    &tok,
+                    ca.cert_pem(),
+                    Some(&local_fp),
+                ) {
+                    eprintln!(
+                        "fail-closed: join token rejected (verify signature \
+                         or fingerprint mismatch): {e}"
+                    );
                     std::process::exit(1);
                 }
-                info!("join token validated — starting node daemon");
+                // Optional legacy lookup: if the token was registered via
+                // an internal mint path it'll be in /boi/join-tokens/.
+                // Missing-key here is NOT fatal — signature already proved
+                // authenticity.
+                let key = format!("{JOIN_TOKENS_PREFIX}{tok}");
+                let _ = etcd.get(key).await;
+                info!("join token signature validated — starting node daemon");
             }
             run_daemon().await?;
         }
