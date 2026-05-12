@@ -306,6 +306,10 @@ pub fn tags_match(runner_tags_json: &str, required_tags_json: &str) -> bool { ..
 pub fn dequeue_filtered(&self, runner_tags_json: &str) -> Result<Option<SpecRecord>> { ... }
 ```
 
+#### Dependency DAG (`depends_on`)
+
+The `depends_on` column accepts a comma-separated list of spec IDs (e.g. `"SA7F3,TB2E1,SC990"`). A spec is eligible for dequeue only when **every** listed dependency has `status = 'completed'`. Whitespace around each ID is trimmed, so `"a, b, c"` is equivalent to `"a,b,c"`. An empty or NULL `depends_on` means no dependencies. This is enforced in Rust (not SQL) via `Queue::deps_all_completed`, which applies to all three dequeue functions: `dequeue`, `dequeue_filtered`, and `dequeue_for_pools`.
+
 ### File Lock
 
 All queue mutations (outside SQLite transactions) acquire an advisory `fcntl` lock on `~/.boi/queue/.lock`. In Rust, use `fs2` crate or manual `fcntl(F_SETLK)` via `nix`:
