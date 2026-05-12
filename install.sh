@@ -436,7 +436,10 @@ setup_alias() {
 
     local bin_dir="${HOME}/bin"
     local symlink_path="${bin_dir}/boi"
-    local target="${SCRIPT_DIR}/boi.sh"
+    # 2026-05-12: symlink directly to the Rust binary. boi.sh is a 6-line
+    # passthrough that execs the same binary — keeping it in the chain
+    # forced every `boi` invocation to spawn a bash subshell first.
+    local target="${HOME}/.boi/bin/boi"
 
     if [[ "${DRY_RUN}" == "true" ]]; then
         log_info "[dry-run] Would create: ${symlink_path} -> ${target}"

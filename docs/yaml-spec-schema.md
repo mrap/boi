@@ -21,6 +21,7 @@ Use `.yaml` or `.yml` extension. BOI detects format by extension:
 | `outcomes` | Recommended | list of outcome objects | Spec-level declarations of what this spec delivers. Verified after all tasks DONE. |
 | `phase_overrides` | No | map of phase-name → override object | Per-phase runtime/model overrides applied to every task in this spec |
 | `worker_pool` | No | string | Named pool to dispatch this spec's workers on. Omit to use the registry default. Validated at dispatch time. |
+| `max_cost_usd` | No | float | Per-spec cost ceiling in USD. Halt with `cost_limit_exceeded` status once cumulative phase spend reaches this value. Omit for no limit. |
 | `tasks` | Yes | list of task objects | Ordered list of tasks |
 
 ## Outcome Object Fields
@@ -116,6 +117,7 @@ phase_overrides:        # optional — per-phase runtime/model/timeout overrides
     runtime: openrouter
     model: google/gemini-2.5-flash
 worker_pool: fly-runners  # optional — named pool; omit for registry default
+max_cost_usd: 2.50      # optional — halt at $2.50 cumulative spend; omit for no limit
 tasks:                  # required, list of task objects
   - id: t-1             # required, unique
     title: string       # required

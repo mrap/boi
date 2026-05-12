@@ -126,6 +126,7 @@ phase_overrides:                # optional: swap runtime/model for named phases
     runtime: openrouter
     model: google/gemini-2.5-flash
 worker_pool: fly-runners        # optional: named pool; omit for registry default
+max_cost_usd: 2.50              # optional: halt at $2.50 cumulative spend; omit for no limit
 
 tasks:
   ...

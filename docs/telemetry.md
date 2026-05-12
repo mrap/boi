@@ -43,6 +43,7 @@ Added to support pipeline experimentation. See `projects/hex-autonomy/boi-experi
 | ttft_ms | INTEGER | 3 | Time-to-first-token (same as cold_start_ms for CLI-spawned phases) |
 | loop_iteration | INTEGER | 5 | Which iteration of the critique↔improve loop produced this phase run (1-indexed; 1 = first/only pass) |
 | verify_exit_code | INTEGER | 10 | Exit code from the task's shell verify command (NULL for phases with no verify command; 0 = pass, non-zero = fail) |
+| context_json | TEXT | — | Experiment context blob (JSON). Currently populated by EXP-010 arm assignment (e.g. `{"arm":"A","exp":"010"}`); NULL for non-experiment phases. |
 
 ### Data flow
 
@@ -56,6 +57,7 @@ ClaudePhaseRunner::run_phase_inner() -> PhaseMetrics
 
 worker::record_phase_run()
   Adds: attempt (from retry loop), pipeline_id (hash of mode + phase lists + binary version, formatted as 16-char hex; wired at all call sites)
+  Adds: context_json (optional; experiment callers pass JSON blob, e.g. EXP-010 arm; non-experiment call sites pass None)
   Writes: INSERT INTO phase_runs with all columns
 ```
 

@@ -107,10 +107,18 @@ boi cancel q-001
 ### How do I stop everything?
 
 ```bash
-boi stop
+boi daemon stop
 ```
 
-Stops the daemon and kills all worker sessions.
+Stops the daemon. Running specs continue in the background and will be requeued on next daemon start.
+
+To also cancel all in-flight specs (destructive — permanent):
+
+```bash
+boi daemon stop --destroy-running
+```
+
+In non-TTY environments (scripts, CI), add `--yes` to skip the confirmation prompt.
 
 ### Can I run multiple specs at once?
 
