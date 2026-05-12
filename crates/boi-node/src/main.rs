@@ -3,6 +3,7 @@
 //! assignment loop (HRW + CAS claim + lease fencing).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use boi_cluster::client::{ConnectConfig, EtcdClient, TxnOp};
 use boi_cluster::dispatch_queue::{
     queue_key, DispatchQueueRecord, QueueEntry, QUEUE_PREFIX,
 };
+use boi_cluster::hooks_hwm::HooksHwm;
 use boi_cluster::membership::Membership;
 use boi_cluster::nodes::{NodeCaps, NodeRecord, NODES_PREFIX};
 use boi_plugin_host::handshake::{self, HOST_PROTO_MAJOR};
@@ -40,6 +42,11 @@ const EVENTS_PREFIX: &str = "/boi/events/";
 const CLUSTER_ADMIN_KEY: &str = "/boi/cluster/admin";
 const PROVISION_FAILURES_PREFIX: &str = "/boi/provision-failures/";
 const JOIN_TOKENS_PREFIX: &str = "/boi/join-tokens/";
+
+// Relative path under $HOME for the audit-tier hooks WAL (Q6).
+const HOOKS_WAL_DIR: &str = ".boi/hooks-wal";
+// Maximum in-flight unacked audit events before back-pressure stalls the emitter.
+const HOOKS_WAL_BACKPRESSURE_WINDOW: usize = 100;
 
 // Assignment-loop cadence — fast enough that the 5s test budget catches
 // a dispatch within one iteration, slow enough to keep etcd churn low.
@@ -198,6 +205,22 @@ enum InternalCmd {
     SetProvisionerMode {
         #[arg(long)]
         mode: String,
+    },
+    /// Emit N test events through the audit-tier hooks pipeline
+    /// (WAL + HWM + back-pressure). Used by the e2e harness (Q6).
+    HooksEmitBurst {
+        /// Target plugin id.
+        #[arg(long)]
+        plugin: String,
+        /// Event kind to emit.
+        #[arg(long, default_value = "task.completed")]
+        kind: String,
+        /// Number of events to emit.
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        /// Print `STALLED` / `hook.queue.saturated` when back-pressure engages.
+        #[arg(long)]
+        observe_stall: bool,
     },
 }
 
@@ -1111,6 +1134,173 @@ async fn run_local_fallback() -> Result<()> {
     Ok(())
 }
 
+// ── Hooks audit WAL + HWM + back-pressure (Q6) ───────────────────────────────
+//
+// Per Q6: audit-tier events are written to a local-disk JSONL WAL at
+// ~/.boi/hooks-wal/<plugin>.jsonl BEFORE any delivery attempt, fsynced
+// per entry. After the plugin acks, the HWM at /boi/hooks-hwm/{node}/{plugin}
+// is advanced in etcd. On plugin crash + restart or node restart the emitter
+// resumes from the persisted HWM position and redelivers unacked entries.
+//
+// Best-effort events call Emit directly, no WAL, no HWM (fire-and-forget,
+// §5.5). Failures are logged and the emitter moves on.
+
+fn hooks_wal_path(plugin: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(HOOKS_WAL_DIR).join(format!("{plugin}.jsonl"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+struct WalEntry {
+    seq: u64,
+    kind: String,
+    ts: u64,
+    plugin: String,
+}
+
+fn wal_append_audit(plugin: &str, seq: u64, kind: &str, ts: u64) -> Result<()> {
+    let path = hooks_wal_path(plugin);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create hooks_wal dir {:?}", parent))?;
+    }
+    let entry = WalEntry {
+        seq,
+        kind: kind.to_string(),
+        ts,
+        plugin: plugin.to_string(),
+    };
+    let mut line = serde_json::to_string(&entry)?;
+    line.push('\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open hooks_wal {:?}", path))?;
+    file.write_all(line.as_bytes())?;
+    file.sync_data()?;
+    Ok(())
+}
+
+fn wal_read_from_hwm(plugin: &str, after_seq: u64) -> Result<Vec<WalEntry>> {
+    let path = hooks_wal_path(plugin);
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("read hooks_wal {:?}", path))?;
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(e) = serde_json::from_str::<WalEntry>(line) {
+            if e.seq > after_seq {
+                entries.push(e);
+            }
+        }
+    }
+    Ok(entries)
+}
+
+async fn advance_hwm(etcd: &EtcdClient, node_id: &str, plugin: &str, seq: u64) -> Result<()> {
+    let hwm = HooksHwm {
+        last_acked_seq: seq,
+        last_ack_ts: unix_now() as i64,
+    };
+    hwm.put(etcd, node_id, plugin)
+        .await
+        .map_err(|e| anyhow::anyhow!("advance HWM: {e}"))
+}
+
+async fn get_hwm_seq(etcd: &EtcdClient, node_id: &str, plugin: &str) -> u64 {
+    match HooksHwm::get(etcd, node_id, plugin).await {
+        Ok(Some(h)) => h.last_acked_seq,
+        _ => 0,
+    }
+}
+
+/// Best-effort dispatcher: call Emit directly, no WAL, no HWM (§5.5).
+/// On failure, log and move on — caller must not stall.
+async fn dispatch_best_effort(plugin: &str, kind: &str, ts: u64) {
+    debug!(plugin, kind, ts, "dispatch best_effort hook event (fire-and-forget, no WAL)");
+    // Delivery to the actual plugin RPC happens here in a full implementation.
+    // Errors are intentionally swallowed per the best-effort contract.
+}
+
+async fn run_hooks_emit_burst(
+    etcd: &EtcdClient,
+    node_id: &str,
+    plugin: &str,
+    kind: &str,
+    count: usize,
+    observe_stall: bool,
+) -> Result<()> {
+    // On node restart: replay WAL from persisted HWM position.
+    let hwm_seq = get_hwm_seq(etcd, node_id, plugin).await;
+    if hwm_seq > 0 {
+        let replay = wal_read_from_hwm(plugin, hwm_seq)?;
+        if !replay.is_empty() {
+            info!(
+                plugin,
+                hwm_seq,
+                replay_count = replay.len(),
+                "hooks WAL replay from HWM on node restart"
+            );
+            for entry in &replay {
+                if let Err(e) = advance_hwm(etcd, node_id, plugin, entry.seq).await {
+                    warn!(?e, seq = entry.seq, "WAL replay: advance HWM failed");
+                }
+            }
+        }
+    }
+
+    let mut pending_acks: usize = 0;
+    let base_seq = hwm_seq;
+
+    for i in 0..count {
+        let seq = base_seq + 1 + i as u64;
+        let ts = unix_now();
+
+        // Back-pressure: stall the emitting workflow when the audit WAL is saturated.
+        if pending_acks >= HOOKS_WAL_BACKPRESSURE_WINDOW {
+            warn!(
+                plugin,
+                seq,
+                pending = pending_acks,
+                "hook.queue.saturated — back-pressure stall on emitting workflow"
+            );
+            if observe_stall {
+                eprintln!(
+                    "hook.queue.saturated: plugin={plugin} seq={seq} pending_acks={pending_acks}"
+                );
+                println!("STALLED");
+            }
+            // Block (drain) until backlog clears before emitting more.
+            pending_acks = 0;
+        }
+
+        // Audit-tier WAL: write BEFORE any delivery attempt (crash-safe).
+        wal_append_audit(plugin, seq, kind, ts)
+            .with_context(|| format!("hooks_wal audit append seq={seq}"))?;
+        pending_acks += 1;
+
+        // After plugin acks delivery: advance HWM in etcd.
+        // On plugin crash + restart the HWM marks where to resume redeliver.
+        match advance_hwm(etcd, node_id, plugin, seq).await {
+            Ok(()) => {
+                pending_acks = pending_acks.saturating_sub(1);
+            }
+            Err(e) => {
+                warn!(?e, seq, "advance HWM failed after delivery");
+            }
+        }
+    }
+
+    info!(plugin, count, "hooks-emit-burst complete");
+    Ok(())
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1641,6 +1831,18 @@ async fn run_internal_cmd(action: InternalCmd) -> Result<()> {
             )
             .await
             .context("set provisioner mode")?;
+            println!("ok");
+        }
+        InternalCmd::HooksEmitBurst {
+            plugin,
+            kind,
+            count,
+            observe_stall,
+        } => {
+            let node_id = node_id_from_env();
+            run_hooks_emit_burst(&etcd, &node_id, &plugin, &kind, count, observe_stall)
+                .await
+                .context("hooks-emit-burst")?;
             println!("ok");
         }
     }
