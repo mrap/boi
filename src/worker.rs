@@ -222,6 +222,20 @@ pub fn effective_timeout(phase: &phases::PhaseConfig, config_timeout_secs: u64) 
         .unwrap_or(config_timeout_secs)
 }
 
+/// Returns the startup phase-override warning message if any user overrides are active.
+/// Extracted for testability — the caller logs it via boi_log!.
+pub fn phase_override_warning_message(registry: &phases::PhaseRegistry) -> Option<String> {
+    let user_phase_names = registry.user_names();
+    if user_phase_names.is_empty() {
+        return None;
+    }
+    let names_list = user_phase_names.join(", ");
+    Some(format!(
+        "[WARN] Phase overrides active: {}. Source repo edits to these phases will NOT take effect until overrides are cleared.",
+        names_list
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 /// EXP-010: deterministic arm assignment for spec-critique A/B test.
 /// Uses SHA-256 of spec_id; last bit gives arm (0=A/CLI, 1=B/API).
@@ -371,10 +385,8 @@ pub fn run_worker_with_phases(
     }));
 
     // Warn if user phase overrides are active — edits to the source repo won't take effect.
-    let user_phase_names = registry.user_names();
-    if !user_phase_names.is_empty() {
-        let names_list = user_phase_names.join(", ");
-        boi_log!("[WARN] Phase overrides active: {}. Source repo edits to these phases will NOT take effect until overrides are cleared.", names_list);
+    if let Some(msg) = phase_override_warning_message(registry) {
+        boi_log!("{}", msg);
     }
 
     // Load spec and task data from DB — YAML file is not read at runtime.
