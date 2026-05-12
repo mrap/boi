@@ -6,3 +6,13 @@ edition = "2021"
 [[bin]]
 name = "boi-node"
 path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+boi-cluster = { path = "../boi-cluster" }
+boi-identity = { path = "../boi-identity" }

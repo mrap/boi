@@ -398,6 +398,16 @@ dependencies = [
 [[package]]
 name = "boi-node"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boi-cluster",
+ "boi-identity",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "boi-plugin-host"
