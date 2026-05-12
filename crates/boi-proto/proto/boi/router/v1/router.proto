@@ -1,0 +1,32 @@
+// Router plugin contract — Phase 2.
+//
+// The default in-tree router is passthrough: it returns the input
+// node_id without modification. Custom routers may use the cap_hint
+// or workload_hint to rebalance.
+syntax = "proto3";
+
+package boi.router.v1;
+
+service Router {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Route(RouteRequest) returns (RouteResponse);
+}
+
+message HandshakeRequest { uint32 host_proto_minor = 1; }
+message HandshakeResponse {
+  uint32 plugin_proto_minor = 1;
+  repeated string capabilities = 2;
+}
+
+message RouteRequest {
+  string spec_id = 1;
+  string task_id = 2;
+  string cap_hint = 3;
+  string workload_hint = 4;
+  // Candidate node IDs in arbitrary order.
+  repeated string candidates = 5;
+}
+message RouteResponse {
+  // Empty = no preference; host falls back to passthrough.
+  string chosen_node_id = 1;
+}

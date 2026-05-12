@@ -1,0 +1,51 @@
+// Provisioner plugin contract — Phase 2.
+//
+// The provisioner brings new compute online (e.g. Fly machines, k8s
+// jobs, on-prem boxes). The core issues a short-lived JoinToken and
+// passes it to the provisioner; the provisioner forwards it to the
+// newly-booted node. The provisioner itself NEVER touches etcd —
+// only the new node does, using the token to attest its identity.
+syntax = "proto3";
+
+package boi.provisioner.v1;
+
+service Provisioner {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Provision(ProvisionRequest) returns (ProvisionResponse);
+  rpc Deprovision(DeprovisionRequest) returns (DeprovisionResponse);
+}
+
+message HandshakeRequest { uint32 host_proto_minor = 1; }
+message HandshakeResponse {
+  uint32 plugin_proto_minor = 1;
+  repeated string capabilities = 2;
+}
+
+message JoinToken {
+  // Opaque to the provisioner; the node verifies it on join.
+  string token = 1;
+  // When the token stops being accepted by the cluster (RFC3339).
+  string expires_at = 2;
+}
+
+message CapHint {
+  // Reserved keys: os, arch, region, runtime. Custom keys MUST be
+  // prefixed `x-vendor-`.
+  map<string, string> caps = 1;
+}
+
+message ProvisionRequest {
+  JoinToken join_token = 1;
+  CapHint cap_hint = 2;
+  string spec_id = 3;
+}
+message ProvisionResponse {
+  // Provider-specific machine identifier.
+  string machine_id = 1;
+  // Once the node has registered itself in etcd, this is the same
+  // node_id that appears in /boi/nodes/.
+  string expected_node_id = 2;
+}
+
+message DeprovisionRequest { string machine_id = 1; }
+message DeprovisionResponse {}

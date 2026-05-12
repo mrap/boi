@@ -1,0 +1,14 @@
+version: v2
+# Rust codegen is performed at `cargo build` time by
+# `crates/boi-proto/build.rs` (tonic-build). This file exists for
+# consumers who want to generate clients in other languages and for
+# `buf` lint/breaking tooling that expects it adjacent to buf.yaml.
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: gen/go
+    opt:
+      - paths=source_relative
+  - remote: buf.build/grpc/go
+    out: gen/go
+    opt:
+      - paths=source_relative

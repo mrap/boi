@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`depends_on` now accepts comma-separated spec IDs.** `Queue::dequeue`,
+  `dequeue_filtered`, and `dequeue_for_pools` previously treated `depends_on`
+  as a single spec ID and did the dependency check in SQL. All three now use
+  `Queue::deps_all_completed` (Rust-side), which splits the column on `,`,
+  trims whitespace, and requires every listed ID to have `status = 'completed'`
+  before the spec is eligible. A spec with `depends_on = "SA7F3,TB2E1"` was
+  silently ignored before this fix.
+
 - **Worker state-machine entry no longer hardcoded.** New
   `fn initial_worker_state(order, done_ids, pre_spec_phases) -> Result<WorkerState>`
   drives the initial state from the pipeline declaration and DB state. Branches:

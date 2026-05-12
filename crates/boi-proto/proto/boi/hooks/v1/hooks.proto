@@ -1,0 +1,44 @@
+// Hooks plugin contract — Phase 2.
+//
+// Per Q6 (hooks delivery semantics):
+//   • delivery_tier = BEST_EFFORT: fire-and-forget. The host MAY drop
+//     events under backpressure. Suitable for telemetry / live UI.
+//   • delivery_tier = AUDIT: durable. The host persists the event,
+//     advances /boi/hooks-hwm/{node}/{plugin}, and only then acks.
+//     Retried on plugin restart from HWM.
+syntax = "proto3";
+
+package boi.hooks.v1;
+
+service Hooks {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+  rpc Emit(EmitRequest) returns (EmitResponse);
+}
+
+message HandshakeRequest { uint32 host_proto_minor = 1; }
+message HandshakeResponse {
+  uint32 plugin_proto_minor = 1;
+  repeated string capabilities = 2;
+}
+
+enum DeliveryTier {
+  DELIVERY_TIER_UNSPECIFIED = 0;
+  DELIVERY_TIER_BEST_EFFORT = 1;
+  DELIVERY_TIER_AUDIT = 2;
+}
+
+message EmitRequest {
+  string event_type = 1;
+  // Monotonic per (node, plugin); used for HWM bookkeeping.
+  uint64 sequence = 2;
+  DeliveryTier delivery_tier = 3;
+  string spec_id = 4;
+  string task_id = 5;
+  // Free-form structured payload; format negotiated via capabilities.
+  bytes payload_json = 6;
+}
+message EmitResponse {
+  // Echo of `sequence` once durably accepted (AUDIT) or immediately
+  // (BEST_EFFORT).
+  uint64 acked_sequence = 1;
+}

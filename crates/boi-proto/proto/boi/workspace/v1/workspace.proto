@@ -1,0 +1,68 @@
+// Workspace plugin contract — Phase 2.
+//
+// Major version is encoded in the file path / package (`v1`) per
+// design §16 Q4 (file-name major versioning). Backwards-compatible
+// additions bump the minor (returned by Handshake); breaking changes
+// require a new `v2/` package.
+syntax = "proto3";
+
+package boi.workspace.v1;
+
+service Workspace {
+  // Mandatory on every plugin. Returns the proto minor version the
+  // plugin was built against and the optional capability set it
+  // advertises. The host rejects a connection whose major package
+  // differs from its own.
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+
+  rpc Provision(ProvisionRequest) returns (ProvisionResponse);
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+  rpc Setup(SetupRequest) returns (SetupResponse);
+  rpc Verify(VerifyRequest) returns (VerifyResponse);
+  rpc Exec(ExecRequest) returns (ExecResponse);
+  rpc Cleanup(CleanupRequest) returns (CleanupResponse);
+}
+
+message HandshakeRequest {
+  // Minor version the host speaks. The plugin may use this to enable
+  // forward-compatible behavior.
+  uint32 host_proto_minor = 1;
+}
+
+message HandshakeResponse {
+  uint32 plugin_proto_minor = 1;
+  repeated string capabilities = 2;
+}
+
+message ProvisionRequest {
+  string spec_id = 1;
+  string task_id = 2;
+  string source_uri = 3;
+}
+message ProvisionResponse {
+  string workspace_id = 1;
+  string path = 2;
+}
+
+message FetchRequest { string workspace_id = 1; string ref_name = 2; }
+message FetchResponse { string head_sha = 1; }
+
+message SetupRequest { string workspace_id = 1; }
+message SetupResponse {}
+
+message VerifyRequest { string workspace_id = 1; }
+message VerifyResponse { bool ok = 1; string detail = 2; }
+
+message ExecRequest {
+  string workspace_id = 1;
+  repeated string argv = 2;
+  map<string, string> env = 3;
+}
+message ExecResponse {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+}
+
+message CleanupRequest { string workspace_id = 1; }
+message CleanupResponse {}
