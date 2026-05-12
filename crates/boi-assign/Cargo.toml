@@ -1,0 +1,18 @@
+[package]
+name = "boi-assign"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+boi-cluster = { path = "../boi-cluster" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+testcontainers = "0.20"

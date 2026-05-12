@@ -282,6 +282,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boi-assign"
+version = "0.1.0"
+dependencies = [
+ "boi-cluster",
+ "serde",
+ "serde_json",
+ "sha2",
+ "testcontainers",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boi-cluster"
 version = "0.1.0"
 dependencies = [
