@@ -690,3 +690,30 @@ Locked-decision references used in dispositions:
 (Q5 was resolved during the critique pass: CA fingerprint is embedded in the signed join-token payload; see §6 Join.)
 
 **Recommended next step.** Write the v0.1 implementation plan: a sequenced, person-week-sized breakdown of the §11 module list against the §13 scope, with explicit milestones for each Open Question's resolution. The implementation plan, not this design, is the right place to capture the week-3 etcd-revision-pinning experiment, the Pool fencing-token choice, and the version-skew testing matrix.
+
+---
+
+## 16. Decisions log — domain expert resolutions of §14 open questions
+
+Six expert agents, each given one open question + the design doc + the brief
+to be decisive. Full reasoning in `docs/extensibility/decisions/q{N}-*.md`.
+This section locks the answers into the design.
+
+| Q | Decision | Confidence | Where to update |
+|---|---|---|---|
+| **Q1** | Pin HRW snapshots to etcd `mod_revision` with `W=64` stale-window comparator on the claim Txn. Refresh-and-retry up to 3 times, then fall through to next-best HRW candidate. | 7/10 | §7 — assign() pseudocode; §9 — stale-window observability metric |
+| **Q2** | Fencing token = etcd `lease_id` directly (i64). No new field, no rotation on renewal. Stored as `claim_lease_id` in `/boi/dispatch-queue/{task_id}` (already in §4). Rides on wire as gRPC metadata `boi-claim-lease`. Recommend dedicated sub-key for single-field Txn compare. | 8/10 | §5.2 — Pool plugin contract metadata convention; §4 — confirm `claim_lease_id` sub-key path |
+| **Q3** | Capability-gated mint. `MintJoinToken` RPC rejects unless local node has `caps.static.cluster_admin=true`. Provisioner plugins call the same gated RPC. Bootstrap: `boi cluster init` auto-grants seed node admin atomically with CA creation. Day-2: `boi cluster admin grant\|revoke\|list`. Break-glass: `--ca-key` for offline mint. Critical: `cluster_admin` is write-only via the admin path, not self-declarable at join. | 8/10 | §6 — Join subsection; §11 — CLI surface (`boi cluster admin`); §5.4 — Provisioner plugin must run on admin nodes |
+| **Q4** | Hybrid versioning. File-name major (`boi.workspace.v1` package, gRPC service path). Mandatory in-proto `Handshake` RPC per service returns `plugin_proto_minor: u32` + capability strings. `buf breaking` runs in CI. Major bump = new package; minor skew tolerated via standard unknown-field rules; per-RPC capabilities gate optional fields. | 8/10 | §5 — Plugin lifecycle adds Handshake step; §11 — `boi plugin test` exercises Handshake; §12 — migration story for v0.1 → v0.2 |
+| **Q6** | Two tiers. **best_effort** (default, §5.5 unchanged) + **audit** (opt-in via plugin manifest). Audit queue: local-disk WAL on emitting node for bulk events; etcd holds only per-(plugin, node) HWM for gap detection. Ordering: per-(node, plugin) FIFO. Back-pressure stalls the workflow that emits. Plugin-side dedup via `(node_id, seq, kind, ts)` key. | 7/10 | §5.5 — Hooks contract grows `delivery_tier` declaration; §4 — `/boi/hooks-hwm/` prefix added; `boi plugin test` covers both tiers |
+| **Q7** | Tee `WorkerEvent` chunks host-side to `~/.boi/logs/{spec_id}/{task_id}.log` on the executing node. Retention: 7 days post-terminal OR 100 MB cap, operator-tunable. Reattach: `boi spec tail <task_id> [--follow]`; core resolves `claimant_node_id` from etcd and opens an internal `Tail` RPC to that node. `WorkerEvent` proto unchanged. | 8/10 | §5.2 — Pool host-side tee responsibility documented; §11 — `boi spec tail` CLI; §13 — v0.1 includes Tail RPC |
+
+**Aggregate confidence:** mean 7.7/10. No decision below 7. The two 7s (Q1 stale-window, Q6 audit tier) are the natural week-3 measurement targets — operator-tunable knobs that should be data-driven post-v0.1.
+
+**Status of §14 open questions after this log:**
+
+- Q1, Q2, Q3, Q4, Q6, Q7 — **resolved**, see table above
+- Q5 — already resolved in F-04 disposition (CA fingerprint in signed join token)
+
+§14 is now fully closed. The next step is the v0.1 implementation plan.
+
