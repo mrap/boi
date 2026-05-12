@@ -1,0 +1,72 @@
+# Hermetic E2E topology for distributed BOI v0.1.
+#
+# No named volumes — every `docker compose up` is a fresh slate; running
+# `make e2e` twice in a row must produce identical results.
+services:
+  etcd:
+    image: bitnami/etcd:3.5
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd:2379"
+      ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+    networks:
+      - boi-test
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  node-a:
+    build:
+      context: ../../..
+      dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
+    command: ["boi-node", "--node-id=node-a"]
+    environment:
+      BOI_ETCD_ENDPOINTS: "http://etcd:2379"
+      BOI_NODE_ID: "node-a"
+    networks:
+      - boi-test
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+  node-b:
+    build:
+      context: ../../..
+      dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
+    command: ["boi-node", "--node-id=node-b"]
+    environment:
+      BOI_ETCD_ENDPOINTS: "http://etcd:2379"
+      BOI_NODE_ID: "node-b"
+    networks:
+      - boi-test
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+  node-c:
+    build:
+      context: ../../..
+      dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
+    command: ["boi-node", "--node-id=node-c"]
+    environment:
+      BOI_ETCD_ENDPOINTS: "http://etcd:2379"
+      BOI_NODE_ID: "node-c"
+    networks:
+      - boi-test
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+  # Placeholder for plugin sidecars used by Phase 2+ tests. Image is the
+  # same boi-node base so tests can drop a plugin binary in via override.
+  plugin-sidecar:
+    image: alpine:3.20
+    command: ["sh", "-c", "echo 'plugin-sidecar placeholder; Phase 2 wires real plugins' && sleep infinity"]
+    networks:
+      - boi-test
+
+networks:
+  boi-test:
+    driver: bridge

@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "crates/boi-test-harness", "crates/boi-node"]
+
 [package]
 name = "boi"
 version = "1.4.0"
