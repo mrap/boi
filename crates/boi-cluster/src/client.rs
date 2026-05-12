@@ -271,6 +271,20 @@ impl EtcdClient {
         Ok(resp.kvs().first().map(|kv| kv.value().to_vec()))
     }
 
+    /// Read a single key and return its value together with its
+    /// `mod_revision`. `None` if the key is absent.
+    pub async fn get_with_mod_revision(
+        &self,
+        key: impl Into<Vec<u8>>,
+    ) -> Result<Option<(Vec<u8>, i64)>> {
+        let mut c = self.inner.lock().await;
+        let resp = c.get(key, None).await?;
+        Ok(resp
+            .kvs()
+            .first()
+            .map(|kv| (kv.value().to_vec(), kv.mod_revision())))
+    }
+
     /// Range-read by prefix. Returns `(key, value)` pairs.
     pub async fn get_prefix(&self, prefix: impl Into<Vec<u8>>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let opts = GetOptions::new().with_prefix();

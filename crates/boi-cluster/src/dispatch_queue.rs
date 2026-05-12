@@ -1,8 +1,12 @@
 //! `/boi/dispatch-queue/{task_id}` envelope.
 //!
 //! Per design §4. Every state-machine transition is gated by an etcd
-//! Txn `compare(value.state_version == N)` against the serialised
-//! envelope: stale writers see `Conflict` and abort.
+//! Txn `compare(mod_revision == N)` against the etcd `mod_revision`
+//! from the last read: stale writers see `Conflict` and abort.
+//!
+//! Using `mod_revision` (rather than a full-value compare) means CAS
+//! correctness is independent of serialisation: schema evolution that
+//! adds `#[serde(default)]` fields does not invalidate the predicate.
 //!
 //! State machine (§4 line 110-114):
 //! ```text
@@ -53,6 +57,16 @@ pub struct DispatchQueueRecord {
     pub claimant_node_id: Option<String>,
     #[serde(default)]
     pub claim_lease_id: Option<i64>,
+}
+
+/// A [`DispatchQueueRecord`] paired with the etcd `mod_revision` at
+/// which it was last written. `mod_revision` is the CAS token for the
+/// next transition — it is stable across re-serialisations, so schema
+/// evolution (adding `#[serde(default)]` fields) never invalidates it.
+#[derive(Debug, Clone)]
+pub struct QueueEntry {
+    pub record: DispatchQueueRecord,
+    pub mod_revision: i64,
 }
 
 impl DispatchQueueRecord {
@@ -115,41 +129,46 @@ impl DispatchQueueRecord {
         Ok(())
     }
 
-    /// Fetch the current envelope, if any.
-    pub async fn get(client: &EtcdClient, task_id: &str) -> Result<Option<Self>> {
-        let raw = match client.get(queue_key(task_id)).await? {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-        Self::decode(&raw).map(Some)
+    /// Fetch the current envelope, returning the record together with
+    /// its etcd `mod_revision` (the CAS token for transitions).
+    pub async fn get(client: &EtcdClient, task_id: &str) -> Result<Option<QueueEntry>> {
+        match client.get_with_mod_revision(queue_key(task_id)).await? {
+            None => Ok(None),
+            Some((raw, mod_revision)) => {
+                let record = Self::decode(&raw)?;
+                Ok(Some(QueueEntry {
+                    record,
+                    mod_revision,
+                }))
+            }
+        }
     }
 
     /// Apply `mutate` to a clone of `self` and CAS-write the result iff
-    /// the envelope at `task_id` still has the same `state_version`.
-    /// Returns the freshly-written record on success; `Conflict` if a
-    /// concurrent writer raced ahead.
-    async fn cas_transition<F>(self, client: &EtcdClient, mutate: F) -> Result<Self>
+    /// the key's `mod_revision` still equals `prior_rev`.
+    /// Returns the freshly-written entry (with its new `mod_revision`)
+    /// on success; `Conflict` if a concurrent writer raced ahead.
+    async fn cas_transition<F>(
+        self,
+        client: &EtcdClient,
+        prior_rev: i64,
+        mutate: F,
+    ) -> Result<QueueEntry>
     where
         F: FnOnce(&mut Self),
     {
         let expected_version = self.state_version;
         let key = queue_key(&self.task_id).into_bytes();
-        let prior_body = self.encode()?;
         let mut next = self.clone();
         mutate(&mut next);
         next.state_version = expected_version + 1;
         let next_body = next.encode()?;
         let resp = client
             .txn(
-                // Single-field CAS: predicate is "the value bytes at
-                // `key` equal the bytes we last read". This is the same
-                // serialisation we will write back, so any concurrent
-                // writer that bumped `state_version` (or anything else)
-                // breaks the compare.
-                vec![etcd_client::Compare::value(
+                vec![etcd_client::Compare::mod_revision(
                     key.clone(),
                     etcd_client::CompareOp::Equal,
-                    prior_body,
+                    prior_rev,
                 )],
                 vec![TxnOp::Put {
                     key,
@@ -161,13 +180,21 @@ impl DispatchQueueRecord {
             .await?;
         if !resp.succeeded() {
             return Err(ClusterError::Conflict(format!(
-                "dispatch-queue/{} state_version != {}",
-                next.task_id, expected_version
+                "dispatch-queue/{} mod_revision != {}",
+                next.task_id, prior_rev
             )));
         }
-        Ok(next)
+        // After a successful put the key's mod_revision equals the
+        // cluster revision returned in the txn header.
+        let new_mod_revision = resp.header().map(|h| h.revision()).unwrap_or(0);
+        Ok(QueueEntry {
+            record: next,
+            mod_revision: new_mod_revision,
+        })
     }
+}
 
+impl QueueEntry {
     /// PENDING → CLAIMED. Sets claimant + lease.
     pub async fn claim(
         self,
@@ -175,78 +202,89 @@ impl DispatchQueueRecord {
         node_id: impl Into<String>,
         lease_id: i64,
     ) -> Result<Self> {
-        if self.state != TaskState::Pending {
+        if self.record.state != TaskState::Pending {
             return Err(ClusterError::Invalid(format!(
                 "claim requires PENDING, got {:?}",
-                self.state
+                self.record.state
             )));
         }
         let node_id = node_id.into();
-        self.cas_transition(client, |r| {
-            r.state = TaskState::Claimed;
-            r.claimant_node_id = Some(node_id);
-            r.claim_lease_id = Some(lease_id);
-        })
-        .await
+        let mod_revision = self.mod_revision;
+        self.record
+            .cas_transition(client, mod_revision, |r| {
+                r.state = TaskState::Claimed;
+                r.claimant_node_id = Some(node_id);
+                r.claim_lease_id = Some(lease_id);
+            })
+            .await
     }
 
     /// CLAIMED → RUNNING.
     pub async fn mark_running(self, client: &EtcdClient) -> Result<Self> {
-        if self.state != TaskState::Claimed {
+        if self.record.state != TaskState::Claimed {
             return Err(ClusterError::Invalid(format!(
                 "mark_running requires CLAIMED, got {:?}",
-                self.state
+                self.record.state
             )));
         }
-        self.cas_transition(client, |r| {
-            r.state = TaskState::Running;
-            r.attempts = r.attempts.saturating_add(1);
-        })
-        .await
+        let mod_revision = self.mod_revision;
+        self.record
+            .cas_transition(client, mod_revision, |r| {
+                r.state = TaskState::Running;
+                r.attempts = r.attempts.saturating_add(1);
+            })
+            .await
     }
 
     /// RUNNING → DONE.
     pub async fn mark_done(self, client: &EtcdClient) -> Result<Self> {
-        if self.state != TaskState::Running {
+        if self.record.state != TaskState::Running {
             return Err(ClusterError::Invalid(format!(
                 "mark_done requires RUNNING, got {:?}",
-                self.state
+                self.record.state
             )));
         }
-        self.cas_transition(client, |r| r.state = TaskState::Done).await
+        let mod_revision = self.mod_revision;
+        self.record
+            .cas_transition(client, mod_revision, |r| r.state = TaskState::Done)
+            .await
     }
 
     /// RUNNING → FAILED, recording `err`.
     pub async fn mark_failed(self, client: &EtcdClient, err: impl Into<String>) -> Result<Self> {
-        if self.state != TaskState::Running {
+        if self.record.state != TaskState::Running {
             return Err(ClusterError::Invalid(format!(
                 "mark_failed requires RUNNING, got {:?}",
-                self.state
+                self.record.state
             )));
         }
         let err = err.into();
-        self.cas_transition(client, |r| {
-            r.state = TaskState::Failed;
-            r.last_error = Some(err);
-        })
-        .await
+        let mod_revision = self.mod_revision;
+        self.record
+            .cas_transition(client, mod_revision, |r| {
+                r.state = TaskState::Failed;
+                r.last_error = Some(err);
+            })
+            .await
     }
 
     /// CLAIMED → PENDING (monitor re-queue after lease expiry). Clears
     /// claimant + lease (per §4 line 114).
     pub async fn requeue(self, client: &EtcdClient) -> Result<Self> {
-        if self.state != TaskState::Claimed {
+        if self.record.state != TaskState::Claimed {
             return Err(ClusterError::Invalid(format!(
                 "requeue requires CLAIMED, got {:?}",
-                self.state
+                self.record.state
             )));
         }
-        self.cas_transition(client, |r| {
-            r.state = TaskState::Pending;
-            r.claimant_node_id = None;
-            r.claim_lease_id = None;
-        })
-        .await
+        let mod_revision = self.mod_revision;
+        self.record
+            .cas_transition(client, mod_revision, |r| {
+                r.state = TaskState::Pending;
+                r.claimant_node_id = None;
+                r.claim_lease_id = None;
+            })
+            .await
     }
 }
 
@@ -321,27 +359,27 @@ mod tests {
         let err = dup.insert(&client).await;
         assert!(matches!(err, Err(ClusterError::Conflict(_))));
 
-        let cur = DispatchQueueRecord::get(&client, "t1")
+        let entry = DispatchQueueRecord::get(&client, "t1")
             .await
             .expect("get")
             .expect("present");
-        assert_eq!(cur.state, TaskState::Pending);
-        assert_eq!(cur.state_version, 0);
+        assert_eq!(entry.record.state, TaskState::Pending);
+        assert_eq!(entry.record.state_version, 0);
 
-        let claimed = cur.claim(&client, "n1", 7777).await.expect("claim");
-        assert_eq!(claimed.state, TaskState::Claimed);
-        assert_eq!(claimed.state_version, 1);
-        assert_eq!(claimed.claimant_node_id.as_deref(), Some("n1"));
-        assert_eq!(claimed.claim_lease_id, Some(7777));
+        let entry = entry.claim(&client, "n1", 7777).await.expect("claim");
+        assert_eq!(entry.record.state, TaskState::Claimed);
+        assert_eq!(entry.record.state_version, 1);
+        assert_eq!(entry.record.claimant_node_id.as_deref(), Some("n1"));
+        assert_eq!(entry.record.claim_lease_id, Some(7777));
 
-        let running = claimed.mark_running(&client).await.expect("running");
-        assert_eq!(running.state, TaskState::Running);
-        assert_eq!(running.state_version, 2);
-        assert_eq!(running.attempts, 1);
+        let entry = entry.mark_running(&client).await.expect("running");
+        assert_eq!(entry.record.state, TaskState::Running);
+        assert_eq!(entry.record.state_version, 2);
+        assert_eq!(entry.record.attempts, 1);
 
-        let done = running.mark_done(&client).await.expect("done");
-        assert_eq!(done.state, TaskState::Done);
-        assert_eq!(done.state_version, 3);
+        let entry = entry.mark_done(&client).await.expect("done");
+        assert_eq!(entry.record.state, TaskState::Done);
+        assert_eq!(entry.record.state_version, 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -361,9 +399,9 @@ mod tests {
             .expect("present");
         let b = a.clone();
 
-        // First claim wins, bumping state_version to 1.
+        // First claim wins, bumping mod_revision.
         let _ = a.claim(&client, "n1", 1).await.expect("claim-a");
-        // Second claim is stale (still thinks state_version==0).
+        // Second claim is stale (still holds the old mod_revision).
         let err = b.claim(&client, "n2", 2).await;
         assert!(matches!(err, Err(ClusterError::Conflict(_))));
     }
@@ -379,15 +417,79 @@ mod tests {
             .insert(&client)
             .await
             .expect("insert");
-        let p = DispatchQueueRecord::get(&client, "t3")
+        let entry = DispatchQueueRecord::get(&client, "t3")
             .await
             .unwrap()
             .unwrap();
-        let c = p.claim(&client, "n1", 99).await.expect("claim");
-        let requeued = c.requeue(&client).await.expect("requeue");
-        assert_eq!(requeued.state, TaskState::Pending);
-        assert!(requeued.claimant_node_id.is_none());
-        assert!(requeued.claim_lease_id.is_none());
-        assert_eq!(requeued.state_version, 2);
+        let entry = entry.claim(&client, "n1", 99).await.expect("claim");
+        let entry = entry.requeue(&client).await.expect("requeue");
+        assert_eq!(entry.record.state, TaskState::Pending);
+        assert!(entry.record.claimant_node_id.is_none());
+        assert!(entry.record.claim_lease_id.is_none());
+        assert_eq!(entry.record.state_version, 2);
+    }
+
+    /// Prove that schema evolution does not break CAS.
+    ///
+    /// A future writer may store JSON with an extra `#[serde(default)]`
+    /// field. Our reader decodes it (serde ignores unknown fields) and
+    /// re-encodes without that field — producing different bytes. The
+    /// old full-value-compare predicate would fail on that byte
+    /// difference. With `Compare::mod_revision` the predicate is
+    /// independent of serialisation and the CAS succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schema_evolution_does_not_break_cas() {
+        let Some((_c, ep)) = crate::testutil::etcd_endpoint().await else {
+            return;
+        };
+        let client = EtcdClient::connect([ep]).await.expect("connect");
+
+        // Write a JSON envelope that includes an unknown future field,
+        // simulating a record written by a newer schema version.
+        let task_id = "schema-evo-t1";
+        let key = queue_key(task_id);
+        let raw_json = serde_json::json!({
+            "spec_id": "s1",
+            "task_id": task_id,
+            "state": "PENDING",
+            "requires": {},
+            "attempts": 0,
+            "last_error": null,
+            "state_version": 0,
+            "claimant_node_id": null,
+            "claim_lease_id": null,
+            // Extra field that a future schema version added with #[serde(default)].
+            // Our current DispatchQueueRecord will drop it on decode+re-encode.
+            "priority": "high"
+        });
+        let raw_bytes = serde_json::to_vec(&raw_json).unwrap();
+        // Use a raw put (bypasses insert()'s CAS) to simulate an external writer.
+        client
+            .put(key.clone(), raw_bytes.clone(), None)
+            .await
+            .expect("raw put");
+
+        // Read via our typed reader: serde ignores "priority", so decode succeeds.
+        let entry = DispatchQueueRecord::get(&client, task_id)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(entry.record.state, TaskState::Pending);
+
+        // Sanity: re-encoding drops the extra field, so bytes differ from stored.
+        let reencoded = serde_json::to_vec(&entry.record).unwrap();
+        assert_ne!(
+            reencoded, raw_bytes,
+            "expected re-encoded bytes to differ (extra field stripped)"
+        );
+
+        // CAS transition must succeed despite the byte difference — the
+        // predicate is mod_revision, not the value bytes.
+        let entry = entry
+            .claim(&client, "n1", 42)
+            .await
+            .expect("CAS must succeed despite schema drift");
+        assert_eq!(entry.record.state, TaskState::Claimed);
+        assert_eq!(entry.record.state_version, 1);
     }
 }
