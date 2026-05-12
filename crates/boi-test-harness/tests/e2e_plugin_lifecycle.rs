@@ -85,7 +85,11 @@ fn ensure_cluster() -> Result<boi_test_harness::Cluster> {
 // that intentionally never emits the token.
 #[test]
 fn plugin_ready_signal_required() {
-    run_subtest("plugin_ready_signal_required", || {
+    if !docker_available() {
+        eprintln!("SKIP plugin_ready_signal_required: docker not on PATH");
+        return;
+    }
+    (|| -> Result<()> {
         let _cluster = ensure_cluster()?;
         let out = boi_node_exec(
             "node-a",
@@ -122,7 +126,8 @@ fn plugin_ready_signal_required() {
             stdout.trim(),
             stderr.trim()
         );
-    });
+    })()
+    .unwrap();
 }
 
 // ---------------------------------------------------------------
@@ -177,7 +182,11 @@ fn handshake_returns_capabilities() {
 // error.
 #[test]
 fn major_version_mismatch_rejected() {
-    run_subtest("major_version_mismatch_rejected", || {
+    if !docker_available() {
+        eprintln!("SKIP major_version_mismatch_rejected: docker not on PATH");
+        return;
+    }
+    (|| -> Result<()> {
         let _cluster = ensure_cluster()?;
         let out = boi_node_exec(
             "node-a",
@@ -213,7 +222,8 @@ fn major_version_mismatch_rejected() {
             stdout.trim(),
             stderr.trim()
         );
-    });
+    })()
+    .unwrap();
 }
 
 // ---------------------------------------------------------------
@@ -288,7 +298,11 @@ fn crash_under_threshold_restarts() {
 // it present under `/boi/nodes/`.
 #[test]
 fn plugin_crash_does_not_kill_core() {
-    run_subtest("plugin_crash_does_not_kill_core", || {
+    if !docker_available() {
+        eprintln!("SKIP plugin_crash_does_not_kill_core: docker not on PATH");
+        return;
+    }
+    (|| -> Result<()> {
         let _cluster = ensure_cluster()?;
         let _ = boi_node_exec(
             "node-a",
@@ -313,5 +327,6 @@ fn plugin_crash_does_not_kill_core() {
                  plugin failures from boi-node) not yet implemented"
             ),
         }
-    });
+    })()
+    .unwrap();
 }
