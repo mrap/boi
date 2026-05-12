@@ -516,11 +516,25 @@ impl PhaseRegistry {
                             self.user.insert(phase.name.clone(), phase);
                         }
                         Err(e) => {
+                            // Loud failure: a user-override phase TOML is broken.
+                            // Refuse to use any phases from this dir, with a
+                            // clear pointer to the file. Test gate same as
+                            // load_phases_from_dir below — production exit 2,
+                            // tests assert on return value.
                             eprintln!(
-                                "WARN: failed to load phase {}: {}",
+                                "[boi] FATAL: failed to load user-override phase {}: {}",
                                 entry.display(),
                                 e
                             );
+                            if !cfg!(test) {
+                                eprintln!(
+                                    "[boi] Refusing to start with a broken phase override. \
+                                     Fix or remove the file above. See \
+                                     docs/phase-configurability-2026-05-12.md for the \
+                                     required schema."
+                                );
+                                std::process::exit(2);
+                            }
                         }
                     }
                 }
@@ -723,6 +737,26 @@ fn load_pipeline_from_file(path: &Path, mode: &str) -> Option<PipelineConfig> {
         other => other,
     };
     parsed.mode.get(key).map(|m| {
+        // Loud-failure migration warning (2026-05-12): the legacy magic-string
+        // sorter that split `spec_phases` into pre/post by name was removed.
+        // If a user's pipelines.toml uses the old `spec_phases = [...]` shape
+        // without explicit `spec_pre_phases`/`spec_post_phases`, behavior
+        // silently shifts (a `plan-critique` that used to run PRE now runs
+        // POST via the spec_post_phases backfill below). Surface this loudly.
+        if !m.spec_phases.is_empty()
+            && m.spec_pre_phases.is_empty()
+            && m.spec_post_phases.is_empty()
+        {
+            eprintln!(
+                "[boi] WARN: pipeline mode '{}' at {} uses legacy `spec_phases = [...]` \
+                 with no explicit `spec_pre_phases` / `spec_post_phases`. The phase split \
+                 fallback was removed 2026-05-12. All phases will run POST-task; if any \
+                 (e.g. `plan-critique`) was meant as PRE-task, declare it explicitly in \
+                 `spec_pre_phases`. See docs/phase-configurability-2026-05-12.md.",
+                key, path.display()
+            );
+        }
+
         // Backward compat: if spec_post_phases not provided, use spec_phases as spec_post_phases.
         let spec_post = if !m.spec_post_phases.is_empty() {
             m.spec_post_phases.clone()
@@ -877,15 +911,24 @@ fn core_phases_dir() -> Option<PathBuf> {
 
 /// Load core phases from TOML files in the phases/ directory.
 /// Returns empty vec if no directory found (caller should use fallback).
+///
+/// Loud-failure policy (2026-05-12, Standing Order S6): if any file matching
+/// `*.phase.toml` fails to load, the process aborts with a clear stderr
+/// message. The bare `*.toml` glob (which used to catch `pipelines.toml`)
+/// was removed — pipelines.toml is loaded by `load_pipeline_from_file`, not
+/// by the phase walker. Mixing them caused WARN-and-skip noise where the
+/// pipelines file was tried as a phase, failed validation, and silently
+/// dropped — exactly the swallowed-failure pattern S6 prohibits.
 fn load_phases_from_dir(phases_dir: &Path) -> Vec<PhaseConfig> {
     if !phases_dir.is_dir() {
         return Vec::new();
     }
 
     let mut phases = Vec::new();
+    // ONLY *.phase.toml — bare *.toml catches pipelines.toml etc which are
+    // not phase files.
     let patterns = [
         phases_dir.join("*.phase.toml"),
-        phases_dir.join("*.toml"),
     ];
     let mut seen = std::collections::HashSet::new();
 
@@ -901,11 +944,29 @@ fn load_phases_from_dir(phases_dir: &Path) -> Vec<PhaseConfig> {
                         phases.push(phase);
                     }
                     Err(e) => {
+                        // Loud failure: a malformed core phase TOML means BOI
+                        // is misconfigured / corrupted. Refuse to start with a
+                        // clear pointer instead of silently substituting a
+                        // fallback that might mismatch user expectations.
+                        //
+                        // Test gate: in `cargo test`, the loader is called
+                        // against synthetic fixture dirs (some intentionally
+                        // malformed). Exiting the test process loses all signal.
+                        // Tests assert on the loader's RETURN value instead;
+                        // production keeps the FATAL behavior.
                         eprintln!(
-                            "WARN: failed to load core phase {}: {}",
+                            "[boi] FATAL: failed to load core phase {}: {}",
                             entry.display(),
                             e
                         );
+                        if !cfg!(test) {
+                            eprintln!(
+                                "[boi] Refusing to start with a broken phase registry. \
+                                 Fix the file above or restore from `git checkout HEAD -- {}`.",
+                                entry.display()
+                            );
+                            std::process::exit(2);
+                        }
                     }
                 }
             }
@@ -2255,6 +2316,91 @@ task_phases = ["execute"]
             assert_eq!(cfg.level, PhaseLevel::Task);
             assert!(!cfg.can_add_tasks);
             assert!(!cfg.can_fail_spec);
+        }
+
+        #[test]
+        fn errors_loudly_when_level_is_invalid_string() {
+            // serde's enum-from-string error fires before our explicit
+            // missing-field check. Confirm we get a clear failure naming
+            // the bad value (not a silent fallback to Task).
+            let toml_str = r#"
+                name = "bad-level"
+                [phase]
+                level = "wrong"
+                can_add_tasks = false
+                can_fail_spec = false
+            "#;
+            // Parsing the raw TOML into PhaseToml fails at the serde layer.
+            let result: Result<PhaseToml, _> = toml::from_str(toml_str);
+            let err = result.expect_err("expected serde failure on invalid level");
+            let msg = err.to_string();
+            // The error must include the field name OR the invalid value so
+            // a user can fix it. Both are present in serde's default message.
+            assert!(
+                msg.contains("level") || msg.contains("wrong") || msg.contains("variant"),
+                "error message must point to the invalid `level` field, got: {}",
+                msg
+            );
+        }
+    }
+
+    // ── Layer 3 integration — every repo phase TOML loads ───────────────────
+    // Catches the case where a phase TOML in `phases/` is missing a required
+    // field. Without this test, a malformed core TOML only surfaces at daemon
+    // start. Re-runnable in CI; fast because it's a directory walk + parse.
+    mod repo_phase_tomls_load {
+        use super::*;
+        use std::path::PathBuf;
+
+        #[test]
+        fn every_phase_toml_in_repo_loads() {
+            let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let phases_dir = repo_root.join("phases");
+            assert!(
+                phases_dir.is_dir(),
+                "repo phases dir must exist at {}",
+                phases_dir.display()
+            );
+
+            let entries: Vec<_> = std::fs::read_dir(&phases_dir)
+                .expect("read phases dir")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .to_string_lossy()
+                        .ends_with(".phase.toml")
+                })
+                .collect();
+
+            assert!(
+                !entries.is_empty(),
+                "expected at least one *.phase.toml in {}",
+                phases_dir.display()
+            );
+
+            let mut failures: Vec<String> = Vec::new();
+            for entry in &entries {
+                let p = entry.path();
+                let content = std::fs::read_to_string(&p)
+                    .expect(&format!("read {}", p.display()));
+                let parsed: Result<PhaseToml, _> = toml::from_str(&content);
+                match parsed {
+                    Ok(toml_parsed) => {
+                        if let Err(e) = PhaseConfig::from_toml(toml_parsed) {
+                            failures.push(format!("{}: {}", p.display(), e));
+                        }
+                    }
+                    Err(e) => {
+                        failures.push(format!("{}: serde parse: {}", p.display(), e));
+                    }
+                }
+            }
+
+            assert!(
+                failures.is_empty(),
+                "phase TOML load failures:\n{}",
+                failures.join("\n")
+            );
         }
     }
 }

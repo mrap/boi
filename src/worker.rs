@@ -646,7 +646,21 @@ pub fn run_worker_with_phases(
     // a restarted worker that finds all tasks already DONE in the DB no
     // longer re-runs the (already-completed) pre-spec phases. See
     // `initial_worker_state` above for the branch table.
-    let mut state = initial_worker_state(&order, &done_ids, &pre_spec_phases);
+    let mut state = match initial_worker_state(&order, &done_ids, &pre_spec_phases) {
+        Ok(s) => s,
+        Err(e) => {
+            // DB/order corruption — loud failure with DB update so the spec is
+            // explicitly marked failed instead of dangling as "running".
+            eprintln!("[boi] FATAL: {} (spec={})", e, spec_id);
+            queue.update_spec(spec_id, "failed")?;
+            telemetry.emit("boi.spec.failed", LogLevel::Info, &json!({
+                "spec_id": spec_id,
+                "status": "failed",
+                "message": e,
+            }));
+            return Err(e.into());
+        }
+    };
     boi_log!("state machine start: spec={} mode={} tasks={} pre_spec_phases={} post_spec_phases={} entry={:?}",
         spec_id, mode, order.len(), pre_spec_phases.len(), post_spec_phases.len(), state);
 
@@ -1702,40 +1716,45 @@ fn load_prior_checkpoint(spec_id: &str, done_ids: &std::collections::HashSet<Str
 /// all tasks were already DONE in the DB. Drives the entry state from the
 /// pipeline's declared shape + the DB's done-state.
 ///
-/// Loud-failure invariant: panics if `done_ids` contains an ID not present
-/// in `order`. That would mean the DB and the in-memory task list disagree —
-/// a corruption signal that must not be silently tolerated.
+/// Loud-failure invariant: returns `Err` if `done_ids` contains an ID not
+/// present in `order`. That would mean the DB and the in-memory task list
+/// disagree — a corruption signal. Returning `Err` (rather than panicking)
+/// lets the caller update the spec's DB row to "failed" via the normal
+/// `queue.update_spec(spec_id, "failed")?` path, instead of leaking a
+/// half-dead worker thread that leaves the spec stuck as "running" forever
+/// (per architectural review 2026-05-12, addressing Standing Order S6).
 pub(crate) fn initial_worker_state(
     order: &[String],
     done_ids: &std::collections::HashSet<String>,
     pre_spec_phases: &[&str],
-) -> WorkerState {
+) -> Result<WorkerState, String> {
     // Loud: catch inconsistency before we make decisions on stale state.
     for id in done_ids {
         if !order.iter().any(|o| o == id) {
-            panic!(
+            return Err(format!(
                 "initial_worker_state: done_ids contains '{}' not in order {:?}; \
                  DB/order disagreement — refusing to silently start",
                 id, order
-            );
+            ));
         }
     }
 
     if order.is_empty() {
         // Degenerate spec — no tasks declared. Treat as terminal success.
-        return WorkerState::Cleanup { success: true };
+        boi_log!("state machine entry: empty order → Cleanup{{success:true}}");
+        return Ok(WorkerState::Cleanup { success: true });
     }
     if done_ids.len() == order.len() {
         // All tasks already complete (e.g. fresh worker after restart).
         // Skip pre-spec phases entirely; jump straight to post-task wrap-up.
-        return WorkerState::PostTaskSpecPhase { phase_idx: 0 };
+        return Ok(WorkerState::PostTaskSpecPhase { phase_idx: 0 });
     }
     if pre_spec_phases.is_empty() {
         // Pipeline declares no pre-spec phases — go directly to task selection.
-        return WorkerState::TaskSelect;
+        return Ok(WorkerState::TaskSelect);
     }
     // Normal entry: there are pending tasks and pre-spec phases to run first.
-    WorkerState::SpecPhase { phase_idx: 0 }
+    Ok(WorkerState::SpecPhase { phase_idx: 0 })
 }
 
 #[cfg(test)]
@@ -2232,16 +2251,20 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
         assert_eq!(st.tasks[1].status, "DONE");
     }
 
-    #[test]
-    // TODO(2026-05-12-layer3): rewrite for the explicit pipeline shape.
-    // This test encodes a verdict-consumption sequence that assumed the legacy
-    // `spec_phases = [...]` + magic-string fallback shape. After the
-    // phase-configurability fix (docs/phase-configurability-2026-05-12.md),
-    // verdict ordering changed (e.g. challenge no longer references the
-    // phantom `spec-review` phase). Rewrite verdicts to match
-    // pre=[plan-critique], post=[critic] explicit shape. Keep the test —
-    // it covers real redo-injection behavior, not legacy plumbing.
-    #[ignore = "Layer 3 follow-up — verdict sequence needs update for new pipeline shape"]
+    // Re-ignored 2026-05-12 (PR #19): test correctly catches BUG M-5, but the
+    // bug is real and pre-dates this PR. After a task phase returns Verdict::Redo
+    // with injected tasks, the original task's DB row stays at `in_progress` —
+    // so `queue.try_claim_task` rejects re-selection, the worker deadlocks, and
+    // the spec fails. The injected task runs fine; the ORIGINAL task is stranded.
+    //
+    // Fix scope is the task-state machinery in worker.rs around the Redo branch
+    // of TaskPhase + queue.update_task_status — needs to reset the original task
+    // back to PENDING after Redo (or transition to a different lifecycle state).
+    // Tracked as a follow-up spec — separate from phase-configurability.
+    //
+    // The test stays in the file (not deleted) so the bug remains visible.
+    #[ignore = "Pre-existing BUG M-5: task stays 'in_progress' after Redo, blocks re-selection. \
+                Not introduced by PR #19; tracked as a separate follow-up spec on the task-state machine."]
     #[test]
     fn test_redo_tasks_are_executed() {
         // BUG M-5: When Verdict::Redo injects new tasks via queue.add_task(), the
@@ -2496,17 +2519,16 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
     }
 
     // --- Quality loop tests ---
-    // TODO(2026-05-12-layer3): both quality-loop tests below assume the legacy
-    // pipeline shape that included a phantom `spec-review` phase in pre_spec_phases.
-    // The new explicit pipeline (challenge mode) has pre=[plan-critique], post=[critic].
-    // Rewrite mock verdict sequences to match. The quality-loop machinery itself
-    // is untouched — only the test fixture references the dead phase name.
+    // Rewritten 2026-05-12 for the explicit pipeline shape.
+    // challenge mode: pre=[plan-critique], post=[critic], task=[execute, task-verify].
+    // No more phantom `spec-review` phase. The quality-loop machinery itself
+    // is unchanged — plan-critique returning Redo with `on_reject: requeue:plan-critique`
+    // loops back to itself (the only phase in spec_pre_phases for this mode).
 
-    #[ignore = "Layer 3 follow-up — verdict sequence assumes phantom spec-review phase"]
     #[test]
-    fn test_quality_loop_plan_critique_loops_back_to_spec_review() {
-        // challenge mode: pre_spec_phases = [spec-review, plan-critique]
-        // plan-critique rejects once → loops back to spec-review → approved on second pass
+    fn test_quality_loop_plan_critique_loops_back_on_redo() {
+        // challenge mode: pre_spec_phases = [plan-critique]
+        // plan-critique rejects once → loops back to plan-critique → approved on second pass
         let yaml = "title: \"Quality Loop Test\"\nmode: challenge\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
         let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("quality_loop", yaml);
         let config = WorkerConfig {
@@ -2518,18 +2540,17 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             models: None,
         };
         let registry = PhaseRegistry::new();
-        // Phase call order:
-        //   spec-review(pre), plan-critique(pre→Redo→loop), spec-review(pre loop1),
-        //   plan-critique(pre loop1), execute, task-verify, spec-review(post), critic(post→exhausted)
+        // Phase call order (post-Layer-3):
+        //   plan-critique(pre) Redo → quality loop back to plan-critique
+        //   plan-critique(pre, loop 1) Proceed → exit pre
+        //   execute (task), task-verify (task)
+        //   critic (post)
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            Verdict::Proceed,                      // spec-review (pre)
             Verdict::Redo { tasks: vec![] },       // plan-critique rejects → quality loop
-            Verdict::Proceed,                      // spec-review (loop 1)
             Verdict::Proceed,                      // plan-critique (loop 1 — approved)
             Verdict::Proceed,                      // execute
             Verdict::Proceed,                      // task-verify
-            Verdict::Proceed,                      // spec-review (post)
-            // critic (post) → exhausted, MockPhaseRunner returns Proceed automatically
+            Verdict::Proceed,                      // critic (post)
         ]);
         let tel = test_telemetry();
 
@@ -2555,10 +2576,11 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
         assert_eq!(remaining, 0, "all verdicts should be consumed — quality loop must have run (got {} remaining)", remaining);
     }
 
-    #[ignore = "Layer 3 follow-up — verdict sequence assumes phantom spec-review phase"]
     #[test]
     fn test_quality_loop_max_exceeded_proceeds_to_task_select() {
-        // plan-critique rejects 3 times — after 3 loops (max), proceed anyway
+        // Post-Layer-3 challenge mode: pre=[plan-critique], no phantom spec-review.
+        // With max_spec_loops=3: loops 0→1, 1→2, 2→3 (3 Redos retry the loop).
+        // The 4th Redo finds count==3 (not < 3) so proceeds to TaskSelect.
         let yaml = "title: \"Max Loop Test\"\nmode: challenge\ntasks:\n  - id: t-1\n    title: \"Task\"\n    status: PENDING\n";
         let (queue, spec_id, db_path, spec_path, repo) = setup_phase_test("quality_loop_max", yaml);
         let config = WorkerConfig {
@@ -2570,24 +2592,17 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             models: None,
         };
         let registry = PhaseRegistry::new();
-        // With max_spec_loops=3: loops 1,2,3 retry; on loop 3's rejection spec_loop_count=3
-        // which is NOT < 3, so proceed to TaskSelect.
         // Phase call order:
-        //   sr(pre), pc(rej→loop1), sr, pc(rej→loop2), sr, pc(rej→loop3), sr, pc(rej→proceed!),
-        //   execute, task-verify, sr(post), critic(post→exhausted)
+        //   plan-critique(rej→loop1), plan-critique(rej→loop2), plan-critique(rej→loop3),
+        //   plan-critique(rej→max exceeded, proceed!), execute, task-verify, critic(post)
         let mock = crate::runner::MockPhaseRunner::new(vec![
-            Verdict::Proceed,                      // spec-review (pre)
             Verdict::Redo { tasks: vec![] },       // plan-critique → loop 1
-            Verdict::Proceed,                      // spec-review (loop 1)
             Verdict::Redo { tasks: vec![] },       // plan-critique → loop 2
-            Verdict::Proceed,                      // spec-review (loop 2)
             Verdict::Redo { tasks: vec![] },       // plan-critique → loop 3
-            Verdict::Proceed,                      // spec-review (loop 3)
-            Verdict::Redo { tasks: vec![] },       // plan-critique → max exceeded, proceed anyway
+            Verdict::Redo { tasks: vec![] },       // plan-critique → max exceeded, proceed
             Verdict::Proceed,                      // execute
             Verdict::Proceed,                      // task-verify
-            Verdict::Proceed,                      // spec-review (post)
-            // critic (post) → exhausted
+            Verdict::Proceed,                      // critic (post)
         ]);
         let tel = test_telemetry();
 
@@ -2841,7 +2856,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
 
     #[test]
     fn initial_state_empty_order_goes_to_cleanup() {
-        let s = initial_worker_state(&[], &done_set(&[]), &[]);
+        let s = initial_worker_state(&[], &done_set(&[]), &[]).expect("Ok expected");
         match s {
             WorkerState::Cleanup { success: true } => {}
             other => panic!("expected Cleanup{{success:true}}, got {:?}", other),
@@ -2852,7 +2867,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
     fn initial_state_all_done_jumps_to_post_task_phase() {
         let order = ids(&["t1", "t2", "t3"]);
         let done = done_set(&["t1", "t2", "t3"]);
-        let s = initial_worker_state(&order, &done, &["spec-review", "plan-critique"]);
+        let s = initial_worker_state(&order, &done, &["spec-review", "plan-critique"]).expect("Ok expected");
         match s {
             WorkerState::PostTaskSpecPhase { phase_idx: 0 } => {}
             other => panic!("expected PostTaskSpecPhase{{0}}, got {:?}", other),
@@ -2863,7 +2878,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
     fn initial_state_empty_pre_phases_goes_to_task_select() {
         let order = ids(&["t1"]);
         let done = done_set(&[]);
-        let s = initial_worker_state(&order, &done, &[]);
+        let s = initial_worker_state(&order, &done, &[]).expect("Ok expected");
         match s {
             WorkerState::TaskSelect => {}
             other => panic!("expected TaskSelect, got {:?}", other),
@@ -2874,7 +2889,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
     fn initial_state_normal_starts_at_spec_phase_zero() {
         let order = ids(&["t1", "t2"]);
         let done = done_set(&[]);
-        let s = initial_worker_state(&order, &done, &["spec-review"]);
+        let s = initial_worker_state(&order, &done, &["spec-review"]).expect("Ok expected");
         match s {
             WorkerState::SpecPhase { phase_idx: 0 } => {}
             other => panic!("expected SpecPhase{{0}}, got {:?}", other),
@@ -2885,7 +2900,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
     fn initial_state_partial_done_with_pre_phases_starts_at_spec_phase() {
         let order = ids(&["t1", "t2", "t3"]);
         let done = done_set(&["t1"]);
-        let s = initial_worker_state(&order, &done, &["plan-critique"]);
+        let s = initial_worker_state(&order, &done, &["plan-critique"]).expect("Ok expected");
         match s {
             WorkerState::SpecPhase { phase_idx: 0 } => {}
             other => panic!("expected SpecPhase{{0}}, got {:?}", other),
@@ -2893,11 +2908,23 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
     }
 
     #[test]
-    #[should_panic(expected = "DB/order disagreement")]
-    fn initial_state_inconsistent_done_ids_panics_loudly() {
+    fn initial_state_inconsistent_done_ids_returns_err_loudly() {
         // Loud failure: done_ids contains an ID not in order — DB corruption.
+        // Returns Err so the caller can update the DB to "failed" via the
+        // normal error path, rather than panicking and leaving the worker
+        // thread dead while the spec sits as "running".
         let order = ids(&["t1", "t2"]);
         let done = done_set(&["t1", "t-ghost"]);
-        let _ = initial_worker_state(&order, &done, &["spec-review"]);
+        let err = initial_worker_state(&order, &done, &["spec-review"])
+            .expect_err("expected Err on inconsistent done_ids");
+        assert!(
+            err.contains("DB/order disagreement"),
+            "error message must name the disagreement, got: {}", err
+        );
+        assert!(
+            err.contains("t-ghost"),
+            "error message must name the offending id, got: {}", err
+        );
+        let _ = (order, done); // keep variables live for clarity
     }
 }
