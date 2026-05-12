@@ -1,18 +1,32 @@
+# BOI pipeline modes. Each [mode.X] declares explicit phase ordering.
+# spec_pre_phases  — run once before tasks (e.g. spec planning, critique)
+# spec_post_phases — run once after all tasks complete (e.g. critic, merge, cleanup)
+# task_phases      — run per task in order
+# max_loops        — cap on spec_pre_phases ↔ on_reject:requeue iterations (default 3)
+#
+# Migrated 2026-05-12 from legacy `spec_phases` (which relied on a magic-string
+# fallback in worker.rs to split into pre/post by name). All modes now declare
+# the split explicitly. See docs/phase-configurability-2026-05-12.md for context.
+
 [mode.default]
-spec_phases = ["critic"]
-task_phases = ["execute", "task-verify"]
+spec_pre_phases  = []
+spec_post_phases = ["critic"]
+task_phases      = ["execute", "task-verify"]
 
 [mode.challenge]
-spec_phases = ["plan-critique", "critic"]
-task_phases = ["execute", "task-verify"]
+spec_pre_phases  = ["plan-critique"]
+spec_post_phases = ["critic"]
+task_phases      = ["execute", "task-verify"]
 
 [mode.discover]
-spec_phases = ["critic", "evaluate"]
-task_phases = ["execute", "task-verify"]
+spec_pre_phases  = []
+spec_post_phases = ["critic", "evaluate"]
+task_phases      = ["execute", "task-verify"]
 
 [mode.generate]
-spec_phases = ["plan-critique", "critic", "evaluate"]
-task_phases = ["decompose", "execute", "code-review", "task-verify"]
+spec_pre_phases  = ["plan-critique"]
+spec_post_phases = ["critic", "evaluate"]
+task_phases      = ["decompose", "execute", "code-review", "task-verify"]
 
 [mode.v2]
 spec_pre_phases  = ["spec-critique", "spec-improve"]

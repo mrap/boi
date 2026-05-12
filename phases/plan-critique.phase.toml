@@ -3,6 +3,8 @@ description = "Evaluate spec quality before execution: catch non-executable veri
 
 [phase]
 level = "spec"
+can_add_tasks = true
+can_fail_spec = true
 
 [worker]
 runtime = "claude"
@@ -15,7 +17,7 @@ timeout = 300
 approve_signal = "## Plan Approved"
 reject_signal = "[PLAN-CRITIQUE]"
 on_approve = "next"
-on_reject = "requeue:spec-review"
+on_reject = "requeue:plan-critique"
 on_crash = "retry"
 
 [hooks]

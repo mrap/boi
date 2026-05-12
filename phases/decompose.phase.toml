@@ -4,6 +4,8 @@ completion_handler = "builtin:decompose"
 
 [phase]
 level = "task"
+can_add_tasks = true
+can_fail_spec = false
 
 [worker]
 runtime = "claude"

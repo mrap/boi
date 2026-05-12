@@ -4,6 +4,8 @@ completion_handler = "builtin:cleanup"
 
 [phase]
 level = "spec"
+can_add_tasks = false
+can_fail_spec = false
 
 [worker]
 runtime = "deterministic"

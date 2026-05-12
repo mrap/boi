@@ -18,6 +18,7 @@ pub enum TemplateVar {
     TaskSpec,
     TaskVerify,
     TaskDepends,
+    PriorTaskContext,
 }
 
 impl TemplateVar {
@@ -34,6 +35,7 @@ impl TemplateVar {
             Self::TaskSpec => "TASK_SPEC",
             Self::TaskVerify => "TASK_VERIFY",
             Self::TaskDepends => "TASK_DEPENDS",
+            Self::PriorTaskContext => "PRIOR_TASK_CONTEXT",
         }
     }
 
@@ -183,10 +185,18 @@ struct HooksSection {
 }
 
 impl PhaseConfig {
-    fn from_toml(toml: PhaseToml) -> Option<Self> {
+    /// Build a PhaseConfig from a parsed TOML.
+    ///
+    /// Returns `Err` (loud) on missing required `[phase]` fields. The legacy
+    /// `derive_level` / `derive_can_add_tasks` / `derive_can_fail_spec`
+    /// magic-string fallbacks were deleted 2026-05-12 — phase TOMLs must
+    /// now declare these fields explicitly. See
+    /// docs/phase-configurability-2026-05-12.md for migration.
+    fn from_toml(toml: PhaseToml) -> Result<Self, String> {
         let name = toml
             .phase.as_ref().and_then(|p| p.name.clone())
-            .or(toml.name.clone())?;
+            .or(toml.name.clone())
+            .ok_or_else(|| "phase TOML missing required `name` (either [phase].name or top-level `name`)".to_string())?;
 
         let description = toml
             .phase.as_ref().and_then(|p| p.description.clone())
@@ -200,25 +210,31 @@ impl PhaseConfig {
 
         // timeout_minutes is intentionally NOT populated from TOML here. It is set
         // exclusively by apply_phase_overrides_from_map at runtime (pipeline overrides).
-        // Reading TOML-level timeout values here caused all phases to use short per-phase
-        // TOML ceilings (2-10 min) instead of the 1800s global default. The [worker]
-        // timeout / [phase] timeout_minutes TOML fields are metadata-only.
         let timeout_minutes: Option<u32> = None;
 
-        // Read level from [phase] section; fall back to name-based derivation for
-        // user-created phases that don't specify level.
+        // Required field: [phase].level. Loud failure if missing — no name-based inference.
         let level = toml.phase.as_ref().and_then(|p| p.level)
-            .unwrap_or_else(|| derive_level(&name));
+            .ok_or_else(|| format!(
+                "phase '{}': [phase].level is required (\"spec\" or \"task\") — \
+                 name-based inference removed 2026-05-12",
+                name
+            ))?;
 
-        // Derive can_add_tasks: explicit [phase] setting wins, else derive from completion_handler
-        let can_add_tasks = toml
-            .phase.as_ref().and_then(|p| p.can_add_tasks)
-            .unwrap_or_else(|| derive_can_add_tasks(&name, toml.completion_handler.as_deref()));
+        // Required field: [phase].can_add_tasks. Loud failure if missing.
+        let can_add_tasks = toml.phase.as_ref().and_then(|p| p.can_add_tasks)
+            .ok_or_else(|| format!(
+                "phase '{}': [phase].can_add_tasks is required (true|false) — \
+                 name-based inference removed 2026-05-12",
+                name
+            ))?;
 
-        // Derive can_fail_spec: explicit [phase] setting wins, else derive from name
-        let can_fail_spec = toml
-            .phase.as_ref().and_then(|p| p.can_fail_spec)
-            .unwrap_or_else(|| derive_can_fail_spec(&name));
+        // Required field: [phase].can_fail_spec. Loud failure if missing.
+        let can_fail_spec = toml.phase.as_ref().and_then(|p| p.can_fail_spec)
+            .ok_or_else(|| format!(
+                "phase '{}': [phase].can_fail_spec is required (true|false) — \
+                 name-based inference removed 2026-05-12",
+                name
+            ))?;
 
         let runtime = toml.worker.as_ref().and_then(|w| w.runtime.clone());
         let completion_handler = toml.completion_handler.clone();
@@ -246,7 +262,7 @@ impl PhaseConfig {
         let hooks_pre = toml.hooks.as_ref().and_then(|h| h.pre.clone()).unwrap_or_default();
         let hooks_post = toml.hooks.as_ref().and_then(|h| h.post.clone()).unwrap_or_default();
 
-        Some(PhaseConfig {
+        Ok(PhaseConfig {
             name,
             level,
             description,
@@ -273,30 +289,10 @@ impl PhaseConfig {
     }
 }
 
-/// Derive phase level from name. Spec-level phases: plan-critique, critic, evaluate, review, spec-review/spec-critique/spec-improve.
-fn derive_level(name: &str) -> PhaseLevel {
-    match name {
-        "plan-critique" | "critic" | "evaluate" | "review"
-        | "spec-review" | "spec-critique" | "spec-improve" => PhaseLevel::Spec,
-        _ => PhaseLevel::Task,
-    }
-}
-
-/// Derive can_add_tasks from completion_handler or name.
-fn derive_can_add_tasks(name: &str, completion_handler: Option<&str>) -> bool {
-    if let Some(handler) = completion_handler {
-        if handler == "builtin:decompose" {
-            return true;
-        }
-    }
-    // Phases that structurally add tasks: critic, decompose, evaluate, plan-critique, code-review, review, spec-review/spec-critique
-    matches!(name, "critic" | "decompose" | "evaluate" | "plan-critique" | "code-review" | "review" | "spec-review" | "spec-critique")
-}
-
-/// Derive can_fail_spec from name.
-fn derive_can_fail_spec(name: &str) -> bool {
-    matches!(name, "plan-critique" | "critic")
-}
+// derive_level / derive_can_add_tasks / derive_can_fail_spec REMOVED 2026-05-12.
+// Phase TOMLs must now declare these fields explicitly. Loud-failure load-time
+// validation in PhaseConfig::from_toml above. See
+// docs/phase-configurability-2026-05-12.md for context + migration.
 
 fn non_empty(opt: &Option<String>) -> Option<String> {
     opt.as_ref().and_then(|s| {
@@ -520,11 +516,25 @@ impl PhaseRegistry {
                             self.user.insert(phase.name.clone(), phase);
                         }
                         Err(e) => {
+                            // Loud failure: a user-override phase TOML is broken.
+                            // Refuse to use any phases from this dir, with a
+                            // clear pointer to the file. Test gate same as
+                            // load_phases_from_dir below — production exit 2,
+                            // tests assert on return value.
                             eprintln!(
-                                "WARN: failed to load phase {}: {}",
+                                "[boi] FATAL: failed to load user-override phase {}: {}",
                                 entry.display(),
                                 e
                             );
+                            if !cfg!(test) {
+                                eprintln!(
+                                    "[boi] Refusing to start with a broken phase override. \
+                                     Fix or remove the file above. See \
+                                     docs/phase-configurability-2026-05-12.md for the \
+                                     required schema."
+                                );
+                                std::process::exit(2);
+                            }
                         }
                     }
                 }
@@ -727,6 +737,26 @@ fn load_pipeline_from_file(path: &Path, mode: &str) -> Option<PipelineConfig> {
         other => other,
     };
     parsed.mode.get(key).map(|m| {
+        // Loud-failure migration warning (2026-05-12): the legacy magic-string
+        // sorter that split `spec_phases` into pre/post by name was removed.
+        // If a user's pipelines.toml uses the old `spec_phases = [...]` shape
+        // without explicit `spec_pre_phases`/`spec_post_phases`, behavior
+        // silently shifts (a `plan-critique` that used to run PRE now runs
+        // POST via the spec_post_phases backfill below). Surface this loudly.
+        if !m.spec_phases.is_empty()
+            && m.spec_pre_phases.is_empty()
+            && m.spec_post_phases.is_empty()
+        {
+            eprintln!(
+                "[boi] WARN: pipeline mode '{}' at {} uses legacy `spec_phases = [...]` \
+                 with no explicit `spec_pre_phases` / `spec_post_phases`. The phase split \
+                 fallback was removed 2026-05-12. All phases will run POST-task; if any \
+                 (e.g. `plan-critique`) was meant as PRE-task, declare it explicitly in \
+                 `spec_pre_phases`. See docs/phase-configurability-2026-05-12.md.",
+                key, path.display()
+            );
+        }
+
         // Backward compat: if spec_post_phases not provided, use spec_phases as spec_post_phases.
         let spec_post = if !m.spec_post_phases.is_empty() {
             m.spec_post_phases.clone()
@@ -756,32 +786,37 @@ pub fn default_pipeline(mode: &str) -> PipelineConfig {
 }
 
 pub(crate) fn fallback_pipeline(mode: &str) -> PipelineConfig {
+    // Migrated 2026-05-12 to use explicit spec_pre_phases / spec_post_phases.
+    // The old shape used `spec_phases` + a legacy magic-string fallback in worker.rs
+    // to infer pre/post by name; that fallback was removed.
+    // Note: `spec-review` is referenced here but no such phase TOML exists — those
+    // entries are filtered out at runtime by registry.get(...).filter_map() in worker.rs.
     match mode {
         "execute" => PipelineConfig {
-            spec_phases: vec!["spec-review".into(), "critic".into()],
+            spec_phases: vec![],
             spec_pre_phases: vec![],
-            spec_post_phases: vec!["spec-review".into(), "critic".into()],
+            spec_post_phases: vec!["critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
             max_loops: 3,
         },
         "challenge" => PipelineConfig {
-            spec_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into()],
-            spec_pre_phases: vec![],
-            spec_post_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into()],
+            spec_phases: vec![],
+            spec_pre_phases: vec!["plan-critique".into()],
+            spec_post_phases: vec!["critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
             max_loops: 3,
         },
         "discover" => PipelineConfig {
-            spec_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
+            spec_phases: vec![],
             spec_pre_phases: vec![],
-            spec_post_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
+            spec_post_phases: vec!["critic".into(), "evaluate".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
             max_loops: 3,
         },
         "generate" => PipelineConfig {
-            spec_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
-            spec_pre_phases: vec![],
-            spec_post_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
+            spec_phases: vec![],
+            spec_pre_phases: vec!["plan-critique".into()],
+            spec_post_phases: vec!["critic".into(), "evaluate".into()],
             task_phases: vec!["decompose".into(), "execute".into(), "code-review".into(), "task-verify".into()],
             max_loops: 3,
         },
@@ -803,9 +838,8 @@ fn load_phase_file(path: &Path) -> Result<PhaseConfig, Box<dyn std::error::Error
 fn load_phase_file_with_base(path: &Path, base_dir: Option<&Path>) -> Result<PhaseConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
     let toml_parsed: PhaseToml = toml::from_str(&content)?;
-    let mut phase = PhaseConfig::from_toml(toml_parsed).ok_or_else(|| {
-        format!("phase file missing name: {}", path.display())
-    })?;
+    let mut phase = PhaseConfig::from_toml(toml_parsed)
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
 
     // If prompt_template is a file path (not inline content), resolve and read it.
     // Search order: ~/.boi/ (user override) → repo root (default)
@@ -877,15 +911,24 @@ fn core_phases_dir() -> Option<PathBuf> {
 
 /// Load core phases from TOML files in the phases/ directory.
 /// Returns empty vec if no directory found (caller should use fallback).
+///
+/// Loud-failure policy (2026-05-12, Standing Order S6): if any file matching
+/// `*.phase.toml` fails to load, the process aborts with a clear stderr
+/// message. The bare `*.toml` glob (which used to catch `pipelines.toml`)
+/// was removed — pipelines.toml is loaded by `load_pipeline_from_file`, not
+/// by the phase walker. Mixing them caused WARN-and-skip noise where the
+/// pipelines file was tried as a phase, failed validation, and silently
+/// dropped — exactly the swallowed-failure pattern S6 prohibits.
 fn load_phases_from_dir(phases_dir: &Path) -> Vec<PhaseConfig> {
     if !phases_dir.is_dir() {
         return Vec::new();
     }
 
     let mut phases = Vec::new();
+    // ONLY *.phase.toml — bare *.toml catches pipelines.toml etc which are
+    // not phase files.
     let patterns = [
         phases_dir.join("*.phase.toml"),
-        phases_dir.join("*.toml"),
     ];
     let mut seen = std::collections::HashSet::new();
 
@@ -901,11 +944,29 @@ fn load_phases_from_dir(phases_dir: &Path) -> Vec<PhaseConfig> {
                         phases.push(phase);
                     }
                     Err(e) => {
+                        // Loud failure: a malformed core phase TOML means BOI
+                        // is misconfigured / corrupted. Refuse to start with a
+                        // clear pointer instead of silently substituting a
+                        // fallback that might mismatch user expectations.
+                        //
+                        // Test gate: in `cargo test`, the loader is called
+                        // against synthetic fixture dirs (some intentionally
+                        // malformed). Exiting the test process loses all signal.
+                        // Tests assert on the loader's RETURN value instead;
+                        // production keeps the FATAL behavior.
                         eprintln!(
-                            "WARN: failed to load core phase {}: {}",
+                            "[boi] FATAL: failed to load core phase {}: {}",
                             entry.display(),
                             e
                         );
+                        if !cfg!(test) {
+                            eprintln!(
+                                "[boi] Refusing to start with a broken phase registry. \
+                                 Fix the file above or restore from `git checkout HEAD -- {}`.",
+                                entry.display()
+                            );
+                            std::process::exit(2);
+                        }
                     }
                 }
             }
@@ -1208,6 +1269,7 @@ description = "Custom execute phase"
 [phase]
 name = "execute"
 description = "Custom execute phase"
+level = "task"
 timeout_minutes = 60
 can_add_tasks = false
 can_fail_spec = false
@@ -1242,6 +1304,7 @@ description = "Custom lint phase"
 [phase]
 name = "custom-lint"
 description = "Custom lint phase"
+level = "task"
 can_add_tasks = false
 can_fail_spec = true
 requires_claude = true
@@ -1373,52 +1436,53 @@ approve_signal = ""
 
     // --- Step 2: PipelineConfig tests ---
 
+    // Updated 2026-05-12: assert the explicit spec_pre_phases / spec_post_phases
+    // shape that replaced the legacy `spec_phases + magic-string fallback`.
+
     #[test]
     fn test_default_pipeline_execute() {
         let p = fallback_pipeline("execute");
-        assert_eq!(p.spec_phases, vec!["spec-review", "critic"]);
+        assert_eq!(p.spec_pre_phases, Vec::<String>::new());
+        assert_eq!(p.spec_post_phases, vec!["critic"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_challenge() {
         let p = fallback_pipeline("challenge");
-        assert_eq!(p.spec_phases, vec!["spec-review", "plan-critique", "critic"]);
+        assert_eq!(p.spec_pre_phases, vec!["plan-critique"]);
+        assert_eq!(p.spec_post_phases, vec!["critic"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_discover() {
         let p = fallback_pipeline("discover");
-        assert_eq!(p.spec_phases, vec!["spec-review", "critic", "evaluate"]);
+        assert_eq!(p.spec_pre_phases, Vec::<String>::new());
+        assert_eq!(p.spec_post_phases, vec!["critic", "evaluate"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_generate() {
         let p = fallback_pipeline("generate");
-        assert_eq!(p.spec_phases, vec!["spec-review", "critic", "evaluate"]);
+        assert_eq!(p.spec_pre_phases, vec!["plan-critique"]);
+        assert_eq!(p.spec_post_phases, vec!["critic", "evaluate"]);
         assert_eq!(p.task_phases, vec!["decompose", "execute", "code-review", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_unknown_mode() {
         let p = fallback_pipeline("unknown");
-        assert!(p.spec_phases.is_empty());
+        assert!(p.spec_pre_phases.is_empty());
+        assert!(p.spec_post_phases.is_empty());
         assert_eq!(p.task_phases, vec!["execute"]);
     }
 
-    #[test]
-    fn test_spec_review_is_first_spec_phase() {
-        for mode in &["execute", "challenge", "discover", "generate"] {
-            let p = fallback_pipeline(mode);
-            assert_eq!(
-                p.spec_phases.first().map(|s| s.as_str()),
-                Some("spec-review"),
-                "spec-review must be first spec phase in mode '{mode}'"
-            );
-        }
-    }
+    // test_spec_review_is_first_spec_phase REMOVED 2026-05-12:
+    // `spec-review` was a phantom phase name in the legacy fallback that
+    // never had a corresponding *.phase.toml. The current pipeline uses
+    // `plan-critique` for pre-task critique and `critic` for post.
 
     // --- Step 3: New core phases tests ---
 
@@ -1801,17 +1865,21 @@ approve_signal = ""
 
     #[test]
     fn test_pipeline_contains_all_levels() {
+        // Updated 2026-05-12: spec-level phases now live in spec_pre_phases
+        // and spec_post_phases (not the legacy spec_phases field).
         let registry = test_registry();
 
         for mode in &["execute", "challenge", "discover", "generate"] {
             let pipeline = fallback_pipeline(mode);
 
-            let has_spec_phase = pipeline.spec_phases.iter().any(|name| {
-                registry.get(name).map(|p| p.level == PhaseLevel::Spec).unwrap_or(false)
-            });
+            let has_spec_phase = pipeline.spec_pre_phases.iter()
+                .chain(pipeline.spec_post_phases.iter())
+                .any(|name| {
+                    registry.get(name).map(|p| p.level == PhaseLevel::Spec).unwrap_or(false)
+                });
             assert!(
                 has_spec_phase,
-                "mode '{mode}' pipeline must include at least one Spec-level phase in spec_phases"
+                "mode '{mode}' pipeline must include at least one Spec-level phase in spec_pre_phases or spec_post_phases"
             );
 
             let has_task_phase = pipeline.task_phases.iter().any(|name| {
@@ -1854,12 +1922,8 @@ template = "Do something at the spec level."
             "user phase with level='spec' in TOML must load as PhaseLevel::Spec"
         );
 
-        // The name alone would derive to Task — this confirms TOML field wins over name derivation
-        assert_eq!(
-            derive_level("my-custom-phase"),
-            PhaseLevel::Task,
-            "name-derived level for 'my-custom-phase' should be Task"
-        );
+        // derive_level was removed 2026-05-12 — phase TOMLs must declare level
+        // explicitly. The assert above (phase.level == Spec) is the test now.
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2019,6 +2083,8 @@ template = "Do something at the spec level."
             context_files: None,
             phase_overrides: Default::default(),
             worker_pool: None,
+            max_cost_usd: None,
+            key_artifacts: None,
             tasks: vec![
                 crate::spec::BoiTask {
                     id: "t-1".into(),
@@ -2156,6 +2222,185 @@ spec_phases = ["critic"]
 task_phases = ["execute"]
 "#);
             assert!(load_pipeline_from_file(&path, "nonexistent").is_none());
+        }
+    }
+
+    // ── Layer 3 — magic-string derive removal — 2026-05-12 ─────────────────
+    // Phase TOMLs must declare level / can_add_tasks / can_fail_spec
+    // explicitly. PhaseConfig::from_toml returns Err on any missing field.
+
+    mod loud_phase_toml_validation {
+        use super::*;
+
+        fn parse(toml_str: &str) -> Result<PhaseConfig, String> {
+            let parsed: PhaseToml = toml::from_str(toml_str)
+                .unwrap_or_else(|e| panic!("TOML parse error: {}", e));
+            PhaseConfig::from_toml(parsed)
+        }
+
+        #[test]
+        fn errors_loudly_when_level_missing() {
+            let r = parse(r#"
+                name = "custom-phase"
+                [phase]
+                can_add_tasks = false
+                can_fail_spec = false
+            "#);
+            let err = r.expect_err("expected Err: missing [phase].level");
+            assert!(
+                err.contains("[phase].level is required"),
+                "error message must name the missing field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn errors_loudly_when_can_add_tasks_missing() {
+            let r = parse(r#"
+                name = "custom-phase"
+                [phase]
+                level = "task"
+                can_fail_spec = false
+            "#);
+            let err = r.expect_err("expected Err: missing [phase].can_add_tasks");
+            assert!(
+                err.contains("[phase].can_add_tasks is required"),
+                "error message must name the missing field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn errors_loudly_when_can_fail_spec_missing() {
+            let r = parse(r#"
+                name = "custom-phase"
+                [phase]
+                level = "spec"
+                can_add_tasks = true
+            "#);
+            let err = r.expect_err("expected Err: missing [phase].can_fail_spec");
+            assert!(
+                err.contains("[phase].can_fail_spec is required"),
+                "error message must name the missing field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn errors_loudly_when_name_missing() {
+            let r = parse(r#"
+                [phase]
+                level = "task"
+                can_add_tasks = false
+                can_fail_spec = false
+            "#);
+            let err = r.expect_err("expected Err: missing name");
+            assert!(
+                err.contains("missing required `name`"),
+                "error must name the missing field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn loads_ok_when_all_required_fields_present() {
+            let r = parse(r#"
+                name = "custom-phase"
+                [phase]
+                level = "task"
+                can_add_tasks = false
+                can_fail_spec = false
+            "#);
+            let cfg = r.expect("should load with all required fields");
+            assert_eq!(cfg.name, "custom-phase");
+            assert_eq!(cfg.level, PhaseLevel::Task);
+            assert!(!cfg.can_add_tasks);
+            assert!(!cfg.can_fail_spec);
+        }
+
+        #[test]
+        fn errors_loudly_when_level_is_invalid_string() {
+            // serde's enum-from-string error fires before our explicit
+            // missing-field check. Confirm we get a clear failure naming
+            // the bad value (not a silent fallback to Task).
+            let toml_str = r#"
+                name = "bad-level"
+                [phase]
+                level = "wrong"
+                can_add_tasks = false
+                can_fail_spec = false
+            "#;
+            // Parsing the raw TOML into PhaseToml fails at the serde layer.
+            let result: Result<PhaseToml, _> = toml::from_str(toml_str);
+            let err = result.expect_err("expected serde failure on invalid level");
+            let msg = err.to_string();
+            // The error must include the field name OR the invalid value so
+            // a user can fix it. Both are present in serde's default message.
+            assert!(
+                msg.contains("level") || msg.contains("wrong") || msg.contains("variant"),
+                "error message must point to the invalid `level` field, got: {}",
+                msg
+            );
+        }
+    }
+
+    // ── Layer 3 integration — every repo phase TOML loads ───────────────────
+    // Catches the case where a phase TOML in `phases/` is missing a required
+    // field. Without this test, a malformed core TOML only surfaces at daemon
+    // start. Re-runnable in CI; fast because it's a directory walk + parse.
+    mod repo_phase_tomls_load {
+        use super::*;
+        use std::path::PathBuf;
+
+        #[test]
+        fn every_phase_toml_in_repo_loads() {
+            let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let phases_dir = repo_root.join("phases");
+            assert!(
+                phases_dir.is_dir(),
+                "repo phases dir must exist at {}",
+                phases_dir.display()
+            );
+
+            let entries: Vec<_> = std::fs::read_dir(&phases_dir)
+                .expect("read phases dir")
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .to_string_lossy()
+                        .ends_with(".phase.toml")
+                })
+                .collect();
+
+            assert!(
+                !entries.is_empty(),
+                "expected at least one *.phase.toml in {}",
+                phases_dir.display()
+            );
+
+            let mut failures: Vec<String> = Vec::new();
+            for entry in &entries {
+                let p = entry.path();
+                let content = std::fs::read_to_string(&p)
+                    .expect(&format!("read {}", p.display()));
+                let parsed: Result<PhaseToml, _> = toml::from_str(&content);
+                match parsed {
+                    Ok(toml_parsed) => {
+                        if let Err(e) = PhaseConfig::from_toml(toml_parsed) {
+                            failures.push(format!("{}: {}", p.display(), e));
+                        }
+                    }
+                    Err(e) => {
+                        failures.push(format!("{}: serde parse: {}", p.display(), e));
+                    }
+                }
+            }
+
+            assert!(
+                failures.is_empty(),
+                "phase TOML load failures:\n{}",
+                failures.join("\n")
+            );
         }
     }
 }

@@ -3,6 +3,8 @@ description = "Review completed spec for quality issues. Add [CRITIC] tasks if p
 
 [phase]
 level = "spec"
+can_add_tasks = true
+can_fail_spec = true
 
 [worker]
 runtime = "claude"

@@ -5,6 +5,8 @@ completion_handler = "builtin:task-verify"
 [phase]
 name = "task-verify"
 level = "task"
+can_add_tasks = false
+can_fail_spec = false
 requires_claude = false
 
 [worker]
