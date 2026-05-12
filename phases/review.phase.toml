@@ -3,6 +3,8 @@ description = "Code review phase: checks correctness, security, error handling, 
 
 [phase]
 level = "spec"
+can_add_tasks = true
+can_fail_spec = false
 
 [worker]
 runtime = "claude"

@@ -3,6 +3,8 @@ description = "Update documentation affected by code changes"
 
 [phase]
 level = "task"
+can_add_tasks = false
+can_fail_spec = false
 
 [worker]
 runtime = "claude"

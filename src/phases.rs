@@ -18,6 +18,7 @@ pub enum TemplateVar {
     TaskSpec,
     TaskVerify,
     TaskDepends,
+    PriorTaskContext,
 }
 
 impl TemplateVar {
@@ -34,6 +35,7 @@ impl TemplateVar {
             Self::TaskSpec => "TASK_SPEC",
             Self::TaskVerify => "TASK_VERIFY",
             Self::TaskDepends => "TASK_DEPENDS",
+            Self::PriorTaskContext => "PRIOR_TASK_CONTEXT",
         }
     }
 
@@ -183,10 +185,18 @@ struct HooksSection {
 }
 
 impl PhaseConfig {
-    fn from_toml(toml: PhaseToml) -> Option<Self> {
+    /// Build a PhaseConfig from a parsed TOML.
+    ///
+    /// Returns `Err` (loud) on missing required `[phase]` fields. The legacy
+    /// `derive_level` / `derive_can_add_tasks` / `derive_can_fail_spec`
+    /// magic-string fallbacks were deleted 2026-05-12 — phase TOMLs must
+    /// now declare these fields explicitly. See
+    /// docs/phase-configurability-2026-05-12.md for migration.
+    fn from_toml(toml: PhaseToml) -> Result<Self, String> {
         let name = toml
             .phase.as_ref().and_then(|p| p.name.clone())
-            .or(toml.name.clone())?;
+            .or(toml.name.clone())
+            .ok_or_else(|| "phase TOML missing required `name` (either [phase].name or top-level `name`)".to_string())?;
 
         let description = toml
             .phase.as_ref().and_then(|p| p.description.clone())
@@ -200,25 +210,31 @@ impl PhaseConfig {
 
         // timeout_minutes is intentionally NOT populated from TOML here. It is set
         // exclusively by apply_phase_overrides_from_map at runtime (pipeline overrides).
-        // Reading TOML-level timeout values here caused all phases to use short per-phase
-        // TOML ceilings (2-10 min) instead of the 1800s global default. The [worker]
-        // timeout / [phase] timeout_minutes TOML fields are metadata-only.
         let timeout_minutes: Option<u32> = None;
 
-        // Read level from [phase] section; fall back to name-based derivation for
-        // user-created phases that don't specify level.
+        // Required field: [phase].level. Loud failure if missing — no name-based inference.
         let level = toml.phase.as_ref().and_then(|p| p.level)
-            .unwrap_or_else(|| derive_level(&name));
+            .ok_or_else(|| format!(
+                "phase '{}': [phase].level is required (\"spec\" or \"task\") — \
+                 name-based inference removed 2026-05-12",
+                name
+            ))?;
 
-        // Derive can_add_tasks: explicit [phase] setting wins, else derive from completion_handler
-        let can_add_tasks = toml
-            .phase.as_ref().and_then(|p| p.can_add_tasks)
-            .unwrap_or_else(|| derive_can_add_tasks(&name, toml.completion_handler.as_deref()));
+        // Required field: [phase].can_add_tasks. Loud failure if missing.
+        let can_add_tasks = toml.phase.as_ref().and_then(|p| p.can_add_tasks)
+            .ok_or_else(|| format!(
+                "phase '{}': [phase].can_add_tasks is required (true|false) — \
+                 name-based inference removed 2026-05-12",
+                name
+            ))?;
 
-        // Derive can_fail_spec: explicit [phase] setting wins, else derive from name
-        let can_fail_spec = toml
-            .phase.as_ref().and_then(|p| p.can_fail_spec)
-            .unwrap_or_else(|| derive_can_fail_spec(&name));
+        // Required field: [phase].can_fail_spec. Loud failure if missing.
+        let can_fail_spec = toml.phase.as_ref().and_then(|p| p.can_fail_spec)
+            .ok_or_else(|| format!(
+                "phase '{}': [phase].can_fail_spec is required (true|false) — \
+                 name-based inference removed 2026-05-12",
+                name
+            ))?;
 
         let runtime = toml.worker.as_ref().and_then(|w| w.runtime.clone());
         let completion_handler = toml.completion_handler.clone();
@@ -246,7 +262,7 @@ impl PhaseConfig {
         let hooks_pre = toml.hooks.as_ref().and_then(|h| h.pre.clone()).unwrap_or_default();
         let hooks_post = toml.hooks.as_ref().and_then(|h| h.post.clone()).unwrap_or_default();
 
-        Some(PhaseConfig {
+        Ok(PhaseConfig {
             name,
             level,
             description,
@@ -273,30 +289,10 @@ impl PhaseConfig {
     }
 }
 
-/// Derive phase level from name. Spec-level phases: plan-critique, critic, evaluate, review, spec-review/spec-critique/spec-improve.
-fn derive_level(name: &str) -> PhaseLevel {
-    match name {
-        "plan-critique" | "critic" | "evaluate" | "review"
-        | "spec-review" | "spec-critique" | "spec-improve" => PhaseLevel::Spec,
-        _ => PhaseLevel::Task,
-    }
-}
-
-/// Derive can_add_tasks from completion_handler or name.
-fn derive_can_add_tasks(name: &str, completion_handler: Option<&str>) -> bool {
-    if let Some(handler) = completion_handler {
-        if handler == "builtin:decompose" {
-            return true;
-        }
-    }
-    // Phases that structurally add tasks: critic, decompose, evaluate, plan-critique, code-review, review, spec-review/spec-critique
-    matches!(name, "critic" | "decompose" | "evaluate" | "plan-critique" | "code-review" | "review" | "spec-review" | "spec-critique")
-}
-
-/// Derive can_fail_spec from name.
-fn derive_can_fail_spec(name: &str) -> bool {
-    matches!(name, "plan-critique" | "critic")
-}
+// derive_level / derive_can_add_tasks / derive_can_fail_spec REMOVED 2026-05-12.
+// Phase TOMLs must now declare these fields explicitly. Loud-failure load-time
+// validation in PhaseConfig::from_toml above. See
+// docs/phase-configurability-2026-05-12.md for context + migration.
 
 fn non_empty(opt: &Option<String>) -> Option<String> {
     opt.as_ref().and_then(|s| {
@@ -756,32 +752,37 @@ pub fn default_pipeline(mode: &str) -> PipelineConfig {
 }
 
 pub(crate) fn fallback_pipeline(mode: &str) -> PipelineConfig {
+    // Migrated 2026-05-12 to use explicit spec_pre_phases / spec_post_phases.
+    // The old shape used `spec_phases` + a legacy magic-string fallback in worker.rs
+    // to infer pre/post by name; that fallback was removed.
+    // Note: `spec-review` is referenced here but no such phase TOML exists — those
+    // entries are filtered out at runtime by registry.get(...).filter_map() in worker.rs.
     match mode {
         "execute" => PipelineConfig {
-            spec_phases: vec!["spec-review".into(), "critic".into()],
+            spec_phases: vec![],
             spec_pre_phases: vec![],
-            spec_post_phases: vec!["spec-review".into(), "critic".into()],
+            spec_post_phases: vec!["critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
             max_loops: 3,
         },
         "challenge" => PipelineConfig {
-            spec_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into()],
-            spec_pre_phases: vec![],
-            spec_post_phases: vec!["spec-review".into(), "plan-critique".into(), "critic".into()],
+            spec_phases: vec![],
+            spec_pre_phases: vec!["plan-critique".into()],
+            spec_post_phases: vec!["critic".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
             max_loops: 3,
         },
         "discover" => PipelineConfig {
-            spec_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
+            spec_phases: vec![],
             spec_pre_phases: vec![],
-            spec_post_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
+            spec_post_phases: vec!["critic".into(), "evaluate".into()],
             task_phases: vec!["execute".into(), "task-verify".into()],
             max_loops: 3,
         },
         "generate" => PipelineConfig {
-            spec_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
-            spec_pre_phases: vec![],
-            spec_post_phases: vec!["spec-review".into(), "critic".into(), "evaluate".into()],
+            spec_phases: vec![],
+            spec_pre_phases: vec!["plan-critique".into()],
+            spec_post_phases: vec!["critic".into(), "evaluate".into()],
             task_phases: vec!["decompose".into(), "execute".into(), "code-review".into(), "task-verify".into()],
             max_loops: 3,
         },
@@ -803,9 +804,8 @@ fn load_phase_file(path: &Path) -> Result<PhaseConfig, Box<dyn std::error::Error
 fn load_phase_file_with_base(path: &Path, base_dir: Option<&Path>) -> Result<PhaseConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)?;
     let toml_parsed: PhaseToml = toml::from_str(&content)?;
-    let mut phase = PhaseConfig::from_toml(toml_parsed).ok_or_else(|| {
-        format!("phase file missing name: {}", path.display())
-    })?;
+    let mut phase = PhaseConfig::from_toml(toml_parsed)
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
 
     // If prompt_template is a file path (not inline content), resolve and read it.
     // Search order: ~/.boi/ (user override) → repo root (default)
@@ -1208,6 +1208,7 @@ description = "Custom execute phase"
 [phase]
 name = "execute"
 description = "Custom execute phase"
+level = "task"
 timeout_minutes = 60
 can_add_tasks = false
 can_fail_spec = false
@@ -1242,6 +1243,7 @@ description = "Custom lint phase"
 [phase]
 name = "custom-lint"
 description = "Custom lint phase"
+level = "task"
 can_add_tasks = false
 can_fail_spec = true
 requires_claude = true
@@ -1373,52 +1375,53 @@ approve_signal = ""
 
     // --- Step 2: PipelineConfig tests ---
 
+    // Updated 2026-05-12: assert the explicit spec_pre_phases / spec_post_phases
+    // shape that replaced the legacy `spec_phases + magic-string fallback`.
+
     #[test]
     fn test_default_pipeline_execute() {
         let p = fallback_pipeline("execute");
-        assert_eq!(p.spec_phases, vec!["spec-review", "critic"]);
+        assert_eq!(p.spec_pre_phases, Vec::<String>::new());
+        assert_eq!(p.spec_post_phases, vec!["critic"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_challenge() {
         let p = fallback_pipeline("challenge");
-        assert_eq!(p.spec_phases, vec!["spec-review", "plan-critique", "critic"]);
+        assert_eq!(p.spec_pre_phases, vec!["plan-critique"]);
+        assert_eq!(p.spec_post_phases, vec!["critic"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_discover() {
         let p = fallback_pipeline("discover");
-        assert_eq!(p.spec_phases, vec!["spec-review", "critic", "evaluate"]);
+        assert_eq!(p.spec_pre_phases, Vec::<String>::new());
+        assert_eq!(p.spec_post_phases, vec!["critic", "evaluate"]);
         assert_eq!(p.task_phases, vec!["execute", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_generate() {
         let p = fallback_pipeline("generate");
-        assert_eq!(p.spec_phases, vec!["spec-review", "critic", "evaluate"]);
+        assert_eq!(p.spec_pre_phases, vec!["plan-critique"]);
+        assert_eq!(p.spec_post_phases, vec!["critic", "evaluate"]);
         assert_eq!(p.task_phases, vec!["decompose", "execute", "code-review", "task-verify"]);
     }
 
     #[test]
     fn test_default_pipeline_unknown_mode() {
         let p = fallback_pipeline("unknown");
-        assert!(p.spec_phases.is_empty());
+        assert!(p.spec_pre_phases.is_empty());
+        assert!(p.spec_post_phases.is_empty());
         assert_eq!(p.task_phases, vec!["execute"]);
     }
 
-    #[test]
-    fn test_spec_review_is_first_spec_phase() {
-        for mode in &["execute", "challenge", "discover", "generate"] {
-            let p = fallback_pipeline(mode);
-            assert_eq!(
-                p.spec_phases.first().map(|s| s.as_str()),
-                Some("spec-review"),
-                "spec-review must be first spec phase in mode '{mode}'"
-            );
-        }
-    }
+    // test_spec_review_is_first_spec_phase REMOVED 2026-05-12:
+    // `spec-review` was a phantom phase name in the legacy fallback that
+    // never had a corresponding *.phase.toml. The current pipeline uses
+    // `plan-critique` for pre-task critique and `critic` for post.
 
     // --- Step 3: New core phases tests ---
 
@@ -1801,17 +1804,21 @@ approve_signal = ""
 
     #[test]
     fn test_pipeline_contains_all_levels() {
+        // Updated 2026-05-12: spec-level phases now live in spec_pre_phases
+        // and spec_post_phases (not the legacy spec_phases field).
         let registry = test_registry();
 
         for mode in &["execute", "challenge", "discover", "generate"] {
             let pipeline = fallback_pipeline(mode);
 
-            let has_spec_phase = pipeline.spec_phases.iter().any(|name| {
-                registry.get(name).map(|p| p.level == PhaseLevel::Spec).unwrap_or(false)
-            });
+            let has_spec_phase = pipeline.spec_pre_phases.iter()
+                .chain(pipeline.spec_post_phases.iter())
+                .any(|name| {
+                    registry.get(name).map(|p| p.level == PhaseLevel::Spec).unwrap_or(false)
+                });
             assert!(
                 has_spec_phase,
-                "mode '{mode}' pipeline must include at least one Spec-level phase in spec_phases"
+                "mode '{mode}' pipeline must include at least one Spec-level phase in spec_pre_phases or spec_post_phases"
             );
 
             let has_task_phase = pipeline.task_phases.iter().any(|name| {
@@ -1854,12 +1861,8 @@ template = "Do something at the spec level."
             "user phase with level='spec' in TOML must load as PhaseLevel::Spec"
         );
 
-        // The name alone would derive to Task — this confirms TOML field wins over name derivation
-        assert_eq!(
-            derive_level("my-custom-phase"),
-            PhaseLevel::Task,
-            "name-derived level for 'my-custom-phase' should be Task"
-        );
+        // derive_level was removed 2026-05-12 — phase TOMLs must declare level
+        // explicitly. The assert above (phase.level == Spec) is the test now.
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2019,6 +2022,8 @@ template = "Do something at the spec level."
             context_files: None,
             phase_overrides: Default::default(),
             worker_pool: None,
+            max_cost_usd: None,
+            key_artifacts: None,
             tasks: vec![
                 crate::spec::BoiTask {
                     id: "t-1".into(),
@@ -2156,6 +2161,100 @@ spec_phases = ["critic"]
 task_phases = ["execute"]
 "#);
             assert!(load_pipeline_from_file(&path, "nonexistent").is_none());
+        }
+    }
+
+    // ── Layer 3 — magic-string derive removal — 2026-05-12 ─────────────────
+    // Phase TOMLs must declare level / can_add_tasks / can_fail_spec
+    // explicitly. PhaseConfig::from_toml returns Err on any missing field.
+
+    mod loud_phase_toml_validation {
+        use super::*;
+
+        fn parse(toml_str: &str) -> Result<PhaseConfig, String> {
+            let parsed: PhaseToml = toml::from_str(toml_str)
+                .unwrap_or_else(|e| panic!("TOML parse error: {}", e));
+            PhaseConfig::from_toml(parsed)
+        }
+
+        #[test]
+        fn errors_loudly_when_level_missing() {
+            let r = parse(r#"
+                name = "custom-phase"
+                [phase]
+                can_add_tasks = false
+                can_fail_spec = false
+            "#);
+            let err = r.expect_err("expected Err: missing [phase].level");
+            assert!(
+                err.contains("[phase].level is required"),
+                "error message must name the missing field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn errors_loudly_when_can_add_tasks_missing() {
+            let r = parse(r#"
+                name = "custom-phase"
+                [phase]
+                level = "task"
+                can_fail_spec = false
+            "#);
+            let err = r.expect_err("expected Err: missing [phase].can_add_tasks");
+            assert!(
+                err.contains("[phase].can_add_tasks is required"),
+                "error message must name the missing field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn errors_loudly_when_can_fail_spec_missing() {
+            let r = parse(r#"
+                name = "custom-phase"
+                [phase]
+                level = "spec"
+                can_add_tasks = true
+            "#);
+            let err = r.expect_err("expected Err: missing [phase].can_fail_spec");
+            assert!(
+                err.contains("[phase].can_fail_spec is required"),
+                "error message must name the missing field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn errors_loudly_when_name_missing() {
+            let r = parse(r#"
+                [phase]
+                level = "task"
+                can_add_tasks = false
+                can_fail_spec = false
+            "#);
+            let err = r.expect_err("expected Err: missing name");
+            assert!(
+                err.contains("missing required `name`"),
+                "error must name the missing field, got: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn loads_ok_when_all_required_fields_present() {
+            let r = parse(r#"
+                name = "custom-phase"
+                [phase]
+                level = "task"
+                can_add_tasks = false
+                can_fail_spec = false
+            "#);
+            let cfg = r.expect("should load with all required fields");
+            assert_eq!(cfg.name, "custom-phase");
+            assert_eq!(cfg.level, PhaseLevel::Task);
+            assert!(!cfg.can_add_tasks);
+            assert!(!cfg.can_fail_spec);
         }
     }
 }

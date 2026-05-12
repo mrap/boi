@@ -3,6 +3,8 @@ description = "Evaluate spec quality before execution: catch non-executable veri
 
 [phase]
 level = "spec"
+can_add_tasks = true
+can_fail_spec = true
 
 [worker]
 runtime = "claude"
