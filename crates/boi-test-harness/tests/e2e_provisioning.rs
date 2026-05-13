@@ -36,12 +36,7 @@ fn run_subtest(name: &str, body: impl FnOnce() -> Result<()>) {
         return;
     }
     match body() {
-        Ok(()) => panic!(
-            "subtest `{name}` unexpectedly PASSED — Phase 5 (router \
-             ProvisionRequest emission, admin-gated BOI_TOKEN mint, \
-             Docker-provisioner plugin, F-06 cooldown) is not yet \
-             implemented, so a green result here means the test is wrong"
-        ),
+        Ok(()) => {},
         Err(e) => {
             let _ = dump_artifacts(name);
             panic!("RED [{name}] {e:#}");

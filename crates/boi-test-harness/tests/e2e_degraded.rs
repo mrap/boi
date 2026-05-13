@@ -34,12 +34,7 @@ fn run_subtest(name: &str, body: impl FnOnce() -> Result<()>) {
         return;
     }
     match body() {
-        Ok(()) => panic!(
-            "subtest `{name}` unexpectedly PASSED — Phase 6 (degraded \
-             mode: F-07 local-fallback + F-08 pending-flush + F-12 \
-             metrics) is not implemented, so green here means the \
-             test is wrong"
-        ),
+        Ok(()) => {},
         Err(e) => {
             let _ = dump_artifacts(name);
             panic!("RED [{name}] {e:#}");

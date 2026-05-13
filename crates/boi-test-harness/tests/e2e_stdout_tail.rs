@@ -27,12 +27,7 @@ fn run_subtest(name: &str, body: impl FnOnce() -> Result<()>) {
         return;
     }
     match body() {
-        Ok(()) => panic!(
-            "subtest `{name}` unexpectedly PASSED — Phase 7 (Q7 stdout \
-             tee-to-disk + `boi spec tail` + claimant resolution via \
-             etcd + retention rotation) is not implemented, so a green \
-             result here means the test is wrong"
-        ),
+        Ok(()) => {},
         Err(e) => {
             let _ = dump_artifacts(name);
             panic!("RED [{name}] {e:#}");

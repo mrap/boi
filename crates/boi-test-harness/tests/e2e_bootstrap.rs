@@ -29,11 +29,7 @@ fn run_subtest(name: &str, body: impl FnOnce() -> Result<()>) {
         return;
     }
     match body() {
-        Ok(()) => panic!(
-            "subtest `{name}` unexpectedly PASSED — Phase 1/3 is not \
-             implemented, so this red test passing means the test \
-             itself is wrong"
-        ),
+        Ok(()) => {},
         Err(e) => {
             let _ = dump_artifacts(name);
             // Surface the informative red message and fail the test.

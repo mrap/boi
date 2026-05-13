@@ -35,11 +35,7 @@ fn run_subtest(name: &str, body: impl FnOnce() -> Result<()>) {
         return;
     }
     match body() {
-        Ok(()) => panic!(
-            "subtest `{name}` unexpectedly PASSED — Phase 4 (assignment + \
-             HRW + CAS + lease fencing) is not implemented, so this red \
-             test passing means the test itself is wrong"
-        ),
+        Ok(()) => {},
         Err(e) => {
             let _ = dump_artifacts(name);
             panic!("RED [{name}] {e:#}");
