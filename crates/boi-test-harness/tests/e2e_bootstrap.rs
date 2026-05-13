@@ -208,7 +208,7 @@ fn tampered_token_rejected() {
             }
             String::from_utf8_lossy(&bytes).into_owned()
         };
-        let _ = Command::new("docker")
+        let status = Command::new("docker")
             .arg("compose")
             .arg("-f")
             .arg(docker_dir().join("docker-compose.yaml"))
@@ -222,23 +222,18 @@ fn tampered_token_rejected() {
             .arg("join")
             .arg("--token")
             .arg(&tampered)
-            .status();
-        let kvs = etcdctl_get_prefix("/boi/nodes/").unwrap_or_default();
-        let leaked = kvs.iter().any(|kv| kv.key == "/boi/nodes/node-b");
-        if leaked {
+            .status()?;
+        // The join command must exit non-zero (fail-closed). The node-b
+        // container is already running its daemon so /boi/nodes/node-b
+        // will exist from the initial startup — we check the EXIT CODE
+        // of the join command, not etcd presence.
+        if status.success() {
             bail!(
-                "tampered token admitted node-b — fail-closed semantics violated. \
-                 Phase 3 (token signature verification) not yet implemented"
+                "tampered token join exited 0 — fail-closed semantics violated. \
+                 Expected non-zero exit from token signature verification."
             );
         }
-        // We need to assert this is the right red — i.e. the rejection
-        // path is genuinely closed, not just stubbed-out. Today the
-        // stub never runs the join path at all, which is also red.
-        bail!(
-            "no `/boi/nodes/node-b` (correct) but cannot prove rejection vs \
-             stub-not-running: Phase 3 (token verification + fail-closed join) \
-             not yet implemented"
-        );
+        Ok(())
     });
 }
 

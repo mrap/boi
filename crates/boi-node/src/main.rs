@@ -143,6 +143,11 @@ enum SpecCmd {
         /// Capability requires clause, e.g. `os=mac,runtime=xcode-15`.
         #[arg(long, default_value = "")]
         requires: String,
+        /// Test mode: simulated task duration in milliseconds. The
+        /// assignment loop will sleep for this duration before marking
+        /// the task done, creating a "long-running" task for E2E tests.
+        #[arg(long, default_value_t = 0)]
+        sleep_ms: u64,
     },
 }
 
@@ -798,6 +803,19 @@ async fn assignment_tick(
                         serde_json::json!({ "task_id": task_id }),
                     )
                     .await;
+                    // Test mode: simulate long-running task via _sleep_ms
+                    let sleep_ms = rec.requires.get("_sleep_ms")
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    if sleep_ms > 0 {
+                        let etcd_done = etcd.clone();
+                        let tid = task_id.to_string();
+                        let lid = claim.lease_id;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                            let _ = commit_task_with_fence(&etcd_done, &tid, Some(lid), "done").await;
+                        });
+                    }
                 }
             }
             AssignResult::NeedProvision => {
@@ -1412,7 +1430,7 @@ async fn run_plugin_cmd(action: PluginCmd) -> Result<()> {
 
 async fn run_spec_cmd(action: SpecCmd) -> Result<()> {
     match action {
-        SpecCmd::Dispatch { name, requires } => {
+        SpecCmd::Dispatch { name, requires, sleep_ms } => {
             // F-01 FAIL-LOUD DISPATCH: use a single-attempt connect so CLI
             // commands fail fast when etcd is unreachable rather than waiting
             // through the full 6-attempt retry budget.
@@ -1439,6 +1457,9 @@ async fn run_spec_cmd(action: SpecCmd) -> Result<()> {
                 if let Some((k, v)) = tok.split_once('=') {
                     rec.requires.insert(k.trim().into(), v.trim().into());
                 }
+            }
+            if sleep_ms > 0 {
+                rec.requires.insert("_sleep_ms".into(), sleep_ms.to_string());
             }
             rec.insert(&etcd).await.context("insert dispatch-queue task")?;
             emit_event(
