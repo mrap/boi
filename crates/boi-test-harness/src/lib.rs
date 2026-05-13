@@ -66,6 +66,7 @@ pub fn start_cluster(n: usize) -> Result<Cluster> {
         .arg(&compose)
         .arg("up")
         .arg("-d")
+        .arg("--build")
         .arg("etcd");
     for p in &profiles {
         cmd.arg(p);
