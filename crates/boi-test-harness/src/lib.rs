@@ -98,6 +98,14 @@ impl Cluster {
         if self.torn_down {
             return Ok(());
         }
+        // Unpause any paused containers so docker compose down doesn't
+        // wait 10s per container for SIGTERM delivery.
+        let _ = Command::new("docker")
+            .arg("compose")
+            .arg("-f")
+            .arg(&self.compose)
+            .arg("unpause")
+            .status();
         let status = Command::new("docker")
             .arg("compose")
             .arg("-f")
@@ -249,6 +257,125 @@ pub fn docker_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Resolve the Docker Compose container name for a service.
+fn compose_container_name(service: &str) -> Result<String> {
+    let out = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(docker_dir().join("docker-compose.yaml"))
+        .arg("ps")
+        .arg("-q")
+        .arg(service)
+        .output()
+        .with_context(|| format!("docker compose ps -q {service}"))?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        bail!("no container found for service {service}");
+    }
+    Ok(name)
+}
+
+/// Resolve the actual Docker network name for the boi-test network.
+fn compose_network_name() -> Result<String> {
+    let out = Command::new("docker")
+        .arg("network")
+        .arg("ls")
+        .arg("--filter")
+        .arg("name=boi-test")
+        .arg("--format")
+        .arg("{{.Name}}")
+        .output()
+        .context("docker network ls")?;
+    let names = String::from_utf8_lossy(&out.stdout);
+    let name = names.lines().next().unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        bail!("boi-test network not found");
+    }
+    Ok(name)
+}
+
+/// Disconnect a compose service from the boi-test network, using the
+/// correct container ID and network name (handles Docker Compose project
+/// name prefixing).
+pub fn network_disconnect(service: &str) -> Result<()> {
+    let container = compose_container_name(service)?;
+    let network = compose_network_name()?;
+    let out = Command::new("docker")
+        .arg("network")
+        .arg("disconnect")
+        .arg(&network)
+        .arg(&container)
+        .output()
+        .with_context(|| format!("docker network disconnect {network} {container}"))?;
+    if !out.status.success() {
+        bail!(
+            "docker network disconnect failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Reconnect a compose service to the boi-test network.
+pub fn network_connect(service: &str) -> Result<()> {
+    let container = compose_container_name(service)?;
+    let network = compose_network_name()?;
+    let out = Command::new("docker")
+        .arg("network")
+        .arg("connect")
+        .arg(&network)
+        .arg(&container)
+        .output()
+        .with_context(|| format!("docker network connect {network} {container}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.contains("already") {
+            bail!("docker network connect failed: {stderr}");
+        }
+    }
+    Ok(())
+}
+
+/// Pause a compose service (freezes all processes — reliable for simulating
+/// node failure without container restart). The daemon's lease keepalive
+/// stops, so etcd revokes the lease after the TTL.
+pub fn compose_pause(service: &str) -> Result<()> {
+    let out = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(docker_dir().join("docker-compose.yaml"))
+        .arg("pause")
+        .arg(service)
+        .output()
+        .with_context(|| format!("docker compose pause {service}"))?;
+    if !out.status.success() {
+        bail!(
+            "docker compose pause {service} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Unpause a compose service (resumes frozen processes).
+pub fn compose_unpause(service: &str) -> Result<()> {
+    let out = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(docker_dir().join("docker-compose.yaml"))
+        .arg("unpause")
+        .arg(service)
+        .output()
+        .with_context(|| format!("docker compose unpause {service}"))?;
+    if !out.status.success() {
+        bail!(
+            "docker compose unpause {service} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
 }
 
 /// Convenience: assert the harness can locate a path inside the workspace.

@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use boi_test_harness::{
-    docker_available, docker_dir, dump_artifacts, etcdctl_get_prefix, start_cluster,
-    wait_for_etcd_key,
+    compose_pause, compose_unpause, docker_available, docker_dir, dump_artifacts,
+    etcdctl_get_prefix, network_connect, network_disconnect, start_cluster, wait_for_etcd_key,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -75,36 +75,29 @@ fn raw_exec(service: &str, args: &[&str]) -> Result<std::process::Output> {
         .with_context(|| format!("invoke `docker compose exec {service} {args:?}`"))
 }
 
-/// Disconnect a single service from the test docker network — simulates
-/// an etcd partition from that node's POV.
-fn docker_network(action: &str, service: &str) -> Result<std::process::Output> {
-    Command::new("docker")
-        .arg("network")
-        .arg(action)
-        .arg("boi-test")
-        .arg(service)
-        .output()
-        .with_context(|| format!("docker network {action} boi-test {service}"))
+fn docker_network_action(action: &str, service: &str) -> Result<()> {
+    match action {
+        "disconnect" => network_disconnect(service),
+        "connect" => network_connect(service),
+        _ => Ok(()),
+    }
 }
 
-/// Partition every boi-node from the etcd container by removing them
-/// from the shared docker network. (Equivalent to etcd being unreachable
-/// from each node.) Returns the list of services actually disconnected.
+/// Partition all nodes from etcd by disconnecting each node from the
+/// boi-test network. Uses the proper container/network name resolution.
 fn partition_all_from_etcd() -> Result<Vec<&'static str>> {
     let mut disconnected = Vec::new();
     for n in ["node-a", "node-b", "node-c"] {
-        // Disconnect etcd from each node — using the etcd container is
-        // sufficient: pulling etcd off the network partitions it from
-        // every peer at once. We loop over nodes to keep failures local.
-        let _ = docker_network("disconnect", n);
-        disconnected.push(n);
+        if network_disconnect(n).is_ok() {
+            disconnected.push(n);
+        }
     }
     Ok(disconnected)
 }
 
 fn reconnect_all_to_etcd(svcs: &[&'static str]) -> Result<()> {
     for s in svcs {
-        let _ = docker_network("connect", s);
+        let _ = network_connect(s);
     }
     Ok(())
 }
@@ -146,7 +139,7 @@ fn dispatch_long_task() -> Result<(boi_test_harness::Cluster, String)> {
             "--name",
             "e2e-degraded-task",
             "--sleep-ms",
-            "20000",
+            "5000",
         ],
     )?;
     let task_id = String::from_utf8_lossy(&out.stdout).trim().to_string();

@@ -285,6 +285,16 @@ impl EtcdClient {
             .map(|kv| (kv.value().to_vec(), kv.mod_revision())))
     }
 
+    /// Read the lease_id attached to a key. `None` if absent or no lease.
+    pub async fn get_lease(&self, key: impl Into<Vec<u8>>) -> Result<Option<i64>> {
+        let mut c = self.inner.lock().await;
+        let resp = c.get(key, None).await?;
+        Ok(resp.kvs().first().and_then(|kv| {
+            let lid = kv.lease();
+            if lid == 0 { None } else { Some(lid) }
+        }))
+    }
+
     /// Range-read by prefix. Returns `(key, value)` pairs.
     pub async fn get_prefix(&self, prefix: impl Into<Vec<u8>>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let opts = GetOptions::new().with_prefix();

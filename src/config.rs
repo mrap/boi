@@ -245,6 +245,8 @@ pub struct Config {
     pub max_workers: Option<u32>,
     pub task_timeout_minutes: Option<u32>,
     pub retry_count: Option<u32>,
+    /// Kill a task early if requeued >= this many times. None = disabled.
+    pub convergence_threshold: Option<u32>,
     pub cleanup_on_failure: Option<bool>,
     pub hooks: Option<HashMap<String, HookEntry>>,
     pub paths: Option<Paths>,
@@ -297,6 +299,10 @@ impl Config {
 
     pub fn retry_count(&self) -> u32 {
         self.retry_count.unwrap_or(3)
+    }
+
+    pub fn convergence_threshold(&self) -> Option<u32> {
+        self.convergence_threshold
     }
 
     pub fn cleanup_on_failure(&self) -> bool {

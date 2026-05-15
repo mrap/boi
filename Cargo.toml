@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/boi-test-harness", "crates/boi-node", "crates/boi-cluster", "crates/boi-identity", "crates/boi-proto", "crates/boi-plugin-host"]
+members = [".", "crates/boi-test-harness", "crates/boi-node", "crates/boi-cluster", "crates/boi-identity", "crates/boi-proto", "crates/boi-plugin-host", "crates/boi-mock-plugin"]
 
 [package]
 name = "boi"

@@ -410,6 +410,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "boi-mock-plugin"
+version = "0.1.0"
+dependencies = [
+ "boi-proto",
+ "clap",
+ "prost",
+ "serde_json",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "boi-node"
 version = "0.1.0"
 dependencies = [

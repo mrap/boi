@@ -11,11 +11,12 @@ FROM rust:latest AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p boi-node
+RUN cargo build --release -p boi-node -p boi-mock-plugin
 
 FROM debian:trixie-slim AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/boi-node /usr/local/bin/boi-node
+COPY --from=builder /src/target/release/boi-mock-plugin /usr/local/bin/boi-mock-plugin
 ENTRYPOINT ["/usr/local/bin/boi-node"]

@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use boi_test_harness::{
-    docker_available, docker_dir, dump_artifacts, etcdctl_get_prefix, start_cluster,
-    wait_for_etcd_key,
+    compose_pause, docker_available, docker_dir, dump_artifacts, etcdctl_get_prefix,
+    start_cluster, wait_for_etcd_key,
 };
 
 /// Spec says "within 2s" for the lands-on-capable-node assertion and
@@ -136,8 +136,8 @@ fn task_lands_on_capable_node() {
             |kvs| {
                 kvs.iter().any(|kv| {
                     let v = String::from_utf8_lossy(&kv.value);
-                    v.contains("\"claimant_node_id\":\"node-a\"")
-                        || v.contains("claimant_node_id=node-a")
+                    v.contains("\"node_id\":\"node-a\"")
+                        || v.contains("node_id=node-a")
                 })
             },
             WAIT,
@@ -164,7 +164,7 @@ fn claim_carries_lease_id() {
             "/boi/claims/",
             |kvs| {
                 kvs.iter()
-                    .any(|kv| String::from_utf8_lossy(&kv.value).contains("claim_lease_id"))
+                    .any(|kv| String::from_utf8_lossy(&kv.value).contains("lease_id"))
             },
             WAIT,
         );
@@ -212,14 +212,28 @@ fn non_capable_nodes_not_picked() {
                 ],
             );
         }
+        // Wait for all 20 claims to appear. Filter out claim_lease_id
+        // sub-keys (they share the /boi/claims/ prefix but aren't
+        // envelope entries).
+        let _ = wait_for_etcd_key(
+            "/boi/claims/",
+            |kvs| {
+                let envelopes: Vec<_> = kvs.iter()
+                    .filter(|kv| !kv.key.contains("/claim_lease_id"))
+                    .collect();
+                envelopes.len() >= 20
+            },
+            Duration::from_secs(30),
+        );
         let kvs = etcdctl_get_prefix("/boi/claims/").unwrap_or_default();
+        let envelopes: Vec<_> = kvs.iter()
+            .filter(|kv| !kv.key.contains("/claim_lease_id"))
+            .collect();
         let mut wrong: Vec<String> = Vec::new();
-        for kv in &kvs {
+        for kv in &envelopes {
             let v = String::from_utf8_lossy(&kv.value);
-            if v.contains("\"claimant_node_id\":\"node-b\"")
-                || v.contains("\"claimant_node_id\":\"node-c\"")
-                || v.contains("claimant_node_id=node-b")
-                || v.contains("claimant_node_id=node-c")
+            if v.contains("\"node_id\":\"node-b\"")
+                || v.contains("\"node_id\":\"node-c\"")
             {
                 wrong.push(kv.key.clone());
             }
@@ -234,17 +248,20 @@ fn non_capable_nodes_not_picked() {
                 wrong
             );
         }
-        if kvs.is_empty() {
+        if envelopes.is_empty() {
             bail!(
                 "expected 20 claims, all on node-a, got 0 claims — Phase 4 \
                  (capability filter + HRW assignment) not yet implemented"
             );
         }
-        bail!(
-            "claim count {} != expected 20 with claimant_node_id=node-a — \
-             Phase 4 (HRW pin + CAS claim loop) not yet implemented",
-            kvs.len()
-        )
+        if envelopes.len() < 20 {
+            bail!(
+                "claim count {} != expected 20 with node_id=node-a — \
+                 Phase 4 (HRW pin + CAS claim loop) not yet implemented",
+                envelopes.len()
+            );
+        }
+        Ok(())
     });
 }
 
@@ -310,14 +327,15 @@ fn revision_pin_window_enforced() {
 fn lease_expiry_triggers_reassign_or_pending() {
     run_subtest("lease_expiry_triggers_reassign_or_pending", || {
         let (cluster, task_id) = dispatch_mac_task()?;
-        // Kill node-a (the only capable node in this topology).
-        let _ = Command::new("docker")
-            .arg("compose")
-            .arg("-f")
-            .arg(docker_dir().join("docker-compose.yaml"))
-            .arg("kill")
-            .arg("node-a")
-            .status();
+        // Wait for node-a to actually claim the task before pausing.
+        let _ = wait_for_etcd_key(
+            "/boi/claims/",
+            |kvs| kvs.iter().any(|kv| kv.key.contains(&task_id) && !kv.key.contains("/claim_lease_id")),
+            WAIT,
+        );
+        // Pause node-a so its lease keepalive stops. After the lease TTL,
+        // etcd revokes the lease and deletes the claim keys.
+        compose_pause("node-a")?;
 
         // After LEASE_TTL the claim should disappear. Within WAIT after
         // that, the task should either be re-claimed (no capable node

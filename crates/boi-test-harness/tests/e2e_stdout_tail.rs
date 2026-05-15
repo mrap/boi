@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use boi_test_harness::{
-    docker_available, docker_dir, dump_artifacts, etcdctl_get_prefix, start_cluster,
-    wait_for_etcd_key,
+    docker_available, docker_dir, dump_artifacts, etcdctl_get_prefix, network_connect,
+    network_disconnect, start_cluster, wait_for_etcd_key,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -68,14 +68,12 @@ fn container_exec(service: &str, args: &[&str]) -> Result<std::process::Output> 
         .with_context(|| format!("invoke `docker compose exec {service} {args:?}`"))
 }
 
-fn docker_network(action: &str, service: &str) -> Result<std::process::Output> {
-    Command::new("docker")
-        .arg("network")
-        .arg(action)
-        .arg("boi-test")
-        .arg(service)
-        .output()
-        .with_context(|| format!("docker network {action} boi-test {service}"))
+fn docker_network_action(action: &str, service: &str) -> Result<()> {
+    match action {
+        "disconnect" => network_disconnect(service),
+        "connect" => network_connect(service),
+        _ => Ok(()),
+    }
 }
 
 fn ensure_cluster() -> Result<boi_test_harness::Cluster> {
@@ -85,11 +83,25 @@ fn ensure_cluster() -> Result<boi_test_harness::Cluster> {
     )
 }
 
-/// Common setup: init cluster, advertise caps so node-a claims, dispatch
+/// Detect which node claimed a task by reading /boi/claims/.
+fn detect_claimant(task_id: &str) -> String {
+    let kvs = etcdctl_get_prefix("/boi/claims/").unwrap_or_default();
+    kvs.iter()
+        .filter(|kv| kv.key.contains(task_id) && !kv.key.contains("/claim_lease_id"))
+        .find_map(|kv| {
+            let v = String::from_utf8_lossy(&kv.value).to_string();
+            serde_json::from_str::<serde_json::Value>(&v)
+                .ok()
+                .and_then(|p| p.get("node_id").and_then(|n| n.as_str()).map(String::from))
+        })
+        .unwrap_or_else(|| "node-a".to_string())
+}
+
+/// Common setup: init cluster, advertise caps so any node claims, dispatch
 /// a long-running task that streams structured stdout via the
 /// `boi-node internal emit-stdout` helper. Returns (cluster, spec_id,
-/// task_id).
-fn dispatch_long_streaming_task() -> Result<(boi_test_harness::Cluster, String, String)> {
+/// task_id, claimant).
+fn dispatch_long_streaming_task() -> Result<(boi_test_harness::Cluster, String, String, String)> {
     let cluster = ensure_cluster()?;
     let _ = boi_node_exec("node-a", &["cluster", "init"]);
     for n in ["node-a", "node-b", "node-c"] {
@@ -132,7 +144,14 @@ fn dispatch_long_streaming_task() -> Result<(boi_test_harness::Cluster, String, 
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok((cluster, spec_id, task_id))
+    // Wait for the claim to land so we know which node is the claimant.
+    let _ = wait_for_etcd_key(
+        "/boi/claims/",
+        |kvs| kvs.iter().any(|kv| kv.key.contains(&task_id) && !kv.key.contains("/claim_lease_id")),
+        WAIT,
+    );
+    let claimant = detect_claimant(&task_id);
+    Ok((cluster, spec_id, task_id, claimant))
 }
 
 // ---------------------------------------------------------------
@@ -141,16 +160,10 @@ fn dispatch_long_streaming_task() -> Result<(boi_test_harness::Cluster, String, 
 #[test]
 fn stdout_tee_to_disk() {
     run_subtest("stdout_tee_to_disk", || {
-        let (_cluster, spec_id, task_id) = dispatch_long_streaming_task()?;
-        let path = format!("/boi/node-a/.boi/logs/{spec_id}/{task_id}.log");
+        let (_cluster, spec_id, task_id, claimant) = dispatch_long_streaming_task()?;
+        let path = format!("/root/.boi/logs/{spec_id}/{task_id}.log");
 
-        // Wait for the log file to exist with non-zero size, then
-        // observe that the size strictly grows on a second sample.
         let saw_growth = wait_for_etcd_key(
-            // Re-use the poll loop for filesystem state by piggybacking
-            // on an etcd prefix that records on-disk tail offsets. The
-            // expected Phase 7 design publishes
-            // `/boi/tail-offsets/<task_id>` with current byte length.
             &format!("/boi/tail-offsets/{task_id}"),
             |kvs| {
                 kvs.iter().any(|kv| {
@@ -164,10 +177,10 @@ fn stdout_tee_to_disk() {
             WAIT,
         );
 
-        let first = container_exec("node-a", &["stat", "-c", "%s", &path])
+        let first = container_exec(&claimant, &["stat", "-c", "%s", &path])
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-        let second = container_exec("node-a", &["stat", "-c", "%s", &path])
+        let second = container_exec(&claimant, &["stat", "-c", "%s", &path])
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
 
@@ -178,7 +191,7 @@ fn stdout_tee_to_disk() {
             return Ok(());
         }
         bail!(
-            "expected stdout tee'd to `{path}` to exist and grow; got \
+            "expected stdout tee'd to `{path}` on {claimant} to exist and grow; got \
              first_size={first_n} second_size={second_n} tail_offset_seen={} \
              — Phase 7 (stdout tee-to-disk under \
              /boi/<node>/.boi/logs/<spec_id>/<task_id>.log) not yet implemented",
@@ -193,7 +206,7 @@ fn stdout_tee_to_disk() {
 #[test]
 fn tail_command_streams() {
     run_subtest("tail_command_streams", || {
-        let (_cluster, _spec_id, task_id) = dispatch_long_streaming_task()?;
+        let (_cluster, _spec_id, task_id, _claimant) = dispatch_long_streaming_task()?;
 
         // Capture `boi spec tail --since-bytes=0 --max-bytes=4096`
         // from node-b. The Phase 7 CLI must emit the first chunk
@@ -249,13 +262,20 @@ fn tail_command_streams() {
 #[test]
 fn disconnect_reattach_no_gap() {
     run_subtest("disconnect_reattach_no_gap", || {
-        let (_cluster, spec_id, task_id) = dispatch_long_streaming_task()?;
-        let path = format!("/boi/node-a/.boi/logs/{spec_id}/{task_id}.log");
+        let (_cluster, spec_id, task_id, claimant) = dispatch_long_streaming_task()?;
+        let path = format!("/root/.boi/logs/{spec_id}/{task_id}.log");
 
-        // Tail first window from node-b, recording the byte offset
-        // returned by the CLI as the resume point.
+        // Pick two non-claimant nodes for tailing.
+        let non_claimants: Vec<&str> = ["node-a", "node-b", "node-c"]
+            .iter()
+            .copied()
+            .filter(|n| *n != claimant.as_str())
+            .collect();
+        let tailer1 = non_claimants[0];
+        let tailer2 = non_claimants[1];
+
         let first = boi_node_exec(
-            "node-b",
+            tailer1,
             &[
                 "spec",
                 "tail",
@@ -274,8 +294,7 @@ fn disconnect_reattach_no_gap() {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
 
-        // Simulate node-b dropping by partitioning it from etcd.
-        docker_network("disconnect", "node-b")?;
+        docker_network_action("disconnect", tailer1)?;
         // Let the task continue producing bytes; wait until the on-disk
         // offset is well past `resume_offset` before reattach.
         let _ = wait_for_etcd_key(
@@ -292,10 +311,8 @@ fn disconnect_reattach_no_gap() {
             WAIT,
         );
 
-        // Reattach from node-c (a third node, not the claimant nor the
-        // original tailer). Must resume at exactly `resume_offset`.
         let second = boi_node_exec(
-            "node-c",
+            tailer2,
             &[
                 "spec",
                 "tail",
@@ -312,7 +329,7 @@ fn disconnect_reattach_no_gap() {
         // canonical on-disk log slice [0 .. first.len()+second.len()].
         let total_len = first_stdout.len() + second_stdout.len();
         let on_disk = container_exec(
-            "node-a",
+            &claimant,
             &[
                 "dd",
                 &format!("if={path}"),
@@ -321,9 +338,8 @@ fn disconnect_reattach_no_gap() {
                 &format!("skip=0"),
             ],
         );
-        // Use `head -c` for a precise prefix slice.
         let canonical = container_exec(
-            "node-a",
+            &claimant,
             &["sh", "-c", &format!("head -c {total_len} {path}")],
         )?;
 
@@ -337,7 +353,7 @@ fn disconnect_reattach_no_gap() {
         }
         bail!(
             "expected `tail(0..N1) ++ tail({resume_offset}..N1+N2)` from \
-             node-b then node-c to byte-equal the on-disk prefix of \
+             {tailer1} then {tailer2} to byte-equal the on-disk prefix of \
              `{path}`; got first_bytes={} second_bytes={} canonical_bytes={} \
              equal={} — Phase 7 (durable tail offsets + cross-node Tail RPC \
              resume) not yet implemented",
@@ -355,20 +371,18 @@ fn disconnect_reattach_no_gap() {
 #[test]
 fn retention_7d_or_100mb_caps() {
     run_subtest("retention_7d_or_100mb_caps", || {
-        let (_cluster, spec_id, task_id) = dispatch_long_streaming_task()?;
-        let cur = format!("/boi/node-a/.boi/logs/{spec_id}/{task_id}.log");
+        let (_cluster, spec_id, task_id, claimant) = dispatch_long_streaming_task()?;
+        let cur = format!("/root/.boi/logs/{spec_id}/{task_id}.log");
         let old_task = format!("rotme-{task_id}");
-        let old = format!("/boi/node-a/.boi/logs/{spec_id}/{old_task}.log");
+        let old = format!("/root/.boi/logs/{spec_id}/{old_task}.log");
 
-        // Plant 110 MB of fake content for an older sibling task under
-        // the same spec, then ask boi-node to enforce retention.
         container_exec(
-            "node-a",
+            &claimant,
             &[
                 "sh",
                 "-c",
                 &format!(
-                    "mkdir -p /boi/node-a/.boi/logs/{spec_id} && \
+                    "mkdir -p /root/.boi/logs/{spec_id} && \
                      dd if=/dev/zero of={old} bs=1M count=110 status=none && \
                      touch -d '8 days ago' {old}"
                 ),
@@ -376,7 +390,7 @@ fn retention_7d_or_100mb_caps() {
         )?;
 
         let out = boi_node_exec(
-            "node-a",
+            &claimant,
             &["internal", "retention-sweep", "--spec-id", &spec_id],
         )?;
         if !out.status.success() {
@@ -389,10 +403,10 @@ fn retention_7d_or_100mb_caps() {
             );
         }
 
-        let old_gone = container_exec("node-a", &["test", "-e", &old])
+        let old_gone = container_exec(&claimant, &["test", "-e", &old])
             .map(|o| !o.status.success())
             .unwrap_or(false);
-        let cur_present = container_exec("node-a", &["test", "-s", &cur])
+        let cur_present = container_exec(&claimant, &["test", "-s", &cur])
             .map(|o| o.status.success())
             .unwrap_or(false);
 
@@ -414,26 +428,13 @@ fn retention_7d_or_100mb_caps() {
 #[test]
 fn tail_resolves_via_etcd() {
     run_subtest("tail_resolves_via_etcd", || {
-        let (_cluster, _spec_id, task_id) = dispatch_long_streaming_task()?;
+        let (_cluster, _spec_id, task_id, claimant) = dispatch_long_streaming_task()?;
 
-        // Confirm claim landed on node-a.
-        let _ = wait_for_etcd_key(
-            "/boi/claims/",
-            |kvs| {
-                kvs.iter().any(|kv| {
-                    kv.key.contains(&task_id)
-                        && String::from_utf8_lossy(&kv.value).contains("node-a")
-                })
-            },
-            WAIT,
-        );
+        // Pick a non-claimant node for the tail request.
+        let tailer = if claimant == "node-c" { "node-b" } else { "node-c" };
 
-        // From node-c (not the claimant) tail the task. The CLI must
-        // (a) read /boi/claims/<task_id> → node-a, (b) open the
-        // internal Tail RPC against node-a. Phase 7 publishes an RPC
-        // counter under /boi/traces/rpc/<dst>/<method>.
         let out = boi_node_exec(
-            "node-c",
+            tailer,
             &[
                 "spec",
                 "tail",
@@ -445,8 +446,9 @@ fn tail_resolves_via_etcd() {
             ],
         )?;
 
+        let trace_key = format!("/boi/traces/rpc/{claimant}/Tail");
         let trace_seen = wait_for_etcd_key(
-            "/boi/traces/rpc/node-a/Tail",
+            &trace_key,
             |kvs| {
                 kvs.iter().any(|kv| {
                     String::from_utf8_lossy(&kv.value)
@@ -459,27 +461,26 @@ fn tail_resolves_via_etcd() {
             WAIT,
         );
 
-        // Sanity: claims row must have been consulted (resolve path).
         let claims = etcdctl_get_prefix("/boi/claims/").unwrap_or_default();
-        let resolves_to_a = claims.iter().any(|kv| {
+        let resolves_to_claimant = claims.iter().any(|kv| {
             kv.key.contains(&task_id)
-                && String::from_utf8_lossy(&kv.value).contains("node-a")
+                && String::from_utf8_lossy(&kv.value).contains(&claimant)
         });
 
-        if out.status.success() && out.stdout.len() > 0 && trace_seen.is_ok() && resolves_to_a {
+        if out.status.success() && out.stdout.len() > 0 && trace_seen.is_ok() && resolves_to_claimant {
             return Ok(());
         }
         bail!(
-            "expected `boi spec tail {task_id}` from node-c to resolve \
-             claimant via /boi/claims/ and open a Tail RPC against node-a \
-             (observed via /boi/traces/rpc/node-a/Tail counter); got \
-             status={:?} bytes={} trace_seen={} resolves_to_a={} stderr=`{}` \
+            "expected `boi spec tail {task_id}` from {tailer} to resolve \
+             claimant via /boi/claims/ and open a Tail RPC against {claimant} \
+             (observed via {trace_key} counter); got \
+             status={:?} bytes={} trace_seen={} resolves_to_claimant={} stderr=`{}` \
              — Phase 7 (claimant resolution + internal Tail RPC) not yet \
              implemented",
             out.status.code(),
             out.stdout.len(),
             trace_seen.is_ok(),
-            resolves_to_a,
+            resolves_to_claimant,
             String::from_utf8_lossy(&out.stderr).trim(),
         );
     });

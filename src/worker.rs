@@ -38,6 +38,7 @@ pub struct WorkerConfig {
     pub cleanup_on_failure: bool,
     pub claude_bin: String,
     pub models: Option<HashMap<String, String>>,
+    pub convergence_threshold: Option<u32>,
 }
 
 impl Default for WorkerConfig {
@@ -49,6 +50,7 @@ impl Default for WorkerConfig {
             cleanup_on_failure: false,
             claude_bin: std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string()),
             models: None,
+            convergence_threshold: None,
         }
     }
 }
@@ -1334,6 +1336,34 @@ pub fn run_worker_with_phases(
                         reason: format!("task {} requeue limit exceeded", task_id_owned),
                     };
                     continue;
+                }
+
+                // Kill tasks that redo without progress (convergence_threshold)
+                if let Some(threshold) = config.convergence_threshold {
+                    if attempts >= threshold as usize {
+                        let task = task_map.get(task_id_owned.as_str());
+                        let task_title = task.map(|t| t.title.as_str()).unwrap_or("unknown");
+                        boi_log!(" convergence_threshold ({}) reached for task {}", threshold, task_id_owned);
+                        let db_task_id_ct = task_id_owned.clone();
+                        queue.update_task(spec_id, &db_task_id_ct, "FAILED")?;
+                        let task_payload = json!({
+                            "spec_id": spec_id,
+                            "task_id": task_id_owned,
+                            "task_title": task_title,
+                        });
+                        let _ = hooks::fire(hook_config, ON_TASK_FAIL, &task_payload);
+                        telemetry.emit("boi.task.failed", LogLevel::Info, &json!({
+                            "spec_id": spec_id,
+                            "task_id": task_id_owned,
+                            "status": "FAILED",
+                            "failure_mode": "convergence_threshold_kill",
+                            "message": format!("{} failed: convergence_threshold_kill (requeued {} times)", task_id_owned, attempts),
+                        }));
+                        state = WorkerState::Failed {
+                            reason: format!("task {} convergence_threshold_kill", task_id_owned),
+                        };
+                        continue;
+                    }
                 }
 
                 let task = match task_map.get(task_id_owned.as_str()) {

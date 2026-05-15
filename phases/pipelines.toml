@@ -9,9 +9,10 @@
 # the split explicitly. See docs/phase-configurability-2026-05-12.md for context.
 
 [mode.default]
-spec_pre_phases  = []
+spec_pre_phases  = ["spec-critique", "spec-improve"]
 spec_post_phases = ["critic"]
 task_phases      = ["execute", "task-verify"]
+max_loops        = 1
 
 [mode.challenge]
 spec_pre_phases  = ["plan-critique"]

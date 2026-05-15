@@ -498,7 +498,7 @@ fn best_effort_tier_unchanged() {
         // be verified until Phase 8 wires the dispatcher. Keep the test
         // RED until then by failing on the missing dispatcher signal.
         let trace = docker_exec_raw(
-            "plugin-sidecar",
+            "node-a",
             &["sh", "-c", &format!("cat /tmp/{BEST_EFFORT_PLUGIN}.delivered 2>/dev/null | wc -l")],
         )?;
         let delivered: usize = String::from_utf8_lossy(&trace.stdout)

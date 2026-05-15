@@ -24,6 +24,14 @@ services:
     environment:
       BOI_ETCD_ENDPOINTS: "http://etcd:2379"
       BOI_NODE_ID: "node-a"
+      BOI_LEASE_TTL_SECS: "10"
+      BOI_PROVISIONER_ADDR: "http://plugin-sidecar:50051"
+      BOI_PROVISION_JOIN_TIMEOUT_SECS: "3"
+      RUST_MIN_STACK: "8388608"
+    ulimits:
+      stack:
+        soft: 67108864
+        hard: 67108864
     networks:
       - boi-test
     depends_on:
@@ -37,6 +45,13 @@ services:
     environment:
       BOI_ETCD_ENDPOINTS: "http://etcd:2379"
       BOI_NODE_ID: "node-b"
+      BOI_LEASE_TTL_SECS: "10"
+      BOI_PROVISION_JOIN_TIMEOUT_SECS: "3"
+      RUST_MIN_STACK: "8388608"
+    ulimits:
+      stack:
+        soft: 67108864
+        hard: 67108864
     networks:
       - boi-test
     depends_on:
@@ -50,17 +65,25 @@ services:
     environment:
       BOI_ETCD_ENDPOINTS: "http://etcd:2379"
       BOI_NODE_ID: "node-c"
+      BOI_LEASE_TTL_SECS: "10"
+      BOI_PROVISION_JOIN_TIMEOUT_SECS: "3"
+      RUST_MIN_STACK: "8388608"
+    ulimits:
+      stack:
+        soft: 67108864
+        hard: 67108864
     networks:
       - boi-test
     depends_on:
       etcd:
         condition: service_healthy
 
-  # Placeholder for plugin sidecars used by Phase 2+ tests. Image is the
-  # same boi-node base so tests can drop a plugin binary in via override.
   plugin-sidecar:
-    image: alpine:3.20
-    command: ["sh", "-c", "echo 'plugin-sidecar placeholder; Phase 2 wires real plugins' && sleep infinity"]
+    build:
+      context: ../../..
+      dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
+    entrypoint: ["/usr/local/bin/boi-mock-plugin"]
+    command: ["--provisioner", "--port", "50051"]
     networks:
       - boi-test
 

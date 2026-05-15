@@ -90,7 +90,7 @@ async fn current_cluster_revision(etcd: &EtcdClient) -> Result<i64> {
 /// the assignment loop ranks over carries cap info. Missing caps are
 /// treated as empty (the node simply won't satisfy a non-empty
 /// `requires`, but it remains visible — matches `NodeCaps::default()`).
-async fn join_caps(
+pub async fn join_caps_pub(
     etcd: &EtcdClient,
     snapshot: &MembershipSnapshot,
 ) -> Result<Vec<AssignNode>> {
@@ -118,7 +118,7 @@ pub async fn assign(
     claim_lease_id: i64,
 ) -> Result<AssignResult> {
     // Step 1 — join membership with caps so we can filter.
-    let mut joined = join_caps(etcd, snapshot).await?;
+    let mut joined = join_caps_pub(etcd, snapshot).await?;
 
     // Step 2 — capability filter (also drops degraded nodes per F-06).
     let mut candidates = capability_filter(&joined, &task.requires);
@@ -378,7 +378,7 @@ mod tests {
         };
 
         // Predict the HRW winner using the same primitives the loop uses.
-        let joined = join_caps(&client, &snap).await.expect("join");
+        let joined = join_caps_pub(&client, &snap).await.expect("join");
         let filtered = capability_filter(&joined, &task.requires);
         let expected = hrw_rank(&task.id, &filtered)
             .into_iter()

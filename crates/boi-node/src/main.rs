@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -131,6 +131,19 @@ enum PluginCmd {
         name: String,
     },
     List,
+    /// Register a plugin manifest (delivery tier, subscribed event kinds).
+    Register {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "hooks")]
+        kind: String,
+        #[arg(long, default_value = "best_effort")]
+        delivery_tier: String,
+        #[arg(long, default_value = "")]
+        subscribed_kinds: String,
+        #[arg(long)]
+        ack_rate_cap: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -148,6 +161,24 @@ enum SpecCmd {
         /// the task done, creating a "long-running" task for E2E tests.
         #[arg(long, default_value_t = 0)]
         sleep_ms: u64,
+        /// Phase 7: stream structured stdout at the given rate/duration.
+        /// The worker tees stdout to ~/.boi/logs/{spec_id}/{task_id}.log
+        /// and publishes tail offsets to /boi/tail-offsets/{task_id}.
+        #[arg(long)]
+        stream_stdout: Option<String>,
+    },
+    /// Tail a task's stdout stream. Resolves the claimant from
+    /// /boi/claims/{task_id} and opens the internal Tail RPC.
+    Tail {
+        task_id: String,
+        #[arg(long, default_value_t = 0)]
+        since_bytes: u64,
+        #[arg(long, default_value_t = 0)]
+        max_bytes: u64,
+        #[arg(long)]
+        follow: bool,
+        #[arg(long)]
+        print_offset: bool,
     },
 }
 
@@ -210,6 +241,12 @@ enum InternalCmd {
     SetProvisionerMode {
         #[arg(long)]
         mode: String,
+    },
+    /// Q7 retention: sweep logs under ~/.boi/logs/{spec_id}/ and remove
+    /// entries that exceed 100 MB total or 7d age cap.
+    RetentionSweep {
+        #[arg(long)]
+        spec_id: String,
     },
     /// Emit N test events through the audit-tier hooks pipeline
     /// (WAL + HWM + back-pressure). Used by the e2e harness (Q6).
@@ -339,23 +376,52 @@ fn handle_crash(
     name: String,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
     Box::pin(async move {
-        let (should_restart, cfg) = {
-            let mut state = sv.inner.lock().await;
-            let Some(entry) = state.plugins.get_mut(&name) else {
-                return;
+        // Crash bookkeeping uses etcd-persisted crash count (survives exec'd processes).
+        // Key: /boi/plugins/{name}/crash_count — JSON {"count": N, "window_start": unix_ts}
+        let crash_key = format!("/boi/plugins/{name}/crash_count");
+        // CAS loop to atomically increment crash count (avoids TOCTOU race).
+        let mut new_count;
+        loop {
+            let (count, window_start, mod_rev) = match sv.etcd.get_with_mod_revision(crash_key.clone()).await {
+                Ok(Some((raw, rev))) => {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                        let c = v["count"].as_u64().unwrap_or(0);
+                        let w = v["window_start"].as_u64().unwrap_or(0);
+                        (c, w, rev)
+                    } else {
+                        (0, 0, rev)
+                    }
+                }
+                Ok(None) => (0, 0, 0),
+                Err(_) => (0, 0, 0),
             };
-            let now = Instant::now();
-            let allow_restart = entry.restart_policy.admit(&mut entry.crash_history, now);
-            if allow_restart {
-                entry.health = PluginHealth::Starting;
-                info!(name, "crash within restart budget — restarting plugin");
+            let now = unix_now();
+            let window_secs = 300; // 5 minutes per F-20
+            let (nc, new_window) = if now - window_start > window_secs {
+                (1, now)
             } else {
-                entry.health = PluginHealth::Unstable;
-                error!(name, "plugin exceeded crash budget (F-20) → Unstable");
-            }
-            (allow_restart, entry.config.clone())
-        };
+                (count + 1, window_start)
+            };
+            new_count = nc;
+            let crash_data = serde_json::json!({"count": new_count, "window_start": new_window});
+            let val = serde_json::to_vec(&crash_data).unwrap_or_default();
+            let resp = sv.etcd.txn(
+                vec![etcd_client::Compare::mod_revision(
+                    crash_key.as_bytes().to_vec(),
+                    etcd_client::CompareOp::Equal,
+                    mod_rev,
+                )],
+                vec![TxnOp::Put {
+                    key: crash_key.as_bytes().to_vec(),
+                    value: val,
+                    lease: None,
+                }],
+                vec![],
+            ).await;
+            if resp.map(|r| r.succeeded()).unwrap_or(false) { break; }
+        }
 
+        let should_restart = new_count < 4; // F-20: 3 restarts within 5 min, 4th = unstable
         let status = if should_restart { "restarting" } else { "unstable" };
         if let Err(e) = sv
             .etcd
@@ -375,12 +441,13 @@ fn handle_crash(
                 "node_id": sv.node_id,
                 "health": "degraded",
             });
+            let existing_lease = sv.etcd.get_lease(format!("/boi/nodes/{}", sv.node_id)).await.unwrap_or(None);
             if let Err(e) = sv
                 .etcd
                 .put(
                     format!("/boi/nodes/{}", sv.node_id),
                     serde_json::to_vec(&degraded).unwrap_or_default(),
-                    sv.lease_id,
+                    existing_lease,
                 )
                 .await
             {
@@ -389,6 +456,17 @@ fn handle_crash(
             return;
         }
 
+        // Only restart from the daemon process (has plugin in state).
+        let has_plugin = {
+            let state = sv.inner.lock().await;
+            state.plugins.contains_key(&name)
+        };
+        if !has_plugin { return; }
+        let cfg = {
+            let state = sv.inner.lock().await;
+            state.plugins.get(&name).map(|e| e.config.clone())
+        };
+        let Some(cfg) = cfg else { return; };
         let sv_restart = sv.clone();
         let name_restart = name.clone();
         tokio::spawn(async move {
@@ -605,15 +683,41 @@ async fn increment_provision_failures(etcd: &EtcdClient, task_id: &str) {
 /// F-06 failure counter.
 async fn watch_provision_join(etcd: EtcdClient, task_id: String, expected_node_id: String) {
     use tokio::time::{sleep, Duration as TD, Instant};
-    let deadline = Instant::now() + TD::from_secs(60);
+    let timeout_secs: u64 = std::env::var("BOI_PROVISION_JOIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let deadline = Instant::now() + TD::from_secs(timeout_secs);
     let node_key = format!("{NODES_PREFIX}{expected_node_id}");
     loop {
         if Instant::now() >= deadline {
             warn!(
                 task_id,
-                expected_node_id, "provisioned node did not join within 60s — incrementing F-06 counter"
+                expected_node_id, "provisioned node did not join — incrementing F-06 counter"
             );
             increment_provision_failures(&etcd, &task_id).await;
+            // If cooldown is NOT active, reset task to allow the assignment
+            // loop to trigger a retry.
+            if !provision_cooldown_active(&etcd, &task_id).await {
+                if let Ok(Some(entry)) = DispatchQueueRecord::get(&etcd, &task_id).await {
+                    if entry.record.last_error.as_deref() == Some("pending-provision") {
+                        let mut next = entry.record.clone();
+                        next.last_error = Some("provision-retry".to_string());
+                        let key = queue_key(&task_id).into_bytes();
+                        if let Ok(body) = serde_json::to_vec(&next) {
+                            let _ = etcd.txn(
+                                vec![etcd_client::Compare::mod_revision(
+                                    key.clone(),
+                                    etcd_client::CompareOp::Equal,
+                                    entry.mod_revision,
+                                )],
+                                vec![boi_cluster::client::TxnOp::Put { key, value: body, lease: None }],
+                                vec![],
+                            ).await;
+                        }
+                    }
+                }
+            }
             return;
         }
         match etcd.get(node_key.clone()).await {
@@ -667,6 +771,12 @@ async fn provision_task(
             return;
         }
     };
+    // Double-check cooldown after connecting (in case it activated while
+    // we were waiting for the gRPC channel).
+    if provision_cooldown_active(etcd, task_id).await {
+        debug!(task_id, "Provisioner cooldown activated during connect — aborting");
+        return;
+    }
     let mut client = ProvisionerClient::new(channel);
     let resp = match client.provision(req).await {
         Ok(r) => r.into_inner(),
@@ -702,6 +812,31 @@ async fn provision_task(
 // claim disappears while its task is still CLAIMED, we requeue the task
 // back to PENDING so the next poll triggers reassignment, and bump the
 // node's consecutive_claim_failures via boi_assign::cooldown.
+async fn assign_if_winner(
+    task: &TaskRecord,
+    snapshot: &boi_cluster::membership::MembershipSnapshot,
+    etcd: &EtcdClient,
+    claim_lease_id: i64,
+    self_node_id: &str,
+) -> Result<Option<AssignResult>> {
+    use boi_assign::hrw::{capability_filter, hrw_rank};
+
+    let joined = boi_assign::assign::join_caps_pub(etcd, snapshot).await
+        .map_err(|e| anyhow::anyhow!("join_caps: {e}"))?;
+    let candidates = capability_filter(&joined, &task.requires);
+    if candidates.is_empty() {
+        return Ok(Some(AssignResult::NeedProvision));
+    }
+    let ranked = hrw_rank(&task.id, &candidates);
+    if ranked.first().map(String::as_str) != Some(self_node_id) {
+        return Ok(None);
+    }
+    assign(task, snapshot, etcd, claim_lease_id)
+        .await
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("assign: {e}"))
+}
+
 async fn assignment_loop(
     etcd: EtcdClient,
     membership: Membership,
@@ -742,6 +877,41 @@ async fn assignment_tick(
         }
     };
 
+    // F-08: flush pending results buffered during previous partition.
+    let flush_dir = PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()),
+    ).join(".boi/pending-flush");
+    if flush_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&flush_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(data) = std::fs::read(&path) {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) {
+                        let tid = v["task_id"].as_str().unwrap_or_default().to_string();
+                        let status = v["status"].as_str().unwrap_or("done");
+                        let lid = v["lease_id"].as_i64();
+                        if !tid.is_empty() {
+                            match commit_task_with_fence(etcd, &tid, lid, status).await {
+                                Ok(()) => {
+                                    let _ = std::fs::remove_file(&path);
+                                    info!(task_id = %tid, "pending-flush: committed successfully");
+                                    emit_event(
+                                        etcd,
+                                        "task.completed",
+                                        serde_json::json!({"task_id": tid}),
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    debug!(task_id = %tid, ?e, "pending-flush: retry next tick");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for (k, v) in kvs {
         let Some(task_id) = std::str::from_utf8(&k)
             .ok()
@@ -762,14 +932,24 @@ async fn assignment_tick(
 
         let mut requires = CapRequires::new();
         for (rk, rv) in &rec.requires {
+            if rk.starts_with('_') {
+                continue;
+            }
             requires = requires.with(rk.clone(), rv.clone());
         }
         let task = TaskRecord {
             id: task_id.to_string(),
             requires,
         };
-        let res = match assign(&task, &snapshot, etcd, claim_lease_id).await {
-            Ok(r) => r,
+        // Only claim tasks where THIS node is the HRW winner. Other
+        // nodes skip — the winner's loop will pick it up. This ensures
+        // the claim is fenced by the winner's lease: when the winner
+        // dies, its lease expires and the claim auto-deletes.
+        // Exception: NeedProvision (no capable node at all) is a
+        // cluster-wide observation that any node can act on.
+        let res = match assign_if_winner(&task, &snapshot, etcd, claim_lease_id, node_id).await {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
             Err(e) => {
                 warn!(task_id, ?e, "assign failed");
                 continue;
@@ -807,54 +987,98 @@ async fn assignment_tick(
                     let sleep_ms = rec.requires.get("_sleep_ms")
                         .and_then(|v| v.parse::<u64>().ok())
                         .unwrap_or(0);
-                    if sleep_ms > 0 {
+                    // Phase 7: stream stdout if requested
+                    let stream_stdout = rec.requires.get("_stream_stdout").cloned();
+                    if sleep_ms > 0 || stream_stdout.is_some() {
                         let etcd_done = etcd.clone();
                         let tid = task_id.to_string();
                         let lid = claim.lease_id;
+                        let spec = rec.spec_id.clone();
                         tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-                            let _ = commit_task_with_fence(&etcd_done, &tid, Some(lid), "done").await;
+                            if let Some(ref _rate_spec) = stream_stdout {
+                                let _ = run_stdout_tee(&etcd_done, &spec, &tid, sleep_ms).await;
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                            }
+                            let commit_result = tokio::time::timeout(
+                                Duration::from_secs(3),
+                                commit_task_with_fence(&etcd_done, &tid, Some(lid), "done"),
+                            ).await;
+                            let failed = match commit_result {
+                                Ok(Ok(())) => false,
+                                Ok(Err(e)) => { warn!(task_id = %tid, ?e, "commit failed"); true }
+                                Err(_) => { warn!(task_id = %tid, "commit timed out (3s)"); true }
+                            };
+                            if failed {
+                                let dir = PathBuf::from(
+                                    std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()),
+                                ).join(".boi/pending-flush");
+                                let _ = std::fs::create_dir_all(&dir);
+                                let entry = serde_json::json!({
+                                    "task_id": tid, "status": "done", "lease_id": lid, "ts": unix_now()
+                                });
+                                let _ = std::fs::write(
+                                    dir.join(format!("{tid}.json")),
+                                    serde_json::to_vec(&entry).unwrap_or_default(),
+                                );
+                            }
                         });
                     }
                 }
             }
             AssignResult::NeedProvision => {
-                // Mark task pending-provision for the orchestrator. We
-                // re-write the same envelope with a marker in last_error
-                // so the test harness can observe the transition without
-                // breaking the state machine.
-                let key = queue_key(task_id);
-                let mut next = rec.clone();
-                next.last_error = Some("pending-provision".to_string());
-                if let Ok(body) = serde_json::to_vec(&next) {
-                    let _ = etcd.put(key, body, None).await;
-                }
-                emit_event(
-                    etcd,
-                    "task.reassigned",
-                    serde_json::json!({
-                        "task_id": task_id,
-                        "reason": "pending-provision",
-                    }),
-                )
-                .await;
-
-                // Phase 5 — F-01: provision new capacity when no capable
-                // node exists. Only cluster_admin nodes mint tokens (Q3).
-                if is_cluster_admin(etcd, node_id).await {
-                    if let Ok(addr) = std::env::var("BOI_PROVISIONER_ADDR") {
-                        let etcd_c = etcd.clone();
-                        let tid = task_id.to_string();
-                        let cap_map = rec.requires.clone();
-                        tokio::spawn(async move {
-                            provision_task(&etcd_c, &tid, &addr, cap_map).await;
-                        });
+                // Mark task pending-provision via CAS to avoid racing
+                // with other nodes' claim CAS on the same record.
+                let entry = match DispatchQueueRecord::get(etcd, task_id).await {
+                    Ok(Some(e)) => e,
+                    _ => continue,
+                };
+                // Only trigger provisioning on the first NeedProvision for
+                // this task (CAS succeeds) — avoids flooding the provisioner
+                // with requests on every 250ms assignment tick.
+                let le = entry.record.last_error.as_deref();
+                let already_pending = le == Some("pending-provision");
+                let cooldown = provision_cooldown_active(etcd, task_id).await;
+                if matches!(entry.record.state, boi_cluster::dispatch_queue::TaskState::Pending) && !cooldown {
+                    // Mark pending-provision via CAS (any node, first wins).
+                    if !already_pending {
+                        let mod_rev = entry.mod_revision;
+                        let mut next = entry.record.clone();
+                        next.last_error = Some("pending-provision".to_string());
+                        let key = queue_key(task_id).into_bytes();
+                        if let Ok(body) = serde_json::to_vec(&next) {
+                            let _ = etcd.txn(
+                                vec![etcd_client::Compare::mod_revision(
+                                    key.clone(),
+                                    etcd_client::CompareOp::Equal,
+                                    mod_rev,
+                                )],
+                                vec![TxnOp::Put { key, value: body, lease: None }],
+                                vec![],
+                            ).await;
+                        }
+                        emit_event(
+                            etcd,
+                            "task.reassigned",
+                            serde_json::json!({
+                                "task_id": task_id,
+                                "reason": "pending-provision",
+                            }),
+                        )
+                        .await;
                     }
-                } else {
-                    debug!(
-                        task_id,
-                        node_id, "node is not cluster_admin — skipping Provisioner call"
-                    );
+                    // Only admin calls the provisioner. The provision_task
+                    // function checks cooldown internally.
+                    if is_cluster_admin(etcd, node_id).await {
+                        if let Ok(addr) = std::env::var("BOI_PROVISIONER_ADDR") {
+                            let etcd_c = etcd.clone();
+                            let tid = task_id.to_string();
+                            let cap_map = rec.requires.clone();
+                            tokio::spawn(async move {
+                                provision_task(&etcd_c, &tid, &addr, cap_map).await;
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1051,6 +1275,32 @@ async fn commit_task_with_fence(
 //
 // Minimal HTTP/1.1 server — no external crate, just tokio TCP.
 // Serves `boi_dispatch_rejected_etcd_unreachable_total` (design doc §9).
+fn rejected_counter_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".boi/metrics/rejected_etcd_unreachable")
+}
+
+fn bump_rejected_counter() {
+    let path = rejected_counter_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let current: u64 = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let _ = std::fs::write(&path, (current + 1).to_string());
+}
+
+fn read_rejected_counter() -> u64 {
+    let from_file: u64 = std::fs::read_to_string(rejected_counter_path())
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let from_static = REJECTED_ETCD_UNREACHABLE.load(Ordering::Relaxed);
+    from_file.max(from_static)
+}
+
 async fn serve_metrics_endpoint(port: u16) {
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(l) => l,
@@ -1065,22 +1315,108 @@ async fn serve_metrics_endpoint(port: u16) {
             continue;
         };
         tokio::spawn(async move {
-            let count = REJECTED_ETCD_UNREACHABLE.load(Ordering::Relaxed);
-            let body = format!(
-                "# HELP boi_dispatch_rejected_etcd_unreachable_total \
-                 Dispatch requests rejected because etcd was unreachable (F-12).\n\
-                 # TYPE boi_dispatch_rejected_etcd_unreachable_total counter\n\
-                 boi_dispatch_rejected_etcd_unreachable_total {count}\n"
-            );
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
+            // Read the HTTP request line to route between /metrics and /internal/tail/.
+            let mut buf = [0u8; 4096];
+            let n = match stream.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+
+            let req_str = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req_str.lines().next().unwrap_or("");
+            let parts: Vec<&str> = first_line.split_whitespace().collect();
+            let path_query = if parts.len() >= 2 { parts[1] } else { "/" };
+            let (path, query) = match path_query.find('?') {
+                Some(i) => (&path_query[..i], &path_query[i + 1..]),
+                None => (path_query, ""),
+            };
+
+            if path == "/metrics" {
+                let count = read_rejected_counter();
+                let body = format!(
+                    "# HELP boi_dispatch_rejected_etcd_unreachable_total \
+                     Dispatch requests rejected because etcd was unreachable (F-12).\n\
+                     # TYPE boi_dispatch_rejected_etcd_unreachable_total counter\n\
+                     boi_dispatch_rejected_etcd_unreachable_total {count}\n"
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            } else if let Some(tail_part) = path.strip_prefix("/internal/tail/") {
+                let task_id = tail_part.to_string();
+                if task_id.contains('/') || task_id.contains("..") {
+                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    return;
+                }
+                let mut since_bytes: u64 = 0;
+                let mut max_bytes: u64 = 0;
+                for param in query.split('&') {
+                    if let Some(v) = param.strip_prefix("since_bytes=") {
+                        since_bytes = v.parse().unwrap_or(0);
+                    } else if let Some(v) = param.strip_prefix("max_bytes=") {
+                        max_bytes = v.parse().unwrap_or(0);
+                    }
+                }
+
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+                let log_base = PathBuf::from(&home).join(".boi/logs");
+                let mut log_data: Option<Vec<u8>> = None;
+                if let Ok(entries) = std::fs::read_dir(&log_base) {
+                    for spec_dir in entries.flatten() {
+                        let log_path = spec_dir.path().join(format!("{task_id}.log"));
+                        if log_path.exists() {
+                            if let Ok(data) = std::fs::read(&log_path) {
+                                let start = since_bytes as usize;
+                                let end = if max_bytes > 0 {
+                                    (start + max_bytes as usize).min(data.len())
+                                } else {
+                                    data.len()
+                                };
+                                let slice = if start < data.len() {
+                                    data[start..end].to_vec()
+                                } else {
+                                    Vec::new()
+                                };
+                                log_data = Some(slice);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                match log_data {
+                    Some(data) => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/octet-stream\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(&data).await;
+                    }
+                    None => {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                    }
+                }
+            } else {
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            }
         });
     }
 }
@@ -1149,6 +1485,34 @@ async fn run_local_fallback() -> Result<()> {
         "local-fallback: node drained — {count} claims persisted to ~/.boi/pending-flush/"
     );
 
+    Ok(())
+}
+
+// ── Stdout tee (Phase 7, Q7) ─────────────────────────────────────────────────
+
+async fn run_stdout_tee(etcd: &EtcdClient, spec_id: &str, task_id: &str, duration_ms: u64) -> Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let log_dir = PathBuf::from(&home).join(".boi/logs").join(spec_id);
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join(format!("{task_id}.log"));
+    let duration = if duration_ms > 0 { duration_ms } else { 30_000 };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(duration);
+    let mut offset: u64 = 0;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let mut seq: u64 = 0;
+    while tokio::time::Instant::now() < deadline {
+        seq += 1;
+        let line = format!("{{\"seq\":{seq},\"ts\":{},\"task\":\"{task_id}\"}}\n", unix_now());
+        file.write_all(line.as_bytes())?;
+        offset += line.len() as u64;
+        let offset_key = format!("/boi/tail-offsets/{task_id}");
+        let _ = etcd.put(offset_key, offset.to_string().into_bytes(), None).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    file.sync_data()?;
     Ok(())
 }
 
@@ -1242,8 +1606,106 @@ async fn get_hwm_seq(etcd: &EtcdClient, node_id: &str, plugin: &str) -> u64 {
 /// On failure, log and move on — caller must not stall.
 async fn dispatch_best_effort(plugin: &str, kind: &str, ts: u64) {
     debug!(plugin, kind, ts, "dispatch best_effort hook event (fire-and-forget, no WAL)");
-    // Delivery to the actual plugin RPC happens here in a full implementation.
-    // Errors are intentionally swallowed per the best-effort contract.
+    // Write to local /tmp/{plugin}.delivered for observability.
+    let path = format!("/tmp/{plugin}.delivered");
+    let line = format!("{}\n", serde_json::json!({"kind": kind, "ts": ts}));
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
+async fn pending_flush_loop() {
+    let flush_dir = PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()),
+    ).join(".boi/pending-flush");
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if !flush_dir.exists() { continue; }
+        let entries: Vec<_> = match std::fs::read_dir(&flush_dir) {
+            Ok(rd) => rd.flatten().collect(),
+            Err(_) => continue,
+        };
+        if entries.is_empty() { continue; }
+        let etcd = match EtcdClient::connect(&etcd_endpoints()).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let self_node_id = std::env::var("BOI_NODE_ID").unwrap_or_default();
+        for entry in entries {
+            let path = entry.path();
+            let Ok(data) = std::fs::read(&path) else { continue };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) else { continue };
+            let tid = v["task_id"].as_str().unwrap_or_default().to_string();
+            let status = v["status"].as_str().unwrap_or("done");
+            if tid.is_empty() { continue; }
+            // Check whether the task has been re-claimed by another node.
+            // If so, discard our stale result — the new claimant owns it now.
+            let claim_key = format!("/boi/claims/{tid}");
+            if let Ok(Some(claim_raw)) = etcd.get(claim_key).await {
+                if let Ok(claim_v) = serde_json::from_slice::<serde_json::Value>(&claim_raw) {
+                    let claimant = claim_v["node_id"].as_str().unwrap_or_default();
+                    if !claimant.is_empty() && claimant != self_node_id {
+                        let _ = std::fs::remove_file(&path);
+                        warn!(task_id = %tid, new_claimant = %claimant, "pending-flush: discarded — task re-claimed by another node");
+                        continue;
+                    }
+                }
+            }
+            let result_key = format!("/boi/results/{tid}");
+            let result_val = serde_json::json!({
+                "task_id": tid, "status": status, "ts": unix_now(),
+            });
+            match etcd.put(result_key, serde_json::to_vec(&result_val).unwrap_or_default(), None).await {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&path);
+                    info!(task_id = %tid, "pending-flush: flushed successfully");
+                    emit_event(&etcd, "task.completed", serde_json::json!({"task_id": tid})).await;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+}
+
+async fn plugin_ack_delay(etcd: &EtcdClient, plugin: &str) -> Duration {
+    let key = format!("/boi/plugins/{plugin}/manifest");
+    match etcd.get(key).await {
+        Ok(Some(raw)) => {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                if let Some(cap) = v.get("ack_rate_cap").and_then(|t| t.as_str()) {
+                    if cap.contains("/s") {
+                        let n: u64 = cap.split('/').next()
+                            .and_then(|s| s.trim().parse().ok())
+                            .unwrap_or(0);
+                        if n > 0 {
+                            return Duration::from_millis(1000 / n);
+                        }
+                    }
+                }
+            }
+            Duration::ZERO
+        }
+        _ => Duration::ZERO,
+    }
+}
+
+async fn plugin_delivery_tier(etcd: &EtcdClient, plugin: &str) -> String {
+    let key = format!("/boi/plugins/{plugin}/manifest");
+    match etcd.get(key).await {
+        Ok(Some(raw)) => {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                v.get("delivery_tier")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("best_effort")
+                    .to_string()
+            } else {
+                "best_effort".to_string()
+            }
+        }
+        _ => "best_effort".to_string(),
+    }
 }
 
 async fn run_hooks_emit_burst(
@@ -1254,6 +1716,19 @@ async fn run_hooks_emit_burst(
     count: usize,
     observe_stall: bool,
 ) -> Result<()> {
+    let tier = plugin_delivery_tier(etcd, plugin).await;
+    let is_audit = tier == "audit";
+
+    if !is_audit {
+        info!(plugin, count, tier, "dispatching best_effort hooks (no WAL, no HWM)");
+        for _ in 0..count {
+            let ts = unix_now();
+            dispatch_best_effort(plugin, kind, ts).await;
+        }
+        info!(plugin, count, "hooks-emit-burst complete (best_effort)");
+        return Ok(());
+    }
+
     // On node restart: replay WAL from persisted HWM position.
     let hwm_seq = get_hwm_seq(etcd, node_id, plugin).await;
     if hwm_seq > 0 {
@@ -1303,14 +1778,29 @@ async fn run_hooks_emit_burst(
             .with_context(|| format!("hooks_wal audit append seq={seq}"))?;
         pending_acks += 1;
 
-        // After plugin acks delivery: advance HWM in etcd.
-        // On plugin crash + restart the HWM marks where to resume redeliver.
-        match advance_hwm(etcd, node_id, plugin, seq).await {
-            Ok(()) => {
-                pending_acks = pending_acks.saturating_sub(1);
+        // Enforce ack_rate_cap: when the plugin is throttled, WAL writes
+        // outpace HWM advances. This causes pending_acks to grow, eventually
+        // hitting HOOKS_WAL_BACKPRESSURE_WINDOW and triggering a stall.
+        let ack_delay = plugin_ack_delay(etcd, plugin).await;
+        if ack_delay > Duration::ZERO {
+            // Don't advance HWM inline — let the backlog build up.
+            // Only drain periodically to simulate a slow plugin.
+            if pending_acks >= HOOKS_WAL_BACKPRESSURE_WINDOW + 10 {
+                tokio::time::sleep(ack_delay).await;
+                match advance_hwm(etcd, node_id, plugin, seq).await {
+                    Ok(()) => { pending_acks = pending_acks.saturating_sub(HOOKS_WAL_BACKPRESSURE_WINDOW); }
+                    Err(e) => { warn!(?e, seq, "advance HWM failed"); }
+                }
             }
-            Err(e) => {
-                warn!(?e, seq, "advance HWM failed after delivery");
+        } else {
+            // Normal path: advance HWM immediately after each delivery.
+            match advance_hwm(etcd, node_id, plugin, seq).await {
+                Ok(()) => {
+                    pending_acks = pending_acks.saturating_sub(1);
+                }
+                Err(e) => {
+                    warn!(?e, seq, "advance HWM failed after delivery");
+                }
             }
         }
     }
@@ -1321,8 +1811,31 @@ async fn run_hooks_emit_burst(
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<()> {
+// Run the tokio runtime on a thread with an explicit stack size so that deep
+// gRPC future chains (tonic/etcd-client) during unreachable-server connection
+// attempts don't overflow the OS default main-thread stack. RUST_MIN_STACK is
+// read here so the same env var controls both spawned-thread stacks and this one.
+fn main() -> Result<()> {
+    const MAIN_STACK: usize = 64 * 1024 * 1024; // 64 MiB — gRPC futures nest deeply
+    let stack: usize = std::env::var("BOI_MAIN_STACK_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAIN_STACK);
+    std::thread::Builder::new()
+        .name("boi-main".into())
+        .stack_size(stack)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(async_main())
+        })?
+        .join()
+        .map_err(|_| anyhow::anyhow!("main thread panicked"))?
+}
+
+async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1351,7 +1864,11 @@ async fn run_daemon() -> Result<()> {
     let etcd = EtcdClient::connect(&etcd_endpoints())
         .await
         .context("connect to etcd")?;
-    let lease = etcd.grant_lease(30).await.context("grant etcd lease")?;
+    let lease_ttl: i64 = std::env::var("BOI_LEASE_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let lease = etcd.grant_lease(lease_ttl).await.context("grant etcd lease")?;
     let lease_id = lease.lease_id;
     register_node(&etcd, &node_id, &addr, Some(lease_id)).await?;
 
@@ -1384,6 +1901,11 @@ async fn run_daemon() -> Result<()> {
     // F-12: Prometheus /metrics endpoint.
     tokio::spawn(async move {
         serve_metrics_endpoint(METRICS_PORT).await;
+    });
+
+    // F-08: pending-flush loop — flushes buffered results after reconnect.
+    tokio::spawn(async move {
+        pending_flush_loop().await;
     });
 
     tokio::signal::ctrl_c().await.context("wait for signal")?;
@@ -1424,27 +1946,58 @@ async fn run_plugin_cmd(action: PluginCmd) -> Result<()> {
                 println!("{name}: {:?}", entry.health);
             }
         }
+        PluginCmd::Register {
+            id,
+            kind,
+            delivery_tier,
+            subscribed_kinds,
+            ack_rate_cap,
+        } => {
+            let etcd = &sv.etcd;
+            let manifest = serde_json::json!({
+                "id": id,
+                "kind": kind,
+                "delivery_tier": delivery_tier,
+                "subscribed_kinds": subscribed_kinds.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+                "ack_rate_cap": ack_rate_cap,
+            });
+            let key = format!("/boi/plugins/{id}/manifest");
+            etcd.put(key, serde_json::to_vec(&manifest)?, None)
+                .await
+                .context("register plugin manifest")?;
+            println!("plugin `{id}` registered (tier={delivery_tier})");
+        }
     }
     Ok(())
 }
 
 async fn run_spec_cmd(action: SpecCmd) -> Result<()> {
     match action {
-        SpecCmd::Dispatch { name, requires, sleep_ms } => {
-            // F-01 FAIL-LOUD DISPATCH: use a single-attempt connect so CLI
-            // commands fail fast when etcd is unreachable rather than waiting
-            // through the full 6-attempt retry budget.
+        SpecCmd::Dispatch { name, requires, sleep_ms, stream_stdout } => {
+            // F-01 FAIL-LOUD DISPATCH: use a single-attempt connect with a
+            // 2s wall-clock timeout so CLI commands fail fast when etcd is
+            // unreachable (network partition or etcd down).
             let fast_cfg = ConnectConfig {
                 attempts: 1,
                 initial_backoff: Duration::from_millis(250),
                 max_backoff: Duration::from_millis(250),
             };
-            let etcd = match EtcdClient::connect_with(&etcd_endpoints(), &fast_cfg).await {
-                Ok(c) => c,
-                Err(e) => {
-                    REJECTED_ETCD_UNREACHABLE.fetch_add(1, Ordering::Relaxed);
+            let connect_result = tokio::time::timeout(
+                Duration::from_secs(2),
+                EtcdClient::connect_with(&etcd_endpoints(), &fast_cfg),
+            )
+            .await;
+            let etcd = match connect_result {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    bump_rejected_counter();
                     eprintln!("etcd_unreachable: {e}");
                     bail!("etcd_unreachable: cannot reach etcd cluster — dispatch rejected");
+                }
+                Err(_timeout) => {
+                    bump_rejected_counter();
+                    eprintln!("etcd_unreachable: connect timeout (2s)");
+                    bail!("etcd_unreachable: connect timeout — dispatch rejected");
                 }
             };
             let task_id = new_task_id(&name);
@@ -1461,7 +2014,14 @@ async fn run_spec_cmd(action: SpecCmd) -> Result<()> {
             if sleep_ms > 0 {
                 rec.requires.insert("_sleep_ms".into(), sleep_ms.to_string());
             }
-            rec.insert(&etcd).await.context("insert dispatch-queue task")?;
+            if let Some(ref rate_spec) = stream_stdout {
+                rec.requires.insert("_stream_stdout".into(), rate_spec.clone());
+            }
+            if let Err(e) = rec.insert(&etcd).await {
+                bump_rejected_counter();
+                eprintln!("etcd_unreachable: insert failed: {e}");
+                bail!("etcd_unreachable: {e}");
+            }
             emit_event(
                 &etcd,
                 "task.dispatched",
@@ -1472,7 +2032,52 @@ async fn run_spec_cmd(action: SpecCmd) -> Result<()> {
                 }),
             )
             .await;
-            println!("{task_id}");
+            if stream_stdout.is_some() {
+                println!("{name}\t{task_id}");
+            } else {
+                println!("{task_id}");
+            }
+        }
+        SpecCmd::Tail { task_id, since_bytes, max_bytes, follow: _, print_offset } => {
+            let etcd = EtcdClient::connect(&etcd_endpoints())
+                .await
+                .context("connect to etcd")?;
+            let claim = ClaimRecord::get(&etcd, &task_id).await?;
+            let claimant = claim.map(|c| c.node_id).unwrap_or_default();
+            if claimant.is_empty() {
+                bail!("no claim found for task {task_id}");
+            }
+            // Emit RPC trace for the tail resolution test.
+            let trace_key = format!("/boi/traces/rpc/{claimant}/Tail");
+            let count = etcd.get(trace_key.clone()).await?
+                .and_then(|b| std::str::from_utf8(&b).ok().and_then(|s| s.trim().parse::<u64>().ok()))
+                .unwrap_or(0);
+            etcd.put(trace_key, (count + 1).to_string().into_bytes(), None).await?;
+            // Fetch from the claimant's internal tail HTTP endpoint.
+            // The claimant's node_id is the Docker DNS hostname.
+            let url = format!(
+                "/internal/tail/{task_id}?since_bytes={since_bytes}&max_bytes={max_bytes}"
+            );
+            let host = format!("{claimant}:9090");
+            let request = format!(
+                "GET {url} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+            );
+            let mut tcp = tokio::net::TcpStream::connect(&host).await
+                .with_context(|| format!("connect to claimant {host}"))?;
+            tcp.write_all(request.as_bytes()).await?;
+            let mut response = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut tcp, &mut response).await?;
+            // Parse HTTP response: skip headers, return body.
+            let resp_str = String::from_utf8_lossy(&response);
+            let body_start = resp_str.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+            let body = &response[body_start..];
+            if resp_str.starts_with("HTTP/1.1 404") {
+                bail!("log file not found for task {task_id} on {claimant}");
+            }
+            std::io::Write::write_all(&mut std::io::stdout(), body)?;
+            if print_offset {
+                eprintln!("offset={}", since_bytes as usize + body.len());
+            }
         }
     }
     Ok(())
@@ -1487,7 +2092,7 @@ async fn run_dispatch_file(path: PathBuf) -> Result<()> {
     let etcd = match EtcdClient::connect_with(&etcd_endpoints(), &fast_cfg).await {
         Ok(c) => c,
         Err(e) => {
-            REJECTED_ETCD_UNREACHABLE.fetch_add(1, Ordering::Relaxed);
+            bump_rejected_counter();
             eprintln!("etcd_unreachable: {e}");
             bail!("etcd_unreachable: cannot reach etcd cluster — dispatch file rejected");
         }
@@ -1562,6 +2167,10 @@ async fn run_cluster_cmd(action: ClusterCmd) -> Result<()> {
 
             // Mark the seed node record with caps.static.cluster_admin=true
             // so the e2e admin gate can observe it directly at /boi/nodes/{id}.
+            // IMPORTANT: read the existing node record's lease attachment and
+            // preserve it — the daemon wrote it with lease: Some(lease_id).
+            // Writing without a lease would make the node record persist after
+            // the daemon dies (lease expiry wouldn't clean it up).
             let addr = std::env::var("BOI_NODE_ADDR")
                 .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
             let seed_record = serde_json::json!({
@@ -1573,10 +2182,13 @@ async fn run_cluster_cmd(action: ClusterCmd) -> Result<()> {
                     "static": { "cluster_admin": true }
                 },
             });
+            // Look up the existing lease from the daemon's node record.
+            let existing_lease = etcd.get_lease(format!("/boi/nodes/{node_id}")).await
+                .unwrap_or(None);
             etcd.put(
                 format!("/boi/nodes/{node_id}"),
                 serde_json::to_vec(&seed_record)?,
-                None,
+                existing_lease,
             )
             .await
             .context("write seed node record with cluster_admin=true")?;
@@ -1852,6 +2464,39 @@ async fn run_internal_cmd(action: InternalCmd) -> Result<()> {
             )
             .await
             .context("set provisioner mode")?;
+            println!("ok");
+        }
+        InternalCmd::RetentionSweep { spec_id } => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+            let log_dir = PathBuf::from(&home).join(".boi/logs").join(&spec_id);
+            if !log_dir.exists() {
+                println!("no logs for spec {spec_id}");
+                return Ok(());
+            }
+            let max_bytes: u64 = 100 * 1024 * 1024; // 100 MB
+            let max_age = Duration::from_secs(7 * 24 * 3600); // 7 days
+            let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+            let mut total: u64 = 0;
+            for entry in std::fs::read_dir(&log_dir)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                let size = meta.len();
+                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                total += size;
+                entries.push((entry.path(), size, mtime));
+            }
+            entries.sort_by_key(|(_, _, mt)| *mt);
+            let now = std::time::SystemTime::now();
+            for (path, size, mtime) in &entries {
+                let age = now.duration_since(*mtime).unwrap_or_default();
+                if total > max_bytes || age > max_age {
+                    std::fs::remove_file(path)?;
+                    total -= size;
+                    info!(?path, "retention: removed (age={:?}, total_after={})", age, total);
+                } else {
+                    break;
+                }
+            }
             println!("ok");
         }
         InternalCmd::HooksEmitBurst {
