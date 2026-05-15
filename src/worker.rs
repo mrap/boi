@@ -2410,6 +2410,7 @@ tasks:\n  - id: t-1\n    title: \"Step\"\n    status: PENDING\n    spec: \"Do it
             cleanup_on_failure: false,
             claude_bin: script.to_str().unwrap().to_string(),
             models: None,
+            convergence_threshold: None,
         };
 
         let tel = test_telemetry();
@@ -2445,6 +2446,7 @@ tasks:\n  - id: t-1\n    title: \"Will Fail\"\n    status: PENDING\n";
             cleanup_on_failure: false,
             claude_bin: script.to_str().unwrap().to_string(),
             models: None,
+            convergence_threshold: None,
         };
 
         let tel = test_telemetry();
@@ -2483,6 +2485,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: script.to_str().unwrap().to_string(),
             models: None,
+            convergence_threshold: None,
         };
 
         let tel = test_telemetry();
@@ -2536,6 +2539,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -2575,6 +2579,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -2613,6 +2618,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -2651,6 +2657,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         // spec-review runs first (pre-spec phase), then execute times out
@@ -2690,6 +2697,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -2731,6 +2739,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -2790,6 +2799,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         let new_task = spec::BoiTask {
@@ -2998,6 +3008,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -3049,6 +3060,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         // Phase call order (post-Layer-3):
@@ -3101,6 +3113,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         // Phase call order:
@@ -3148,6 +3161,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         let mock = crate::runner::MockPhaseRunner::new(vec![
@@ -3320,6 +3334,7 @@ tasks:\n  - id: t-1\n    title: \"Done\"\n    status: PENDING\n  - id: t-2\n    
             cleanup_on_failure: false,
             claude_bin: "true".to_string(),
             models: None,
+            convergence_threshold: None,
         };
         let registry = PhaseRegistry::new();
         let mock = CostMockPhaseRunner::new(0.001);

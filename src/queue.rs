@@ -171,6 +171,8 @@ fn gen_id(prefix: char, conn: &Connection) -> String {
     format!("{}{:02X}{:02X}{:02X}{:02X}", prefix, bytes[0], bytes[1], bytes[2], bytes[3])
 }
 
+const SCHEMA_VERSION: i32 = 2;
+
 impl Queue {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -298,59 +300,96 @@ impl Queue {
             );",
         )?;
 
-        // Migrate existing specs tables that lack new columns
-        Self::ensure_column(&conn, "specs", "max_iterations", "INTEGER DEFAULT 30");
-        Self::ensure_column(&conn, "specs", "iteration", "INTEGER DEFAULT 0");
-        Self::ensure_column(&conn, "specs", "project", "TEXT");
-        Self::ensure_column(&conn, "specs", "phase", "TEXT DEFAULT 'execute'");
-        Self::ensure_column(&conn, "specs", "worker_timeout_seconds", "INTEGER");
-        Self::ensure_column(&conn, "specs", "context", "TEXT");
-        Self::ensure_column(&conn, "specs", "workspace", "TEXT");
-        Self::ensure_column(&conn, "specs", "phase_loop_count", "INTEGER DEFAULT 0");
-        Self::ensure_column(&conn, "specs", "project_context", "TEXT");
-        Self::ensure_column(&conn, "specs", "task_phases", "TEXT");
-        Self::ensure_column(&conn, "specs", "spec_phases", "TEXT");
-        Self::ensure_column(&conn, "specs", "phase_overrides", "TEXT");
-        Self::ensure_column(&conn, "specs", "worker_pool", "TEXT");
-        Self::ensure_column(&conn, "specs", "runner_id", "TEXT");
-        Self::ensure_column(&conn, "specs", "remote_cost_usd", "REAL");
-        Self::ensure_column(&conn, "specs", "remote_duration_secs", "REAL");
-        Self::ensure_column(&conn, "tasks", "spec_content", "TEXT");
-        Self::ensure_column(&conn, "tasks", "verify_content", "TEXT");
-
-        // Telemetry columns for experiment instrumentation (Gap 1-16, 19)
-        Self::ensure_column(&conn, "phase_runs", "model", "TEXT");
-        Self::ensure_column(&conn, "phase_runs", "runtime", "TEXT");
-        Self::ensure_column(&conn, "phase_runs", "pipeline_id", "TEXT");
-        Self::ensure_column(&conn, "phase_runs", "attempt", "INTEGER DEFAULT 1");
-        Self::ensure_column(&conn, "phase_runs", "failure_mode", "TEXT");
-        Self::ensure_column(&conn, "phase_runs", "cold_start_ms", "INTEGER");
-        Self::ensure_column(&conn, "phase_runs", "inference_ms", "INTEGER");
-        Self::ensure_column(&conn, "phase_runs", "cache_read_tokens", "INTEGER");
-        Self::ensure_column(&conn, "phase_runs", "cache_creation_tokens", "INTEGER");
-        Self::ensure_column(&conn, "phase_runs", "tool_call_count", "INTEGER");
-        Self::ensure_column(&conn, "phase_runs", "tool_calls_by_type", "TEXT");
-        Self::ensure_column(&conn, "phase_runs", "ttft_ms", "INTEGER");
-        Self::ensure_column(&conn, "phase_runs", "loop_iteration", "INTEGER");
-        Self::ensure_column(&conn, "phase_runs", "verify_exit_code", "INTEGER");
-        Self::ensure_column(&conn, "phase_runs", "context_json", "TEXT");
-
-        Self::ensure_column(&conn, "bench_results", "total_cost_usd", "REAL");
-        Self::ensure_column(&conn, "bench_results", "total_input_tokens", "INTEGER");
-        Self::ensure_column(&conn, "bench_results", "total_output_tokens", "INTEGER");
-        Self::ensure_column(&conn, "bench_results", "tasks_skipped", "INTEGER DEFAULT 0");
-
-        // Phase 3: load-aware dispatch hints
-        Self::ensure_column(&conn, "runners", "slots_free", "INTEGER");
-        Self::ensure_column(&conn, "runners", "ram_free_mb", "INTEGER");
-        // Phase 3: tag matching
-        Self::ensure_column(&conn, "specs", "required_tags", "TEXT DEFAULT '[]'");
+        Self::run_migrations(&conn, path)?;
 
         Ok(Queue { conn })
     }
 
-    fn ensure_column(conn: &Connection, table: &str, column: &str, col_type: &str) {
-        // Check if column exists by querying table_info
+    fn run_migrations(conn: &Connection, db_path: &str) -> Result<()> {
+        let current: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current >= SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        // Auto-backup before migrating
+        let backup_path = format!("{}.backup-v{}", db_path, current);
+        if let Err(e) = std::fs::copy(db_path, &backup_path) {
+            eprintln!("[boi] WARNING: could not backup DB to {} before migration: {}", backup_path, e);
+        } else {
+            eprintln!("[boi] backed up DB to {} before migration (v{} → v{})", backup_path, current, SCHEMA_VERSION);
+        }
+
+        for version in (current + 1)..=SCHEMA_VERSION {
+            match version {
+                1 => Self::migrate_v1(conn)?,
+                2 => Self::migrate_v2(conn)?,
+                _ => return Err(rusqlite::Error::InvalidParameterName(
+                    format!("unknown migration version {}", version),
+                )),
+            }
+            conn.execute_batch(&format!("PRAGMA user_version = {}", version))?;
+            eprintln!("[boi] migrated DB to schema v{}", version);
+        }
+        Ok(())
+    }
+
+    /// v1: all columns that existed as of 2026-05-15 (the ensure_column era).
+    fn migrate_v1(conn: &Connection) -> Result<()> {
+        let columns = [
+            ("specs", "max_iterations", "INTEGER DEFAULT 30"),
+            ("specs", "iteration", "INTEGER DEFAULT 0"),
+            ("specs", "project", "TEXT"),
+            ("specs", "phase", "TEXT DEFAULT 'execute'"),
+            ("specs", "worker_timeout_seconds", "INTEGER"),
+            ("specs", "context", "TEXT"),
+            ("specs", "workspace", "TEXT"),
+            ("specs", "phase_loop_count", "INTEGER DEFAULT 0"),
+            ("specs", "project_context", "TEXT"),
+            ("specs", "task_phases", "TEXT"),
+            ("specs", "spec_phases", "TEXT"),
+            ("specs", "phase_overrides", "TEXT"),
+            ("specs", "worker_pool", "TEXT"),
+            ("specs", "runner_id", "TEXT"),
+            ("specs", "remote_cost_usd", "REAL"),
+            ("specs", "remote_duration_secs", "REAL"),
+            ("specs", "required_tags", "TEXT DEFAULT '[]'"),
+            ("tasks", "spec_content", "TEXT"),
+            ("tasks", "verify_content", "TEXT"),
+            ("phase_runs", "model", "TEXT"),
+            ("phase_runs", "runtime", "TEXT"),
+            ("phase_runs", "pipeline_id", "TEXT"),
+            ("phase_runs", "attempt", "INTEGER DEFAULT 1"),
+            ("phase_runs", "failure_mode", "TEXT"),
+            ("phase_runs", "cold_start_ms", "INTEGER"),
+            ("phase_runs", "inference_ms", "INTEGER"),
+            ("phase_runs", "cache_read_tokens", "INTEGER"),
+            ("phase_runs", "cache_creation_tokens", "INTEGER"),
+            ("phase_runs", "tool_call_count", "INTEGER"),
+            ("phase_runs", "tool_calls_by_type", "TEXT"),
+            ("phase_runs", "ttft_ms", "INTEGER"),
+            ("phase_runs", "loop_iteration", "INTEGER"),
+            ("phase_runs", "verify_exit_code", "INTEGER"),
+            ("phase_runs", "context_json", "TEXT"),
+            ("bench_results", "total_cost_usd", "REAL"),
+            ("bench_results", "total_input_tokens", "INTEGER"),
+            ("bench_results", "total_output_tokens", "INTEGER"),
+            ("bench_results", "tasks_skipped", "INTEGER DEFAULT 0"),
+            ("runners", "slots_free", "INTEGER"),
+            ("runners", "ram_free_mb", "INTEGER"),
+        ];
+        for (table, column, col_type) in columns {
+            Self::add_column_if_missing(conn, table, column, col_type)?;
+        }
+        Ok(())
+    }
+
+    /// v2: workspace_rationale field for spec validation.
+    fn migrate_v2(conn: &Connection) -> Result<()> {
+        Self::add_column_if_missing(conn, "specs", "workspace_rationale", "TEXT")?;
+        Ok(())
+    }
+
+    fn add_column_if_missing(conn: &Connection, table: &str, column: &str, col_type: &str) -> Result<()> {
         let has_col: bool = conn
             .prepare(&format!("PRAGMA table_info({})", table))
             .and_then(|mut stmt| {
@@ -361,13 +400,10 @@ impl Queue {
                 Ok(rows.filter_map(|r| r.ok()).any(|n| n == column))
             })
             .unwrap_or(false);
-
         if !has_col {
-            let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type);
-            if let Err(e) = conn.execute(&sql, []) {
-                eprintln!("[boi] ERROR: failed to add column {}.{}: {}", table, column, e);
-            }
+            conn.execute(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type), [])?;
         }
+        Ok(())
     }
 
     pub fn enqueue(
