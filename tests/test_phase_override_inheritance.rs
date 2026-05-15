@@ -31,6 +31,8 @@ name = "t-verify"
 level = "task"
 requires_claude = false
 timeout_minutes = 5
+can_add_tasks = false
+can_fail_spec = false
 "#;
 
 /// User override: ONLY [worker] section — no [phase] section.

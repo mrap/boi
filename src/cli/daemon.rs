@@ -205,6 +205,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
         cleanup_on_failure: cfg.cleanup_on_failure(),
         claude_bin: cfg.claude_bin(),
         models: cfg.models.clone(),
+        convergence_threshold: cfg.convergence_threshold(),
     };
 
     // Orphan cleanup: kill any setsid'd Claude processes from a previous crash (F-03)
@@ -348,6 +349,7 @@ pub fn cmd_daemon(db_str: &str, hook_cfg: hooks::HookConfig, cfg: &config::Confi
                             cleanup_on_failure: wc.cleanup_on_failure,
                             claude_bin: wc.claude_bin.clone(),
                             models: wc.models.clone(),
+                            convergence_threshold: wc.convergence_threshold,
                         };
 
                         eprintln!("[boi daemon] starting worker for {} on pool '{}'", spec_id, pool_name);

@@ -1,0 +1,29 @@
+[package]
+name = "boi-node"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "boi-node"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "signal", "time", "sync", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+hex = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+boi-cluster = { path = "../boi-cluster" }
+boi-identity = { path = "../boi-identity" }
+boi-assign = { path = "../boi-assign" }
+boi-plugin-host = { path = "../boi-plugin-host" }
+etcd-client = "0.14"
+tonic = "0.12"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

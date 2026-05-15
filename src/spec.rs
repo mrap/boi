@@ -315,10 +315,15 @@ pub fn topological_sort(spec: &BoiSpec) -> Result<Vec<String>, ValidationError> 
         }
     }
 
-    let mut queue: VecDeque<&str> = in_degree
+    // Seed the queue in spec.tasks declaration order so the topological sort
+    // is deterministic. Iterating in_degree (a HashMap) would order zero-deg
+    // tasks by HashMap iteration, which uses a per-process random seed — this
+    // is what made test_cost_ceiling_halt flake when both tasks had no deps.
+    let mut queue: VecDeque<&str> = spec
+        .tasks
         .iter()
-        .filter(|(_, &d)| d == 0)
-        .map(|(&id, _)| id)
+        .filter(|t| in_degree.get(t.id.as_str()).copied() == Some(0))
+        .map(|t| t.id.as_str())
         .collect();
 
     let mut order: Vec<String> = Vec::with_capacity(spec.tasks.len());

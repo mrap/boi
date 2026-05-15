@@ -1,0 +1,8 @@
+/boi/nodes/node-a
+{"node_id":"node-a","addr":"0.0.0.0:7001","version":"0.1.0","started_at":1778811284}
+/boi/plugins/crasher/caps
+[]
+/boi/plugins/crasher/crash_count
+{"count":1,"window_start":1778811284}
+/boi/plugins/crasher/status
+restarting

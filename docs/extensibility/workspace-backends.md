@@ -1,5 +1,14 @@
 # Workspace Backends
 
+> **v0.1 status.** The supported workspace plugin contract is now
+> **gRPC** — see `boi.workspace.v1` in
+> `crates/boi-proto/proto/boi/workspace/v1/workspace.proto`. The
+> in-process Rust trait described below is **legacy v0.0** and is
+> kept here for reference only; new backends MUST implement the v1
+> gRPC service. See
+> `docs/migration/single-node-to-distributed-v0.1.md` for the port
+> path and `docs/plugins/getting-started.md` for a worked example.
+
 Pluggable workspace isolation for BOI. The current git worktree backend becomes one of several options.
 
 ## What BOI Needs from a Workspace

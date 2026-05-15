@@ -88,6 +88,8 @@ pub struct PhaseConfig {
     pub on_crash: Option<String>,
     pub min_lines_changed: Option<u32>,
     pub model: Option<String>,
+    // DEPRECATED: parsed from TOML for backwards compatibility but never read after construction.
+    // Setting this in a phase.toml has no effect — use `model` instead.
     pub code_model: Option<String>,
     pub effort: Option<String>,
     pub hooks_pre: Vec<String>,
@@ -146,6 +148,7 @@ struct WorkerSection {
     runtime: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    // Kept for TOML backwards compatibility; value is stored in PhaseConfig but never consumed.
     #[serde(default)]
     code_model: Option<String>,
 }
@@ -287,7 +290,84 @@ impl PhaseConfig {
             hooks_post,
         })
     }
-}
+
+    /// Like `from_toml` but accepts missing `level`/`can_add_tasks`/`can_fail_spec`.
+    /// Used when loading user-override phases that inherit these fields from their
+    /// core counterpart. Placeholders (Task / false / false) are always replaced by
+    /// the inheritance logic in `load_user_phases` before the phase is stored.
+    fn from_toml_override(toml: PhaseToml) -> Result<Self, String> {
+        let name = toml
+            .phase.as_ref().and_then(|p| p.name.clone())
+            .or(toml.name.clone())
+            .ok_or_else(|| "phase TOML missing required `name`".to_string())?;
+
+        let description = toml
+            .phase.as_ref().and_then(|p| p.description.clone())
+            .or(toml.description.clone())
+            .unwrap_or_default();
+
+        let prompt_template = toml
+            .prompt.as_ref().and_then(|p| p.template.clone())
+            .or_else(|| toml.worker.as_ref().and_then(|w| w.prompt_template.clone()))
+            .unwrap_or_default();
+
+        let timeout_minutes: Option<u32> = None;
+
+        // Required fields default to placeholders — will be inherited from core.
+        let level = toml.phase.as_ref().and_then(|p| p.level).unwrap_or(PhaseLevel::Task);
+        let can_add_tasks = toml.phase.as_ref().and_then(|p| p.can_add_tasks).unwrap_or(false);
+        let can_fail_spec = toml.phase.as_ref().and_then(|p| p.can_fail_spec).unwrap_or(false);
+
+        let runtime = toml.worker.as_ref().and_then(|w| w.runtime.clone());
+        let completion_handler = toml.completion_handler.clone();
+
+        let requires_claude = toml
+            .phase.as_ref().and_then(|p| p.requires_claude)
+            .unwrap_or_else(|| {
+                runtime.as_deref()
+                    .map(|r| r == "claude")
+                    .unwrap_or(true)
+            });
+
+        let completion = toml.completion.as_ref();
+        let approve_signal = completion.and_then(|c| non_empty(&c.approve_signal));
+        let reject_signal = completion.and_then(|c| non_empty(&c.reject_signal));
+        let on_approve = completion.and_then(|c| c.on_approve.clone());
+        let on_reject = completion.and_then(|c| c.on_reject.clone());
+        let on_crash = completion.and_then(|c| c.on_crash.clone());
+        let min_lines_changed = toml.trigger.as_ref().and_then(|t| t.min_lines_changed);
+        let model = toml.worker.as_ref().and_then(|w| w.model.clone());
+        let code_model = toml.worker.as_ref().and_then(|w| w.code_model.clone());
+        let effort = toml.worker.as_ref().and_then(|w| w.effort.clone());
+        let hooks_pre = toml.hooks.as_ref().and_then(|h| h.pre.clone()).unwrap_or_default();
+        let hooks_post = toml.hooks.as_ref().and_then(|h| h.post.clone()).unwrap_or_default();
+
+        Ok(PhaseConfig {
+            name,
+            level,
+            description,
+            prompt_template,
+            timeout_minutes,
+            retry_count: None,
+            can_add_tasks,
+            can_fail_spec,
+            requires_claude,
+            runtime,
+            completion_handler,
+            approve_signal,
+            reject_signal,
+            on_approve,
+            on_reject,
+            on_crash,
+            min_lines_changed,
+            model,
+            code_model,
+            effort,
+            hooks_pre,
+            hooks_post,
+        })
+    }
+} // end impl PhaseConfig
 
 // derive_level / derive_can_add_tasks / derive_can_fail_spec REMOVED 2026-05-12.
 // Phase TOMLs must now declare these fields explicitly. Loud-failure load-time
@@ -456,7 +536,7 @@ impl PhaseRegistry {
                         .and_then(|c| c.parse::<toml::Value>().ok())
                         .map(|v| PhaseExplicitFlags::from_toml_value(&v))
                         .unwrap_or(PhaseExplicitFlags::assume_all_explicit());
-                    match load_phase_file(&entry) {
+                    match load_phase_file_override(&entry) {
                         Ok(mut phase) => {
                             // Inherit [phase] fields from core when the user override
                             // didn't set them explicitly. Without this, the runtime-based
@@ -567,7 +647,7 @@ impl PhaseRegistry {
                     let explicit = raw.parse::<toml::Value>().ok()
                         .map(|v| PhaseExplicitFlags::from_toml_value(&v))
                         .unwrap_or_else(PhaseExplicitFlags::assume_all_explicit);
-                    if let Ok(mut phase) = load_phase_file(source_path) {
+                    if let Ok(mut phase) = load_phase_file_override(source_path) {
                         if let Some(core) = self.core.get(&phase.name) {
                             if !explicit.requires_claude { phase.requires_claude = core.requires_claude; }
                             if !explicit.level { phase.level = core.level; }
@@ -714,8 +794,13 @@ struct PipelineModeToml {
 
 /// Find the pipelines.toml file.
 /// Priority: BOI_PIPELINES_FILE env > ~/.boi/pipelines.toml > None
+/// Setting BOI_PIPELINES_FILE="" (empty string) disables file-based lookup
+/// entirely (useful in tests to force use of the hardcoded fallback pipeline).
 fn find_pipelines_file() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("BOI_PIPELINES_FILE") {
+        if path.is_empty() {
+            return None;
+        }
         let p = PathBuf::from(&path);
         if p.is_file() {
             return Some(p);
@@ -813,6 +898,12 @@ pub(crate) fn fallback_pipeline(mode: &str) -> PipelineConfig {
             task_phases: vec!["execute".into(), "task-verify".into()],
             max_loops: 3,
         },
+        // doc-update is intentionally absent from generate mode: this mode produces
+        // prose/design documents, and doc-update is a code-maintenance phase with no
+        // useful work on a pure document-generation spec. Pre-2026-05-12 logs showed
+        // it running (SA9EE anomaly) due to a legacy pipeline shape that was removed
+        // in the 2026-05-12 migration. Use phase_overrides to add it per-task if a
+        // generate spec also writes code.
         "generate" => PipelineConfig {
             spec_phases: vec![],
             spec_pre_phases: vec!["plan-critique".into()],
@@ -832,6 +923,59 @@ pub(crate) fn fallback_pipeline(mode: &str) -> PipelineConfig {
 
 fn load_phase_file(path: &Path) -> Result<PhaseConfig, Box<dyn std::error::Error>> {
     load_phase_file_with_base(path, None)
+}
+
+/// Like `load_phase_file` but uses lenient parsing for user-override TOMLs.
+/// Required fields (`level`, `can_add_tasks`, `can_fail_spec`) default to
+/// placeholders that are always replaced by core inheritance in `load_user_phases`.
+fn load_phase_file_override(path: &Path) -> Result<PhaseConfig, Box<dyn std::error::Error>> {
+    load_phase_file_override_with_base(path, None)
+}
+
+fn load_phase_file_override_with_base(path: &Path, base_dir: Option<&Path>) -> Result<PhaseConfig, Box<dyn std::error::Error>> {
+    let content = std::fs::read_to_string(path)?;
+    let toml_parsed: PhaseToml = toml::from_str(&content)?;
+    let mut phase = PhaseConfig::from_toml_override(toml_parsed)
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+
+    // Resolve prompt_template file paths (same logic as load_phase_file_with_base).
+    if !phase.prompt_template.is_empty()
+        && !phase.prompt_template.contains('\n')
+        && phase.prompt_template.ends_with(".md")
+    {
+        let template_ref = &phase.prompt_template;
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let user_path = PathBuf::from(&home).join(".boi").join(template_ref);
+        let repo_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(template_ref);
+        let base_path = base_dir.map(|b| b.join(template_ref));
+
+        let resolved = if user_path.is_file() {
+            Some(user_path)
+        } else if repo_path.is_file() {
+            Some(repo_path)
+        } else if let Some(ref bp) = base_path {
+            if bp.is_file() { Some(bp.clone()) } else { None }
+        } else {
+            None
+        };
+
+        if let Some(template_path) = resolved {
+            match std::fs::read_to_string(&template_path) {
+                Ok(template_content) => {
+                    phase.prompt_template = template_content;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARN: failed to read prompt template {}: {}",
+                        template_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(phase)
 }
 
 /// Load a phase TOML file, optionally resolving prompt_template paths relative to base_dir.
@@ -2031,7 +2175,9 @@ template = "Do something at the spec level."
         let _guard = test_utils::HOME_LOCK.lock().unwrap();
         let repo = test_utils::test_git_repo("pv2-e2e");
         let home = test_utils::test_dir("pv2-e2e-home");
-        std::env::set_var("HOME", home.to_str().unwrap());
+        let old_home = std::env::var("HOME").ok();
+        // SAFETY: HOME_LOCK is held, so no concurrent HOME reads from other tests.
+        unsafe { std::env::set_var("HOME", home.to_str().unwrap()); }
 
         let registry = test_registry();
         let spec_id = "pv2-e2e-001";
@@ -2058,6 +2204,14 @@ template = "Do something at the spec level."
         let ctx = BuiltinContext { spec_id, task_title: "", repo_path: repo.to_str().unwrap() };
         assert!(matches!(run_builtin(handler, &ctx), BuiltinResult::Success(_)), "cleanup phase failed");
         assert!(!dest.exists(), "worktree must be removed after cleanup");
+
+        // SAFETY: HOME_LOCK is held, restoring HOME after the test.
+        unsafe {
+            match old_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 
     #[test]

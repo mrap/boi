@@ -12,6 +12,7 @@ pub mod prune;
 pub mod providers;
 pub mod research;
 pub mod spec_mgmt;
+pub mod tail_cmd;
 pub mod status;
 pub mod telemetry_cmd;
 pub mod workers;

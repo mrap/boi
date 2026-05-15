@@ -58,6 +58,8 @@ completion_handler = "builtin:task-verify"
 name = "task-verify"
 level = "task"
 requires_claude = false
+can_add_tasks = false
+can_fail_spec = false
 timeout_minutes = 5
 
 [completion]
@@ -100,6 +102,8 @@ description = "Core my-phase"
 name = "my-phase"
 level = "task"
 requires_claude = false
+can_add_tasks = false
+can_fail_spec = false
 timeout_minutes = 30
 "#;
 

@@ -1,0 +1,22 @@
+name: buf-breaking
+
+on:
+  pull_request:
+    paths:
+      - "crates/boi-proto/proto/**"
+      - "buf.yaml"
+      - "buf.gen.yaml"
+      - ".github/workflows/buf-breaking.yml"
+
+jobs:
+  breaking:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: bufbuild/buf-setup-action@v1
+      - name: Lint proto
+        run: buf lint
+      - name: Check for breaking changes against main
+        run: buf breaking --against ".git#branch=main"

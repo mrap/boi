@@ -473,26 +473,32 @@ impl Queue {
         Ok(id)
     }
 
-    /// Returns the highest-priority queued spec whose depends_on (if any) is completed.
+    /// Returns the highest-priority queued spec whose every depends_on dependency (if any) is completed.
     /// Atomically sets the spec status to 'assigning' to prevent double-dispatch.
     pub fn dequeue(&self) -> Result<Option<SpecRecord>> {
         let tx = self.conn.unchecked_transaction()?;
 
-        let maybe_id: Option<String> = {
+        let candidates: Vec<(String, Option<String>)> = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM specs
+                "SELECT id, depends_on FROM specs
                  WHERE status = 'queued'
-                   AND (depends_on IS NULL OR depends_on = ''
-                        OR EXISTS (SELECT 1 FROM specs s2
-                                   WHERE s2.id = specs.depends_on AND s2.status = 'completed'))
-                 ORDER BY priority ASC, queued_at ASC
-                 LIMIT 1",
+                 ORDER BY priority ASC, queued_at ASC",
             )?;
-            match stmt.query_row([], |row| row.get::<_, String>(0)) {
-                Ok(id) => Some(id),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(e) => return Err(e),
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let maybe_id: Option<String> = {
+            let mut found: Option<String> = None;
+            for (id, deps) in candidates {
+                if Self::deps_all_completed(&tx, deps.as_deref())? {
+                    found = Some(id);
+                    break;
+                }
             }
+            found
         };
 
         let id = match maybe_id {
@@ -523,6 +529,44 @@ impl Queue {
         Ok(Some(rec))
     }
 
+    /// Returns true if every comma-separated id in `depends_on` corresponds to a
+    /// spec with status='completed'. NULL, empty, or all-empty (e.g. ",,") lists
+    /// are treated as no deps and return true. Whitespace around each id is
+    /// trimmed before lookup.
+    fn deps_all_completed(
+        tx: &rusqlite::Connection,
+        depends_on: Option<&str>,
+    ) -> Result<bool> {
+        let raw = match depends_on {
+            None => return Ok(true),
+            Some(s) => s,
+        };
+        let ids: Vec<&str> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Ok(true);
+        }
+        let mut stmt =
+            tx.prepare_cached("SELECT status FROM specs WHERE id = ?1")?;
+        for id in ids {
+            let status: Option<String> = match stmt.query_row(params![id], |row| {
+                row.get::<_, String>(0)
+            }) {
+                Ok(s) => Some(s),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(e),
+            };
+            match status.as_deref() {
+                Some("completed") => continue,
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     /// Returns true if every tag in `required_tags_json` (a JSON array) is present
     /// in `runner_tags_json` (also a JSON array).  An empty required list always matches.
     pub fn tags_match(runner_tags_json: &str, required_tags_json: &str) -> bool {
@@ -536,17 +580,18 @@ impl Queue {
     pub fn dequeue_filtered(&self, runner_tags_json: &str) -> Result<Option<SpecRecord>> {
         let tx = self.conn.unchecked_transaction()?;
 
-        let candidates: Vec<(String, String)> = {
+        let candidates: Vec<(String, String, Option<String>)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, COALESCE(required_tags, '[]') FROM specs
+                "SELECT id, COALESCE(required_tags, '[]'), depends_on FROM specs
                  WHERE status = 'queued'
-                   AND (depends_on IS NULL OR depends_on = ''
-                        OR EXISTS (SELECT 1 FROM specs s2
-                                   WHERE s2.id = specs.depends_on AND s2.status = 'completed'))
                  ORDER BY priority ASC, queued_at ASC",
             )?;
             let mapped = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             });
             match mapped {
                 Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
@@ -554,11 +599,18 @@ impl Queue {
             }
         };
 
-        let id = match candidates
-            .into_iter()
-            .find(|(_, req_tags)| Self::tags_match(runner_tags_json, req_tags))
-        {
-            Some((id, _)) => id,
+        let mut chosen: Option<String> = None;
+        for (cid, req_tags, deps) in candidates {
+            if !Self::tags_match(runner_tags_json, &req_tags) {
+                continue;
+            }
+            if Self::deps_all_completed(&tx, deps.as_deref())? {
+                chosen = Some(cid);
+                break;
+            }
+        }
+        let id = match chosen {
+            Some(id) => id,
             None => return Ok(None),
         };
 
@@ -615,32 +667,38 @@ impl Queue {
         let default_in_available = available_pools.contains(&default_pool);
 
         let sql = format!(
-            "SELECT id FROM specs
+            "SELECT id, depends_on FROM specs
              WHERE status = 'queued'
-               AND (depends_on IS NULL OR depends_on = ''
-                    OR EXISTS (SELECT 1 FROM specs s2
-                               WHERE s2.id = specs.depends_on AND s2.status = 'completed'))
                AND (
                  (worker_pool IN ({placeholders}))
                  OR (worker_pool IS NULL AND {default_available})
                )
-             ORDER BY priority ASC, queued_at ASC
-             LIMIT 1",
+             ORDER BY priority ASC, queued_at ASC",
             placeholders = placeholders,
             default_available = if default_in_available { "1" } else { "0" },
         );
 
-        let maybe_id: Option<String> = {
+        let candidates: Vec<(String, Option<String>)> = {
             let mut stmt = tx.prepare(&sql)?;
             let pool_params: Vec<&dyn rusqlite::ToSql> = available_pools
                 .iter()
                 .map(|p| p as &dyn rusqlite::ToSql)
                 .collect();
-            match stmt.query_row(pool_params.as_slice(), |row| row.get::<_, String>(0)) {
-                Ok(id) => Some(id),
-                Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                Err(e) => return Err(e),
+            let rows = stmt.query_map(pool_params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        let maybe_id: Option<String> = {
+            let mut found: Option<String> = None;
+            for (id, deps) in candidates {
+                if Self::deps_all_completed(&tx, deps.as_deref())? {
+                    found = Some(id);
+                    break;
+                }
             }
+            found
         };
 
         let id = match maybe_id {
@@ -2129,6 +2187,167 @@ mod tests {
         q.update_spec(&blocker_id, "completed").unwrap();
         let dequeued2 = q.dequeue().unwrap().unwrap();
         assert_eq!(dequeued2.id, id2);
+    }
+
+    // --- Multi-dep dequeue eligibility (comma-separated depends_on) ---
+    //
+    // Helper: insert 3 specs (A, B, C), then a 4th (X) with depends_on="A,B,C".
+    // The statuses for A, B, C are caller-supplied.  Returns (a_id, b_id, c_id, x_id).
+    fn setup_three_deps(
+        q: &Queue,
+        a_status: &str,
+        b_status: &str,
+        c_status: &str,
+    ) -> (String, String, String, String) {
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let a = q.enqueue(&spec, None).unwrap();
+        let b = q.enqueue(&spec, None).unwrap();
+        let c = q.enqueue(&spec, None).unwrap();
+        let x = q.enqueue(&spec, None).unwrap();
+        // Force statuses on A, B, C.
+        for (id, st) in [(&a, a_status), (&b, b_status), (&c, c_status)] {
+            q.conn
+                .execute(
+                    "UPDATE specs SET status = ?1 WHERE id = ?2",
+                    params![st, id],
+                )
+                .unwrap();
+        }
+        // Set X.depends_on to the comma-separated list.
+        let deps = format!("{},{},{}", a, b, c);
+        q.conn
+            .execute(
+                "UPDATE specs SET depends_on = ?1 WHERE id = ?2",
+                params![deps, x],
+            )
+            .unwrap();
+        (a, b, c, x)
+    }
+
+    #[test]
+    fn dequeue_promotes_when_all_multi_deps_completed() {
+        let q = open_mem();
+        let (_a, _b, _c, x) = setup_three_deps(&q, "completed", "completed", "completed");
+        // X is the only spec still in 'queued' — dequeue must return it.
+        let rec = q.dequeue().unwrap();
+        assert!(rec.is_some(), "X must be dequeued when all multi-deps are completed");
+        assert_eq!(rec.unwrap().id, x);
+    }
+
+    #[test]
+    fn dequeue_blocks_when_any_multi_dep_incomplete() {
+        let q = open_mem();
+        // B is still running — X must NOT dequeue.
+        let (_a, _b, _c, _x) = setup_three_deps(&q, "completed", "running", "completed");
+        let rec = q.dequeue().unwrap();
+        assert!(
+            rec.is_none(),
+            "X must NOT dequeue while any of its multi-deps is not completed; got {:?}",
+            rec.map(|r| r.id)
+        );
+    }
+
+    #[test]
+    fn dequeue_still_works_for_single_dep() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let a = q.enqueue(&spec, None).unwrap();
+        let x = q.enqueue(&spec, None).unwrap();
+        q.conn
+            .execute(
+                "UPDATE specs SET status = 'completed' WHERE id = ?1",
+                params![a],
+            )
+            .unwrap();
+        q.conn
+            .execute(
+                "UPDATE specs SET depends_on = ?1 WHERE id = ?2",
+                params![a, x],
+            )
+            .unwrap();
+        let rec = q.dequeue().unwrap();
+        assert!(rec.is_some(), "single-dep eligibility must still work");
+        assert_eq!(rec.unwrap().id, x);
+    }
+
+    #[test]
+    fn dequeue_filtered_promotes_when_all_multi_deps_completed() {
+        let q = open_mem();
+        let (_a, _b, _c, x) = setup_three_deps(&q, "completed", "completed", "completed");
+        let rec = q.dequeue_filtered("[]").unwrap();
+        assert!(rec.is_some(), "dequeue_filtered must return X when all multi-deps completed");
+        assert_eq!(rec.unwrap().id, x);
+    }
+
+    #[test]
+    fn dequeue_filtered_blocks_when_any_multi_dep_incomplete() {
+        let q = open_mem();
+        let _ = setup_three_deps(&q, "completed", "running", "completed");
+        let rec = q.dequeue_filtered("[]").unwrap();
+        assert!(rec.is_none(), "dequeue_filtered must not return X when any multi-dep incomplete");
+    }
+
+    #[test]
+    fn dequeue_filtered_still_works_for_single_dep() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let a = q.enqueue(&spec, None).unwrap();
+        let x = q.enqueue(&spec, None).unwrap();
+        q.conn
+            .execute(
+                "UPDATE specs SET status = 'completed' WHERE id = ?1",
+                params![a],
+            )
+            .unwrap();
+        q.conn
+            .execute(
+                "UPDATE specs SET depends_on = ?1 WHERE id = ?2",
+                params![a, x],
+            )
+            .unwrap();
+        let rec = q.dequeue_filtered("[]").unwrap();
+        assert!(rec.is_some(), "dequeue_filtered single-dep eligibility must still work");
+        assert_eq!(rec.unwrap().id, x);
+    }
+
+    #[test]
+    fn dequeue_for_pools_promotes_when_all_multi_deps_completed() {
+        let q = open_mem();
+        let (_a, _b, _c, x) = setup_three_deps(&q, "completed", "completed", "completed");
+        let rec = q.dequeue_for_pools(&["local"], "local").unwrap();
+        assert!(rec.is_some(), "dequeue_for_pools must return X when all multi-deps completed");
+        assert_eq!(rec.unwrap().id, x);
+    }
+
+    #[test]
+    fn dequeue_for_pools_blocks_when_any_multi_dep_incomplete() {
+        let q = open_mem();
+        let _ = setup_three_deps(&q, "completed", "running", "completed");
+        let rec = q.dequeue_for_pools(&["local"], "local").unwrap();
+        assert!(rec.is_none(), "dequeue_for_pools must not return X when any multi-dep incomplete");
+    }
+
+    #[test]
+    fn dequeue_for_pools_still_works_for_single_dep() {
+        let q = open_mem();
+        let spec = make_spec("S", vec![make_task("t-1", "T")]);
+        let a = q.enqueue(&spec, None).unwrap();
+        let x = q.enqueue(&spec, None).unwrap();
+        q.conn
+            .execute(
+                "UPDATE specs SET status = 'completed' WHERE id = ?1",
+                params![a],
+            )
+            .unwrap();
+        q.conn
+            .execute(
+                "UPDATE specs SET depends_on = ?1 WHERE id = ?2",
+                params![a, x],
+            )
+            .unwrap();
+        let rec = q.dequeue_for_pools(&["local"], "local").unwrap();
+        assert!(rec.is_some(), "dequeue_for_pools single-dep eligibility must still work");
+        assert_eq!(rec.unwrap().id, x);
     }
 
     // --- spec_improve: loop cap enforcement ---

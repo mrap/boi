@@ -68,6 +68,7 @@ impl WorkerPool for LocalThreadPool {
             cleanup_on_failure: config.cleanup_on_failure,
             claude_bin: config.claude_bin.clone(),
             models: config.models.clone(),
+            convergence_threshold: config.convergence_threshold,
         };
         let tel = Telemetry::new(PathBuf::from(&qpath));
 

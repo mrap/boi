@@ -1,5 +1,14 @@
 # Worker Pool Providers
 
+> **v0.1 status.** The supported worker pool plugin contract is now
+> **gRPC** — see `boi.pool.v1` in
+> `crates/boi-proto/proto/boi/pool/v1/pool.proto`. The in-process
+> Rust trait described below is **legacy v0.0** and is kept here for
+> reference only; new plugins MUST implement the v1 gRPC service.
+> See `docs/migration/single-node-to-distributed-v0.1.md` for the
+> port path and `docs/plugins/getting-started.md` for a worked
+> example.
+
 Pluggable worker pool for BOI. The current local-thread pool becomes one of several options.
 
 ## What BOI Needs from a Worker Pool

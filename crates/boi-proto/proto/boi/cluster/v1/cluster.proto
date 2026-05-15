@@ -1,0 +1,87 @@
+// Cluster control-plane contract — Phase 2.
+//
+// This is the RPC surface that the core (boi-cluster) exposes to its
+// own nodes — not a third-party plugin slot. Defined here so plugins
+// and out-of-tree tooling can speak it with the same codegen pipeline.
+syntax = "proto3";
+
+package boi.cluster.v1;
+
+service Cluster {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+
+  // Issue a short-lived join token (consumed by Provisioner.Provision).
+  rpc IssueJoinToken(IssueJoinTokenRequest) returns (IssueJoinTokenResponse);
+
+  // Called by a freshly-booted node to register itself in /boi/nodes/.
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+
+  // Returns the current MembershipSnapshot for read-mostly callers.
+  rpc GetMembership(GetMembershipRequest) returns (GetMembershipResponse);
+
+  // Stream worker stdout for a task from the claimant node. Internal
+  // node-to-node RPC (not exposed to plugins): the boi CLI resolves
+  // /boi/claims/<task_id> to the claimant node_id and opens this RPC
+  // against that node. The server reads from the durable tee at
+  // ~/.boi/logs/<spec_id>/<task_id>.log starting at `since_bytes` and
+  // streams chunks until the cap or EOF (with `follow=true`, blocks
+  // for newly-appended bytes). Per §16 Q7.
+  rpc Tail(TailRequest) returns (stream TailChunk);
+}
+
+message TailRequest {
+  string task_id = 1;
+  // Resume from this absolute byte offset in the on-disk log.
+  uint64 since_bytes = 2;
+  // Hard cap on bytes streamed (0 = unbounded).
+  uint64 max_bytes = 3;
+  // If true, stream new appends until the task completes.
+  bool follow = 4;
+}
+
+message TailChunk {
+  bytes data = 1;
+  // Absolute byte offset of the first byte in `data`.
+  uint64 offset = 2;
+  // True on the final chunk in this stream.
+  bool eof = 3;
+}
+
+message HandshakeRequest { uint32 host_proto_minor = 1; }
+message HandshakeResponse {
+  uint32 plugin_proto_minor = 1;
+  repeated string capabilities = 2;
+}
+
+message IssueJoinTokenRequest {
+  uint32 ttl_seconds = 1;
+  map<string, string> cap_hint = 2;
+}
+message IssueJoinTokenResponse {
+  string token = 1;
+  string expires_at = 2;
+}
+
+message RegisterNodeRequest {
+  string token = 1;
+  string node_id = 2;
+  map<string, string> caps = 3;
+}
+message RegisterNodeResponse {
+  int64 lease_id = 1;
+  // The mod_revision at which the node record was created (per Q1).
+  int64 mod_revision = 2;
+}
+
+message GetMembershipRequest {}
+message GetMembershipResponse {
+  int64 mod_revision = 1;
+  repeated NodeRecord nodes = 2;
+}
+
+message NodeRecord {
+  string node_id = 1;
+  map<string, string> caps = 2;
+  string status = 3;
+  int64 lease_id = 4;
+}

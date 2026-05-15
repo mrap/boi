@@ -1,0 +1,70 @@
+// Pool plugin contract — Phase 2.
+//
+// Idempotency contract (per F-05):
+//   • Every Spawn request MUST carry a `claim_lease_id` set by the
+//     core during dispatch. The pool plugin treats `claim_lease_id`
+//     as the idempotency key — a duplicate Spawn with the same
+//     `claim_lease_id` MUST NOT spin up a second worker; instead it
+//     returns the existing `worker_id` and continues streaming
+//     WorkerEvent chunks from the live process.
+//   • Tail is the canonical recovery RPC. After a host restart the
+//     host re-subscribes by `worker_id` and the plugin replays from
+//     the last byte the host acked (per Q7 tee-to-disk semantics).
+//   • Cancel is idempotent — cancelling a worker that has already
+//     exited returns Ok with the recorded exit_code.
+syntax = "proto3";
+
+package boi.pool.v1;
+
+service Pool {
+  rpc Handshake(HandshakeRequest) returns (HandshakeResponse);
+
+  // Spawn returns immediately with a worker_id; consumers Tail for
+  // the live event stream.
+  rpc Spawn(SpawnRequest) returns (SpawnResponse);
+
+  // Bidi: host acks chunks by byte offset; plugin streams
+  // WorkerEvent records. Host tees raw chunks to
+  // ~/.boi/logs/{spec_id}/{task_id}.log per Q7.
+  rpc Tail(stream TailAck) returns (stream WorkerEvent);
+
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+}
+
+message HandshakeRequest { uint32 host_proto_minor = 1; }
+message HandshakeResponse {
+  uint32 plugin_proto_minor = 1;
+  repeated string capabilities = 2;
+}
+
+message SpawnRequest {
+  string spec_id = 1;
+  string task_id = 2;
+  // Required. Idempotency key (also carried as gRPC metadata
+  // `boi-claim-lease` per Q2).
+  string claim_lease_id = 3;
+  repeated string argv = 4;
+  map<string, string> env = 5;
+  string workspace_path = 6;
+}
+message SpawnResponse { string worker_id = 1; bool resumed = 2; }
+
+message TailAck {
+  string worker_id = 1;
+  // Last byte offset durably persisted by the host.
+  uint64 acked_offset = 2;
+}
+
+message WorkerEvent {
+  string worker_id = 1;
+  uint64 offset = 2;
+  oneof kind {
+    bytes stdout_chunk = 10;
+    bytes stderr_chunk = 11;
+    int32 exit_code = 12;
+    string status = 13;
+  }
+}
+
+message CancelRequest { string worker_id = 1; }
+message CancelResponse { int32 exit_code = 1; }

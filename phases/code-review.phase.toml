@@ -15,7 +15,11 @@ timeout = 600
 
 [completion]
 approve_signal = "## Code Review Approved"
-reject_signal = "[CODE-REVIEW]"
+# Use a delimited token that cannot appear in task-heading prefixes (chosen over
+# structural line-match because it requires no changes to the detection code in
+# src/phases.rs — the existing `output.contains(signal)` check is correct for a
+# unique sentinel that the LLM emits only on rejection).
+reject_signal = "<<CODE-REVIEW-REJECT>>"
 on_approve = "next"
 on_reject = "requeue:execute"
 on_crash = "retry"

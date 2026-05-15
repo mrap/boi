@@ -1,0 +1,92 @@
+# Hermetic E2E topology for distributed BOI v0.1.
+#
+# No named volumes — every `docker compose up` is a fresh slate; running
+# `make e2e` twice in a row must produce identical results.
+services:
+  etcd:
+    image: bitnami/etcd:3.5
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd:2379"
+      ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+    networks:
+      - boi-test
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  node-a:
+    build:
+      context: ../../..
+      dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
+    environment:
+      BOI_ETCD_ENDPOINTS: "http://etcd:2379"
+      BOI_NODE_ID: "node-a"
+      BOI_LEASE_TTL_SECS: "10"
+      BOI_PROVISIONER_ADDR: "http://plugin-sidecar:50051"
+      BOI_PROVISION_JOIN_TIMEOUT_SECS: "3"
+      RUST_MIN_STACK: "8388608"
+    ulimits:
+      stack:
+        soft: 67108864
+        hard: 67108864
+    networks:
+      - boi-test
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+  node-b:
+    build:
+      context: ../../..
+      dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
+    environment:
+      BOI_ETCD_ENDPOINTS: "http://etcd:2379"
+      BOI_NODE_ID: "node-b"
+      BOI_LEASE_TTL_SECS: "10"
+      BOI_PROVISION_JOIN_TIMEOUT_SECS: "3"
+      RUST_MIN_STACK: "8388608"
+    ulimits:
+      stack:
+        soft: 67108864
+        hard: 67108864
+    networks:
+      - boi-test
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+  node-c:
+    build:
+      context: ../../..
+      dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
+    environment:
+      BOI_ETCD_ENDPOINTS: "http://etcd:2379"
+      BOI_NODE_ID: "node-c"
+      BOI_LEASE_TTL_SECS: "10"
+      BOI_PROVISION_JOIN_TIMEOUT_SECS: "3"
+      RUST_MIN_STACK: "8388608"
+    ulimits:
+      stack:
+        soft: 67108864
+        hard: 67108864
+    networks:
+      - boi-test
+    depends_on:
+      etcd:
+        condition: service_healthy
+
+  plugin-sidecar:
+    build:
+      context: ../../..
+      dockerfile: crates/boi-test-harness/docker/boi-node.Dockerfile
+    entrypoint: ["/usr/local/bin/boi-mock-plugin"]
+    command: ["--provisioner", "--port", "50051"]
+    networks:
+      - boi-test
+
+networks:
+  boi-test:
+    driver: bridge

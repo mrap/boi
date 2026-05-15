@@ -1,0 +1,23 @@
+[package]
+name = "boi-test-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+# `e2e` pulls in heavy runtime deps (testcontainers, tonic) used by tests
+# that exercise real Docker topologies. Default builds stay light.
+e2e = ["dep:testcontainers", "dep:tonic"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+testcontainers = { version = "0.20", optional = true }
+tonic = { version = "0.12", optional = true }
+
+[dev-dependencies]
+assert_cmd = "2"

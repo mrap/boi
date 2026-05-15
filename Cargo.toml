@@ -1,6 +1,9 @@
+[workspace]
+members = [".", "crates/boi-test-harness", "crates/boi-node", "crates/boi-cluster", "crates/boi-identity", "crates/boi-proto", "crates/boi-plugin-host", "crates/boi-mock-plugin"]
+
 [package]
 name = "boi"
-version = "1.4.0"
+version = "2.0.0"
 edition = "2021"
 
 [dependencies]
@@ -28,6 +31,7 @@ sha2 = "0.10"
 
 [dev-dependencies]
 serial_test = "3"
+libc = "0.2"
 
 [profile.release]
 strip = true
