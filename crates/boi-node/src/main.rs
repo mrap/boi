@@ -380,8 +380,8 @@ fn handle_crash(
         // Key: /boi/plugins/{name}/crash_count — JSON {"count": N, "window_start": unix_ts}
         let crash_key = format!("/boi/plugins/{name}/crash_count");
         // CAS loop to atomically increment crash count (avoids TOCTOU race).
-        let mut new_count;
-        loop {
+        let mut new_count = 1;
+        for cas_attempt in 0..10u32 {
             let (count, window_start, mod_rev) = match sv.etcd.get_with_mod_revision(crash_key.clone()).await {
                 Ok(Some((raw, rev))) => {
                     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
@@ -393,10 +393,14 @@ fn handle_crash(
                     }
                 }
                 Ok(None) => (0, 0, 0),
-                Err(_) => (0, 0, 0),
+                Err(e) => {
+                    error!(name, ?e, cas_attempt, "crash counter: etcd read failed — defaulting to unstable");
+                    new_count = 4;
+                    break;
+                }
             };
             let now = unix_now();
-            let window_secs = 300; // 5 minutes per F-20
+            let window_secs = 300;
             let (nc, new_window) = if now - window_start > window_secs {
                 (1, now)
             } else {
@@ -418,7 +422,15 @@ fn handle_crash(
                 }],
                 vec![],
             ).await;
-            if resp.map(|r| r.succeeded()).unwrap_or(false) { break; }
+            match resp {
+                Ok(r) if r.succeeded() => break,
+                Ok(_) => continue,
+                Err(e) => {
+                    error!(name, ?e, cas_attempt, "crash counter: CAS txn failed — defaulting to unstable");
+                    new_count = 4;
+                    break;
+                }
+            }
         }
 
         let should_restart = new_count < 4; // F-20: 3 restarts within 5 min, 4th = unstable
@@ -590,7 +602,8 @@ fn new_task_id(name: &str) -> String {
 
 async fn emit_event(etcd: &EtcdClient, kind: &str, payload: serde_json::Value) {
     let ts = unix_now();
-    let key = format!("{EVENTS_PREFIX}{ts:020}-{kind}");
+    let uid = Uuid::new_v4().as_simple().to_string();
+    let key = format!("{EVENTS_PREFIX}{ts:020}-{kind}-{uid}");
     let body = serde_json::json!({
         "kind": kind,
         "ts": ts,
@@ -637,7 +650,11 @@ async fn provision_cooldown_active(etcd: &EtcdClient, task_id: &str) -> bool {
                 false
             }
         }
-        _ => false,
+        Ok(None) => false,
+        Err(e) => {
+            warn!(task_id, ?e, "provision_cooldown_active: etcd unreachable — assuming cooldown active (fail safe)");
+            true
+        }
     }
 }
 
@@ -645,37 +662,54 @@ async fn provision_cooldown_active(etcd: &EtcdClient, task_id: &str) -> bool {
 /// After 3 consecutive failures, set a 5-minute cooldown (F-06).
 async fn increment_provision_failures(etcd: &EtcdClient, task_id: &str) {
     let key = format!("{PROVISION_FAILURES_PREFIX}{task_id}");
-    let (failures, cooldown_until) = match etcd.get(key.clone()).await {
-        Ok(Some(v)) => {
-            if let Ok(map) = serde_json::from_slice::<serde_json::Value>(&v) {
-                let f = map
-                    .get("consecutive_claim_failures")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0)
-                    + 1;
-                let cu = if f >= 3 { unix_now() + 300 } else { 0 };
-                (f, cu)
-            } else {
-                (1, 0)
+    for attempt in 0..10 {
+        let (failures, cooldown_until, mod_rev) = match etcd.get_with_mod_revision(key.clone()).await {
+            Ok(Some((raw, rev))) => {
+                if let Ok(map) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                    let f = map.get("consecutive_claim_failures")
+                        .and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+                    let cu = if f >= 3 { unix_now() + 300 } else { 0 };
+                    (f, cu, rev)
+                } else {
+                    (1, 0, rev)
+                }
+            }
+            Ok(None) => (1, 0, 0),
+            Err(e) => {
+                warn!(task_id, ?e, attempt, "increment_provision_failures: etcd read failed");
+                return;
+            }
+        };
+        let val = serde_json::json!({
+            "consecutive_claim_failures": failures,
+            "cooldown_until": cooldown_until,
+            "task_id": task_id,
+        });
+        let Ok(b) = serde_json::to_vec(&val) else { return };
+        let cas = etcd.txn(
+            vec![etcd_client::Compare::mod_revision(
+                key.as_bytes().to_vec(),
+                etcd_client::CompareOp::Equal,
+                mod_rev,
+            )],
+            vec![TxnOp::Put { key: key.as_bytes().to_vec(), value: b, lease: None }],
+            vec![],
+        ).await;
+        match cas {
+            Ok(r) if r.succeeded() => {
+                if failures >= 3 {
+                    warn!(task_id, failures, "F-06: provision failure threshold reached — cooldown active for 5 min");
+                }
+                return;
+            }
+            Ok(_) => continue,
+            Err(e) => {
+                warn!(task_id, ?e, attempt, "increment_provision_failures: CAS txn failed");
+                return;
             }
         }
-        _ => (1, 0),
-    };
-    let val = serde_json::json!({
-        "consecutive_claim_failures": failures,
-        "cooldown_until": cooldown_until,
-        "task_id": task_id,
-    });
-    if let Ok(b) = serde_json::to_vec(&val) {
-        let _ = etcd.put(key, b, None).await;
     }
-    if failures >= 3 {
-        warn!(
-            task_id,
-            failures,
-            "F-06: provision failure threshold reached — cooldown active for 5 min"
-        );
-    }
+    warn!(task_id, "increment_provision_failures: CAS exhausted 10 retries");
 }
 
 /// After a successful Provision RPC, watch for the expected node to
@@ -1093,39 +1127,48 @@ async fn assignment_tick(
 // holder's lease expired — we requeue the task so the assignment loop
 // picks a new home (reassign).
 async fn lease_expiry_watcher(etcd: EtcdClient) {
-    info!("lease_expiry watcher starting");
-    let start_rev = match etcd.get_prefix_with_revision(CLAIMS_PREFIX).await {
-        Ok((_, rev)) => rev + 1,
-        Err(e) => {
-            warn!(?e, "lease_expiry init read failed");
-            return;
-        }
-    };
-    let (_w, mut stream) = match etcd.watch_prefix(CLAIMS_PREFIX, start_rev).await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(?e, "lease_expiry watch open failed");
-            return;
-        }
-    };
-    while let Ok(Some(resp)) = stream.message().await {
-        for ev in resp.events() {
-            if !matches!(ev.event_type(), etcd_client::EventType::Delete) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        info!("lease_expiry watcher starting");
+        let start_rev = match etcd.get_prefix_with_revision(CLAIMS_PREFIX).await {
+            Ok((_, rev)) => rev + 1,
+            Err(e) => {
+                error!(?e, "lease_expiry init read failed — retrying in {:?}", backoff);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
                 continue;
             }
-            let Some(kv) = ev.kv() else { continue };
-            let key = String::from_utf8_lossy(kv.key()).to_string();
-            // Skip the `/claim_lease_id` sub-key deletions; only the
-            // envelope delete drives reassign.
-            if key.ends_with("/claim_lease_id") {
+        };
+        let (_w, mut stream) = match etcd.watch_prefix(CLAIMS_PREFIX, start_rev).await {
+            Ok(p) => p,
+            Err(e) => {
+                error!(?e, "lease_expiry watch open failed — retrying in {:?}", backoff);
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
                 continue;
             }
-            let task_id = match key.strip_prefix(CLAIMS_PREFIX) {
-                Some(t) => t.to_string(),
-                None => continue,
-            };
-            handle_lease_expiry(&etcd, &task_id).await;
+        };
+        backoff = Duration::from_secs(1);
+        while let Ok(Some(resp)) = stream.message().await {
+            for ev in resp.events() {
+                if !matches!(ev.event_type(), etcd_client::EventType::Delete) {
+                    continue;
+                }
+                let Some(kv) = ev.kv() else { continue };
+                let key = String::from_utf8_lossy(kv.key()).to_string();
+                if key.ends_with("/claim_lease_id") {
+                    continue;
+                }
+                let task_id = match key.strip_prefix(CLAIMS_PREFIX) {
+                    Some(t) => t.to_string(),
+                    None => continue,
+                };
+                handle_lease_expiry(&etcd, &task_id).await;
+            }
         }
+        error!("lease_expiry watch stream terminated — reconnecting in {:?}", backoff);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
 
@@ -1630,18 +1673,28 @@ async fn pending_flush_loop() {
         if entries.is_empty() { continue; }
         let etcd = match EtcdClient::connect(&etcd_endpoints()).await {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                warn!(?e, "pending-flush: etcd connect failed — will retry");
+                continue;
+            }
         };
         let self_node_id = std::env::var("BOI_NODE_ID").unwrap_or_default();
         for entry in entries {
             let path = entry.path();
-            let Ok(data) = std::fs::read(&path) else { continue };
-            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) else { continue };
+            let Ok(data) = std::fs::read(&path) else {
+                warn!(path = %path.display(), "pending-flush: cannot read file");
+                continue;
+            };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&data) else {
+                warn!(path = %path.display(), "pending-flush: corrupt JSON — quarantining");
+                let _ = std::fs::rename(&path, path.with_extension("corrupt"));
+                continue;
+            };
             let tid = v["task_id"].as_str().unwrap_or_default().to_string();
+            let lid = v["lease_id"].as_i64();
             let status = v["status"].as_str().unwrap_or("done");
             if tid.is_empty() { continue; }
             // Check whether the task has been re-claimed by another node.
-            // If so, discard our stale result — the new claimant owns it now.
             let claim_key = format!("/boi/claims/{tid}");
             if let Ok(Some(claim_raw)) = etcd.get(claim_key).await {
                 if let Ok(claim_v) = serde_json::from_slice::<serde_json::Value>(&claim_raw) {
@@ -1653,17 +1706,33 @@ async fn pending_flush_loop() {
                     }
                 }
             }
-            let result_key = format!("/boi/results/{tid}");
-            let result_val = serde_json::json!({
-                "task_id": tid, "status": status, "ts": unix_now(),
-            });
-            match etcd.put(result_key, serde_json::to_vec(&result_val).unwrap_or_default(), None).await {
+            match commit_task_with_fence(&etcd, &tid, lid, status).await {
                 Ok(()) => {
                     let _ = std::fs::remove_file(&path);
-                    info!(task_id = %tid, "pending-flush: flushed successfully");
+                    info!(task_id = %tid, "pending-flush: flushed with fence");
                     emit_event(&etcd, "task.completed", serde_json::json!({"task_id": tid})).await;
                 }
-                Err(_) => {}
+                Err(e) => {
+                    // Fence failed — claim likely expired during partition.
+                    // We already verified no other node re-claimed this task
+                    // (the re-claim check above passed). Safe to force-write
+                    // the result since the work was completed by this node.
+                    warn!(task_id = %tid, ?e, "pending-flush: fence rejected — force-writing (no competing claimant)");
+                    let result_key = format!("/boi/results/{tid}");
+                    let result_val = serde_json::json!({
+                        "task_id": tid, "status": status, "ts": unix_now(),
+                    });
+                    match etcd.put(result_key, serde_json::to_vec(&result_val).unwrap_or_default(), None).await {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(&path);
+                            info!(task_id = %tid, "pending-flush: force-write succeeded");
+                            emit_event(&etcd, "task.completed", serde_json::json!({"task_id": tid})).await;
+                        }
+                        Err(e2) => {
+                            warn!(task_id = %tid, ?e2, "pending-flush: force-write also failed — will retry");
+                        }
+                    }
+                }
             }
         }
     }
@@ -1891,7 +1960,10 @@ async fn run_daemon() -> Result<()> {
                 assignment_loop(etcd_a, membership, node_a, lease_id).await;
             });
         }
-        Err(e) => warn!(?e, "failed to start membership tracker — assignment disabled"),
+        Err(e) => {
+            error!(?e, "FATAL: failed to start membership tracker — this node cannot claim tasks. Exiting.");
+            std::process::exit(1);
+        }
     }
     let etcd_w = etcd.clone();
     tokio::spawn(async move {

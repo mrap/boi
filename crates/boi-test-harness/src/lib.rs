@@ -48,8 +48,8 @@ pub struct KV {
 /// binary (exit 78). That failure mode is intentional: tests assert
 /// "binary stub" as their red signal.
 pub fn start_cluster(n: usize) -> Result<Cluster> {
-    if n == 0 || n > 8 {
-        bail!("start_cluster: n must be in 1..=8, got {n}");
+    if n == 0 || n > 3 {
+        bail!("start_cluster: n must be in 1..=3 (only 3 node services defined in compose), got {n}");
     }
     let compose = docker_dir().join("docker-compose.yaml");
     if !compose.exists() {
