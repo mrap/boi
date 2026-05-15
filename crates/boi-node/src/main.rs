@@ -1714,22 +1714,40 @@ async fn pending_flush_loop() {
                 }
                 Err(e) => {
                     // Fence failed — claim likely expired during partition.
-                    // We already verified no other node re-claimed this task
-                    // (the re-claim check above passed). Safe to force-write
-                    // the result since the work was completed by this node.
-                    warn!(task_id = %tid, ?e, "pending-flush: fence rejected — force-writing (no competing claimant)");
-                    let result_key = format!("/boi/results/{tid}");
+                    // Write the result only if the claim key is still absent
+                    // (no other node re-claimed). This closes the TOCTOU
+                    // window atomically via etcd CAS.
+                    warn!(task_id = %tid, ?e, "pending-flush: fence rejected — attempting fenced force-write");
+                    let claim_key_bytes = format!("/boi/claims/{tid}").into_bytes();
+                    let result_key = format!("/boi/results/{tid}").into_bytes();
                     let result_val = serde_json::json!({
                         "task_id": tid, "status": status, "ts": unix_now(),
                     });
-                    match etcd.put(result_key, serde_json::to_vec(&result_val).unwrap_or_default(), None).await {
-                        Ok(()) => {
+                    let cas = etcd.txn(
+                        vec![etcd_client::Compare::version(
+                            claim_key_bytes,
+                            etcd_client::CompareOp::Equal,
+                            0, // claim key must be absent
+                        )],
+                        vec![TxnOp::Put {
+                            key: result_key,
+                            value: serde_json::to_vec(&result_val).unwrap_or_default(),
+                            lease: None,
+                        }],
+                        vec![],
+                    ).await;
+                    match cas {
+                        Ok(r) if r.succeeded() => {
                             let _ = std::fs::remove_file(&path);
-                            info!(task_id = %tid, "pending-flush: force-write succeeded");
+                            info!(task_id = %tid, "pending-flush: fenced force-write succeeded (claim absent)");
                             emit_event(&etcd, "task.completed", serde_json::json!({"task_id": tid})).await;
                         }
+                        Ok(_) => {
+                            let _ = std::fs::remove_file(&path);
+                            warn!(task_id = %tid, "pending-flush: discarded — task re-claimed by another node during flush");
+                        }
                         Err(e2) => {
-                            warn!(task_id = %tid, ?e2, "pending-flush: force-write also failed — will retry");
+                            warn!(task_id = %tid, ?e2, "pending-flush: fenced force-write failed — will retry");
                         }
                     }
                 }
