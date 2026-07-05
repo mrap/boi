@@ -1,0 +1,24 @@
+# Task-level deterministic phase — clean-state postcondition check (§4 step 6)
+# and the task-pipeline routing terminator (Phase 5a Task 5a.4). Terminal:
+# on.passing omits `next` (TOML has no null). No prompt_template;
+# [runtime] inert. (G13.2)
+name = "workspace_verify_out"
+level = "task"
+kind = "deterministic"
+
+[runtime]
+provider = "deterministic"
+model = "n/a"
+
+[on.passing]
+emit = "task.workspace_verify_out.completed"
+
+[on.redo]
+next = "workspace_verify_out"
+emit = "task.workspace_verify_out.retry"
+
+[on.blocked]
+emit = "task.workspace_verify_out.blocked"
+
+[on.fail]
+emit = "task.workspace_verify_out.failed"

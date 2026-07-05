@@ -1,0 +1,130 @@
+# §13.3 — the test-coverage manifest.
+#
+# `scripts/checks/test-coverage.sh` (Task 10.6) is the §13.3 per-module
+# coverage gate. For every module under `src/service/` and `src/runtime/` it
+# requires:
+#
+#   - an **L2** test — a `fn test_l2_*` in the module's file(s); OR the module
+#     is listed in `l1_only_modules` (its correct tier IS L1 — pure logic /
+#     type round-trips, no integration surface).
+#   - an **L3** test — a `fn test_l3_<module>_*` (in `src/` or
+#     `tests/integration/`); OR the module is in `e2e_covered_modules` (the
+#     real-`goose` Docker E2E is its L3 — `tests/e2e/`); OR in
+#     `l3_tier_covered_modules` (the `service/` orchestration stack the L3
+#     orchestrator-integration tier — `tests/integration/` — drives a real
+#     spec through, end-to-end, on every `test_l3_fixtures_*` run).
+#
+# This file is the SINGLE honest record of how each module's §13.3 coverage
+# is satisfied. Every entry is an explicit, rationale-carrying classification
+# — there is no silent gap. A new `service/`/`runtime/` module that is none
+# of {L2-tested, L3-tested, listed here} fails the gate loudly.
+#
+# ## Scoping note (honest deviation from design §13.3's literal wording)
+#
+# Design §13.3 reads "every module ... has at least one L2 and one L3 test".
+# Phases 0-9 produced modules whose correct tier is L1 (`transitions` — the
+# state-machine matrix; `renderer` — golden render tests; `command` — type
+# round-trips; `deterministic` — the fn-pointer table) and produced no
+# per-module `test_l3_*` for the `service/` orchestration modules — their L3
+# coverage is the orchestrator-integration TIER, not a per-module function.
+# `test-coverage.sh` therefore enforces §13.3's *intent* — no untested
+# module, every mock-bypassed `runtime/` provider module E2E-covered — at the
+# granularity the codebase supports, with every relaxation recorded here
+# explicitly rather than silently skipped.
+
+# --- Modules whose L3 coverage IS the Docker E2E (tests/e2e/) -------------
+# The `runtime/` modules a real `boi daemon` exercises end-to-end in the
+# Docker E2E and the L3 `MockExecutor` structurally bypasses (the mock
+# replaces the `PhaseExecutor` port — everything below it is mock-invisible).
+# The E2E's 3 real-`goose` scenarios drive a real daemon: a real
+# `RuntimeExecutor`, real `goose` worker phases, real deterministic phases
+# (real git on the workspace), real OTel emission.
+e2e_covered_modules = [
+  # The worker-phase provider stack — a real `goose run` against a real model.
+  "runtime/recipe",         # a real worker recipe is written + consumed by `goose run`.
+  "runtime/stream",         # real `goose --output-format stream-json` is drained through it.
+  "runtime/goose",          # spawns the real `goose` child; cancelled mid-stream in scenario 2.
+  "runtime/preflight",      # the E2E's `boi dispatch` runs a real preflight.
+  "runtime/mcp_server",     # `goose` spawns it as a recipe-declared stdio extension.
+  # The executor + deterministic-phase stack — the E2E daemon runs the real
+  # deterministic phases (`workspace_prepare`, `workspace_verify_*`, `commit`,
+  # `merge_to_integration`, …) doing real git on the per-scenario workspace.
+  "runtime/executor",       # the unified RuntimeExecutor the E2E daemon is wired with.
+  "runtime/steps_executor", # the deterministic-phase PhaseExecutor adapter.
+  "runtime/worktree",       # the §5 worktree mechanic — real worktrees in the E2E.
+  "runtime/git_ops",        # the git2 layer the deterministic phases drive.
+  "runtime/validate",       # verification-command execution in the E2E pipeline.
+  "runtime/tool_host",      # the WorkerToolHost a real worker phase uses.
+  # The OTel emission stack — the E2E daemon's bus carries the real
+  # `OtelObserver`, so every E2E event is exported through these.
+  "runtime/otel",           # the EmitObserver adapter.
+  "runtime/otel_export",    # the OTLP/JSON file exporter + OtelGuard.
+  "runtime/otel_hoover",    # the worker-OTel hoover wired into the post-worker step.
+]
+
+# --- Modules L3-covered by the orchestrator-integration TIER --------------
+# The `service/` orchestration stack. Every `test_l3_fixtures_*` /
+# `test_l3_failures_*` run in `tests/integration/` dispatches a real spec and
+# drives the real orchestrator + event bus + repo to quiescence — so these
+# modules are exercised end-to-end on the L3 tier, collectively, rather than
+# by a per-module `test_l3_<module>_*` function. (`orchestrator` and
+# `plan_layer` additionally carry their own in-crate `test_l3_*` tests.)
+l3_tier_covered_modules = [
+  "service/orchestrator",  # the event loop the L3 harness drives.
+  "service/bus",           # every L3 transition flows through the real EventBus.
+  "service/routing",       # every L3 phase advance is a real routing decision.
+  "service/scheduler",     # the L3 DAG fixture exercises real dep-readiness.
+  "service/registry",      # the L3 drains are the real registry drain tasks.
+  "service/context",       # each L3 phase composes a real PhaseContext.
+  "service/adjustment",    # the L3 `03` fixture drives the real side-chain.
+  "service/sweeper",       # the L3 boot path wires the real Sweeper.
+  "service/mcp",           # the L3 daemon path wires the real MCP tool surface.
+]
+
+# --- Modules whose correct test tier is L1 (no L2 integration surface) ----
+# Pure-logic / type modules — an L2 "integration" test would be artificial.
+# Their L1 tests ARE the right coverage; `test-coverage.sh` accepts L1 here
+# in lieu of L2.
+l1_only_modules = [
+  "service/transitions",   # the state-machine legality matrix — pure logic.
+  "service/renderer",      # the `<phase_context>` renderer — golden tests.
+  "service/command",       # `DaemonCommand`/`DaemonResponse` — serde round-trips.
+  "runtime/deterministic", # the `DETERMINISTIC_STEPS` fn-pointer table.
+]
+
+# --- Modules whose L2 tests are integration-grade and have NO v1.0 L3 -----
+# These carry thorough L2 coverage but no hermetic L3 surface at v1.0 — an L3
+# test is documented as a v1.x follow-up, recorded here explicitly rather than
+# silently skipped. `test-coverage.sh` accepts the L2 coverage in lieu of L3.
+l2_sufficient_modules = [
+  # (`runtime/branch_policy` graduated OUT of this list when the GitFlow
+  # enforcement wiring landed: its L3 surface is now real — the hermetic
+  # `test_l3_branch_policy_*` battery in `src/runtime/worktree.rs` drives
+  # prepare_spec/merge_spec through the Layer-3 policy re-checks against
+  # temp GitFlow repos, per requirements §7.1 / AC-4/5/6.)
+  # `boi resolve-conflict` opens an INTERACTIVE shell — there is no hermetic
+  # L3 for an interactive flow. L2 covers re-create-conflict + is-clean.
+  "runtime/conflict",
+  # `bootstrap_provider_env` mutates the process env via `set_var` — sound only
+  # in the single-threaded pre-runtime preamble, so no hermetic L3 exists under
+  # the threaded test harness. L2 covers the permission gates (0700/0600
+  # rejection returns before any env mutation) and the pure line parser; the
+  # env effect itself runs at every CLI startup with loud per-key logging.
+  "runtime/secrets",
+  # The bundled-DuckDB query layer — `boi traces query` is not in the E2E's
+  # 3 scenarios. L2 runs real DuckDB against checked-in sample OTLP fixtures.
+  "runtime/duckdb",
+  # The `NonOverlappingHunkMerger` strategy — staged foundation for the
+  # conflict-resolver track (salvaged from spec Syvwx7psx), not yet wired
+  # into `worktree.rs`'s merge path. Pure splice logic over byte slices; L2
+  # covers the resolve/decline taxonomy. The L3 surface (a real conflicted
+  # rebase resolved through the registry) arrives when the resolver track
+  # wires the registry in.
+  "runtime/merge_strategies/non_overlapping",
+]
+
+# --- The §13.3 failure-path exemption (G16.6) -----------------------------
+# `AwaitingDeps` — no v1.0 component emits `TaskBlocked{AwaitingDeps}` (the
+# scheduler enforces dependency readiness by *not spawning* a task, never by
+# emitting a block). `tests/integration/failures.rs` pins the exemption.
+failure_path_exemptions = ["AwaitingDeps"]

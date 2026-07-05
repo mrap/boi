@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM phase_runs WHERE spec_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "17d55a62741fae5efdb4313965ced38e4c7ef09f48a13a26e5a7b2333b330e68"
+}

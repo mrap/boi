@@ -1,0 +1,16 @@
+# Clippy configuration.
+#
+# `unwrap_used` / `expect_used` are workspace `warn` (see Cargo.toml [lints])
+# so tests may use `.unwrap()` / `.expect()` freely. High-value modules
+# (service/, runtime/) opt into `#![deny(clippy::unwrap_used)]`. These two
+# keys make that opt-in still exempt `#[cfg(test)]` bodies — clippy does NOT
+# exempt test code by default; `allow-unwrap-in-tests` defaults to false.
+# Without this file, the tests/lint_fixtures/unwrap_warns.rs fixture (and any
+# deny-opted module's own tests) would hard-fail under `cargo clippy`.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+# `panic` is also a workspace `warn` lint; `--all-targets -D warnings` escalates
+# it in test code too. Tests legitimately `panic!` (incl. the common
+# `match { _ => panic!() }` idiom), so exempt test bodies — same rationale as
+# the two keys above. (Surfaced by Phase 1 execution.)
+allow-panic-in-tests = true

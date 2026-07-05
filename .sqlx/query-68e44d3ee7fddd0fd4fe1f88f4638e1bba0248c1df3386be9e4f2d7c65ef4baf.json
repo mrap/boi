@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM task_runtime WHERE spec_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "68e44d3ee7fddd0fd4fe1f88f4638e1bba0248c1df3386be9e4f2d7c65ef4baf"
+}

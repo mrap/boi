@@ -1,0 +1,26 @@
+# Spec-level deterministic phase — prepares the integration worktree off the
+# contract's base_branch. No prompt_template (kind = deterministic resolves to
+# a fn-pointer in DETERMINISTIC_STEPS). The [runtime] block is structurally
+# present but inert for deterministic phases — PhaseDef.runtime is non-optional
+# per the Task 2.2 struct.
+name = "workspace_prepare"
+level = "spec"
+kind = "deterministic"
+
+[runtime]
+provider = "deterministic"
+model = "n/a"
+
+[on.passing]
+next = "plan"
+emit = "spec.workspace_prepare.completed"
+
+[on.redo]
+next = "workspace_prepare"
+emit = "spec.workspace_prepare.retry"
+
+[on.blocked]
+emit = "spec.workspace_prepare.blocked"
+
+[on.fail]
+emit = "spec.workspace_prepare.failed"

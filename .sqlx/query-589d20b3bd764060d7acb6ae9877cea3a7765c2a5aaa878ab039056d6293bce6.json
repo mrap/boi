@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE spec_runtime SET current_version = ?2 WHERE spec_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "589d20b3bd764060d7acb6ae9877cea3a7765c2a5aaa878ab039056d6293bce6"
+}

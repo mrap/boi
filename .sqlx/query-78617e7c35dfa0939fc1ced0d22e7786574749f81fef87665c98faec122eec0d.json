@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE phase_runs SET completed_at = ?1 WHERE completed_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "78617e7c35dfa0939fc1ced0d22e7786574749f81fef87665c98faec122eec0d"
+}

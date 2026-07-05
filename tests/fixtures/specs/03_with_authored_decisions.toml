@@ -1,0 +1,31 @@
+# Spec carrying authored decisions — §3.6.
+title = "Add rate limiting to API"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass for new middleware::token_bucket module" },
+]
+
+[[decision]]
+title = "Use TOML for all config"
+summary = "Specs / phases / pipelines / config all TOML."
+rationale = "Single parser; LLMs never parse these; KDL/Dhall lack tooling."
+alternatives = [
+  { name = "YAML", reason = "Whitespace fragility, 3 quoting styles" },
+  { name = "KDL", reason = "Immature ecosystem" },
+  { name = "Dhall", reason = "LSP gap" },
+]
+
+[[decision]]
+title = "Worker process isolation per task"
+summary = "Each task gets its own worktree + subprocess."
+rationale = "Prevents v1 path-divergence incidents; clean cancellation."
+alternatives = [
+  { name = "Single shared process", reason = "v1's bug surface" },
+]

@@ -1,0 +1,41 @@
+# The demo spec — recorded by demo.tape.
+#
+# Three tasks, a DAG (`document-endpoint` is blocked on the other two, which
+# run in parallel), and a mix of both verify-gate kinds: `command` (shell,
+# must exit 0) and `intent` (LLM-judged against the evidence the phase
+# produced). `workspace` points at a throwaway git repo demo.tape creates on
+# the fly at /tmp/boi-demo-workspace — see demo/README.md.
+title = "Add a /healthz endpoint"
+pipeline = "standard"
+delivery = "merge"
+
+[contract]
+scope = "Add a GET /healthz endpoint that returns 200 with a small JSON status body, wired into the router, and documented in the API reference."
+base_branch = "main"
+workspace = "/tmp/boi-demo-workspace"
+verifications = [
+  { command = "export PATH=\"/opt/homebrew/bin:/usr/bin:/bin:$PATH\" && cargo test --test healthz" },
+]
+
+[[tasks]]
+ref = "add-handler"
+behavior = "Add a healthz handler returning {\"status\": \"ok\"} with a 200"
+verifications = [
+  { name = "handler_unit_test", command = "export PATH=\"/opt/homebrew/bin:/usr/bin:/bin:$PATH\" && cargo test healthz::handler" },
+]
+
+[[tasks]]
+ref = "wire-router"
+behavior = "Register GET /healthz on the handler"
+blocked_by = ["add-handler"]
+verifications = [
+  { intent = "GET /healthz returns 200 with a JSON status body" },
+]
+
+[[tasks]]
+ref = "document-endpoint"
+behavior = "Document GET /healthz in the API reference"
+blocked_by = ["add-handler", "wire-router"]
+verifications = [
+  { command = "export PATH=\"/opt/homebrew/bin:/usr/bin:/bin:$PATH\" && cargo test --doc" },
+]

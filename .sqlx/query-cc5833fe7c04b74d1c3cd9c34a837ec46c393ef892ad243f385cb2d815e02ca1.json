@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO spec_versions (spec_id, version, snapshot, trigger, trigger_meta, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "cc5833fe7c04b74d1c3cd9c34a837ec46c393ef892ad243f385cb2d815e02ca1"
+}

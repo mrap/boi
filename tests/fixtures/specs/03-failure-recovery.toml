@@ -1,0 +1,24 @@
+# §13 fixture 03 — the failure-recovery spec.
+#
+# A single-task spec whose `execute` phase is SCRIPTED to fail in the L3
+# harness. The fixture itself is an ordinary valid spec — the failure is
+# injected by the harness's `MockExecutor` script, not by the TOML.
+#
+# `test_l3_03_recovers`: `execute` fails once, then passes — the adjustment
+# side-chain (propose_adjustment → review_adjustment → re-execute) resolves it
+# and the task ends `passing`.
+# `test_l3_03_cap_exceeded`: `execute` fails persistently — the side-chain
+# trips `CAP_TASK_ADJUST` and the task ends `blocked{CapExceeded}`.
+title = "Add input validation to the signup form"
+
+[contract]
+scope = "Reject signups with malformed email addresses before they reach the DB"
+base_branch = "develop"
+workspace = "~/github.com/you/example-app"
+
+[[tasks]]
+ref = "validate-email"
+behavior = "Add an email-format check to the signup handler that rejects malformed addresses"
+verifications = [
+  { intent = "A malformed-email signup returns a 400 with a clear error message" },
+]

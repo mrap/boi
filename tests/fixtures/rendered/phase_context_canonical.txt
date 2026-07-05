@@ -1,0 +1,56 @@
+<phase_context spec_id="S0000001a" task_id="T0000001a" phase="execute" iteration="2">
+
+<phase_context_stable>
+<spec_contract>
+    scope: Add token-bucket rate limiting middleware to all /api routes
+    workspace: /repo/api
+    base_branch: main
+    exclusions:
+      - frontend changes
+      - auth changes
+</spec_contract>
+
+<decisions_stable>
+  <decision index="1" id="D0000001a" origin="authored">
+    title: Use TOML for all config
+    summary: Specs / phases / pipelines / config all TOML.
+    rationale: Single parser; LLMs never parse these.
+    alternatives_rejected:
+      - YAML — Whitespace fragility, 3 quoting styles
+      - KDL — Immature ecosystem
+  </decision>
+</decisions_stable>
+</phase_context_stable>
+
+<phase_context_volatile>
+<decisions_runtime>
+  <decision index="1" id="D0000002b" origin="runtime" phase="execute">
+    title: Sliding-window algorithm for token bucket
+    summary: Use sliding-window over fixed-window for rate limiting.
+    rationale: Avoids burst spikes at window boundaries.
+    alternatives_rejected:
+      - Fixed window — Burst spike at boundary
+      - Leaky bucket — Wrong shape for bursty allowance
+  </decision>
+</decisions_runtime>
+
+<prior_phase_runs>
+  <run index="1" id="P0000001a" phase="execute" iteration="1" outcome="fail" completed="2026-05-17T03:14Z">
+    synopsis: Attempted to implement token_bucket but hit a type error in the middleware chain.
+    error: type-mismatch in middleware chain
+    why: axum 0.7 changed the middleware trait signature
+    fix: use axum::middleware::from_fn_with_state or pin the Body type
+    files_touched: src/middleware/token_bucket.rs
+    decisions_made: D0000002b
+  </run>
+</prior_phase_runs>
+
+<task_contract>
+    behavior: Create token_bucket middleware module
+    verifications:
+      - Unit tests pass for new middleware::token_bucket module
+      - cargo clippy -- -D warnings -p api
+</task_contract>
+</phase_context_volatile>
+
+</phase_context>

@@ -1,0 +1,22 @@
+# Duplicate ref rejection — two tasks share the same ref → ConfigError::DuplicateRef.
+# (Exit-gate rejection fixture; see Phase 2 deviation note.)
+title = "Add rate limiting to API"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+ref = "middleware"
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass for new middleware::token_bucket module" },
+]
+
+[[tasks]]
+ref = "middleware"
+behavior = "Apply middleware to all /api/* handlers"
+verifications = [
+  { intent = "Integration test verifies /api routes return 429" },
+]

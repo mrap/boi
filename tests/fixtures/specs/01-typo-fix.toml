@@ -1,0 +1,23 @@
+# §13 fixture 01 — the trivial single-task spec.
+#
+# A one-task spec exercising the shortest happy path: spec phases
+# (workspace_prepare → plan → critique_plan), one task lifecycle, then the
+# post-<tasks> spec phases (validate → review → merge → teardown). The L3
+# harness (`test_l3_01`) drives this all-passing and asserts the spec ends
+# `completed` with its single task `passing`.
+#
+# This is also the ONLY fixture the Docker E2E (10.5) runs against real
+# `goose` + Ollama — it must therefore stay genuinely trivial.
+title = "Fix a typo in the README"
+
+[contract]
+scope = "Correct the spelling of 'recieve' to 'receive' in README.md"
+base_branch = "develop"
+workspace = "~/github.com/you/example-repo"
+
+[[tasks]]
+ref = "fix-typo"
+behavior = "Replace the misspelled word 'recieve' with 'receive' in README.md"
+verifications = [
+  { name = "typo-fixed", command = "grep -q receive README.md && ! grep -q recieve README.md" },
+]

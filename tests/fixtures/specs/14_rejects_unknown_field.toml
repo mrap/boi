@@ -1,0 +1,18 @@
+# Unknown-field rejection — a genuinely-unknown top-level field (`flavor`)
+# is rejected at parse time by #[serde(deny_unknown_fields)]. This is a
+# GENERIC parse error, distinct from the four typed ex-field rejections
+# (mode/max_iterations/clean_state/initiative).
+# (Exit-gate rejection fixture; see Phase 2 deviation note.)
+title = "Add rate limiting to API"
+flavor = "spicy"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass for new middleware::token_bucket module" },
+]

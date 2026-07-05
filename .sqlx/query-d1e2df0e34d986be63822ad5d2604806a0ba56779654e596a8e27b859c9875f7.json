@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE task_runtime SET iterations_plan_critique = 0, iterations_task_adjust = 0, iterations_execute_review = 0, iterations_spec_review = 0 WHERE task_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "d1e2df0e34d986be63822ad5d2604806a0ba56779654e596a8e27b859c9875f7"
+}

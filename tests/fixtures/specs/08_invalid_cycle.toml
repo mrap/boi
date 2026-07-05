@@ -1,0 +1,24 @@
+# DAG cycle rejection — the blocked_by graph contains a cycle.
+# task-a blocked_by task-b; task-b blocked_by task-a.
+title = "Add rate limiting to API"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+ref = "task-a"
+behavior = "First half of the work"
+blocked_by = ["task-b"]
+verifications = [
+  { intent = "First half verified" },
+]
+
+[[tasks]]
+ref = "task-b"
+behavior = "Second half of the work"
+blocked_by = ["task-a"]
+verifications = [
+  { intent = "Second half verified" },
+]

@@ -1,0 +1,15 @@
+# cargo-audit configuration (read by `cargo audit` and rustsec/audit-check@v2).
+#
+# Ignored advisories — each MUST carry a justification.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — `rsa` Marvin Attack (timing sidechannel key recovery).
+    # NOT APPLICABLE to BOI: `rsa` is a lockfile-only entry pulled by `sqlx`'s
+    # optional `sqlx-mysql` crate, which BOI never enables (we use sqlx with the
+    # `sqlite` feature only). `cargo tree -i rsa` returns nothing — it is never
+    # compiled into the binary. There is also no patched release available. Even
+    # the upstream advisory's own workaround states local, non-network use is
+    # unaffected. Revisit if BOI ever enables a non-sqlite sqlx backend.
+    "RUSTSEC-2023-0071",
+]

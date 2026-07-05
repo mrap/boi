@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO spec_runtime (spec_id, current_version, status) VALUES (?1, ?2, ?3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "a60a30723823c19b1672b1cab7d4e5ef51c2be0991e417367158da7a0e38a4a5"
+}

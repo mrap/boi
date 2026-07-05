@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE task_runtime SET iterations_execute_review = iterations_execute_review + 1 WHERE task_id = ?1 RETURNING iterations_execute_review",
+  "describe": {
+    "columns": [
+      {
+        "name": "iterations_execute_review",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "90e461aa647b3bcde7434bef79daa262f21547b5f929ba4475269ef9141d09ac"
+}

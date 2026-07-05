@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO task_deps (task_id, depends_on) VALUES (?1, ?2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "f2389480f6bb2140d82fdc47b2491cee8d98ccca6e6dfeece63a21f04383af8e"
+}

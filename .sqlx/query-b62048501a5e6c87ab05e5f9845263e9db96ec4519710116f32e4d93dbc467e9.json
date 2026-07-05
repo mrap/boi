@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO task_runtime (task_id, spec_id, ref, state) VALUES (?1, ?2, ?3, ?4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "b62048501a5e6c87ab05e5f9845263e9db96ec4519710116f32e4d93dbc467e9"
+}

@@ -1,0 +1,23 @@
+# Task-level deterministic phase — commits the reviewed change in the task
+# worktree. No prompt_template. The [runtime] block is inert.
+name = "commit"
+level = "task"
+kind = "deterministic"
+
+[runtime]
+provider = "deterministic"
+model = "n/a"
+
+[on.passing]
+next = "workspace_verify_out"
+emit = "task.commit.completed"
+
+[on.redo]
+next = "commit"
+emit = "task.commit.retry"
+
+[on.blocked]
+emit = "task.commit.blocked"
+
+[on.fail]
+emit = "task.commit.failed"

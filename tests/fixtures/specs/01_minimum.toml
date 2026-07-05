@@ -1,0 +1,15 @@
+# Minimum-viable spec — §3 design doc "Minimum-viable spec example".
+# Only the 6 required fields; everything else defaults.
+title = "Add rate limiting to API"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+ref = "setup-middleware"
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass for new middleware::token_bucket module" },
+]

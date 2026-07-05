@@ -1,0 +1,16 @@
+# Verification mutex rejection — a verification entry sets BOTH intent and
+# command. Each entry must set exactly one → ConfigError::VerificationMutex.
+# (Exit-gate rejection fixture; the neither-set case is exercised by a unit
+#  test in validate.rs.)
+title = "Add rate limiting to API"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass", command = "cargo test" },
+]

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE task_runtime SET iterations_task_adjust = iterations_task_adjust + 1 WHERE task_id = ?1 RETURNING iterations_task_adjust",
+  "describe": {
+    "columns": [
+      {
+        "name": "iterations_task_adjust",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "0ed47f217704638c320f24b1ca2888594e14fcb6c238d11ea4826d71756bfa96"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM specs WHERE spec_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "ce39cdc0838bfc3215ab2778f3eb6f5cb465e51c07b0acc2a81dd95f5e8fd605"
+}

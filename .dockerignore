@@ -1,0 +1,10 @@
+# Keep the Docker E2E build context small + clean (tests/e2e/Dockerfile).
+# The build needs the crate source + the committed .sqlx/ cache; nothing else.
+target/
+.git/
+.dev.db
+.dev.db-wal
+.dev.db-shm
+docs/
+.superpowers/
+.boi/

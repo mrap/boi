@@ -1,0 +1,24 @@
+# Spec-level worker phase — the dynamically-inserted plan-revision phase
+# (Phase 5b). A task's `task_report` wakes the plan layer; this phase
+# revises the spec graph and emits `plan.revised`. (G13.2)
+name = "plan_revision"
+level = "spec"
+kind = "worker"
+prompt_template = "plan_revision.md"
+
+[runtime]
+provider = "claude_code"
+model = "claude-opus-4-7"
+
+[on.passing]
+emit = "spec.plan_revision.completed"
+
+[on.redo]
+next = "plan_revision"
+emit = "spec.plan_revision.retry"
+
+[on.blocked]
+emit = "spec.plan_revision.blocked"
+
+[on.fail]
+emit = "spec.plan_revision.failed"

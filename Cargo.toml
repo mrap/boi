@@ -1,0 +1,157 @@
+[package]
+name = "boi"
+version = "3.3.2"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mrap/boi"
+description = "Single-binary Rust harness for orchestrating LLM-powered software-engineering tasks."
+# keywords + categories satisfy clippy::cargo_common_metadata (enabled below).
+keywords = ["llm", "orchestration", "agent", "automation", "harness"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lints.rust]
+unsafe_code = "deny"          # consensus #4: was "forbid"; "deny" lets us escape per-call-site if a proc-macro forces it
+unused_must_use = "deny"
+unreachable_pub = "warn"      # consensus P1 #12 (Lens 1 R3)
+missing_docs = "deny"         # doc-gate: every public item carries a `///`. Verified 0-debt 2026-06-05 and re-verified at 3.2.4 (2026-06-10); keeps the crate agent-navigable. Prefer pub(crate) over filler docs.
+
+[lints.clippy]
+let_underscore_must_use = "deny"
+unwrap_used = "warn"          # consensus #3: was "deny"; tests need .unwrap()
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+redundant_clone = "warn"
+cargo_common_metadata = "warn"   # consensus P1 #13 (Lens 1 C3 clippy::cargo group)
+multiple_crate_versions = "allow"  # transitive deps frequently disagree; we can't fix that — keep noise off
+
+[lib]
+name = "boi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "boi"
+path = "src/main.rs"
+
+# Lint-fixture regression test (Task 0.3). Cargo only auto-discovers test
+# files at the top level of `tests/`; this fixture lives in a subdirectory,
+# so it needs an explicit target declaration to be runnable via
+# `cargo test --test unwrap_warns`.
+[[test]]
+name = "unwrap_warns"
+path = "tests/lint_fixtures/unwrap_warns.rs"
+
+# Phase 10 — the L3 orchestrator-integration test crate. `tests/integration.rs`
+# is the crate root; the L3 modules (`harness`, `fixtures`, `failures`) live in
+# `tests/integration/`. It needs the `testkit` feature (G16.1 — `MockExecutor`
+# lives behind `#[cfg(feature = "testkit")]`), enabled via the self
+# dev-dependency below.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "json", "chrono", "migrate"] }
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "process", "sync", "io-util", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+git2 = "0.19"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+duckdb = { version = "1.1", features = ["bundled"], optional = true }
+serde_yaml_ng = "0.10"        # consensus #2: serde_yaml was archived 2024-03; serde_yaml_ng is the maintained fork
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+anyhow = "1"
+thiserror = "1"
+# Crockford-base32 ID generation (repo::ids, Phase 3.3). Already in the lock
+# graph transitively (via opentelemetry_sdk) — declaring it directly removes
+# the fragility of depending on a transitive dep that could be dropped.
+rand = "0.8"
+# `killpg` for the per-attempt-timeout process-TREE kill (goose.rs D1, 429
+# hardening): a timed-out goose's grandchildren hold the stdout/stderr fds and
+# the stalled provider connection — `start_kill` alone leaves them running.
+# Already in the lock graph transitively (tokio, git2, …).
+libc = "0.2"
+async-trait = "0.1"
+# `server` is the production surface (the BOI MCP tool server). `transport-io`
+# adds `rmcp::transport::io::stdio` — the stdio transport `BoiMcpServer::serve_stdio`
+# speaks over (`server` only pulls `transport-async-rw`, not `transport-io`).
+# `client` is added for Phase 7 Task 7.5's tests: the `BoiMcpServer`
+# stdio-transport tests drive the server through a real rmcp client over an
+# in-memory duplex pipe — a `dev-dependencies` rmcp would be a distinct crate
+# instance (its `()` client would not satisfy the server crate's traits), so
+# `client` rides on the one shared `rmcp`. The production binary constructs no
+# client.
+rmcp = { version = "1", features = ["server", "client", "transport-io"] }
+# Phase 5a Task 5a.1 — `BoxStream` for the `PhaseExecutor` port; the executor
+# yields a `'static` boxed stream of `BoiEvent`s (dyn-compatible without
+# `async-trait`, which cannot express a stream-shaped return).
+futures = "0.3"
+# Phase 7 Task 7.3 — `ReceiverStream` wraps the `GooseRuntime` driver task's
+# `mpsc::Receiver` into the `BoxStream<BoiEvent>` the `PhaseExecutor` port
+# returns. The `sync` feature gates `ReceiverStream`; `time` is dropped (unused).
+tokio-stream = { version = "0.1.18", default-features = false, features = ["sync"] }
+# Phase 8a Task 8a.1 — the OTel file exporter (`runtime/otel_export.rs`) emits
+# *canonical* OTLP/JSON: each JSONL line is one `ExportTraceServiceRequest`
+# `{"resourceSpans":[...]}`. `opentelemetry-proto` carries the generated OTLP
+# proto types + the SDK-`SpanData`→`ResourceSpans` transform that
+# `opentelemetry-otlp` itself uses; `with-serde` adds the `serde` derives whose
+# `rename_all = "camelCase"` produces the exact `resourceSpans`/`traceId`/
+# `startTimeUnixNano` shape DuckDB's `read_otlp_traces` (Phase 8c) parses —
+# canonical *by construction*, not hand-rolled (review C5). `gen-tonic-messages`
+# pulls the message types WITHOUT the tonic gRPC transport (`gen-tonic`); the
+# file exporter never opens a socket. `default-features = false` drops `logs` +
+# `metrics` — BOI emits traces only.
+opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic-messages", "trace", "with-serde"] }
+humantime = "2.3.0"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+# Verify-gate lint (`src/config/verify_lint.rs`) — pure-Rust regex pass over
+# every `Verification::Command` string. Already in the lock graph transitively
+# (via `tracing-subscriber`'s `env-filter` feature); declaring it directly keeps
+# the dependency explicit at the call site.
+regex = "1"
+# Tq0p1hxjt — `boi daemon start/stop/status/restart` install + manage the boi
+# LaunchAgent via daemon-green (per-user gui/<uid> launchd bootstrap on macOS,
+# systemd --user on Linux).
+# daemon-green is vendored at `vendor/daemon-green/` (dual-licensed MIT OR
+# Apache-2.0, same as this crate); upstream lives at
+# https://github.com/mrap/daemon-green. Vendoring keeps this build free of
+# an external network dependency.
+daemon-green = { path = "vendor/daemon-green" }
+
+# Phase 10 — the L3 orchestrator-integration crate (`tests/integration.rs`)
+# imports `boi::service::testkit::MockExecutor`, which is gated behind the
+# non-default `testkit` feature (G16.1). A package may dev-depend on ITSELF
+# with extra features enabled: this turns `testkit` on for the `tests/` +
+# `examples/` + `benches/` build graph WITHOUT enabling it for the production
+# `boi` binary (whose `default` feature set never includes `testkit`).
+[dev-dependencies]
+boi = { path = ".", features = ["testkit"] }
+
+[features]
+default = ["duckdb"]
+duckdb = ["dep:duckdb"]   # consensus P2: gate so `cargo check --no-default-features` skips ~30s DuckDB compile during dev
+# Phase 5a (G16.1) — gates the `service::testkit` test doubles (`MockExecutor`).
+# NON-default: the production build never compiles them. The `service/`
+# modules gate the doubles on `#[cfg(any(test, feature = "testkit"))]` so the
+# in-crate `#[cfg(test)]` orchestrator/routing/registry tests see them under a
+# plain `cargo test`, while a separate `tests/integration/` crate enables
+# `boi/testkit` to reach `boi::service::testkit::MockExecutor` (G16.1's
+# "no Mock* in the *default* surface" amendment).
+testkit = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+strip = true

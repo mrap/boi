@@ -1,0 +1,24 @@
+# Task-level worker phase — validates that a proposed fix is in-scope, then
+# routes back into execute to apply it (§4 adjustment loops).
+name = "review_adjustment"
+level = "task"
+kind = "worker"
+prompt_template = "review_adjustment.md"
+
+[runtime]
+provider = "claude_code"
+model = "claude-opus-4-7"
+
+[on.passing]
+next = "execute"
+emit = "task.review_adjustment.completed"
+
+[on.redo]
+next = "propose_adjustment"
+emit = "task.review_adjustment.retry"
+
+[on.blocked]
+emit = "task.review_adjustment.blocked"
+
+[on.fail]
+emit = "task.review_adjustment.failed"

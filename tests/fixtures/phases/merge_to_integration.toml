@@ -1,0 +1,23 @@
+# Task-level deterministic phase — per-task fast-forward merge of the task
+# branch into the spec integration branch (Batch B fix C4, Phase 5a Task
+# 5a.4). No prompt_template; [runtime] inert. (G13.2)
+name = "merge_to_integration"
+level = "task"
+kind = "deterministic"
+
+[runtime]
+provider = "deterministic"
+model = "n/a"
+
+[on.passing]
+emit = "task.merge_to_integration.completed"
+
+[on.redo]
+next = "merge_to_integration"
+emit = "task.merge_to_integration.retry"
+
+[on.blocked]
+emit = "task.merge_to_integration.blocked"
+
+[on.fail]
+emit = "task.merge_to_integration.failed"

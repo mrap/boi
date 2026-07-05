@@ -1,0 +1,25 @@
+# Spec-level worker phase — adversarial review of the plan. The standard
+# pipeline overrides this phase's runtime to a cross-model provider.
+name = "critique_plan"
+level = "spec"
+kind = "worker"
+prompt_template = "critique_plan.md"
+
+[runtime]
+provider = "claude_code"
+model = "claude-opus-4-7"
+
+[on.passing]
+next = "validate"
+emit = "spec.critique_plan.completed"
+
+[on.redo]
+next = "plan"
+emit = "spec.critique_plan.retry"
+
+[on.blocked]
+emit = "spec.critique_plan.blocked"
+
+[on.fail]
+next = "plan"
+emit = "spec.critique_plan.failed"

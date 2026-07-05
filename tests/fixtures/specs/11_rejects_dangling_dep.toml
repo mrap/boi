@@ -1,0 +1,23 @@
+# Dangling blocked_by rejection — a task references a ref that no task
+# declares → ConfigError::DanglingDep.
+# (Exit-gate rejection fixture; see Phase 2 deviation note.)
+title = "Add rate limiting to API"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+ref = "setup-middleware"
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass for new middleware::token_bucket module" },
+]
+
+[[tasks]]
+behavior = "Apply middleware to all /api/* handlers"
+blocked_by = ["does-not-exist"]
+verifications = [
+  { intent = "Integration test verifies /api routes return 429" },
+]

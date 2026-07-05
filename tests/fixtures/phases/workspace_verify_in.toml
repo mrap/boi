@@ -1,0 +1,23 @@
+# Task-level deterministic phase — clean-state precondition check (§4 step 2).
+# No prompt_template. The [runtime] block is inert for deterministic phases.
+name = "workspace_verify_in"
+level = "task"
+kind = "deterministic"
+
+[runtime]
+provider = "deterministic"
+model = "n/a"
+
+[on.passing]
+next = "write_red_tests"
+emit = "task.workspace_verify_in.completed"
+
+[on.redo]
+next = "workspace_verify_in"
+emit = "task.workspace_verify_in.retry"
+
+[on.blocked]
+emit = "task.workspace_verify_in.blocked"
+
+[on.fail]
+emit = "task.workspace_verify_in.failed"

@@ -1,0 +1,24 @@
+# Task-level deterministic phase — runs the verify_spec command set (Q2:
+# validate is deterministic). No prompt_template. The [runtime] block is inert.
+name = "validate"
+level = "task"
+kind = "deterministic"
+
+[runtime]
+provider = "deterministic"
+model = "n/a"
+
+[on.passing]
+next = "review"
+emit = "task.validate.completed"
+
+[on.redo]
+next = "execute"
+emit = "task.validate.retry"
+
+[on.blocked]
+emit = "task.validate.blocked"
+
+[on.fail]
+next = "propose_adjustment"
+emit = "task.validate.failed"

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO specs (spec_id, created_at) VALUES (?1, ?2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "75f075403fefbd9749569749e4a99241397734f310afef09ffd9c4a52f33e3e8"
+}

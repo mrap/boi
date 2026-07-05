@@ -1,0 +1,25 @@
+# Task-level worker phase — TDD-as-a-phase: write the failing tests before
+# execute implements the behavior. Kept per the design's standard.toml (G13.2).
+name = "write_red_tests"
+level = "task"
+kind = "worker"
+prompt_template = "write_red_tests.md"
+
+[runtime]
+provider = "claude_code"
+model = "claude-opus-4-7"
+
+[on.passing]
+next = "execute"
+emit = "task.write_red_tests.completed"
+
+[on.redo]
+next = "write_red_tests"
+emit = "task.write_red_tests.retry"
+
+[on.blocked]
+emit = "task.write_red_tests.blocked"
+
+[on.fail]
+next = "propose_adjustment"
+emit = "task.write_red_tests.failed"

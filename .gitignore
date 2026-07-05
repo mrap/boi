@@ -1,0 +1,54 @@
+__pycache__/
+*.pyc
+*.pyo
+.boi/
+.env
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Internal development files (not for public repo)
+specs/
+reports/
+__pycache__/
+*.pyc
+.boi/
+*.log
+
+# Rust build artifacts
+target/
+.superpowers/
+
+# BOI v2 Rust scaffold (Task 0.1)
+/target
+**/*.rs.bk
+.DS_Store
+*.swp
+*.swo
+
+# Test fixtures must be tracked. The bare `specs/` dev-files rule above
+# otherwise matches `tests/fixtures/specs/` at any depth — re-include the
+# whole fixture tree here (Phase 2).
+!tests/fixtures/
+!tests/fixtures/**
+
+# SQLx local build-time DB (Phase 3 Task 3.0). `.dev.db` is created by
+# `just prep-sqlx` for compile-time `sqlx::query!` expansion; the `-wal`/`-shm`
+# siblings are WAL-mode journals. CI never sees these — it reads .sqlx/.
+.dev.db
+.dev.db-wal
+.dev.db-shm
+
+# Local worktrees (superpowers / dev isolation)
+.worktrees/
+
+# Local exec wrapper for ~/.boi/bin/boi (machine-local convenience, not part of the engine)
+boi.sh

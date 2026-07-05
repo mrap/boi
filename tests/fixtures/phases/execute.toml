@@ -1,0 +1,25 @@
+# Task-level worker phase — the model implements the task behavior.
+# Mirrors the §4 design-doc phase-declaration example.
+name = "execute"
+level = "task"
+kind = "worker"
+prompt_template = "execute.md"
+
+[runtime]
+provider = "claude_code"
+model = "claude-opus-4-7"
+
+[on.passing]
+next = "validate"
+emit = "task.execute.completed"
+
+[on.redo]
+next = "execute"
+emit = "task.execute.retry"
+
+[on.blocked]
+emit = "task.execute.blocked"
+
+[on.fail]
+next = "propose_adjustment"
+emit = "task.execute.failed"

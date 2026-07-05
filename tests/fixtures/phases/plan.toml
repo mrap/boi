@@ -1,0 +1,23 @@
+# Spec-level worker phase — produces the task graph from the contract.
+name = "plan"
+level = "spec"
+kind = "worker"
+prompt_template = "plan.md"
+
+[runtime]
+provider = "claude_code"
+model = "claude-opus-4-7"
+
+[on.passing]
+next = "critique_plan"
+emit = "spec.plan.completed"
+
+[on.redo]
+next = "plan"
+emit = "spec.plan.retry"
+
+[on.blocked]
+emit = "spec.plan.blocked"
+
+[on.fail]
+emit = "spec.plan.failed"

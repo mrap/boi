@@ -1,0 +1,43 @@
+# §13 fixture 02 — the multi-task DAG spec.
+#
+# Three tasks with an acyclic `blocked_by` graph: `apply-middleware` waits on
+# `setup-middleware`; `document-headers` waits on both. The L3 harness
+# (`test_l3_02`) drives this all-passing and asserts every DAG task ends
+# `passing` AND that the scheduler observed dependency order — a task never
+# starts before its `blocked_by` predecessors are `passing`.
+title = "Add token-bucket rate limiting to the API"
+pipeline = "standard"
+delivery = "merge"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/example-api"
+exclusions = ["frontend changes", "auth changes"]
+verifications = [
+  { intent = "Requests over the limit get a 429 with a Retry-After header" },
+]
+must_emit = ["src/middleware/token_bucket.rs"]
+
+[[tasks]]
+ref = "setup-middleware"
+behavior = "Create the token_bucket middleware module"
+verifications = [
+  { name = "module_unit_tests", intent = "Unit tests pass for the new middleware::token_bucket module" },
+]
+
+[[tasks]]
+ref = "apply-middleware"
+behavior = "Apply the token_bucket middleware to every /api/* handler"
+blocked_by = ["setup-middleware"]
+verifications = [
+  { intent = "An integration test verifies /api routes return 429 after the limit is hit" },
+]
+
+[[tasks]]
+ref = "document-headers"
+behavior = "Document the rate-limit response headers in the API reference"
+blocked_by = ["setup-middleware", "apply-middleware"]
+verifications = [
+  { intent = "The API reference documents the Retry-After and X-RateLimit-* headers" },
+]

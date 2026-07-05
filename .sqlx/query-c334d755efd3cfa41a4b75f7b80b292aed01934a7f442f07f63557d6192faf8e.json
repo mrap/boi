@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE task_runtime SET state = ?2, cancellation_reason = ?3, blocked_reason = ?4, started_at = COALESCE(started_at, ?5), completed_at = COALESCE(completed_at, ?6) WHERE task_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "c334d755efd3cfa41a4b75f7b80b292aed01934a7f442f07f63557d6192faf8e"
+}

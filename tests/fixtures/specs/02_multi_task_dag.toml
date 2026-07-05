@@ -1,0 +1,38 @@
+# Multi-task spec with a valid (acyclic) blocked_by graph.
+title = "Add rate limiting to API"
+pipeline = "standard"
+delivery = "merge"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+exclusions = ["frontend changes", "auth changes"]
+verifications = [
+  { intent = "Returns 429 with Retry-After header on limit hit" },
+  { command = "cargo test --all-features" },
+]
+must_emit = ["src/middleware/token_bucket.rs"]
+
+[[tasks]]
+ref = "setup-middleware"
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { name = "module_unit_tests", intent = "Unit tests pass for new middleware::token_bucket module" },
+  { name = "no_lint_warnings", command = "cargo clippy -- -D warnings -p api" },
+]
+
+[[tasks]]
+ref = "apply-middleware"
+behavior = "Apply middleware to all /api/* handlers"
+blocked_by = ["setup-middleware"]
+verifications = [
+  { intent = "Integration test verifies /api routes return 429 after rate limit hit" },
+]
+
+[[tasks]]
+behavior = "Document the rate-limit headers in the API reference"
+blocked_by = ["setup-middleware", "apply-middleware"]
+verifications = [
+  { command = "cargo test --doc" },
+]

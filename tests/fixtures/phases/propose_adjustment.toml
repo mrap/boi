@@ -1,0 +1,24 @@
+# Task-level worker phase — the adjustment side-chain entry. Emits the
+# ERROR/WHY/FIX triple when execute or review fails (§4 adjustment loops).
+name = "propose_adjustment"
+level = "task"
+kind = "worker"
+prompt_template = "propose_adjustment.md"
+
+[runtime]
+provider = "claude_code"
+model = "claude-opus-4-7"
+
+[on.passing]
+next = "review_adjustment"
+emit = "task.propose_adjustment.completed"
+
+[on.redo]
+next = "propose_adjustment"
+emit = "task.propose_adjustment.retry"
+
+[on.blocked]
+emit = "task.propose_adjustment.blocked"
+
+[on.fail]
+emit = "task.propose_adjustment.failed"

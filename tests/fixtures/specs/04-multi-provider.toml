@@ -1,0 +1,35 @@
+# §13 fixture 04 — the cross-provider spec.
+#
+# A two-task spec run through the `standard` pipeline. The `standard`
+# pipeline's `critique_plan` phase carries a provider OVERRIDE (`openrouter`)
+# while every other phase runs against `claude_code` — so a run of this spec
+# records DISTINCT `provider` values across its `phase_runs` rows.
+#
+# The L3 harness (`test_l3_04`) asserts that provider-routing-config fact: at
+# least two distinct `provider` values appear in `phase_runs`. Real
+# cross-provider EXECUTION (a live second provider) is out of the hermetic L3
+# scope — it is the Docker E2E's domain, and at v1.0 a documented gap (a
+# second provider is not in the E2E container).
+title = "Add a structured-logging layer"
+pipeline = "standard"
+delivery = "merge"
+
+[contract]
+scope = "Emit structured JSON logs for every request, replacing the ad-hoc println logging"
+base_branch = "develop"
+workspace = "~/github.com/you/example-service"
+
+[[tasks]]
+ref = "add-logger"
+behavior = "Introduce a structured JSON logger and a request-scoped logging middleware"
+verifications = [
+  { intent = "Every request emits exactly one structured JSON log line" },
+]
+
+[[tasks]]
+ref = "migrate-call-sites"
+behavior = "Replace every ad-hoc println logging call site with the structured logger"
+blocked_by = ["add-logger"]
+verifications = [
+  { name = "no_println_logging", command = "! grep -rn 'println!' src/ --include='*.rs'" },
+]

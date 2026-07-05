@@ -1,0 +1,4 @@
+# .boi-policy.toml — declares this repo's branch model to the BOI engine.
+model     = "gitflow"        # required: "gitflow" | "trunk"
+protected = ["main"]         # optional; branches the engine must never deliver to.
+                             # default: ["main"] when model = "gitflow", [] when "trunk".

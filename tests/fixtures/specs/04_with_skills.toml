@@ -1,0 +1,19 @@
+# Spec declaring skills — §3.7. Skills render into Goose recipe `extensions:`.
+title = "Add rate limiting to API"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass for new middleware::token_bucket module" },
+]
+
+[[skill]]
+name = "test-driven-development"
+
+[[skill]]
+name = "verification-before-completion"

@@ -1,0 +1,17 @@
+# A-SF-2 rejection — `pipeline` was parsed but never validated, then silently
+# overridden to `standard` at normalize time. `validate.rs`'s `check_pipeline`
+# now rejects any pipeline other than `standard` (or absent) with a typed
+# ConfigError::UnknownPipeline. Otherwise a valid spec.
+title = "Add rate limiting to API"
+pipeline = "turbo"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass for new middleware::token_bucket module" },
+]

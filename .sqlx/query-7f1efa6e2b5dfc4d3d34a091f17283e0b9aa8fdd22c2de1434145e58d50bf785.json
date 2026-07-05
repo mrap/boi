@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM task_deps WHERE task_id = ?1 AND depends_on = ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "7f1efa6e2b5dfc4d3d34a091f17283e0b9aa8fdd22c2de1434145e58d50bf785"
+}

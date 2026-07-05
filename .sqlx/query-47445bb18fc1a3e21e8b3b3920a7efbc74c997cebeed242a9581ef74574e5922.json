@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM phase_runs WHERE spec_id = ?1 AND completed_at IS NOT NULL AND completed_at < ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "47445bb18fc1a3e21e8b3b3920a7efbc74c997cebeed242a9581ef74574e5922"
+}

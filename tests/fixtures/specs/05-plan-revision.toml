@@ -1,0 +1,27 @@
+# §13 fixture 05 — the plan-revision spec.
+#
+# A single-task spec whose task files a BLOCKING `task_report` in the L3
+# harness. The report blocks the reporting task with
+# `PlanRevisionPending` and triggers the spec-level `plan_revision` worker
+# phase; that worker (scripted in the harness) writes a `PlanRevision`
+# artifact carrying an `AddTask` edit — appending a second task and a
+# `spec_versions` v2 row.
+#
+# The fixture TOML is an ordinary one-task spec — the report and the
+# revision are injected by the harness, never by the spec.
+#
+# `test_l3_05` asserts: the spec ends `completed`, the original task AND the
+# revision-added task end `passing`, and a `spec_versions` v2 row exists.
+title = "Add a health-check endpoint"
+
+[contract]
+scope = "Expose a /healthz endpoint that reports service liveness"
+base_branch = "develop"
+workspace = "~/github.com/you/example-service"
+
+[[tasks]]
+ref = "add-healthz"
+behavior = "Add a /healthz route that returns 200 OK when the service is live"
+verifications = [
+  { intent = "GET /healthz returns 200 with a JSON body when the service is up" },
+]

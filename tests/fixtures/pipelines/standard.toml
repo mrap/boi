@@ -1,0 +1,33 @@
+# The `standard` pipeline — the only built-in pipeline at v1.0 (L1).
+# §4 design doc "Pipelines"; the `<tasks>` token is the explicit per-task
+# fan-out boundary (G13.3): the orchestrator advances spec phases until it
+# hits <tasks>, fans out the task lifecycle in parallel, then resumes the
+# remaining spec phases once all tasks settle.
+name = "standard"
+
+spec_phases = [
+  "workspace_prepare",
+  "plan",
+  "critique_plan",
+  "<tasks>",
+  "validate",
+  "review",
+  "merge",
+  "teardown",
+]
+
+task_phases = [
+  "workspace_verify_in",
+  "write_red_tests",
+  "execute",
+  "validate",
+  "review",
+  "commit",
+  "workspace_verify_out",
+]
+
+# Cross-model critique — the critique_plan phase runs against a different
+# provider/model than the rest of the pipeline.
+[overrides.critique_plan.runtime]
+provider = "openrouter"
+model = "openai/gpt-5"

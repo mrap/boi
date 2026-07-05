@@ -1,0 +1,7 @@
+# Valid branch-policy marker fixture (R-C1.4) — the exact §4.1 schema, gitflow
+# model. Tests copy this into a temp workspace and commit it as
+# `<workspace>/.boi-policy.toml` on the branch under test (the engine reads the
+# marker from the committed tree of the spec's base_branch, never the working tree).
+model     = "gitflow"        # required: "gitflow" | "trunk"
+protected = ["main"]         # optional; branches the engine must never deliver to.
+                             # default: ["main"] when model = "gitflow", [] when "trunk".

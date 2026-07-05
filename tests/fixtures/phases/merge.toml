@@ -1,0 +1,24 @@
+# Spec-level deterministic phase — ships the integration branch per the
+# spec's `delivery` (ff-merge / PR / branch-only). No prompt_template.
+# The [runtime] block is inert.
+name = "merge"
+level = "spec"
+kind = "deterministic"
+
+[runtime]
+provider = "deterministic"
+model = "n/a"
+
+[on.passing]
+next = "teardown"
+emit = "spec.merge.completed"
+
+[on.redo]
+next = "merge"
+emit = "spec.merge.retry"
+
+[on.blocked]
+emit = "spec.merge.blocked"
+
+[on.fail]
+emit = "spec.merge.failed"

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM task_deps WHERE task_id IN (SELECT task_id FROM task_runtime WHERE spec_id = ?1) OR depends_on IN (SELECT task_id FROM task_runtime WHERE spec_id = ?1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "bc925c9faa4c64ae84677ca3504f0bb8deb38868e882c03d8d4e9f9efefc1224"
+}

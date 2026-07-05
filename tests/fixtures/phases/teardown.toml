@@ -1,0 +1,23 @@
+# Spec-level deterministic phase — removes worktrees and finalizes the run.
+# Terminal phase: on.passing omits `next` (TOML has no null). No
+# prompt_template; [runtime] inert.
+name = "teardown"
+level = "spec"
+kind = "deterministic"
+
+[runtime]
+provider = "deterministic"
+model = "n/a"
+
+[on.passing]
+emit = "spec.teardown.completed"
+
+[on.redo]
+next = "teardown"
+emit = "spec.teardown.retry"
+
+[on.blocked]
+emit = "spec.teardown.blocked"
+
+[on.fail]
+emit = "spec.teardown.failed"

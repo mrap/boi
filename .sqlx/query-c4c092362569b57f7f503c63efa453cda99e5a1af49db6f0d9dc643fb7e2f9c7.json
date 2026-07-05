@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT spec_id FROM specs WHERE spec_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "spec_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "c4c092362569b57f7f503c63efa453cda99e5a1af49db6f0d9dc643fb7e2f9c7"
+}

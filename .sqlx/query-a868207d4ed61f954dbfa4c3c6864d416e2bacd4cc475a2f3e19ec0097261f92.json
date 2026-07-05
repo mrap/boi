@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE task_runtime SET iterations_plan_critique = iterations_plan_critique + 1 WHERE task_id = ?1 RETURNING iterations_plan_critique",
+  "describe": {
+    "columns": [
+      {
+        "name": "iterations_plan_critique",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a868207d4ed61f954dbfa4c3c6864d416e2bacd4cc475a2f3e19ec0097261f92"
+}

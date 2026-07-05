@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM decisions WHERE phase_run_id IN (SELECT id FROM phase_runs WHERE spec_id = ?1 AND completed_at IS NOT NULL AND completed_at < ?2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "36877fe560af5cfa91caa570ae21c9538d271967883901ad275e253c4380956e"
+}

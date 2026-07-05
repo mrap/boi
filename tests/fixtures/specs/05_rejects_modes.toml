@@ -1,0 +1,16 @@
+# L2 rejection — modes were removed in v1.0. Otherwise a valid spec.
+# `mode` is an explicitly-named v1.0-rejected field: validate.rs emits a
+# typed ConfigError::ModesRemoved instead of a generic unknown-field error.
+title = "Add rate limiting to API"
+mode = "challenge"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+
+[[tasks]]
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass for new middleware::token_bucket module" },
+]

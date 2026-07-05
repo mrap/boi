@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT snapshot AS \"snapshot: Value\" FROM spec_versions WHERE spec_id = ?1 AND version = ?2",
+  "describe": {
+    "columns": [
+      {
+        "name": "snapshot: Value",
+        "ordinal": 0,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "90e4ad7678ef9cffe89f44db395f1bf3808681e48a99a2f86977e794f4d2db2a"
+}

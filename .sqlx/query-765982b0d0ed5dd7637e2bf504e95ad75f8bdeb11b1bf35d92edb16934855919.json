@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE spec_runtime SET iterations_plan_critique = iterations_plan_critique + 1 WHERE spec_id = ?1 RETURNING iterations_plan_critique",
+  "describe": {
+    "columns": [
+      {
+        "name": "iterations_plan_critique",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "765982b0d0ed5dd7637e2bf504e95ad75f8bdeb11b1bf35d92edb16934855919"
+}

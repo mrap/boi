@@ -1,0 +1,18 @@
+# Workspace XOR rejection (§3.1) — BOTH workspace and workspace_rationale
+# present. Exactly one must be set → ConfigError::WorkspaceXor.
+# (Exit-gate rejection fixture; not in the plan's original 9-fixture list —
+#  see Phase 2 deviation note. The neither-present case is exercised by a
+#  unit test in validate.rs.)
+title = "Add rate limiting to API"
+
+[contract]
+scope = "Add token-bucket rate limiting middleware to all /api routes"
+base_branch = "develop"
+workspace = "~/github.com/you/api"
+workspace_rationale = "the api repo, cloned locally"
+
+[[tasks]]
+behavior = "Create token_bucket middleware module"
+verifications = [
+  { intent = "Unit tests pass for new middleware::token_bucket module" },
+]

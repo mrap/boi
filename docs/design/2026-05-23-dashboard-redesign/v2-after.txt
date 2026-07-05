@@ -1,0 +1,40 @@
+BOI                                                                                         ↑↓ · ⏎ open · q quit
+
+RUNNING
+▶ S1RUNNING                                                                                                  5ph  30m00s
+▸ S2RUNNING                                                                                                  2ph  15m00s
+▸ S3RUNNING                                                                                                   1ph  2m00s
+
+QUEUED (2)
+◦ S4QUEUED
+◦ S5QUEUED
+
+FINISHED  (5)
+  S6FINISH                                                                                                     ✓  1h ago
+  S7FINISH                                                                                                     ✓  1h ago
+  S8FAILED                                                                                                     ✗  3h ago
+  S9FINISH                                                                                                    ✓  14h ago
+  SAFINISH                                                                                                    ✓  20h ago
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

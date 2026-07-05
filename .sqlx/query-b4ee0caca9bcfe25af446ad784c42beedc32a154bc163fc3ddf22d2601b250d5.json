@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE phase_runs SET last_heartbeat_at = ?2 WHERE id = ?1 AND completed_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "b4ee0caca9bcfe25af446ad784c42beedc32a154bc163fc3ddf22d2601b250d5"
+}

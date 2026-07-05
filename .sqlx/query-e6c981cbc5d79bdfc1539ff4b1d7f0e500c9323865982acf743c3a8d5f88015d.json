@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO decisions (id, spec_id, phase_run_id, origin, title, summary, rationale, alternatives, supersedes, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 10
+    },
+    "nullable": []
+  },
+  "hash": "e6c981cbc5d79bdfc1539ff4b1d7f0e500c9323865982acf743c3a8d5f88015d"
+}

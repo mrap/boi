@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!: String\" FROM phase_runs WHERE completed_at IS NULL AND COALESCE(last_heartbeat_at, started_at) < ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "a81bc49450d9afe4f2f986575d4e692150d560253a032bb57fcdc7de58525458"
+}

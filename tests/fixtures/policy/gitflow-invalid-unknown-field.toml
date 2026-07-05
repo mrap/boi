@@ -1,0 +1,6 @@
+# Invalid branch-policy marker fixture (R-C1.4) — unknown field. The marker
+# schema is deny_unknown_fields: a present-but-invalid `.boi-policy.toml` is a
+# hard, typed PolicyInvalid error at dispatch and a StepOutcome::Fail at
+# runtime — never silently treated as unmanaged (R-B2 error taxonomy).
+model     = "gitflow"
+protectd  = ["main"]         # typo'd field name — must trigger the unknown-field reject

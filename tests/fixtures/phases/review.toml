@@ -1,0 +1,24 @@
+# Task-level worker phase — reviews the executed change before commit.
+name = "review"
+level = "task"
+kind = "worker"
+prompt_template = "review.md"
+
+[runtime]
+provider = "claude_code"
+model = "claude-opus-4-7"
+
+[on.passing]
+next = "commit"
+emit = "task.review.completed"
+
+[on.redo]
+next = "execute"
+emit = "task.review.retry"
+
+[on.blocked]
+emit = "task.review.blocked"
+
+[on.fail]
+next = "propose_adjustment"
+emit = "task.review.failed"

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE spec_runtime SET status = ?2, failure_reason = ?3, cancellation_reason = ?4, started_at = COALESCE(started_at, ?5), completed_at = COALESCE(completed_at, ?6) WHERE spec_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "b6dd5990f226e149c089525808f6e66516ca7a3a05f49454cd8078c83d16dde4"
+}
