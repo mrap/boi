@@ -66,7 +66,7 @@ depth. Working inside a layer? Read that layer's `AGENTS.md` first.
 | `boi fail <spec-id> --reason …` | operator-marked failure |
 | `boi clean <spec-id>` | delete a spec + cascade (retention) |
 | `boi spec show <spec-id>` | dump the stored spec snapshot |
-| `boi daemon <serve\|start\|stop\|status\|restart>` | service lifecycle; `serve` is the boot loop (the LaunchAgent rides this) |
+| `boi daemon <serve\|install\|start\|stop\|status\|restart>` | service lifecycle; `serve` is the boot loop (the LaunchAgent rides this) |
 | `boi traces` / `boi failures` | OTel queries (needs the `duckdb` build feature) |
 | `boi completions <shell>` | emit a shell completion script |
 | `boi mcp-serve` | one stdio MCP server bound to a single worker's phase run |

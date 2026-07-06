@@ -9,6 +9,9 @@ the spec format, see the CLI table in the root [AGENTS.md](../AGENTS.md).
 - **Rust 1.85+** and a C compiler (the bundled DuckDB build needs one)
 - **git** (worker phases run in git worktrees)
 - **goose** on `PATH`, version `>=1.34, <2.0` — preflight gates every dispatch on it
+- **A coding-agent CLI, installed and authenticated** — the default provider is
+  [Claude Code](https://github.com/anthropics/claude-code); its token goes in
+  `~/.boi/v2/secrets/claude.env` (the Secrets section below walks through it)
 
 ## Build
 

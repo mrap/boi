@@ -39,15 +39,9 @@ the `<tasks>` boundary, and routes each phase's verdict until the spec terminate
 
 ## Runtime layout (`~/.boi/v2/`)
 
-| Path | Holds |
-|------|-------|
-| `boi.db` | The SQLite store (specs, spec versions/runtime, task runtime, deps, phase runs, decisions) |
-| `daemon.sock` | The Unix-domain control socket |
-| `phases/`, `pipelines/` | Phase and pipeline TOML declarations |
-| `recipes/` | Goose-recipe scratch files |
-| `secrets/` | Operator `*.env` files with provider tokens, read at daemon startup |
-| `traces/` | OTel JSONL traces (`**/*.jsonl` — what `boi traces` and the dashboard read) |
-| `worktrees/` | Per-spec ephemeral worktrees |
+The full path-by-path table of what lives under `~/.boi/v2/` is in
+[docs/getting-started.md](../getting-started.md) ("Where state lives") — read it
+when you need to find state on disk.
 
 See also: the root [AGENTS.md](../../AGENTS.md) (commands + spec format),
 [invariants.md](invariants.md), [conventions.md](conventions.md),

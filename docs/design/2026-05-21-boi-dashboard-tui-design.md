@@ -51,7 +51,8 @@ missing is a **human-navigable view** of that data.
   the worker log, not the trace file. Deferred — out of scope for the trace
   reader.
 - Mutating runtime state from the dashboard (cancel/unblock/etc.). It is
-  strictly read-only; recovery actions stay on `boi recover`/`cancel`/etc.
+  strictly read-only; recovery actions stay on `boi cancel` / `unblock` /
+  `fail` / `resolve-conflict`.
 
 ## 4. The one screen
 
@@ -214,7 +215,7 @@ boi dashboard [SPEC_ID]
 
 ### 8.1 Removing `boi status`
 
-Per the decision record, `boi status` is deleted, not kept in parallel:
+`boi status` is deleted, not kept in parallel:
 
 - Delete `src/cli/status.rs` (including the `--watch` redraw loop).
 - Remove `Command::Status` from `src/cli/mod.rs`.
@@ -249,8 +250,7 @@ events; the render loop folds both into `DashState` and redraws.
 - A failed poll tick prints a non-fatal status line in the footer and the loop
   continues (matches `boi status --watch`'s existing non-fatal-tick behavior).
 - A missing / unreadable trace file degrades the leaf log to "no trace data"
-  but the structural tree (from SQLite) still renders — loud, not silent (SO
-  S6).
+  but the structural tree (from SQLite) still renders — loud, not silent.
 - Terminal restored on `Ctrl-C` / panic via a guard, so a crash never leaves
   the terminal in raw mode.
 - An unknown / nonexistent `SPEC_ID` exits non-zero with a clear message.

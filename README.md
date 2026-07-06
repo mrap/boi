@@ -113,7 +113,7 @@ verifications = [
 | `boi fail <spec-id> --reason "…"` | operator-marked failure |
 | `boi clean <spec-id>` | delete a spec and its cascade |
 | `boi spec show <spec-id>` | dump the stored spec snapshot |
-| `boi daemon <serve\|start\|stop\|status\|restart>` | service lifecycle |
+| `boi daemon <serve\|install\|start\|stop\|status\|restart>` | service lifecycle |
 | `boi traces` / `boi failures` | OTel-backed recurring-failure queries (needs the `duckdb` feature) |
 | `boi completions <shell>` | emit a shell completion script |
 | `boi mcp-serve` | one stdio MCP server bound to a single worker's phase run |
@@ -163,7 +163,7 @@ you don't fully trust.
 
 ## Status
 
-BOI is under active development (currently v3.3.2). The test suite is ~775
+BOI is under active development (currently v3.3.2). The test suite is 776
 tests, green. Not yet shipped: prebuilt release binaries — `install.sh` (and
 manual `cargo install`) both build from source for now.
 

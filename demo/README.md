@@ -1,6 +1,6 @@
 # Demo
 
-A <90s "money shot" of BOI: a real 3-task spec with a DAG dependency and both
+A <90s demo of BOI: a real 3-task spec with a DAG dependency and both
 verify-gate kinds, dispatched and shown live in the dashboard TUI.
 
 ## Files
@@ -38,20 +38,17 @@ No `boi daemon` is running during this recording, on purpose:
 That's the reproducible half of the demo: anyone can run it, on any machine
 with `boi` built, with zero setup beyond `git` and this repo.
 
-## What needs Mike physically present
+## The live half (needs a real environment)
 
 The other half — watching the pipeline actually *execute* — needs a live
-environment this tape deliberately doesn't touch:
+setup this tape deliberately doesn't touch:
 
 - `boi daemon start` running, with a real `goose` (`>=1.34, <2.0`) on `PATH`.
 - A real `~/.boi/v2/secrets/claude.env` with a live `CLAUDE_CODE_OAUTH_TOKEN`
   (or another authenticated provider) — preflight probes it live before any
   phase spends a token.
-- Re-dispatching `demo/spec.toml` (or a fresh copy) against that daemon, then
-  watching `boi dashboard` while the real pipeline runs: `add-handler` and
+- Re-dispatch `demo/spec.toml` (or a fresh copy) against that daemon, then
+  watch `boi dashboard` while the real pipeline runs: `add-handler` and
   `wire-router` moving `active → passing` in parallel, `document-endpoint`
   unblocking once both clear, real commits landing in the worktrees, and the
   spec merging to `main` in the demo workspace.
-
-Do not record or publish anything until that live pass has actually been run
-and reviewed — this tape and this README are the safe, reviewable half only.
