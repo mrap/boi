@@ -496,12 +496,6 @@ fn probe_plan_with<F>(provider: &str, model: &str, resolve_env: &F) -> ProbePlan
 where
     F: Fn(&str) -> Option<String>,
 {
-    let body = serde_json::json!({
-        "model": model,
-        "max_tokens": 1,
-        "messages": [{ "role": "user", "content": "ping" }],
-    })
-    .to_string();
     match provider {
         "claude_code" | "claude-code" => match resolve_env("CLAUDE_CODE_OAUTH_TOKEN") {
             Some(tok) if !tok.trim().is_empty() => ProbePlan::Request(ProbeRequest {
@@ -535,7 +529,13 @@ where
                     "anthropic-version: 2023-06-01".to_owned(),
                     "content-type: application/json".to_owned(),
                 ],
-                body,
+                // API keys are not shape-gated — the bare 1-token no-op.
+                body: serde_json::json!({
+                    "model": model,
+                    "max_tokens": 1,
+                    "messages": [{ "role": "user", "content": "ping" }],
+                })
+                .to_string(),
             }),
             _ => ProbePlan::Unavailable(
                 "provider `anthropic`: ANTHROPIC_API_KEY is unset — cannot probe the credential"
