@@ -51,6 +51,16 @@
 //! gate, not a network gate (the per-attempt timeout in `goose.rs` D1 is the
 //! runtime backstop). The probe sits behind the [`ProviderProbe`] trait so
 //! tests stub it; production wires [`CurlProviderProbe`].
+//!
+//! ### OAuth shape-gate (incident 2026-07-16)
+//!
+//! The probe's request **shape** matters, not just its credential: Anthropic
+//! 429s any OAuth-token Messages call that lacks the Claude Code system
+//! prompt (see [`CLAUDE_CODE_SYSTEM_PROMPT`]). The original bare-body probe
+//! therefore read as "rate limited" on every dispatch from 2026-06-13 to
+//! 2026-07-16 while the credential and the runtime were perfectly healthy.
+//! The `claude_code` probe now sends the same shape the runtime sends; the
+//! `anthropic` (x-api-key) probe is not shape-gated and stays bare.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -434,6 +444,18 @@ fn distinct_provider_models(phases: &[PhaseDef]) -> BTreeMap<String, String> {
 /// The Anthropic Messages endpoint both probeable providers hit.
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
+/// The system prompt Anthropic's OAuth shape-gate requires (incident
+/// 2026-07-16): a `CLAUDE_CODE_OAUTH_TOKEN` Messages call whose system prompt
+/// does not start with this exact text gets HTTP 429 (`rate_limit_error`,
+/// message "Error", no `retry-after`) **regardless of the credential's real
+/// throttle state** — observed continuously 2026-06-13 → 2026-07-16, refusing
+/// every dispatch pre-spend. Probing WITH it matches the shape the runtime
+/// actually sends (goose's `claude-code` provider drives the `claude` CLI),
+/// so the probe answers the question it exists for — "will the runtime's
+/// requests be throttled?" — and a *genuine* usage-window 429 still comes
+/// back 429 under this shape (the 2026-06-06 incident class stays detected).
+const CLAUDE_CODE_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 /// The hard cap on one probe round-trip.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -490,7 +512,14 @@ where
                     "anthropic-version: 2023-06-01".to_owned(),
                     "content-type: application/json".to_owned(),
                 ],
-                body,
+                // OAuth calls are shape-gated — see `CLAUDE_CODE_SYSTEM_PROMPT`.
+                body: serde_json::json!({
+                    "model": model,
+                    "max_tokens": 1,
+                    "system": [{ "type": "text", "text": CLAUDE_CODE_SYSTEM_PROMPT }],
+                    "messages": [{ "role": "user", "content": "ping" }],
+                })
+                .to_string(),
             }),
             _ => ProbePlan::Unavailable(
                 "provider `claude_code`: CLAUDE_CODE_OAUTH_TOKEN is unset in the daemon \
@@ -1022,6 +1051,44 @@ mod tests {
             probe_plan_with("openrouter", "some-model", &env),
             ProbePlan::Unsupported
         ));
+    }
+
+    /// The `claude_code` probe body must carry the Claude Code system prompt —
+    /// Anthropic shape-gates OAuth-token Messages calls (incident 2026-07-16):
+    /// without it the probe 429s regardless of the credential's real throttle
+    /// state, which is exactly the false-positive this probe must not produce.
+    /// The `anthropic` (x-api-key) probe is not shape-gated and stays bare.
+    #[test]
+    fn test_l1_claude_code_probe_body_carries_the_cc_system_prompt() {
+        let env = |var: &str| match var {
+            "CLAUDE_CODE_OAUTH_TOKEN" => Some("tok-oauth".to_owned()),
+            "ANTHROPIC_API_KEY" => Some("sk-key".to_owned()),
+            _ => None,
+        };
+
+        let ProbePlan::Request(req) = probe_plan_with("claude_code", "claude-opus-4-8", &env)
+        else {
+            panic!("claude_code with a token must yield a request");
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&req.body).expect("probe body must be valid JSON");
+        assert_eq!(
+            body["system"][0]["text"], CLAUDE_CODE_SYSTEM_PROMPT,
+            "the claude_code probe must send the Claude Code system prompt \
+             (the shape Anthropic's OAuth gate accepts), got body {}",
+            req.body,
+        );
+
+        let ProbePlan::Request(req) = probe_plan_with("anthropic", "claude-opus-4-8", &env) else {
+            panic!("anthropic with a key must yield a request");
+        };
+        let body: serde_json::Value =
+            serde_json::from_str(&req.body).expect("probe body must be valid JSON");
+        assert!(
+            body.get("system").is_none(),
+            "the anthropic x-api-key probe is not shape-gated and stays bare, got body {}",
+            req.body,
+        );
     }
 
     /// A missing `goose` binary → `GooseMissing`.
